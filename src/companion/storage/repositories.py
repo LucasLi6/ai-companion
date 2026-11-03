@@ -455,8 +455,11 @@ class AnalysisRepository:
         return row["analysis_id"] if row is not None else None
 
     async def save_candidate(self, candidate: MemoryCandidate) -> None:
+        # INSERT OR IGNORE + idx_candidates_event_content (schema v7) makes a
+        # repeated proposal for the same event a no-op, so retries and
+        # duplicate model output can never multiply candidate rows.
         await self.db.execute(
-            "INSERT INTO memory_candidates(candidate_id, source_event_id,"
+            "INSERT OR IGNORE INTO memory_candidates(candidate_id, source_event_id,"
             " subject_person_id, content, operation, status, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
@@ -521,6 +524,29 @@ class AnalysisRepository:
         row = await cur.fetchone()
         if row is None:
             return None
+        return self._to_action(row)
+
+    async def get_actions_for_events(
+        self, event_ids: list[str]
+    ) -> dict[str, AgentAction]:
+        """Return one action per event in a single query (batched for history).
+
+        Empty input returns an empty mapping. Callers (the context builder) use
+        this to interleave the agent's responses into the recent conversation
+        without issuing one query per event.
+        """
+        if not event_ids:
+            return {}
+        placeholders = ",".join("?" for _ in event_ids)
+        cur = await self.db.execute(
+            "SELECT action_id, event_id, action_type, response_text, reason_code,"
+            f" status, created_at FROM agent_actions WHERE event_id IN ({placeholders})",
+            tuple(event_ids),
+        )
+        rows = await cur.fetchall()
+        return {r["event_id"]: self._to_action(r) for r in rows}
+
+    def _to_action(self, row) -> AgentAction:
         return AgentAction(
             action_id=row["action_id"],
             event_id=row["event_id"],

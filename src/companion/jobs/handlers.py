@@ -44,7 +44,17 @@ async def memory_consolidation(
         raise JobError(f"source event {event_id} not found")
 
     candidates = await repos.analysis.get_candidates(event_id)
-    for cand in candidates:
+
+    # Idempotency: a candidate that already reached a terminal state is never
+    # re-processed, so re-running this job (after a crash, a retry or a lease
+    # expiry) has no further side effects.
+    terminal = {
+        MemoryCandidateStatus.CONSOLIDATED,
+        MemoryCandidateStatus.SKIPPED,
+    }
+    pending = [c for c in candidates if c.status not in terminal]
+
+    for cand in pending:
         if cand.source_event_id != event_id:
             raise JobError(
                 f"candidate {cand.candidate_id} references event {cand.source_event_id},"
@@ -65,7 +75,7 @@ async def memory_consolidation(
     speaker_id = event.speaker_person_id
     source_authorized = await _learning_authorized(repos, speaker_id)
 
-    for cand in candidates:
+    for cand in pending:
         subject_id = cand.subject_person_id or speaker_id
         subject_authorized = await _learning_authorized(repos, subject_id)
 
@@ -96,8 +106,9 @@ async def memory_consolidation(
         )
 
     logger.info(
-        "memory_consolidation_done event_id=%s candidates=%d",
+        "memory_consolidation_done event_id=%s candidates=%d processed=%d",
         event_id,
         len(candidates),
+        len(pending),
     )
     # V0.0: intentionally writes no rows to memory_facts.

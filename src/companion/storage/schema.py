@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -361,6 +361,25 @@ MIGRATIONS: list[tuple[int, str]] = [
               JOIN memory_sources s ON s.source_id = e.source_id
               WHERE s.url LIKE 'https://example.com/%' OR s.extra LIKE '%mock%'
           );
+        """,
+    ),
+    # Version 7 (DeepSeek integration): make model-proposed candidates
+    # idempotent per source event. Existing duplicate rows are collapsed onto
+    # the first insertion before the unique index is created; from then on
+    # ``INSERT OR IGNORE`` (see AnalysisRepository.save_candidate) makes a
+    # repeated proposal a no-op instead of a duplicate row. Candidates remain
+    # inert proposals — this migration never promotes anything to ACTIVE.
+    (
+        7,
+        """
+        DELETE FROM memory_candidates
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM memory_candidates
+            GROUP BY source_event_id, content
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_event_content
+            ON memory_candidates(source_event_id, content);
         """,
     ),
 ]

@@ -144,13 +144,93 @@ For a `--to human` utterance the same trace shows `[DECISION] IGNORE` and no
 
 ---
 
+## Real DeepSeek mode (V0.1)
+
+Mock remains the default: no command makes a network call or spends tokens
+unless you explicitly pass `--provider deepseek`.
+
+### 1. Install the SDK extra
+
+```bash
+uv pip install --python .venv/bin/python -e ".[deepseek]"
+```
+
+### 2. Configure the key (environment only)
+
+```bash
+export DEEPSEEK_API_KEY="sk-..."           # read from the environment only
+# optional overrides
+export DEEPSEEK_MODEL="deepseek-flash"
+export DEEPSEEK_BASE_URL="https://api.deepseek.com"
+export DEEPSEEK_TIMEOUT="60"
+export DEEPSEEK_MAX_RETRIES="2"
+```
+
+The key is never accepted as a CLI flag, never written to SQLite, never logged,
+and never included in error messages.
+
+### 3. Grant external-AI consent
+
+External AI is a **separate** grant from memory learning:
+
+```bash
+python -m companion person add --name "Owner" --role owner \
+  --allow-processing --allow-persistence --allow-memory-learning \
+  --allow-external-ai
+```
+
+A person without `--allow-external-ai` is still processed locally, but their
+input is never sent to DeepSeek: the analysis becomes `WAIT` /
+`permission_denied` and no request leaves the machine.
+
+### 4. Verify without spending tokens
+
+```bash
+python -m companion deepseek check          # offline config check
+python -m companion deepseek check --live   # one minimal real call
+```
+
+### 5. Talk to it
+
+```bash
+python -m companion say --provider deepseek \
+  --person person_xxx --to agent --text "你好"
+
+python -m companion repl --provider deepseek --person person_xxx
+# /status shows backend, person, conversation, addressee and quiet mode
+```
+
+For every authorised input the real pipeline builds a privacy-filtered context
+(recent turns with speaker labels + permitted memories), asks DeepSeek for a
+strict-JSON cognition result (`RESPOND`/`WAIT`/`IGNORE` plus meaning, reason
+code and memory candidates), applies the local policy, and only then asks
+DeepSeek for a reply when the final action is `RESPOND`. The analysis, memory
+candidates and decision are persisted even when no reply is sent. Candidates
+remain inert proposals (`CONSOLIDATED`/`SKIPPED`) and are never auto-promoted
+to `ACTIVE` memory.
+
+Safety invariants:
+
+- the model never controls `event_id`, `speaker_person_id`,
+  `subject_person_id` or memory ids — those are filled by the program;
+- fabricated `referenced_memory_ids` are dropped;
+- an explicit `--to human` is never turned into a reply, even if the model says
+  `RESPOND`;
+- quiet mode and privacy grants are enforced locally, never delegated to the
+  model;
+- a missing key fails loudly — it never silently falls back to mock;
+- `--provider deepseek` cannot pair a real cognitive provider with a mock
+  response provider (or vice versa).
+
+---
+
 ## Run the tests
 
 ```bash
 .venv/bin/python -m pytest -q
 ```
 
-The suite (153 tests) covers: multi-person independence and duplicate names;
+The suite (250 tests) covers: multi-person independence and duplicate names;
 a decision for every allowed utterance; `IGNORE` still recording everything;
 idempotent re-submission and conflict rejection; database-restart persistence;
 background-job recovery (including a crashed `RUNNING` job); provider-exception
@@ -162,6 +242,16 @@ memory job; crash recovery at each pipeline stage; real async concurrency
 transaction isolation); schema-version migration and refusal of unknown
 versions; model validation (UTC datetimes, non-empty ids, illegal statuses);
 REPL identity reuse; and a 100-event integration run.
+
+The V0.1 DeepSeek layers are covered with fake clients only (no key, no
+network): request mapping, fail-fast auth/invalid-request handling, retry with
+backoff for 429/5xx/timeout/empty responses, the foreground privacy gateway
+(per-speaker and per-memory-subject authorisation), the context builder
+(multi-turn interleaving, truncation, filtering), keyword/CJK memory retrieval
+and referenced-id validation, strict-JSON parsing with one repair retry, the
+explicit-human-addressee guard, candidate deduplication/never-auto-`ACTIVE`,
+runtime provider-mixing rejection, missing-key failure, and response-failure
+recovery that reuses a persisted analysis.
 
 ---
 
@@ -187,8 +277,10 @@ Each durable stage leaves a database record, so a failed/partial event is
 - `storage/` — SQLite schema (WAL, FK on, parameterised SQL), connection, repositories.
 - `people/` — person registry + consent.
 - `core/` — orchestrator, conversation manager, policy.
-- `providers/` — mock cognitive + response providers.
-- `memory/` — `MemoryStore` (hand-authored facts via substring match, *not* semantic).
+- `cognition/` — foreground privacy gateway + external-AI context builder.
+- `providers/` — mock providers, DeepSeek client, cognitive and response providers.
+- `prompts/` — versioned cognitive/response prompt builders.
+- `memory/` — `MemoryStore` (hand-authored facts, keyword/CJK retrieval) and candidate dedupe.
 - `jobs/` — durable `JobWorker` + `MEMORY_CONSOLIDATION` handler.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
@@ -196,12 +288,12 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
 
 ## Known limitations
 
-- **No real understanding.** The mock provider decides purely from
-  `addressee_hint` and records `provider=mock` with explicit reason codes. It
-  never fabricates confidence scores.
-- **No automatic memory learning.** Memory *candidates* are stored and
-  validated by the consolidation job, but nothing is promoted to long-term
-  facts (`memory_facts` is only hand-populated in V0.0).
+- **Mock has no real understanding.** The default mock provider decides purely
+  from `addressee_hint` and records `provider=mock` with explicit reason codes.
+  Real understanding requires `--provider deepseek`; it is never simulated.
+- **No automatic memory learning.** Memory *candidates* are stored, deduplicated
+  and validated by the consolidation job, but nothing is promoted to long-term
+  facts (`memory_items` is only hand-populated or human-confirmed).
 - **No speech.** CLI text input stands in for a future ASR-generated
   `UtteranceEvent`; `RESPOND` output is text, not TTS.
 - **No speaker recognition.** The caller supplies `speaker_person_id`
@@ -214,5 +306,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
 
 ## Next steps
 
-See [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) for the concrete V0.1 plan to swap
-in a real DeepSeek cognitive provider.
+V0.1 real-text DeepSeek cognition is implemented (see “Real DeepSeek mode”
+above). Still deliberately out of scope: ASR/TTS and voiceprints, real DeepSeek
+idle reflection, autonomous web research, a vector database, automatic
+long-term fact merging, and a React UI.

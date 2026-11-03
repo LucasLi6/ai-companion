@@ -44,6 +44,7 @@ from companion.domain.models import (
     new_id,
     utcnow,
 )
+from companion.memory.candidates import dedupe_candidates
 from companion.people.registry import PersonRegistry
 from companion.storage.repositories import Repositories
 
@@ -63,6 +64,7 @@ class Orchestrator:
         response,
         memory,
         jobs=None,
+        context_builder=None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repos = repos
@@ -73,6 +75,11 @@ class Orchestrator:
         self.response = response
         self.memory = memory
         self.jobs = jobs
+        # When set (real-DeepSeek mode), the orchestrator builds a privacy-
+        # filtered CognitiveContext and hands the *same* context to both the
+        # cognitive and response providers. In mock mode it stays None and the
+        # providers receive the lightweight ConversationContext as before.
+        self.context_builder = context_builder
         self.logger = logger or logging.getLogger("companion.orchestrator")
         self._conversation_locks: dict[str, asyncio.Lock] = {}
 
@@ -157,6 +164,13 @@ class Orchestrator:
         ]
 
         try:
+            # 4b. Build the external-AI context (privacy-filtered history,
+            # labels, memories) when the real provider is wired in. Mock mode
+            # keeps the lightweight ConversationContext exactly as before.
+            cognitive_context, provider_memories = await self._prepare_context(
+                event, context, memories, steps
+            )
+
             # 5. Cognitive analysis: reuse a durable analysis, else compute.
             analysis = None
             analysis_id: Optional[str] = None
@@ -166,7 +180,9 @@ class Orchestrator:
 
             job_id: Optional[str] = None
             if analysis is None:
-                analysis = await self.cognitive.analyze(event, context, memories)
+                analysis = await self.cognitive.analyze(
+                    event, cognitive_context, provider_memories
+                )
                 if analysis.event_id != event.event_id:
                     raise ValueError(
                         f"analysis event_id mismatch: {analysis.event_id!r} != {event.event_id!r}"
@@ -181,7 +197,13 @@ class Orchestrator:
                 steps.append(f"[COGNITION] Analysis completed by {analysis.provider}")
                 if persist:
                     analysis_id = new_id("ana")
-                    candidates = analysis.memory_candidates if learn else []
+                    # Model output is untrusted: dedupe before writing, and
+                    # drop every candidate when learning is not authorised.
+                    candidates = (
+                        dedupe_candidates(analysis.memory_candidates)
+                        if learn
+                        else []
+                    )
                     job_key = (
                         f"memory:{event.event_id}"
                         if (learn and self.jobs is not None)
@@ -227,7 +249,7 @@ class Orchestrator:
             else:
                 if final_action == CognitiveAction.RESPOND:
                     response_text = await self.response.generate(
-                        event, analysis, context
+                        event, analysis, cognitive_context
                     )
                     steps.append(f"[RESPONSE] {response_text}")
                 if persist:
@@ -292,6 +314,28 @@ class Orchestrator:
             )
 
     # -- helpers -----------------------------------------------------------
+
+    async def _prepare_context(self, event, context, memories, steps):
+        """Return (provider_context, provider_memories) for this utterance.
+
+        Without a builder this is exactly the old behaviour: the lightweight
+        ConversationContext and the retrieved memories. With a builder (real
+        DeepSeek mode) the context is privacy-filtered before it can reach the
+        network, and the providers get the same filtered memory list that the
+        CognitiveContext carries.
+        """
+        if self.context_builder is None:
+            return context, memories
+        cognitive_context = await self.context_builder.build(event, memories)
+        cognitive_context = cognitive_context.model_copy(
+            update={"quiet_mode": context.quiet_mode}
+        )
+        provider_memories = cognitive_context.memories
+        if len(provider_memories) != len(memories):
+            steps.append(
+                f"[PRIVACY] Filtered {len(memories) - len(provider_memories)} memories"
+            )
+        return cognitive_context, provider_memories
 
     async def _persist_input(self, event: UtteranceEvent) -> None:
         to_save = event.model_copy(update={"processing_status": ProcessingStatus.PROCESSING})

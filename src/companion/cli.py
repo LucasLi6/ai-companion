@@ -32,6 +32,12 @@ from companion.memory.models import (
     MemoryPermissionDeniedError,
     MemoryVersionConflictError,
 )
+from companion.providers.deepseek_client import (
+    DeepSeekConfigError,
+    DeepSeekError,
+    build_deepseek_client,
+    load_deepseek_config,
+)
 from companion.recovery import RecoveryError, RecoveryManager
 from companion.runtime import build_runtime
 from companion.storage.database import Database
@@ -40,6 +46,33 @@ DEFAULT_CONVERSATION = "default"
 
 # Memory-management commands act as the trusted local admin, not as a person.
 ADMIN = AccessContext("admin", is_admin=True, role="cli")
+
+
+def _add_provider_arg(parser: argparse.ArgumentParser) -> None:
+    """Attach ``--provider`` to commands that process utterances.
+
+    Default stays ``mock`` on purpose: no command can make a paid API call
+    unless the user explicitly asks for ``deepseek`` (and has a key).
+    """
+    parser.add_argument(
+        "--provider",
+        choices=["mock", "deepseek"],
+        default="mock",
+        help="Cognition backend (default: mock; deepseek requires DEEPSEEK_API_KEY)",
+    )
+
+
+def _build_foreground_runtime(db, provider: str):
+    """Build a runtime for utterance-processing commands.
+
+    A missing key for ``--provider deepseek`` prints a clear error and returns
+    ``None`` — it never falls back to mock and never makes a network call.
+    """
+    try:
+        return build_runtime(db, provider=provider)
+    except DeepSeekConfigError as exc:
+        print(f"deepseek error: {exc}")
+        return None
 
 
 def _common_parser() -> argparse.ArgumentParser:
@@ -70,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--allow-processing", action="store_true", default=False)
     p_add.add_argument("--allow-persistence", action="store_true", default=False)
     p_add.add_argument("--allow-memory-learning", action="store_true", default=False)
+    p_add.add_argument(
+        "--allow-external-ai",
+        action="store_true",
+        default=False,
+        help="Permit this person's context to be sent to an external AI (needed for --provider deepseek)",
+    )
     p_add.set_defaults(func=cmd_person_add)
     p_list = p_person_sub.add_parser("list", parents=[_common_parser()], help="List people")
     p_list.set_defaults(func=cmd_person_list)
@@ -85,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_say.add_argument("--text", required=True)
     p_say.add_argument("--conversation", default=DEFAULT_CONVERSATION)
+    _add_provider_arg(p_say)
     p_say.set_defaults(func=cmd_say)
 
     p_inspect = sub.add_parser("inspect", parents=[_common_parser()], help="Show a full processing trace for an event")
@@ -170,12 +210,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ir = p_idle_sub.add_parser("run", parents=[_common_parser()], help="Run one idle cycle")
     p_ir.set_defaults(func=cmd_idle_run)
 
-    sub.add_parser("demo", parents=[_common_parser()], help="Run a scripted demo on an isolated database").set_defaults(
-        func=cmd_demo
-    )
+    p_demo = sub.add_parser("demo", parents=[_common_parser()], help="Run a scripted demo on an isolated database")
+    _add_provider_arg(p_demo)
+    p_demo.set_defaults(func=cmd_demo)
     p_repl = sub.add_parser("repl", parents=[_common_parser()], help="Start an interactive text session")
     p_repl.add_argument("--conversation", default=DEFAULT_CONVERSATION)
     p_repl.add_argument("--person", default=None, help="Registered person id of the speaker")
+    _add_provider_arg(p_repl)
     p_repl.set_defaults(func=cmd_repl)
 
     p_recovery = sub.add_parser("recovery", parents=[_common_parser()], help="Recover unfinished events after a crash")
@@ -184,7 +225,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec_list.set_defaults(func=cmd_recovery_list)
     p_rec_retry = p_recovery_sub.add_parser("retry", parents=[_common_parser()], help="Safely resume one event")
     p_rec_retry.add_argument("event_id")
+    _add_provider_arg(p_rec_retry)
     p_rec_retry.set_defaults(func=cmd_recovery_retry)
+
+    p_ds = sub.add_parser("deepseek", parents=[_common_parser()], help="Inspect the DeepSeek configuration")
+    p_ds_sub = p_ds.add_subparsers(dest="deepseek_command")
+    p_ds_check = p_ds_sub.add_parser(
+        "check",
+        parents=[_common_parser()],
+        help="Validate DeepSeek configuration offline (add --live for one real call)",
+    )
+    p_ds_check.add_argument(
+        "--live",
+        action="store_true",
+        default=False,
+        help="Make exactly one minimal API call to verify the key (costs tokens)",
+    )
+    p_ds_check.set_defaults(func=cmd_deepseek_check)
 
     return parser
 
@@ -237,6 +294,7 @@ async def cmd_person_add(args) -> int:
             allow_processing=args.allow_processing,
             allow_persistence=args.allow_persistence,
             allow_memory_learning=args.allow_memory_learning,
+            allow_external_ai=args.allow_external_ai,
         )
         print(person.person_id)
     finally:
@@ -254,6 +312,7 @@ async def cmd_person_list(args) -> int:
                 f"processing={int(c.allow_processing)}"
                 f" persistence={int(c.allow_persistence)}"
                 f" learning={int(c.allow_memory_learning)}"
+                f" external_ai={int(c.allow_external_ai)}"
                 if c
                 else "no consent"
             )
@@ -281,6 +340,7 @@ async def cmd_person_show(args) -> int:
             print(f"allow_processing: {c.allow_processing}")
             print(f"allow_persistence: {c.allow_persistence}")
             print(f"allow_memory_learning: {c.allow_memory_learning}")
+            print(f"allow_external_ai: {c.allow_external_ai}")
     finally:
         await db.close()
     return 0
@@ -289,7 +349,9 @@ async def cmd_person_show(args) -> int:
 async def cmd_say(args) -> int:
     db = await _connect(args.db)
     try:
-        rt = build_runtime(db)
+        rt = _build_foreground_runtime(db, getattr(args, "provider", "mock"))
+        if rt is None:
+            return 1
         event = make_utterance_event(
             conversation_id=args.conversation,
             text=args.text,
@@ -686,7 +748,9 @@ async def cmd_recovery_list(args) -> int:
 async def cmd_recovery_retry(args) -> int:
     db = await _connect(args.db)
     try:
-        rt = build_runtime(db)
+        rt = _build_foreground_runtime(db, getattr(args, "provider", "mock"))
+        if rt is None:
+            return 1
         recovery = RecoveryManager(rt.repos, rt.orchestrator)
         try:
             report = await recovery.retry(args.event_id)
@@ -708,14 +772,19 @@ async def cmd_demo(args) -> int:
         db_path = Path(tmp) / "demo.db"
         db = await _connect(db_path)
         try:
-            rt = build_runtime(db)
+            rt = _build_foreground_runtime(db, getattr(args, "provider", "mock"))
+            if rt is None:
+                return 1
+            external_ai = getattr(args, "provider", "mock") == "deepseek"
             owner = await rt.registry.register(
                 "宿主", "owner",
                 allow_processing=True, allow_persistence=True, allow_memory_learning=True,
+                allow_external_ai=external_ai,
             )
             friend = await rt.registry.register(
                 "朋友", "friend",
                 allow_processing=True, allow_persistence=True, allow_memory_learning=True,
+                allow_external_ai=external_ai,
             )
             print(f"registered owner={owner.person_id} friend={friend.person_id}")
             print()
@@ -775,7 +844,10 @@ async def _select_repl_person(rt, person_id):
 async def cmd_repl(args) -> int:
     db = await _connect(args.db)
     try:
-        rt = build_runtime(db)
+        provider = getattr(args, "provider", "mock")
+        rt = _build_foreground_runtime(db, provider)
+        if rt is None:
+            return 1
         person, err = await _select_repl_person(rt, getattr(args, "person", None))
         if person is None:
             print(err)
@@ -783,6 +855,14 @@ async def cmd_repl(args) -> int:
         addressee = "agent"
         print("AI Companion REPL. Type /help for commands.")
         print(f"speaking as {person.person_id} ({person.display_name})")
+        print(f"provider: {rt.provider}")
+        if provider == "deepseek":
+            authorized = await rt.registry.is_external_ai_authorized(person.person_id)
+            if not authorized:
+                print(
+                    "warning: this person has not granted --allow-external-ai;"
+                    " every DeepSeek call will be denied"
+                )
         while True:
             try:
                 line = input("you> ").strip()
@@ -807,8 +887,18 @@ async def cmd_repl(args) -> int:
                 elif cmd == "/history":
                     for e in await rt.repos.utterance.list_events(None, 20):
                         print(f"  {e.event_id} to={e.addressee_hint.value} {e.text}")
+                elif cmd == "/status":
+                    ctx = await rt.repos.conversation.get(args.conversation)
+                    print(f"provider: {rt.provider}")
+                    print(f"person: {person.person_id} ({person.display_name})")
+                    print(f"conversation: {args.conversation}")
+                    print(f"addressee: {addressee}")
+                    print(f"quiet_mode: {'on' if ctx and ctx.quiet_mode else 'off'}")
                 elif cmd == "/help":
-                    print("commands: /to agent|human|unknown  /quiet on|off  /history  /quit")
+                    print(
+                        "commands: /to agent|human|unknown  /quiet on|off"
+                        "  /history  /status  /quit"
+                    )
                 else:
                     print("unknown command (see /help)")
                 continue
@@ -820,10 +910,61 @@ async def cmd_repl(args) -> int:
                 source=EventSource.CLI,
             )
             report = await rt.orchestrator.process_utterance(event)
-            for step in report.steps:
-                print(step)
+            if report.response_text:
+                print(f"assistant> {report.response_text}")
+            elif report.status != "COMPLETED":
+                print(f"[{report.status}] {report.error or ''}".rstrip())
+            else:
+                reason = f" ({report.reason_code.value})" if report.reason_code else ""
+                action = report.action.value if report.action else "no action"
+                print(f"[{action}{reason}]")
             if rt.worker is not None:
                 await rt.worker.run_once()
     finally:
         await db.close()
+    return 0
+
+
+async def cmd_deepseek_check(args) -> int:
+    """Validate DeepSeek configuration without revealing the key.
+
+    Offline by default. ``--live`` makes exactly one minimal API call; it is
+    only attempted when a key is configured, and any failure is reported
+    without ever printing the key or the response body.
+    """
+    config = load_deepseek_config()
+    print("== deepseek configuration ==")
+    print(f"api_key: {'configured' if config.api_key else 'MISSING'}")
+    print(f"base_url: {config.base_url}")
+    print(f"model: {config.model}")
+    print(f"timeout_seconds: {config.timeout_seconds}")
+    print(f"max_retries: {config.max_retries}")
+    print(f"analysis_max_tokens: {config.analysis_max_tokens}")
+    print(f"response_max_tokens: {config.response_max_tokens}")
+    print(f"analysis_reasoning_effort: {config.analysis_reasoning_effort}")
+    print(f"response_reasoning_effort: {config.response_reasoning_effort}")
+
+    if not config.api_key:
+        print("error: DEEPSEEK_API_KEY is not set; --provider deepseek cannot start")
+        return 1
+
+    if not args.live:
+        print("config check passed (offline; pass --live to make one real call)")
+        return 0
+
+    try:
+        client = build_deepseek_client(config)
+        response = await client.complete(
+            [{"role": "user", "content": "Reply with exactly: OK"}],
+            request_type="response",
+            max_tokens=8,
+        )
+    except DeepSeekError as exc:
+        print(f"live check failed: {type(exc).__name__}: {exc}")
+        return 1
+    print(
+        f"live check passed: model={response.model}"
+        f" tokens={response.total_tokens}"
+        f" reply={response.content[:20]!r}"
+    )
     return 0
