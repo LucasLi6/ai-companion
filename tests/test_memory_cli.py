@@ -99,3 +99,79 @@ def test_memory_link_and_delete_missing(tmp_path, capsys):
 
     assert main(["--db", db, "memory", "delete", "mem_missing"]) == 1
     assert "not found" in capsys.readouterr().out
+
+
+def _add_person(db, capsys, name="Owner"):
+    assert main([
+        "--db", db, "person", "add", "--name", name, "--role", "owner",
+        "--allow-processing", "--allow-persistence", "--allow-memory-learning",
+    ]) == 0
+    return capsys.readouterr().out.strip().splitlines()[-1]
+
+
+def test_memory_assign_unassign_and_assignments(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    main(["--db", db, "init"])
+    person_id = _add_person(db, capsys)
+
+    assert main(["--db", db, "memory", "add", "--content", "喜欢川菜"]) == 0
+    memory_id = capsys.readouterr().out.strip()
+
+    assert main(
+        ["--db", db, "memory", "assign", memory_id, "--person", person_id]
+    ) == 0
+    assert f"assigned {memory_id} -> {person_id}" in capsys.readouterr().out
+
+    # Assignment is idempotent.
+    assert main(
+        ["--db", db, "memory", "assign", memory_id, "--person", person_id]
+    ) == 0
+    assert "already assigned" in capsys.readouterr().out
+
+    assert main(["--db", db, "memory", "assignments", memory_id]) == 0
+    out = capsys.readouterr().out
+    assert person_id in out
+
+    # Unknown ids are rejected, never created.
+    assert main(
+        ["--db", db, "memory", "assign", memory_id, "--person", "person_missing"]
+    ) == 1
+    assert "not found" in capsys.readouterr().out
+
+    assert main(
+        ["--db", db, "memory", "unassign", memory_id, "--person", person_id]
+    ) == 0
+    assert f"unassigned {memory_id} -> {person_id}" in capsys.readouterr().out
+    assert main(
+        ["--db", db, "memory", "unassign", memory_id, "--person", person_id]
+    ) == 0
+    assert "was not assigned" in capsys.readouterr().out
+
+    assert main(["--db", db, "memory", "assignments", memory_id]) == 0
+    assert "no assignments" in capsys.readouterr().out
+
+
+def test_policy_show_and_set(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    main(["--db", db, "init"])
+    capsys.readouterr()
+
+    assert main(["--db", db, "policy", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "policy.response_conservatism: balanced" in out
+    assert "policy.interruption_threshold: medium" in out
+    assert "policy.curiosity_level: low" in out
+
+    assert main(
+        ["--db", db, "policy", "set", "policy.response_conservatism", "conservative"]
+    ) == 0
+    assert "policy.response_conservatism = conservative" in capsys.readouterr().out
+
+    # Persisted in SQLite, so a new process sees it.
+    assert main(["--db", db, "policy", "show"]) == 0
+    assert "policy.response_conservatism: conservative" in capsys.readouterr().out
+
+    assert main(
+        ["--db", db, "policy", "set", "policy.curiosity_level", "nonsense"]
+    ) == 1
+    assert "invalid value" in capsys.readouterr().out

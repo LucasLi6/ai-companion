@@ -11,15 +11,13 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from typing import Optional
 
 from companion.domain.enums import (
     MemoryKind,
     MemoryStatus,
     MemoryVisibility,
-    VerificationLevel,
 )
-from companion.domain.models import new_id, utcnow
+from companion.domain.models import utcnow
 from companion.storage.database import Database
 
 from .models import MemoryEvidence, MemoryItem, MemoryRevision, MemorySource
@@ -211,6 +209,197 @@ class MemoryRepository:
             (source_id,),
         )
         return [r["memory_id"] for r in await cur.fetchall()]
+
+    # -- provenance / write-through ---------------------------------------
+
+    async def add_provenance(
+        self,
+        memory_id: str,
+        *,
+        source_event_id: str | None,
+        candidate_id: str | None,
+        speaker_person_id: str | None,
+        subject_person_id: str | None,
+        source_type: str = "utterance",
+        assertion_type: str = "UNKNOWN",
+        certainty_category: str = "UNKNOWN",
+        topic: str | None = None,
+        explicit_remember_request: bool = False,
+        self_reported: bool = False,
+        third_party_reported: bool = False,
+        model_inferred: bool = False,
+    ) -> None:
+        now = _iso(utcnow())
+        await self.db.execute(
+            "INSERT OR REPLACE INTO memory_provenance("
+            " memory_id, source_event_id, candidate_id, speaker_person_id,"
+            " subject_person_id, source_type, assertion_type, certainty_category,"
+            " topic, explicit_remember_request, self_reported, third_party_reported,"
+            " model_inferred, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                memory_id,
+                source_event_id,
+                candidate_id,
+                speaker_person_id,
+                subject_person_id,
+                source_type,
+                assertion_type,
+                certainty_category,
+                topic,
+                int(explicit_remember_request),
+                int(self_reported),
+                int(third_party_reported),
+                int(model_inferred),
+                now,
+                now,
+            ),
+        )
+
+    async def get_provenance(self, memory_id: str) -> dict | None:
+        cur = await self.db.execute(
+            "SELECT * FROM memory_provenance WHERE memory_id = ?", (memory_id,)
+        )
+        row = await cur.fetchone()
+        return dict(row) if row is not None else None
+
+    async def find_memory_by_candidate(self, candidate_id: str) -> str | None:
+        """Return the memory already written from ``candidate_id`` (if any).
+
+        This is the crash-recovery fallback to the write mapping: provenance
+        and the memory are written in one transaction, so a committed memory
+        is always discoverable even if the mapping row was lost.
+        """
+        cur = await self.db.execute(
+            "SELECT memory_id FROM memory_provenance WHERE candidate_id = ?",
+            (candidate_id,),
+        )
+        row = await cur.fetchone()
+        return row["memory_id"] if row is not None else None
+
+    async def list_for_subject(
+        self,
+        subject_id: str,
+        *,
+        statuses: list[str],
+        kinds: list[str] | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Return memories about a PERSON subject, with provenance topic.
+
+        Used by the trusted consolidation layer to detect duplicates and
+        likely corrections before writing. Never used to bypass visibility:
+        the caller is the trusted local pipeline and still writes through
+        :class:`MemoryService`.
+        """
+        if not statuses:
+            return []
+        params: list = [subject_id, *statuses]
+        sql = (
+            "SELECT m.memory_id, m.kind, m.content, m.status, m.visibility,"
+            " m.created_by, m.created_at, m.updated_at, m.version, m.human_confirmed,"
+            " m.source_supported, m.self_reported, m.third_party_reported,"
+            " m.model_inferred, p.topic, p.assertion_type"
+            " FROM memory_items m"
+            " JOIN memory_subjects s ON s.memory_id = m.memory_id"
+            " LEFT JOIN memory_provenance p ON p.memory_id = m.memory_id"
+            " WHERE s.subject_type = 'PERSON' AND s.subject_id = ?"
+            " AND m.status IN (" + ",".join("?" * len(statuses)) + ")"
+        )
+        if kinds:
+            sql += " AND m.kind IN (" + ",".join("?" * len(kinds)) + ")"
+            params.extend(kinds)
+        sql += " ORDER BY m.updated_at DESC LIMIT ?"
+        params.append(limit)
+        cur = await self.db.execute(sql, tuple(params))
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def list_subject_topic(
+        self,
+        subject_id: str,
+        topics: list[str],
+        *,
+        statuses: list[str],
+        kinds: list[str] | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Deterministic lookup by subject + canonical topic (identity facts)."""
+        if not topics or not statuses:
+            return []
+        params: list = [subject_id, *statuses, *topics]
+        sql = (
+            "SELECT m.memory_id, m.kind, m.content, m.status, m.visibility,"
+            " m.created_by, m.created_at, m.updated_at, m.version, m.human_confirmed,"
+            " m.source_supported, m.self_reported, m.third_party_reported,"
+            " m.model_inferred, p.topic"
+            " FROM memory_items m"
+            " JOIN memory_subjects s ON s.memory_id = m.memory_id"
+            " JOIN memory_provenance p ON p.memory_id = m.memory_id"
+            " WHERE s.subject_type = 'PERSON' AND s.subject_id = ?"
+            " AND m.status IN (" + ",".join("?" * len(statuses)) + ")"
+            " AND p.topic IN (" + ",".join("?" * len(topics)) + ")"
+        )
+        if kinds:
+            sql += " AND m.kind IN (" + ",".join("?" * len(kinds)) + ")"
+            params.extend(kinds)
+        sql += " ORDER BY m.updated_at DESC LIMIT ?"
+        params.append(limit)
+        cur = await self.db.execute(sql, tuple(params))
+        return [dict(r) for r in await cur.fetchall()]
+
+    # -- assignments (association, never access) ---------------------------
+
+    async def assign(
+        self, memory_id: str, person_id: str, *, created_by: str
+    ) -> bool:
+        """Associate a memory with a person. Returns False if already assigned.
+
+        Assignment is only an association: it does not change the memory's
+        content, status or visibility, and it never grants access by itself.
+        """
+        now = _iso(utcnow())
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO memory_assignments(memory_id, person_id,"
+            " created_at, created_by) VALUES (?, ?, ?, ?)",
+            (memory_id, person_id, now, created_by),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
+
+    async def unassign(self, memory_id: str, person_id: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM memory_assignments WHERE memory_id = ? AND person_id = ?",
+            (memory_id, person_id),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+
+    async def list_assignments(self, memory_id: str) -> list[dict]:
+        cur = await self.db.execute(
+            "SELECT memory_id, person_id, created_at, created_by"
+            " FROM memory_assignments WHERE memory_id = ? ORDER BY created_at ASC",
+            (memory_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def list_assigned_memory_ids(self, person_id: str) -> list[str]:
+        cur = await self.db.execute(
+            "SELECT memory_id FROM memory_assignments WHERE person_id = ?"
+            " ORDER BY created_at ASC",
+            (person_id,),
+        )
+        return [r["memory_id"] for r in await cur.fetchall()]
+
+    async def get_many(self, memory_ids: list[str]) -> list[MemoryItem]:
+        if not memory_ids:
+            return []
+        cur = await self.db.execute(
+            "SELECT memory_id, kind, content, status, visibility, created_by,"
+            " created_at, updated_at, version, valid_from, valid_until,"
+            " human_confirmed, source_supported, self_reported,"
+            " third_party_reported, model_inferred FROM memory_items"
+            " WHERE memory_id IN (" + ",".join("?" * len(memory_ids)) + ")",
+            tuple(memory_ids),
+        )
+        return [self._to_item(r) for r in await cur.fetchall()]
 
     # -- read --------------------------------------------------------------
 

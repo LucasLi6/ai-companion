@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -380,6 +380,108 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_event_content
             ON memory_candidates(source_event_id, content);
+        """,
+    ),
+    # Version 8 (V0.2A): durable memory write-through, truthful outcomes,
+    # memory assignments and structured cognitive decisions.
+    #
+    # - memory_candidates gains the *suggested* semantic classification and
+    #   evidence span. These are model hints; the trusted consolidation layer
+    #   still decides whether a durable write is allowed.
+    # - cognitive_analyses / agent_actions gain the structured decision fields
+    #   so a model suggestion and the local policy's final action are stored
+    #   separately and remain inspectable.
+    # - memory_candidate_writes is the durable candidate -> memory mapping and
+    #   the idempotency anchor (one row per candidate). Existing legacy
+    #   candidates are stamped NO_MEMORY rather than blindly promoted.
+    # - memory_assignments associates a memory with a person for retrieval.
+    #   It never changes the memory's meaning or its privacy/visibility state.
+    # - memory_provenance records where a model-extracted memory came from
+    #   (source event, candidate, speaker, subject, assertion, topic).
+    (
+        8,
+        """
+        ALTER TABLE memory_candidates ADD COLUMN assertion_type TEXT NOT NULL DEFAULT 'UNKNOWN';
+        ALTER TABLE memory_candidates ADD COLUMN certainty_category TEXT NOT NULL DEFAULT 'UNKNOWN';
+        ALTER TABLE memory_candidates ADD COLUMN explicit_remember_request INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE memory_candidates ADD COLUMN topic TEXT;
+        ALTER TABLE memory_candidates ADD COLUMN kind TEXT;
+        ALTER TABLE memory_candidates ADD COLUMN source_evidence_span TEXT;
+
+        ALTER TABLE cognitive_analyses ADD COLUMN intent TEXT NOT NULL DEFAULT 'unknown';
+        ALTER TABLE cognitive_analyses ADD COLUMN addressed_to TEXT;
+        ALTER TABLE cognitive_analyses ADD COLUMN silence_requested INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE cognitive_analyses ADD COLUMN reply_necessity TEXT NOT NULL DEFAULT 'OPTIONAL';
+        ALTER TABLE cognitive_analyses ADD COLUMN conversation_state TEXT NOT NULL DEFAULT 'unknown';
+
+        ALTER TABLE agent_actions ADD COLUMN model_suggested_action TEXT;
+        ALTER TABLE agent_actions ADD COLUMN policy_final_action TEXT;
+        ALTER TABLE agent_actions ADD COLUMN override_reason TEXT;
+
+        CREATE TABLE IF NOT EXISTS memory_candidate_writes (
+            candidate_id    TEXT PRIMARY KEY
+                            REFERENCES memory_candidates(candidate_id) ON DELETE CASCADE,
+            memory_id       TEXT REFERENCES memory_items(memory_id) ON DELETE SET NULL,
+            source_event_id TEXT NOT NULL,
+            outcome         TEXT NOT NULL,
+            detail          TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_candidate_writes_memory
+            ON memory_candidate_writes(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_candidate_writes_outcome
+            ON memory_candidate_writes(outcome);
+
+        CREATE TABLE IF NOT EXISTS memory_assignments (
+            memory_id  TEXT NOT NULL REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            person_id  TEXT NOT NULL REFERENCES persons(person_id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            PRIMARY KEY (memory_id, person_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_assignments_person
+            ON memory_assignments(person_id);
+
+        CREATE TABLE IF NOT EXISTS memory_provenance (
+            memory_id              TEXT PRIMARY KEY
+                                   REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            source_event_id        TEXT,
+            candidate_id           TEXT,
+            speaker_person_id      TEXT,
+            subject_person_id      TEXT,
+            source_type            TEXT NOT NULL DEFAULT 'utterance',
+            assertion_type         TEXT NOT NULL DEFAULT 'UNKNOWN',
+            certainty_category     TEXT NOT NULL DEFAULT 'UNKNOWN',
+            topic                  TEXT,
+            explicit_remember_request INTEGER NOT NULL DEFAULT 0,
+            self_reported          INTEGER NOT NULL DEFAULT 0,
+            third_party_reported   INTEGER NOT NULL DEFAULT 0,
+            model_inferred         INTEGER NOT NULL DEFAULT 0,
+            created_at             TEXT NOT NULL,
+            updated_at             TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_provenance_candidate
+            ON memory_provenance(candidate_id) WHERE candidate_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_provenance_subject_topic
+            ON memory_provenance(subject_person_id, topic);
+
+        -- Legacy candidates predate durable write-through. Record them
+        -- explicitly as not back-filled: no memory is invented, and the
+        -- consolidation handler treats a candidate with a mapping row as
+        -- already decided.
+        INSERT OR IGNORE INTO memory_candidate_writes(
+            candidate_id, memory_id, source_event_id, outcome, detail,
+            created_at, updated_at
+        )
+        SELECT candidate_id, NULL, source_event_id, 'NO_MEMORY',
+               'legacy_candidate_not_backfilled',
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        FROM memory_candidates;
         """,
     ),
 ]

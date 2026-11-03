@@ -30,9 +30,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from companion.cognition.models import CognitiveContext
 from companion.domain.enums import (
     AddresseeHint,
+    AssertionType,
+    CertaintyCategory,
     CognitiveAction,
+    MemoryKind,
     MemoryOperation,
     ReasonCode,
+    ReplyNecessity,
 )
 from companion.domain.models import CognitiveResult, MemoryCandidate, UtteranceEvent, new_id
 from companion.memory.store import validate_referenced_memory_ids
@@ -51,6 +55,11 @@ class _RawCandidate(BaseModel):
 
     content: str = Field(min_length=1, max_length=4096)
     operation: str = "ADD"
+    assertion_type: str = "UNKNOWN"
+    certainty: str = "UNKNOWN"
+    topic: Optional[str] = Field(default=None, max_length=128)
+    kind: Optional[str] = Field(default=None, max_length=32)
+    evidence_span: Optional[str] = Field(default=None, max_length=4096)
 
 
 class _RawAnalysis(BaseModel):
@@ -58,7 +67,12 @@ class _RawAnalysis(BaseModel):
 
     meaning: str = Field(min_length=1, max_length=2048)
     topic: Optional[str] = Field(default=None, max_length=512)
+    intent: str = Field(default="unknown", max_length=128)
     addressee: Optional[str] = Field(default=None, max_length=32)
+    addressed_to: Optional[str] = Field(default=None, max_length=32)
+    silence_requested: bool = False
+    reply_necessity: str = "OPTIONAL"
+    conversation_state: str = Field(default="unknown", max_length=128)
     action: str = Field(min_length=1, max_length=32)
     reason_code: str = Field(min_length=1, max_length=64)
     referenced_memory_ids: list[str] = Field(default_factory=list)
@@ -206,6 +220,11 @@ class DeepSeekCognitiveProvider:
                 subject_person_id=event.speaker_person_id,  # trusted
                 content=c.content,
                 operation=self._operation(c.operation),
+                assertion_type=self._assertion(c.assertion_type),
+                certainty_category=self._certainty(c.certainty),
+                topic=c.topic,
+                kind=self._kind(c.kind),
+                source_evidence_span=self._evidence(c.evidence_span, event),
             )
             for c in raw.memory_candidates
         ]
@@ -219,6 +238,12 @@ class DeepSeekCognitiveProvider:
             memory_candidates=candidates,
             response_style=raw.response_style.strip() or "deepseek_plain",
             provider=PROVIDER_NAME,
+            intent=(raw.intent or "unknown").strip()[:128] or "unknown",
+            addressed_to=raw.addressed_to or raw.addressee,
+            silence_requested=bool(raw.silence_requested),
+            reply_necessity=self._necessity(raw.reply_necessity),
+            conversation_state=(raw.conversation_state or "unknown").strip()[:128]
+            or "unknown",
         )
 
     @staticmethod
@@ -227,6 +252,46 @@ class DeepSeekCognitiveProvider:
             return MemoryOperation(value.strip().upper())
         except (ValueError, AttributeError):
             return MemoryOperation.ADD
+
+    @staticmethod
+    def _assertion(value: str) -> AssertionType:
+        try:
+            return AssertionType(value.strip().upper())
+        except (ValueError, AttributeError):
+            return AssertionType.UNKNOWN
+
+    @staticmethod
+    def _certainty(value: str) -> CertaintyCategory:
+        try:
+            return CertaintyCategory(value.strip().upper())
+        except (ValueError, AttributeError):
+            return CertaintyCategory.UNKNOWN
+
+    @staticmethod
+    def _kind(value: str | None) -> MemoryKind | None:
+        if not value:
+            return None
+        try:
+            return MemoryKind(value.strip().upper())
+        except (ValueError, AttributeError):
+            return None
+
+    @staticmethod
+    def _necessity(value: str) -> ReplyNecessity:
+        try:
+            return ReplyNecessity(value.strip().upper())
+        except (ValueError, AttributeError):
+            return ReplyNecessity.OPTIONAL
+
+    @staticmethod
+    def _evidence(value: str | None, event: UtteranceEvent) -> str | None:
+        """Keep an evidence span only if it is a verbatim part of the input."""
+        if not value:
+            return None
+        span = value.strip()
+        if not span or span not in event.text:
+            return None
+        return span
 
     def _denied(self, event: UtteranceEvent) -> CognitiveResult:
         return CognitiveResult(

@@ -36,6 +36,56 @@ Every item records independent booleans:
 These are deliberately **not** collapsed into one score. A human-confirmed fact
 and a model-inferred hypothesis look different and are treated differently.
 
+## Write-through: from candidate to durable memory (V0.2A)
+
+A model-proposed `memory_candidate` is inert until the trusted consolidation
+layer (`memory/consolidation.py`) accepts it. The decision uses the stored
+event, the speaker's current consent and the candidate's semantic hints
+(`assertion_type`, `certainty_category`, a verbatim evidence span) — never a
+model-supplied person id or confidence score:
+
+| Category | Meaning | Durable result |
+|----------|---------|----------------|
+| A | Direct, clear self-report | `ACTIVE`, `self_reported=1` (never auto `human_confirmed`) |
+| B | Uncertain or inferred | `CANDIDATE` |
+| C | Third-party report | `CANDIDATE`, `third_party_reported=1`, speaker preserved |
+| D | Hypothetical / quoted / empty | no memory (`NO_MEMORY`) |
+
+Consent is re-checked at write time: a revoked/suspended speaker, or an
+unauthorised subject, yields `DENIED` and no write.
+
+Every candidate has at most one durable outcome, recorded in
+`memory_candidate_writes` (`SAVED`, `UPDATED`, `ALREADY_EXISTS`,
+`PENDING_REVIEW`, `DENIED`, `FAILED`, `NO_MEMORY`). The memory, its
+`memory_provenance` row and this mapping commit in one transaction, so a retry
+or crash cannot create a second memory. A lost mapping is recovered from the
+uniquely indexed provenance `candidate_id`.
+
+Corrections are conservative and local: the same subject + canonical topic
+with changed content updates the current-state memory in place (the old value
+stays in `memory_revisions`); a conflict with a human-confirmed fact creates a
+`NEEDS_REVIEW` item linked with `conflicts_with` and never overwrites it.
+Competing uncertain candidates coexist as separate `CANDIDATE` rows.
+
+## Assignments
+
+`memory_assignments(memory_id, person_id, created_at, created_by)` associates a
+memory with people for retrieval; one memory may be assigned to several
+people. It is *association*, not access:
+
+- it never changes the memory's content, status or visibility;
+- a non-admin may only assign a visible memory to themselves (cross-person
+  assignment requires admin), and listing another person's assignments
+  requires admin;
+- assigning a `PRIVATE` memory to another person does not make it visible to
+  them;
+- self-reported facts are auto-assigned to their speaker; third-party reports
+  are not silently attached to the subject.
+
+Assignments are audited and survive restarts. The `memory_assignments` table is
+the foundation for a future drag-and-drop UI; V0.2A ships the service + CLI
+only.
+
 ## Structure
 
 - `memory_items` — the live version of each record (with `version` for
@@ -47,6 +97,11 @@ and a model-inferred hypothesis look different and are treated differently.
 - `memory_links` — relationships between memories (e.g. `conflicts_with`,
   `supports`, `related_to`).
 - `memory_revisions` — an immutable snapshot of every version (audit/history).
+- `memory_candidate_writes` — one durable row per model candidate: its outcome
+  and the memory it produced (the idempotency anchor).
+- `memory_provenance` — where a model-extracted memory came from: source event,
+  candidate, speaker, subject, assertion type, certainty, topic.
+- `memory_assignments` — person associations for retrieval (not access grants).
 - `memory_items_fts` — an FTS5 index for text search.
 
 ## Rules enforced by `MemoryService`

@@ -28,13 +28,12 @@ from companion.domain.enums import (
     MemoryKind,
     MemoryStatus,
     MemoryVisibility,
-    VerificationLevel,
+    RegistrationStatus,
 )
 from companion.domain.models import new_id, utcnow
 
 from .models import (
     AccessContext,
-    MemoryConflictError,
     MemoryEvidence,
     MemoryItem,
     MemoryNotFoundError,
@@ -46,9 +45,10 @@ from .models import (
 from .repository import MemoryRepository
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from companion.storage.repositories import AuditRepository
+    from companion.storage.repositories import AuditRepository, Repositories
 
 AuthorizeSubject = Callable[[str], Awaitable[bool]]
+PersonExists = Callable[[str], Awaitable[bool]]
 
 
 class MemoryService:
@@ -57,11 +57,13 @@ class MemoryService:
         repo: MemoryRepository,
         *,
         authorize_subject: Optional[AuthorizeSubject] = None,
+        person_exists: Optional[PersonExists] = None,
         audit: Optional["AuditRepository"] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repo = repo
         self.authorize_subject = authorize_subject
+        self.person_exists = person_exists
         self.audit = audit
         self.logger = logger or logging.getLogger("companion.memory")
 
@@ -177,11 +179,15 @@ class MemoryService:
         sources = await self.repo.get_sources(memory_id)
         links = await self.repo.get_links(memory_id)
         revisions = await self.repo.list_revisions(memory_id)
+        provenance = await self.repo.get_provenance(memory_id)
+        assignments = await self.repo.list_assignments(memory_id)
         return {
             "item": self._item_dict(item),
             "subjects": [{"subject_type": t, "subject_id": i} for t, i in subjects],
             "sources": sources,
             "links": links,
+            "assignments": assignments,
+            "provenance": provenance,
             "revisions": [
                 {
                     "revision_id": r.revision_id,
@@ -510,6 +516,115 @@ class MemoryService:
             access, "link", memory_id, f"{linked_memory_id}:{link_type}"
         )
 
+    # -- assignments -------------------------------------------------------
+    #
+    # ``memory_subjects`` says what/who a memory *describes*; an assignment
+    # says which person the memory is *associated with for retrieval*. It is
+    # metadata only: an assignment never changes content, status or
+    # visibility, and it never grants a person access to a private memory.
+
+    async def assign_memory(
+        self, memory_id: str, person_id: str, access: AccessContext
+    ) -> bool:
+        """Associate a memory with a person. Returns False if already assigned.
+
+        A non-admin may only assign a memory they can already see, and only to
+        themselves. A PRIVATE memory may never be cross-person assigned unless
+        an admin does it explicitly; future sharing needs a separate grant.
+        """
+        item = await self.repo.get(memory_id)
+        if item is None:
+            raise MemoryNotFoundError(memory_id)
+        if not await self._person_exists(person_id):
+            raise MemoryNotFoundError(f"person {person_id} not found")
+        if not access.is_admin:
+            if not await self._visible(item, access):
+                raise MemoryPermissionDeniedError(memory_id)
+            if person_id != access.actor_id:
+                raise MemoryPermissionDeniedError(
+                    "cross-person assignment requires admin"
+                )
+        async with self.repo.db.transaction():
+            created = await self.repo.assign(
+                memory_id, person_id, created_by=access.actor_id
+            )
+            await self._audit(
+                access,
+                "assign_memory",
+                memory_id,
+                f"person_id={person_id} new={int(created)}",
+            )
+        self.logger.info(
+            "memory_assigned memory_id=%s person_id=%s new=%d by=%s",
+            memory_id,
+            person_id,
+            int(created),
+            access.actor_id,
+        )
+        return created
+
+    async def unassign_memory(
+        self, memory_id: str, person_id: str, access: AccessContext
+    ) -> bool:
+        item = await self.repo.get(memory_id)
+        if item is None:
+            raise MemoryNotFoundError(memory_id)
+        if not await self._person_exists(person_id):
+            raise MemoryNotFoundError(f"person {person_id} not found")
+        if not access.is_admin:
+            if not await self._visible(item, access):
+                raise MemoryPermissionDeniedError(memory_id)
+            if person_id != access.actor_id:
+                raise MemoryPermissionDeniedError(
+                    "removing another person's assignment requires admin"
+                )
+        async with self.repo.db.transaction():
+            removed = await self.repo.unassign(memory_id, person_id)
+            if removed:
+                await self._audit(
+                    access, "unassign_memory", memory_id, f"person_id={person_id}"
+                )
+        self.logger.info(
+            "memory_unassigned memory_id=%s person_id=%s removed=%d by=%s",
+            memory_id,
+            person_id,
+            int(removed),
+            access.actor_id,
+        )
+        return removed
+
+    async def list_assigned_memories(
+        self, person_id: str, access: AccessContext
+    ) -> list[dict]:
+        """Memories associated with ``person_id`` and visible to ``access``.
+
+        Non-admin callers may only list their own assignments. Visibility is
+        still enforced per item, so an assignment is not an access grant.
+        """
+        if not await self._person_exists(person_id):
+            raise MemoryNotFoundError(f"person {person_id} not found")
+        if not access.is_admin and access.actor_id != person_id:
+            raise MemoryPermissionDeniedError(
+                "listing another person's assignments requires admin"
+            )
+        ids = await self.repo.list_assigned_memory_ids(person_id)
+        items = await self.repo.get_many(ids)
+        out: list[dict] = []
+        for item in items:
+            if await self._visible(item, access):
+                out.append(self._item_dict(item))
+        return out
+
+    async def list_memory_assignments(
+        self, memory_id: str, access: AccessContext
+    ) -> list[dict]:
+        item = await self.repo.get(memory_id)
+        if item is None:
+            raise MemoryNotFoundError(memory_id)
+        if not access.is_admin and not await self._visible(item, access):
+            raise MemoryPermissionDeniedError(memory_id)
+        return await self.repo.list_assignments(memory_id)
+
     # -- helpers -----------------------------------------------------------
 
     async def _invalidate_derived(self, source_id: str, access: AccessContext) -> None:
@@ -561,6 +676,15 @@ class MemoryService:
                     f"person {pid} is not authorised for memory learning"
                 )
 
+    async def _person_exists(self, person_id: str) -> bool:
+        if self.person_exists is not None:
+            return await self.person_exists(person_id)
+        # No callback wired: fall back to the FK-checkable database itself.
+        cur = await self.repo.db.execute(
+            "SELECT 1 FROM persons WHERE person_id = ?", (person_id,)
+        )
+        return await cur.fetchone() is not None
+
     async def _visible(self, item: MemoryItem, access: AccessContext) -> bool:
         if access.is_admin:
             return True
@@ -603,3 +727,30 @@ class MemoryService:
             "third_party_reported": item.third_party_reported,
             "model_inferred": item.model_inferred,
         }
+
+
+def build_memory_service(repos: "Repositories") -> MemoryService:
+    """Build the standard service wired to the runtime repositories.
+
+    The authorization callback is the trusted local one: a person may be the
+    subject of a learned memory only while they are ACTIVE and have consented
+    to memory learning. Consent is re-checked on every write, so revoking it
+    blocks new memories immediately.
+    """
+
+    async def authorize(person_id: str) -> bool:
+        person = await repos.person.get(person_id)
+        if person is None or person.registration_status != RegistrationStatus.ACTIVE:
+            return False
+        consent = await repos.person.get_consent(person_id)
+        return consent is not None and consent.allow_memory_learning
+
+    async def person_exists(person_id: str) -> bool:
+        return await repos.person.get(person_id) is not None
+
+    return MemoryService(
+        MemoryRepository(repos.db),
+        authorize_subject=authorize,
+        person_exists=person_exists,
+        audit=repos.audit,
+    )

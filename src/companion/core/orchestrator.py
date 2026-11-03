@@ -29,6 +29,11 @@ import logging
 import time
 from typing import Optional
 
+from companion.cognition.models import CognitiveContext
+from companion.cognition.silence import (
+    detect_explicit_remember,
+    detect_explicit_silence,
+)
 from companion.domain.enums import (
     CognitiveAction,
     ProcessingStatus,
@@ -44,7 +49,7 @@ from companion.domain.models import (
     new_id,
     utcnow,
 )
-from companion.memory.candidates import dedupe_candidates
+from companion.memory.candidates import prepare_candidates
 from companion.people.registry import PersonRegistry
 from companion.storage.repositories import Repositories
 
@@ -65,6 +70,7 @@ class Orchestrator:
         memory,
         jobs=None,
         context_builder=None,
+        memory_writer=None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repos = repos
@@ -75,6 +81,7 @@ class Orchestrator:
         self.response = response
         self.memory = memory
         self.jobs = jobs
+        self.memory_writer = memory_writer
         # When set (real-DeepSeek mode), the orchestrator builds a privacy-
         # filtered CognitiveContext and hands the *same* context to both the
         # cognitive and response providers. In mock mode it stays None and the
@@ -149,11 +156,19 @@ class Orchestrator:
 
         # 4. Retrieve permitted memories (hand-authored facts only).
         memories = await self.memory.retrieve(event.text, person_id)
+        # Local, trusted turn signals. The detector distinguishes a direct
+        # request from quoted/reported speech, so neither is delegated to the
+        # model.
+        explicit_silence = detect_explicit_silence(event.text)
+        explicit_remember = detect_explicit_remember(event.text)
         self.logger.info(
-            "context_loaded conversation_id=%s quiet_mode=%s memories=%d",
+            "context_loaded conversation_id=%s quiet_mode=%s memories=%d"
+            " explicit_silence=%s explicit_remember=%s",
             event.conversation_id,
             context.quiet_mode,
             len(memories),
+            explicit_silence,
+            explicit_remember,
         )
 
         steps = [
@@ -197,10 +212,16 @@ class Orchestrator:
                 steps.append(f"[COGNITION] Analysis completed by {analysis.provider}")
                 if persist:
                     analysis_id = new_id("ana")
-                    # Model output is untrusted: dedupe before writing, and
-                    # drop every candidate when learning is not authorised.
+                    # Model output is untrusted: rebuild ids/subjects on the
+                    # trusted side, dedupe, and drop every candidate when
+                    # learning is not authorised.
                     candidates = (
-                        dedupe_candidates(analysis.memory_candidates)
+                        await prepare_candidates(
+                            self.repos,
+                            event,
+                            analysis.memory_candidates,
+                            explicit_remember_request=explicit_remember,
+                        )
                         if learn
                         else []
                     )
@@ -228,12 +249,40 @@ class Orchestrator:
                     if job is not None:
                         job_id = job.job_id
 
-            # 6. Policy decides the final action from the (reused or fresh)
-            # analysis.
-            final_action, final_reason = self.policy.decide(analysis, context)
-            steps.append(f"[DECISION] {final_action.value}")
+            # 6. Bounded synchronous write-through for an explicit "remember
+            # this" request: the durable write must finish *before* the reply
+            # that acknowledges it. Ordinary candidates stay with the job.
+            memory_outcomes: list[dict] = []
+            if persist and learn and self.memory_writer is not None:
+                if explicit_remember:
+                    memory_outcomes = await self.memory_writer.consolidate_event(
+                        event.event_id, only_explicit=True
+                    )
+                    steps.append(
+                        "[MEMORY_WRITE] "
+                        + _summarize_outcomes(memory_outcomes)
+                    )
+                else:
+                    memory_outcomes = (
+                        await self.repos.analysis.list_candidate_writes(event.event_id)
+                    )
 
-            # 7. Reuse the durable action if it already exists, else generate a
+            # 7. Policy decides the final action from the (reused or fresh)
+            # analysis. Hard local rules (permission, explicit silence, quiet
+            # mode, explicit human addressee) outrank the model suggestion.
+            await self.policy.refresh(self.repos.settings)
+            decision = self.policy.decide(
+                analysis,
+                context,
+                addressee_hint=event.addressee_hint.value,
+                explicit_silence=explicit_silence,
+            )
+            final_action, final_reason = decision.action, decision.reason_code
+            steps.append(f"[DECISION] {final_action.value}")
+            if decision.overrode_model:
+                steps.append(f"[POLICY] {decision.override_reason}")
+
+            # 8. Reuse the durable action if it already exists, else generate a
             # response and persist the action.
             existing_action = (
                 await self.repos.analysis.get_action(event.event_id)
@@ -248,8 +297,13 @@ class Orchestrator:
                 steps.append("[ACTION] Reused existing action")
             else:
                 if final_action == CognitiveAction.RESPOND:
+                    response_context = cognitive_context
+                    if isinstance(response_context, CognitiveContext):
+                        response_context = response_context.model_copy(
+                            update={"memory_write_outcomes": memory_outcomes}
+                        )
                     response_text = await self.response.generate(
-                        event, analysis, cognitive_context
+                        event, analysis, response_context
                     )
                     steps.append(f"[RESPONSE] {response_text}")
                 if persist:
@@ -262,10 +316,13 @@ class Orchestrator:
                             reason_code=final_reason,
                             status="COMPLETED",
                             created_at=utcnow(),
+                            model_suggested_action=decision.model_action,
+                            policy_final_action=decision.action,
+                            override_reason=decision.override_reason,
                         )
                     )
 
-            # 8. Finalise the durable conversation + event state.
+            # 9. Finalise the durable conversation + event state.
             if persist:
                 await self.conversations.record_last_action(
                     event.conversation_id, final_action.value
@@ -292,6 +349,7 @@ class Orchestrator:
                 reason_code=final_reason,
                 analysis_id=analysis_id,
                 job_id=job_id,
+                memory_write_outcomes=memory_outcomes,
                 steps=steps,
             )
         except Exception as exc:  # provider failure — keep the event retryable.
@@ -386,3 +444,12 @@ class Orchestrator:
             reason_code=action.reason_code if action else None,
             steps=["[STATUS] Duplicate (already completed)"],
         )
+
+
+def _summarize_outcomes(outcomes: list[dict]) -> str:
+    """Render truthful write outcomes without private content."""
+    if not outcomes:
+        return "no candidates"
+    return ", ".join(
+        f"{o.get('candidate_id', '?')}={o.get('outcome', '?')}" for o in outcomes
+    )

@@ -61,6 +61,9 @@ class ReasonCode(str, Enum):
     CONVERSATION_BETWEEN_HUMANS = "conversation_between_humans"
     AMBIGUOUS_ADDRESSEE = "ambiguous_addressee"
     SOCIAL_RESPONSE_NOT_NEEDED = "social_response_not_needed"
+    EXPLICIT_SILENCE_REQUEST = "explicit_silence_request"
+    RESPONSE_NOT_NECESSARY = "response_not_necessary"
+    CONSERVATIVE_AMBIGUITY = "conservative_ambiguity"
     QUIET_MODE = "quiet_mode"
     PERMISSION_DENIED = "permission_denied"
     UNKNOWN = "unknown"
@@ -77,15 +80,62 @@ class MemoryCandidateStatus(str, Enum):
     """Lifecycle of a raw memory *candidate* inside a consolidation job.
 
     This is a separate axis from :class:`MemoryStatus`. ``CONSOLIDATED`` means
-    "the candidate passed validation in the job", *not* that a trusted,
-    ``ACTIVE`` memory now exists — V0.0 does not promote candidates into the
-    unified memory store at all.
+    "the candidate was processed"; the truthful durable result is recorded
+    separately on the candidate write mapping (:class:`MemoryWriteOutcome`).
+    A candidate may be ``CONSOLIDATED`` with ``NO_MEMORY`` when its content is
+    hypothetical or needs no durable fact.
     """
 
     PENDING = "PENDING"
     CONSOLIDATED = "CONSOLIDATED"
     SKIPPED = "SKIPPED"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
     FAILED = "FAILED"
+
+
+class MemoryWriteOutcome(str, Enum):
+    """Truthful result of attempting to turn one candidate into a memory."""
+
+    SAVED = "SAVED"
+    UPDATED = "UPDATED"
+    ALREADY_EXISTS = "ALREADY_EXISTS"
+    PENDING_REVIEW = "PENDING_REVIEW"
+    DENIED = "DENIED"
+    FAILED = "FAILED"
+    NO_MEMORY = "NO_MEMORY"
+
+
+class AssertionType(str, Enum):
+    """What kind of statement the candidate is, from the speaker's view."""
+
+    SELF_REPORT = "SELF_REPORT"
+    THIRD_PARTY_REPORT = "THIRD_PARTY_REPORT"
+    HYPOTHETICAL = "HYPOTHETICAL"
+    INFERENCE = "INFERENCE"
+    CORRECTION = "CORRECTION"
+    UNKNOWN = "UNKNOWN"
+
+
+class CertaintyCategory(str, Enum):
+    """How directly the statement supports a durable fact.
+
+    This is deliberately coarse: it is not a model confidence score and is
+    never used on its own to authorise an ``ACTIVE`` write.
+    """
+
+    DIRECT = "DIRECT"
+    INFERRED = "INFERRED"
+    UNCERTAIN = "UNCERTAIN"
+    UNKNOWN = "UNKNOWN"
+
+
+class ReplyNecessity(str, Enum):
+    """How much a reply is needed for the current turn."""
+
+    REQUIRED = "REQUIRED"
+    USEFUL = "USEFUL"
+    OPTIONAL = "OPTIONAL"
+    UNNECESSARY = "UNNECESSARY"
 
 
 class JobType(str, Enum):

@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from companion.storage.database import Database
-from companion.storage.schema import SCHEMA_SQL, SCHEMA_VERSION
+from companion.storage.database import Database, _statements
+from companion.storage.schema import MIGRATIONS, SCHEMA_SQL, SCHEMA_VERSION
 
 
 async def _versions(db) -> list[int]:
@@ -89,6 +89,112 @@ async def test_newer_schema_version_is_refused(tmp_path):
     cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
     assert (await cur.fetchone())["v"] == 99
     await db.close()
+
+
+async def test_v7_database_upgrades_without_promoting_legacy_candidates(tmp_path):
+    """V0.2A migration 8 upgrades a real V0.1 (version-7) database in place.
+
+    Existing memories and candidates are never deleted or promoted: a legacy
+    candidate is stamped NO_MEMORY in the new write mapping (explicitly "not
+    back-filled"), so nothing is silently turned into a fact.
+    """
+    path = tmp_path / "v7.db"
+    ts = "2024-01-01T00:00:00+00:00"
+
+    db = await Database(path).connect()
+    for version, sql in MIGRATIONS:
+        if version > 7:
+            break
+        for statement in _statements(sql):
+            await db.conn.execute(statement)
+        await db.conn.execute(
+            "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+            (version, ts),
+        )
+    await db.conn.execute(
+        "INSERT INTO persons(person_id, display_name, role, registration_status,"
+        " created_at, updated_at) VALUES ('p1', 'Owner', 'owner', 'ACTIVE', ?, ?)",
+        (ts, ts),
+    )
+    await db.conn.execute(
+        "INSERT INTO conversations(conversation_id, quiet_mode, created_at, updated_at)"
+        " VALUES ('c1', 0, ?, ?)",
+        (ts, ts),
+    )
+    await db.conn.execute(
+        "INSERT INTO utterances(event_id, conversation_id, speaker_person_id, text,"
+        " source, addressee_hint, occurred_at, processing_status, created_at)"
+        " VALUES ('evt1', 'c1', 'p1', '我叫李约', 'TEST', 'agent', ?, 'COMPLETED', ?)",
+        (ts, ts),
+    )
+    await db.conn.execute(
+        "INSERT INTO memory_items(memory_id, kind, content, status, visibility,"
+        " created_by, created_at, updated_at)"
+        " VALUES ('mem_old', 'PERSONAL_FACT', '旧记忆', 'ACTIVE', 'PRIVATE', 'p1', ?, ?)",
+        (ts, ts),
+    )
+    await db.conn.execute(
+        "INSERT INTO memory_candidates(candidate_id, source_event_id,"
+        " subject_person_id, content, operation, status, created_at)"
+        " VALUES ('memc_legacy', 'evt1', 'p1', 'legacy proposal', 'ADD',"
+        " 'CONSOLIDATED', ?)",
+        (ts,),
+    )
+    await db.close()
+
+    db2 = await Database(path).connect()
+    await db2.initialize()
+    try:
+        assert await _versions(db2) == list(range(1, SCHEMA_VERSION + 1))
+
+        # Nothing is lost.
+        cur = await db2.execute(
+            "SELECT content, status FROM memory_items WHERE memory_id = 'mem_old'"
+        )
+        row = await cur.fetchone()
+        assert (row["content"], row["status"]) == ("旧记忆", "ACTIVE")
+
+        cur = await db2.execute(
+            "SELECT content, status, assertion_type FROM memory_candidates"
+            " WHERE candidate_id = 'memc_legacy'"
+        )
+        legacy = await cur.fetchone()
+        assert legacy["content"] == "legacy proposal"
+        assert legacy["status"] == "CONSOLIDATED"  # never blind-promoted
+        assert legacy["assertion_type"] == "UNKNOWN"  # new column default
+
+        # The legacy candidate is explicitly recorded as not back-filled.
+        cur = await db2.execute(
+            "SELECT outcome, memory_id, detail FROM memory_candidate_writes"
+            " WHERE candidate_id = 'memc_legacy'"
+        )
+        mapping = await cur.fetchone()
+        assert mapping["outcome"] == "NO_MEMORY"
+        assert mapping["memory_id"] is None
+        assert mapping["detail"] == "legacy_candidate_not_backfilled"
+
+        # New tables exist; no invented provenance/assignments.
+        for table in ("memory_assignments", "memory_provenance"):
+            cur = await db2.execute(
+                "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            )
+            assert (await cur.fetchone())["n"] == 1
+        cur = await db2.execute("SELECT COUNT(*) AS n FROM memory_provenance")
+        assert (await cur.fetchone())["n"] == 0
+        cur = await db2.execute("SELECT COUNT(*) AS n FROM memory_assignments")
+        assert (await cur.fetchone())["n"] == 0
+
+        cur = await db2.execute("PRAGMA foreign_key_check")
+        assert await cur.fetchall() == []
+    finally:
+        await db2.close()
+
+    # Re-opening is a no-op and stays at the current version.
+    db3 = await Database(path).connect()
+    await db3.initialize()
+    assert await _versions(db3) == list(range(1, SCHEMA_VERSION + 1))
+    await db3.close()
 
 
 async def test_migration_atomicity_on_failure(tmp_path, monkeypatch):

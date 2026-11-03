@@ -70,11 +70,14 @@ Two submissions with the same id and a different fingerprint are a `CONFLICT`.
 
 ## Schema versioning
 
-`schema_version` records the applied version (V0.0 = 1). `schema.py` holds an
-ordered, append-only `MIGRATIONS` list; `Database.initialize` applies missing
-versions in order, is a no-op when already current, and refuses to open a
-database stamped with a newer, unknown version. A database is never deleted to
-"fix" a version mismatch.
+`schema_version` records the applied version (V0.0 = 1; V0.2A = 8).
+`schema.py` holds an ordered, append-only `MIGRATIONS` list;
+`Database.initialize` applies missing versions in order, each inside one
+transaction, is a no-op when already current, and refuses to open a database
+stamped with a newer, unknown version. A database is never deleted to "fix" a
+version mismatch. Migration 8 adds the V0.2A columns/tables and stamps legacy
+candidates as `NO_MEMORY` in `memory_candidate_writes` rather than promoting
+them.
 
 ## Consent semantics
 
@@ -106,32 +109,50 @@ enter persistent processing.
 
 `cognitive_analyses` stores the provider's **suggestion** (`action`,
 `reason_code`, `provider`, `meaning`, `referenced_memory_ids`,
-`response_style`). `agent_actions` stores the **final decision** after policy
-(`action_type`, `reason_code`, `response_text`). They differ, for example, when
-quiet mode downgrades a `RESPOND` suggestion to a `WAIT` decision with
-`reason_code=quiet_mode`.
+`response_style`) plus the V0.2A structured fields (`intent`, `addressed_to`,
+`silence_requested`, `reply_necessity`, `conversation_state`).
+`agent_actions` stores the **final decision** after policy (`action_type`,
+`reason_code`, `response_text`) and, separately, `model_suggested_action`,
+`policy_final_action` and `override_reason`. They differ, for example, when
+quiet mode downgrades a `RESPOND` suggestion to `WAIT`, when an explicit
+current-turn silence forces `IGNORE`, or when a human addressee forces
+`IGNORE`. The model's suggestion is never overwritten.
 
-## Memory candidates and facts
+## Memory candidates, write-through and assignments
 
 A `memory_candidate` is a proposal with an `operation` (`ADD`/`UPDATE`/`LINK`/
-`SKIP`) and a `status` (`PENDING`/`CONSOLIDATED`/…). V0.0 stores candidates and
-the `MEMORY_CONSOLIDATION` job validates their associations (source event and
-subject person must exist) and marks them `CONSOLIDATED`. **No candidate is
-ever promoted to `memory_facts` in V0.0.**
+`SKIP`), a `status` (`PENDING`/`CONSOLIDATED`/`SKIPPED`/`NEEDS_REVIEW`/
+`FAILED`) and V0.2A semantic hints (`assertion_type`, `certainty_category`,
+`explicit_remember_request`, `topic`, `kind`, `source_evidence_span`). The
+`MEMORY_CONSOLIDATION` job routes every candidate through the trusted
+`MemoryWriter`, which writes a durable memory (or decides truthfully that none
+should be written) and records exactly one outcome in
+`memory_candidate_writes`:
 
-## Future multi-subject facts
+- `SAVED` / `UPDATED` / `ALREADY_EXISTS` / `PENDING_REVIEW` / `DENIED` /
+  `FAILED` / `NO_MEMORY`;
+- a direct self-report may become an `ACTIVE`, `self_reported` item; uncertain
+  and third-party proposals stay `CANDIDATE`; hypothetical/quoted/empty
+  proposals write nothing;
+- consent is re-checked at run time (`DENIED` blocks new writes).
 
-`memory_facts.subject_person_id` currently names a single subject. Facts that
-relate *several* people (e.g. "A and B work together") must not force every
-fact to have exactly one subject. The planned change is to add a join table:
+`memory_provenance` records the source event, candidate, speaker, subject,
+assertion, certainty and topic for each written memory. The memory, provenance
+and mapping commit together; a retry reads the mapping (or recovers from the
+uniquely indexed provenance candidate id) instead of writing twice.
 
-```sql
-CREATE TABLE fact_subjects (
-    fact_id  TEXT NOT NULL REFERENCES memory_facts(fact_id),
-    person_id TEXT NOT NULL REFERENCES persons(person_id),
-    PRIMARY KEY (fact_id, person_id)
-);
-```
+`memory_assignments(memory_id, person_id, created_at, created_by)` associates a
+memory with people for retrieval. It does not change meaning or visibility and
+is never an access grant. Self-reported facts are auto-assigned to their
+speaker; assignment to other people is an explicit (admin) action.
 
-This keeps `memory_facts` single-subject-optional while allowing N-way
-associations without breaking the existing schema.
+## Multi-subject memories
+
+The unified store already supports N-way associations without breaking the
+legacy schema: `memory_subjects(memory_id, subject_type, subject_id)` records
+who/what a memory *is about* (with `subject_type` allowing `PERSON` or other
+types), while `memory_assignments(memory_id, person_id)` records who the memory
+is *associated with for retrieval*. They are deliberately separate: a memory
+may describe one person but be assigned to several, and an assignment never
+grants access. The legacy `memory_facts` table is left intact for older data;
+new writes go through `memory_items`.

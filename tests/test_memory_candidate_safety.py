@@ -4,7 +4,7 @@ Candidates are inert proposals from an untrusted model. This module pins:
 
 - duplicate/blank candidates are collapsed before they reach the database;
 - the database itself is idempotent per (source event, content);
-- consolidation never promotes a candidate to an ACTIVE memory;
+- an uncertain candidate becomes a durable CANDIDATE, never an ACTIVE fact;
 - re-running consolidation has no further side effects;
 - nothing is persisted when memory learning is not authorised.
 """
@@ -22,6 +22,7 @@ from companion.domain.enums import (
 from companion.domain.models import MemoryCandidate, make_utterance_event
 from companion.jobs.handlers import memory_consolidation
 from companion.memory.candidates import dedupe_candidates, normalize_candidate_content
+from companion.memory.models import AccessContext
 from companion.providers.deepseek_client import ChatResponse
 from companion.runtime import build_runtime
 
@@ -128,7 +129,10 @@ async def test_duplicate_model_candidates_are_persisted_once(db):
     assert [c.content for c in candidates] == ["Alice 喜欢川菜", "Alice 住在杭州"]
 
 
-async def test_candidates_are_never_promoted_to_active_memory(db):
+async def test_uncertain_candidate_is_stored_as_candidate_not_active(db):
+    # The model supplies no assertion/certainty/evidence, so the trusted layer
+    # cannot treat this as a clear self-report: it is durably staged as a
+    # CANDIDATE, never presented as an ACTIVE fact.
     client = CandidateClient([{"content": "Alice 喜欢川菜"}])
     rt = build_runtime(db, provider="deepseek", deepseek_client=client)
     person = await _person(rt)
@@ -142,9 +146,21 @@ async def test_candidates_are_never_promoted_to_active_memory(db):
     assert candidates[0].status == MemoryCandidateStatus.CONSOLIDATED
     assert candidates[0].subject_person_id == person.person_id
 
-    cur = await db.execute("SELECT COUNT(*) AS n FROM memory_items")
+    write = await rt.repos.analysis.get_candidate_write(candidates[0].candidate_id)
+    assert write["outcome"] == "SAVED"
+    assert write["memory_id"] is not None
+
+    cur = await db.execute(
+        "SELECT status, self_reported, model_inferred FROM memory_items"
+        " WHERE memory_id = ?",
+        (write["memory_id"],),
+    )
     row = await cur.fetchone()
-    assert row["n"] == 0  # consolidation created no long-term memory
+    assert row["status"] == "CANDIDATE"
+    assert row["self_reported"] == 0
+    assert row["model_inferred"] == 1
+    # Nothing is retrievable as a fact yet.
+    assert await rt.memory.retrieve("川菜", person.person_id) == []
 
 
 async def test_consolidation_rerun_changes_nothing(db):
@@ -203,7 +219,7 @@ async def test_save_candidate_is_idempotent_at_the_database_level(rt, register, 
     assert candidates[0].candidate_id == existing.candidate_id
 
 
-async def test_third_party_candidate_is_skipped_not_believed(rt, register, say):
+async def test_third_party_candidate_is_stored_with_attribution(rt, register, say):
     speaker = await register("Alice")
     subject = await register("Bob")
     report = await say(speaker.person_id, "agent", "Bob 喜欢川菜")
@@ -225,7 +241,26 @@ async def test_third_party_candidate_is_skipped_not_believed(rt, register, say):
         c.candidate_id: c
         for c in await rt.repos.analysis.get_candidates(report.event_id)
     }
-    assert candidates["memc_third_party"].status == MemoryCandidateStatus.SKIPPED
-    cur = await rt.db.execute("SELECT COUNT(*) AS n FROM memory_items")
+    assert candidates["memc_third_party"].status == MemoryCandidateStatus.CONSOLIDATED
+
+    write = await rt.repos.analysis.get_candidate_write("memc_third_party")
+    assert write["outcome"] == "SAVED"
+
+    cur = await rt.db.execute(
+        "SELECT status, third_party_reported, self_reported FROM memory_items"
+        " WHERE memory_id = ?",
+        (write["memory_id"],),
+    )
     row = await cur.fetchone()
-    assert row["n"] == 0
+    # Preserved as an attributed, non-authoritative report -- never ACTIVE.
+    assert row["status"] == "CANDIDATE"
+    assert row["third_party_reported"] == 1
+    assert row["self_reported"] == 0
+
+    provenance = await rt.memory_service.repo.get_provenance(write["memory_id"])
+    assert provenance["speaker_person_id"] == speaker.person_id
+    assert provenance["subject_person_id"] is None
+    # The subject is not silently enrolled in someone else's memory.
+    assert await rt.memory_service.list_memory_assignments(
+        write["memory_id"], AccessContext(actor_id="admin", is_admin=True)
+    ) == []

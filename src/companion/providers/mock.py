@@ -8,7 +8,14 @@ and it never fabricates confidence scores. Every result records
 
 from __future__ import annotations
 
-from companion.domain.enums import CognitiveAction, MemoryOperation, ReasonCode
+from companion.domain.enums import (
+    AssertionType,
+    CertaintyCategory,
+    CognitiveAction,
+    MemoryOperation,
+    ReasonCode,
+    ReplyNecessity,
+)
 from companion.domain.models import (
     CognitiveResult,
     ConversationContext,
@@ -30,22 +37,28 @@ class MockCognitiveProvider:
         if event.addressee_hint.value == "agent":
             action = CognitiveAction.RESPOND
             reason = ReasonCode.DIRECT_AGENT_ADDRESS
+            necessity = ReplyNecessity.REQUIRED
         elif event.addressee_hint.value == "human":
             action = CognitiveAction.IGNORE
             reason = ReasonCode.DIRECT_HUMAN_ADDRESS
+            necessity = ReplyNecessity.UNNECESSARY
         else:
             action = CognitiveAction.WAIT
             reason = ReasonCode.UNKNOWN_ADDRESSEE
+            necessity = ReplyNecessity.OPTIONAL
 
         # A single fixed candidate, clearly marked as mock-generated, so the
         # database -> memory-job pipeline can be exercised end-to-end without
-        # pretending any real memory extraction happened.
+        # pretending any real memory extraction happened. It is hypothetical,
+        # so write-through truthfully records NO_MEMORY for it.
         candidate = MemoryCandidate(
             candidate_id=new_id("memc"),
             source_event_id=event.event_id,
             subject_person_id=event.speaker_person_id,
             content=f"[mock] candidate derived from {event.event_id}",
             operation=MemoryOperation.ADD,
+            assertion_type=AssertionType.HYPOTHETICAL,
+            certainty_category=CertaintyCategory.UNKNOWN,
         )
 
         return CognitiveResult(
@@ -57,6 +70,11 @@ class MockCognitiveProvider:
             memory_candidates=[candidate],
             response_style="mock_plain",
             provider="mock",
+            intent="statement",
+            addressed_to=event.addressee_hint.value,
+            silence_requested=False,
+            reply_necessity=necessity,
+            conversation_state="ongoing",
         )
 
 

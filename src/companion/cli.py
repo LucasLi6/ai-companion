@@ -17,9 +17,17 @@ import asyncio
 import tempfile
 from pathlib import Path
 
-from companion.config import Config, configure_logging, default_db_path
+from companion.config import configure_logging, default_db_path
+from companion.core.policy import (
+    INTERRUPTION_THRESHOLD_VALUES,
+    RESPONSE_CONSERVATISM_VALUES,
+    CURIOSITY_LEVEL_VALUES,
+    SETTING_CURIOSITY_LEVEL,
+    SETTING_INTERRUPTION_THRESHOLD,
+    SETTING_RESPONSE_CONSERVATISM,
+    load_policy_config,
+)
 from companion.domain.enums import (
-    AddresseeHint,
     EventSource,
     MemoryKind,
     MemoryStatus,
@@ -41,6 +49,7 @@ from companion.providers.deepseek_client import (
 from companion.recovery import RecoveryError, RecoveryManager
 from companion.runtime import build_runtime
 from companion.storage.database import Database
+from companion.storage.repositories import make_repositories
 
 DEFAULT_CONVERSATION = "default"
 
@@ -185,6 +194,42 @@ def build_parser() -> argparse.ArgumentParser:
     p_ml.add_argument("other_id")
     p_ml.add_argument("--type", default="related_to")
     p_ml.set_defaults(func=cmd_memory_link)
+    p_mas = p_mem_sub.add_parser(
+        "assign", parents=[_common_parser()],
+        help="Associate a memory with a person for retrieval",
+    )
+    p_mas.add_argument("memory_id")
+    p_mas.add_argument("--person", required=True)
+    p_mas.set_defaults(func=cmd_memory_assign)
+    p_muas = p_mem_sub.add_parser(
+        "unassign", parents=[_common_parser()],
+        help="Remove a memory/person association",
+    )
+    p_muas.add_argument("memory_id")
+    p_muas.add_argument("--person", required=True)
+    p_muas.set_defaults(func=cmd_memory_unassign)
+    p_mal = p_mem_sub.add_parser(
+        "assignments", parents=[_common_parser()],
+        help="List the people a memory is associated with",
+    )
+    p_mal.add_argument("memory_id")
+    p_mal.set_defaults(func=cmd_memory_assignments)
+
+    p_policy = sub.add_parser("policy", parents=[_common_parser()], help="Show or set behaviour policy")
+    p_policy_sub = p_policy.add_subparsers(dest="policy_command")
+    p_policy_show = p_policy_sub.add_parser("show", parents=[_common_parser()], help="Show policy settings")
+    p_policy_show.set_defaults(func=cmd_policy_show)
+    p_policy_set = p_policy_sub.add_parser("set", parents=[_common_parser()], help="Set one policy setting")
+    p_policy_set.add_argument(
+        "key",
+        choices=[
+            SETTING_RESPONSE_CONSERVATISM,
+            SETTING_INTERRUPTION_THRESHOLD,
+            SETTING_CURIOSITY_LEVEL,
+        ],
+    )
+    p_policy_set.add_argument("value")
+    p_policy_set.set_defaults(func=cmd_policy_set)
 
     p_ui = sub.add_parser("ui", parents=[_common_parser()], help="Start the management web UI (NiceGUI)")
     p_ui.add_argument("--host", default="127.0.0.1")
@@ -401,18 +446,43 @@ async def cmd_inspect(args) -> int:
             print(f"suggestion: {analysis.action.value}")
             print(f"reason_code: {analysis.reason_code.value}")
             print(f"meaning: {analysis.meaning}")
+            print(f"intent: {analysis.intent}")
+            print(f"addressed_to: {analysis.addressed_to or '-'}")
+            print(f"silence_requested: {analysis.silence_requested}")
+            print(f"reply_necessity: {analysis.reply_necessity.value}")
+            print(f"conversation_state: {analysis.conversation_state}")
 
         action = await rt.repos.analysis.get_action(args.event_id)
         if action:
             print(f"-- action --")
             print(f"decision: {action.action_type.value}")
             print(f"reason_code: {action.reason_code.value}")
+            print(
+                "model_suggested_action: "
+                f"{action.model_suggested_action.value if action.model_suggested_action else '-'}"
+            )
+            print(
+                "policy_final_action: "
+                f"{action.policy_final_action.value if action.policy_final_action else '-'}"
+            )
+            print(f"override_reason: {action.override_reason or '-'}")
             print(f"response_text: {action.response_text or '(none)'}")
 
         candidates = await rt.repos.analysis.get_candidates(args.event_id)
+        writes = {
+            w["candidate_id"]: w
+            for w in await rt.repos.analysis.list_candidate_writes(args.event_id)
+        }
         print(f"-- memory candidates: {len(candidates)} --")
         for c in candidates:
-            print(f"  {c.candidate_id} op={c.operation.value} status={c.status.value}")
+            write = writes.get(c.candidate_id, {})
+            print(
+                f"  {c.candidate_id} op={c.operation.value} status={c.status.value}"
+                f" assertion={c.assertion_type.value} certainty={c.certainty_category.value}"
+                f" topic={c.topic or '-'}"
+                f" memory_write_outcome={write.get('outcome', '(none)')}"
+                f" memory_id={write.get('memory_id') or '-'}"
+            )
 
         job = await rt.repos.job.get_by_key(f"memory:{args.event_id}")
         if job:
@@ -574,6 +644,19 @@ async def cmd_memory_show(args) -> int:
             print(f"source: {s['source_id']} type={s['source_type']} title={s['title']}")
         for l in view["links"]:
             print(f"link: {l['memory_id']} -> {l['linked_memory_id']} ({l['link_type']})")
+        for a in view["assignments"]:
+            print(f"assignment: {a['person_id']} by={a['created_by']} at={a['created_at']}")
+        prov = view.get("provenance")
+        if prov:
+            print(
+                "provenance:"
+                f" source_event={prov.get('source_event_id') or '-'}"
+                f" candidate={prov.get('candidate_id') or '-'}"
+                f" speaker={prov.get('speaker_person_id') or '-'}"
+                f" subject={prov.get('subject_person_id') or '-'}"
+                f" assertion={prov.get('assertion_type')}"
+                f" topic={prov.get('topic') or '-'}"
+            )
         for r in view["revisions"]:
             print(f"revision: v{r['version']} {r['status']} by={r['changed_by']} {r['reason'] or ''}")
     finally:
@@ -633,6 +716,104 @@ async def cmd_memory_link(args) -> int:
             print(f"permission denied: {exc}")
             return 1
         print(f"linked {args.memory_id} -> {args.other_id} ({args.type})")
+    finally:
+        await db.close()
+    return 0
+
+
+def _memory_error(exc: Exception) -> int:
+    if isinstance(exc, MemoryNotFoundError):
+        print(f"not found: {exc}")
+    elif isinstance(exc, MemoryPermissionDeniedError):
+        print(f"permission denied: {exc}")
+    elif isinstance(exc, MemoryVersionConflictError):
+        print(f"version conflict: {exc}")
+    else:
+        print(f"error: {type(exc).__name__}: {exc}")
+    return 1
+
+
+async def cmd_memory_assign(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        try:
+            created = await rt.memory_service.assign_memory(
+                args.memory_id, args.person, ADMIN
+            )
+        except Exception as exc:
+            return _memory_error(exc)
+        status = "assigned" if created else "already assigned"
+        print(f"{status} {args.memory_id} -> {args.person}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_memory_unassign(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        try:
+            removed = await rt.memory_service.unassign_memory(
+                args.memory_id, args.person, ADMIN
+            )
+        except Exception as exc:
+            return _memory_error(exc)
+        status = "unassigned" if removed else "was not assigned"
+        print(f"{status} {args.memory_id} -> {args.person}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_memory_assignments(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        try:
+            assignments = await rt.memory_service.list_memory_assignments(
+                args.memory_id, ADMIN
+            )
+        except Exception as exc:
+            return _memory_error(exc)
+        for a in assignments:
+            print(f"{a['memory_id']}  {a['person_id']}  by={a['created_by']}  at={a['created_at']}")
+        if not assignments:
+            print("no assignments")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_policy_show(args) -> int:
+    db = await _connect(args.db)
+    try:
+        config = await load_policy_config(make_repositories(db).settings)
+        print(f"{SETTING_RESPONSE_CONSERVATISM}: {config.response_conservatism}")
+        print(f"{SETTING_INTERRUPTION_THRESHOLD}: {config.interruption_threshold}")
+        print(f"{SETTING_CURIOSITY_LEVEL}: {config.curiosity_level}")
+        print("defaults: conservative=balanced threshold=medium curiosity=low")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_policy_set(args) -> int:
+    allowed = {
+        SETTING_RESPONSE_CONSERVATISM: RESPONSE_CONSERVATISM_VALUES,
+        SETTING_INTERRUPTION_THRESHOLD: INTERRUPTION_THRESHOLD_VALUES,
+        SETTING_CURIOSITY_LEVEL: CURIOSITY_LEVEL_VALUES,
+    }
+    value = args.value.strip().lower()
+    if value not in allowed[args.key]:
+        print(f"invalid value {args.value!r}; expected one of {allowed[args.key]}")
+        return 1
+    db = await _connect(args.db)
+    try:
+        repos = make_repositories(db)
+        await repos.settings.set(args.key, value)
+        print(f"{args.key} = {value}")
     finally:
         await db.close()
     return 0
@@ -852,10 +1033,15 @@ async def cmd_repl(args) -> int:
         if person is None:
             print(err)
             return 1
-        addressee = "agent"
+        # Real DeepSeek starts conservative: an utterance without an explicit
+        # /to agent is treated as unclear, so the model cannot talk over a
+        # conversation it may not be part of. Mock keeps its old default.
+        addressee = "unknown" if provider == "deepseek" else "agent"
         print("AI Companion REPL. Type /help for commands.")
         print(f"speaking as {person.person_id} ({person.display_name})")
         print(f"provider: {rt.provider}")
+        if provider == "deepseek":
+            print(f"addressee: {addressee} (use /to agent to address me explicitly)")
         if provider == "deepseek":
             authorized = await rt.registry.is_external_ai_authorized(person.person_id)
             if not authorized:

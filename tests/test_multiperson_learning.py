@@ -14,6 +14,7 @@ from companion.domain.enums import (
     JobStatus,
     MemoryCandidateStatus,
     MemoryOperation,
+    MemoryStatus,
     ReasonCode,
 )
 from companion.domain.models import (
@@ -91,8 +92,21 @@ async def test_third_party_report_is_not_confirmed(tmp_path):
     await rt.worker.run_once()
     candidates = await rt.repos.analysis.get_candidates(report.event_id)
     assert len(candidates) == 1
-    # A third-party statement is not a confirmed fact about B.
-    assert candidates[0].status == MemoryCandidateStatus.SKIPPED
+    # The report is preserved with attribution, but never becomes a confirmed
+    # (ACTIVE) fact about B.
+    assert candidates[0].status == MemoryCandidateStatus.CONSOLIDATED
+    write = await rt.repos.analysis.get_candidate_write(candidates[0].candidate_id)
+    assert write["outcome"] == "SAVED"
+
+    item = await rt.memory_service.repo.get(write["memory_id"])
+    assert item is not None
+    assert item.status != MemoryStatus.ACTIVE
+    assert item.third_party_reported is True
+    assert item.human_confirmed is False
+    # B is not silently enrolled: no subject link, no assignment.
+    assert write and await rt.memory_service.repo.list_for_subject(
+        b.person_id, statuses=[MemoryStatus.ACTIVE.value]
+    ) == []
     await db.close()
 
 

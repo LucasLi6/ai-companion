@@ -121,6 +121,20 @@ python -m companion recovery list                 # events left unfinished by a 
 python -m companion recovery retry evt_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 python -m companion demo      # scripted demo on an isolated temp database
 python -m companion repl --person person_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 8. Long-term memory inspection and assignment
+python -m companion memory search "川菜"
+python -m companion memory show mem_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+python -m companion memory confirm mem_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+python -m companion memory assign mem_xxx --person person_xxx
+python -m companion memory unassign mem_xxx --person person_xxx
+python -m companion memory assignments mem_xxx
+
+# 9. Behaviour policy (typed settings, persisted in SQLite)
+python -m companion policy show
+python -m companion policy set policy.response_conservatism conservative
+python -m companion policy set policy.interruption_threshold high
+python -m companion policy set policy.curiosity_level low
 ```
 
 `python -m companion --help` (or any subcommand `--help`) lists every option.
@@ -141,6 +155,77 @@ python -m companion repl --person person_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 For a `--to human` utterance the same trace shows `[DECISION] IGNORE` and no
 `[RESPONSE]` line — the event, analysis, and memory job are still recorded.
+
+---
+
+## V0.2A — durable memory writes and reply policy
+
+V0.2A closes the gap between "the model proposed a memory" and "the companion
+remembers it". All of it still lives in the one SQLite file.
+
+### What becomes a durable memory
+
+A model candidate is a *proposal*, never a fact. The trusted consolidation
+layer (`src/companion/memory/consolidation.py`) decides from the stored event,
+the speaker's consent and the candidate's semantic hints:
+
+| Case | Result |
+|------|--------|
+| Direct, clear self-report ("我叫李悦。") | `ACTIVE`, `self_reported=1`, never `human_confirmed` |
+| Uncertain or inferred | durable `CANDIDATE` (not presented as fact) |
+| Third-party report ("Bob 喜欢川菜") | durable `CANDIDATE` with `third_party_reported=1` and speaker provenance |
+| Hypothetical / quoted / empty | no memory (`NO_MEMORY`) |
+| Learning consent revoked, or subject not authorised | `DENIED`; nothing is written |
+
+Every durable memory records `memory_provenance` (source event, candidate,
+speaker, subject, assertion type, certainty, topic, explicit-remember flag).
+`memory_candidate_writes` maps each candidate to its one durable outcome, so a
+retry, restart or duplicate event cannot create a second memory.
+
+### Truthful write outcomes
+
+The write outcome is one of `SAVED`, `UPDATED`, `ALREADY_EXISTS`,
+`PENDING_REVIEW`, `DENIED`, `FAILED`, `NO_MEMORY`. An explicit "请记住…" performs
+a bounded synchronous write *before* the acknowledgement is generated, and the
+response prompt receives only the committed outcomes — a failed or
+pending-review write is never described as saved. `inspect` shows each
+candidate's outcome and memory id.
+
+A correction ("我刚才说错了，我的名字是李悦。") updates the current-state memory
+in place; the old content remains in `memory_revisions`. A conflict with a
+human-confirmed fact becomes `NEEDS_REVIEW` and never overwrites it.
+
+### Silence, addressees and policy
+
+The final action is decided locally, in this order: permission → explicit
+current-turn silence → quiet mode → explicit human addressee → model
+suggestion → conservative ambiguity. An explicit "这句话不要回复。" produces
+`IGNORE` with no output, while analysis and memory learning still happen;
+quoted or discussed silence ("我的朋友刚才说：不要回答我") does not suppress a
+reply. The model's suggestion and the policy's final action are stored
+separately (`model_suggested_action`, `policy_final_action`,
+`override_reason`).
+
+Policy settings are typed and persisted in `app_settings` (no random
+non-response probabilities):
+
+```bash
+python -m companion policy show
+python -m companion policy set policy.response_conservatism conservative   # conservative | balanced | responsive
+python -m companion policy set policy.interruption_threshold high          # low | medium | high
+python -m companion policy set policy.curiosity_level low                  # off | low | medium | high
+```
+
+In the real-provider REPL the default addressee is `unknown` (conservative):
+use `/to agent` to address the companion explicitly.
+
+### Assignments
+
+`memory_assignments` associates a memory with a person for retrieval. It is
+**not** an access grant: visibility and subject privacy are still enforced by
+`MemoryService`, and a non-admin can only assign a visible memory to
+themselves. Memories created from a self-report are auto-associated with their
+speaker; third-party reports are not silently attached to the subject.
 
 ---
 
@@ -230,7 +315,7 @@ Safety invariants:
 .venv/bin/python -m pytest -q
 ```
 
-The suite (250 tests) covers: multi-person independence and duplicate names;
+The suite (291 tests) covers: multi-person independence and duplicate names;
 a decision for every allowed utterance; `IGNORE` still recording everything;
 idempotent re-submission and conflict rejection; database-restart persistence;
 background-job recovery (including a crashed `RUNNING` job); provider-exception
@@ -253,6 +338,15 @@ explicit-human-addressee guard, candidate deduplication/never-auto-`ACTIVE`,
 runtime provider-mixing rejection, missing-key failure, and response-failure
 recovery that reuses a persisted analysis.
 
+The V0.2A write-through/policy layers are also fake-client only: clear
+self-reports becoming `ACTIVE` with provenance; uncertain, third-party and
+hypothetical candidates; corrections updating in place with revisions;
+duplicate events/content; revocation blocking writes; restart-and-new-
+conversation identity retrieval; explicit-remember durability before the
+reply; truthful response-prompt outcomes; raw/quoted silence; quiet mode;
+human addressees; assignment privacy and restart persistence; lost-mapping
+recovery; and database failures never recorded as success.
+
 ---
 
 ## Architecture at a glance
@@ -265,9 +359,11 @@ Orchestrator.process_utterance  (per-conversation asyncio.Lock)
    1 validate person + status + consent   2 load conversation (read-only if no persistence)
    3 deduplicate / conflict / resume      4 persist input
    5 retrieve permitted memories          6 CognitiveProvider.analyze (or reuse saved analysis)
-   7 Policy.decide (quiet mode)           8 persist analysis + candidates + job (one txn)
-   9 ResponseProvider.generate (only if RESPOND)   10 persist AgentAction (or reuse it)
-   11 record last action + mark COMPLETED
+   7 persist analysis + candidates + job (one txn)
+   8 explicit "remember" -> bounded durable write; otherwise read existing outcomes
+   9 Policy.decide (permission, silence, quiet mode, addressee, necessity)
+  10 ResponseProvider.generate (only if RESPOND)   11 persist AgentAction (or reuse it)
+  12 record last action + mark COMPLETED
 ```
 
 Each durable stage leaves a database record, so a failed/partial event is
@@ -280,7 +376,9 @@ Each durable stage leaves a database record, so a failed/partial event is
 - `cognition/` — foreground privacy gateway + external-AI context builder.
 - `providers/` — mock providers, DeepSeek client, cognitive and response providers.
 - `prompts/` — versioned cognitive/response prompt builders.
-- `memory/` — `MemoryStore` (hand-authored facts, keyword/CJK retrieval) and candidate dedupe.
+- `memory/` — `MemoryStore` (keyword/CJK + deterministic identity retrieval),
+  `MemoryService` (the policy-enforcing gateway), candidate preparation and
+  durable write-through/consolidation.
 - `jobs/` — durable `JobWorker` + `MEMORY_CONSOLIDATION` handler.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
@@ -291,9 +389,13 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
 - **Mock has no real understanding.** The default mock provider decides purely
   from `addressee_hint` and records `provider=mock` with explicit reason codes.
   Real understanding requires `--provider deepseek`; it is never simulated.
-- **No automatic memory learning.** Memory *candidates* are stored, deduplicated
-  and validated by the consolidation job, but nothing is promoted to long-term
-  facts (`memory_items` is only hand-populated or human-confirmed).
+- **No autonomous semantic memory.** Memory *candidates* are consolidated by the
+  trusted local layer (self-reports may become `ACTIVE`; uncertain and
+  third-party candidates stay `CANDIDATE`), but there is no vector search, no
+  semantic merging and no autonomous promotion of raw model output.
+- **Conservative correction handling.** Only unambiguous same-topic corrections
+  update a current-state memory; anything else creates a review item rather
+  than guessing.
 - **No speech.** CLI text input stands in for a future ASR-generated
   `UtteranceEvent`; `RESPOND` output is text, not TTS.
 - **No speaker recognition.** The caller supplies `speaker_person_id`
@@ -306,7 +408,11 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
 
 ## Next steps
 
-V0.1 real-text DeepSeek cognition is implemented (see “Real DeepSeek mode”
-above). Still deliberately out of scope: ASR/TTS and voiceprints, real DeepSeek
-idle reflection, autonomous web research, a vector database, automatic
-long-term fact merging, and a React UI.
+V0.2A durable memory write-through and the structured reply policy are
+implemented (see “V0.2A — durable memory writes and reply policy” above).
+Still deliberately out of scope: ASR/TTS and voiceprints, real DeepSeek idle
+reflection, autonomous web research, a vector database, automatic semantic
+merging, the Memory Board drag-and-drop UI, and a React UI. A likely V0.2B
+focus is real-model acceptance testing, a manual review/approval workflow for
+`NEEDS_REVIEW` items, and richer assignment management in the existing manager
+UI.

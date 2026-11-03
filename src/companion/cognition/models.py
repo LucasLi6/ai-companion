@@ -40,3 +40,7 @@ class CognitiveContext(BaseModel):
     quiet_mode: bool = False
     turns: list[CognitiveTurn] = Field(default_factory=list)
     memories: list[dict] = Field(default_factory=list)
+    # Truthful results of the memory write-through for this turn. These are
+    # trusted application data (the provider never fills them) so the response
+    # can acknowledge only what was actually committed.
+    memory_write_outcomes: list[dict] = Field(default_factory=list)

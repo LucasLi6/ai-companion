@@ -14,16 +14,20 @@ from typing import Optional
 
 from companion.domain.enums import (
     AddresseeHint,
+    AssertionType,
+    CertaintyCategory,
     CognitiveAction,
     EventSource,
     JobStatus,
     JobType,
     MemoryCandidateStatus,
+    MemoryKind,
     MemoryOperation,
     PersonRole,
     ProcessingStatus,
     ReasonCode,
     RegistrationStatus,
+    ReplyNecessity,
 )
 from companion.domain.models import (
     AgentAction,
@@ -411,8 +415,9 @@ class AnalysisRepository:
     async def save_analysis(self, analysis: CognitiveResult, analysis_id: str) -> None:
         await self.db.execute(
             "INSERT INTO cognitive_analyses(analysis_id, event_id, meaning, action,"
-            " reason_code, provider, referenced_memory_ids, response_style, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " reason_code, provider, referenced_memory_ids, response_style, created_at,"
+            " intent, addressed_to, silence_requested, reply_necessity, conversation_state)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 analysis_id,
                 analysis.event_id,
@@ -423,14 +428,20 @@ class AnalysisRepository:
                 json.dumps(analysis.referenced_memory_ids),
                 analysis.response_style,
                 _iso(utcnow()),
+                analysis.intent,
+                analysis.addressed_to,
+                int(analysis.silence_requested),
+                analysis.reply_necessity.value,
+                analysis.conversation_state,
             ),
         )
 
     async def get_analysis(self, event_id: str) -> CognitiveResult | None:
         cur = await self.db.execute(
             "SELECT analysis_id, event_id, meaning, action, reason_code, provider,"
-            " referenced_memory_ids, response_style FROM cognitive_analyses"
-            " WHERE event_id = ?",
+            " referenced_memory_ids, response_style, intent, addressed_to,"
+            " silence_requested, reply_necessity, conversation_state"
+            " FROM cognitive_analyses WHERE event_id = ?",
             (event_id,),
         )
         row = await cur.fetchone()
@@ -444,6 +455,11 @@ class AnalysisRepository:
             referenced_memory_ids=json.loads(row["referenced_memory_ids"]),
             response_style=row["response_style"],
             provider=row["provider"],
+            intent=row["intent"] or "unknown",
+            addressed_to=row["addressed_to"],
+            silence_requested=bool(row["silence_requested"]),
+            reply_necessity=ReplyNecessity(row["reply_necessity"] or "OPTIONAL"),
+            conversation_state=row["conversation_state"] or "unknown",
         )
 
     async def get_analysis_id(self, event_id: str) -> Optional[str]:
@@ -460,8 +476,10 @@ class AnalysisRepository:
         # duplicate model output can never multiply candidate rows.
         await self.db.execute(
             "INSERT OR IGNORE INTO memory_candidates(candidate_id, source_event_id,"
-            " subject_person_id, content, operation, status, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " subject_person_id, content, operation, status, created_at,"
+            " assertion_type, certainty_category, explicit_remember_request, topic,"
+            " kind, source_evidence_span)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 candidate.candidate_id,
                 candidate.source_event_id,
@@ -470,13 +488,22 @@ class AnalysisRepository:
                 candidate.operation.value,
                 candidate.status.value,
                 _iso(utcnow()),
+                candidate.assertion_type.value,
+                candidate.certainty_category.value,
+                int(candidate.explicit_remember_request),
+                candidate.topic,
+                candidate.kind.value if candidate.kind is not None else None,
+                candidate.source_evidence_span,
             ),
         )
 
     async def get_candidates(self, event_id: str) -> list[MemoryCandidate]:
         cur = await self.db.execute(
             "SELECT candidate_id, source_event_id, subject_person_id, content,"
-            " operation, status FROM memory_candidates WHERE source_event_id = ?",
+            " operation, status, assertion_type, certainty_category,"
+            " explicit_remember_request, topic, kind, source_evidence_span"
+            " FROM memory_candidates WHERE source_event_id = ?"
+            " ORDER BY rowid ASC",
             (event_id,),
         )
         rows = await cur.fetchall()
@@ -488,9 +515,45 @@ class AnalysisRepository:
                 content=r["content"],
                 operation=MemoryOperation(r["operation"]),
                 status=MemoryCandidateStatus(r["status"]),
+                assertion_type=AssertionType(r["assertion_type"] or "UNKNOWN"),
+                certainty_category=CertaintyCategory(
+                    r["certainty_category"] or "UNKNOWN"
+                ),
+                explicit_remember_request=bool(r["explicit_remember_request"]),
+                topic=r["topic"],
+                kind=MemoryKind(r["kind"]) if r["kind"] else None,
+                source_evidence_span=r["source_evidence_span"],
             )
             for r in rows
         ]
+
+    async def get_candidate(self, candidate_id: str) -> MemoryCandidate | None:
+        cur = await self.db.execute(
+            "SELECT candidate_id, source_event_id, subject_person_id, content,"
+            " operation, status, assertion_type, certainty_category,"
+            " explicit_remember_request, topic, kind, source_evidence_span"
+            " FROM memory_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return MemoryCandidate(
+            candidate_id=row["candidate_id"],
+            source_event_id=row["source_event_id"],
+            subject_person_id=row["subject_person_id"],
+            content=row["content"],
+            operation=MemoryOperation(row["operation"]),
+            status=MemoryCandidateStatus(row["status"]),
+            assertion_type=AssertionType(row["assertion_type"] or "UNKNOWN"),
+            certainty_category=CertaintyCategory(
+                row["certainty_category"] or "UNKNOWN"
+            ),
+            explicit_remember_request=bool(row["explicit_remember_request"]),
+            topic=row["topic"],
+            kind=MemoryKind(row["kind"]) if row["kind"] else None,
+            source_evidence_span=row["source_evidence_span"],
+        )
 
     async def update_candidate_status(
         self, candidate_id: str, status: MemoryCandidateStatus
@@ -500,10 +563,66 @@ class AnalysisRepository:
             (status.value, candidate_id),
         )
 
+    # -- candidate -> memory write mapping ---------------------------------
+
+    async def get_candidate_write(self, candidate_id: str) -> dict | None:
+        cur = await self.db.execute(
+            "SELECT candidate_id, memory_id, source_event_id, outcome, detail,"
+            " created_at, updated_at FROM memory_candidate_writes"
+            " WHERE candidate_id = ?",
+            (candidate_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row is not None else None
+
+    async def record_candidate_write(
+        self,
+        candidate_id: str,
+        *,
+        source_event_id: str,
+        outcome: str,
+        memory_id: str | None = None,
+        detail: str | None = None,
+    ) -> dict:
+        """Insert the immutable candidate -> memory result (idempotent).
+
+        The first row wins: a retry reads the recorded outcome instead of
+        re-writing a second memory. A DB failure happens before this insert,
+        so a failure is never recorded as success.
+        """
+        now = _iso(utcnow())
+        await self.db.execute(
+            "INSERT OR IGNORE INTO memory_candidate_writes(candidate_id, memory_id,"
+            " source_event_id, outcome, detail, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (candidate_id, memory_id, source_event_id, outcome, detail, now, now),
+        )
+        existing = await self.get_candidate_write(candidate_id)
+        return existing if existing is not None else {
+            "candidate_id": candidate_id,
+            "memory_id": memory_id,
+            "source_event_id": source_event_id,
+            "outcome": outcome,
+            "detail": detail,
+        }
+
+    async def list_candidate_writes(self, event_id: str) -> list[dict]:
+        cur = await self.db.execute(
+            "SELECT w.candidate_id, w.memory_id, w.source_event_id, w.outcome,"
+            " w.detail, w.created_at, w.updated_at"
+            " FROM memory_candidate_writes w"
+            " JOIN memory_candidates c ON c.candidate_id = w.candidate_id"
+            " WHERE c.source_event_id = ? ORDER BY c.rowid ASC",
+            (event_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
     async def save_action(self, action: AgentAction) -> None:
         await self.db.execute(
             "INSERT INTO agent_actions(action_id, event_id, action_type, response_text,"
-            " reason_code, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " reason_code, status, created_at, model_suggested_action,"
+            " policy_final_action, override_reason)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 action.action_id,
                 action.event_id,
@@ -512,13 +631,21 @@ class AnalysisRepository:
                 action.reason_code.value,
                 action.status,
                 _iso(action.created_at),
+                action.model_suggested_action.value
+                if action.model_suggested_action is not None
+                else None,
+                action.policy_final_action.value
+                if action.policy_final_action is not None
+                else None,
+                action.override_reason,
             ),
         )
 
     async def get_action(self, event_id: str) -> AgentAction | None:
         cur = await self.db.execute(
             "SELECT action_id, event_id, action_type, response_text, reason_code,"
-            " status, created_at FROM agent_actions WHERE event_id = ?",
+            " status, created_at, model_suggested_action, policy_final_action,"
+            " override_reason FROM agent_actions WHERE event_id = ?",
             (event_id,),
         )
         row = await cur.fetchone()
@@ -540,7 +667,8 @@ class AnalysisRepository:
         placeholders = ",".join("?" for _ in event_ids)
         cur = await self.db.execute(
             "SELECT action_id, event_id, action_type, response_text, reason_code,"
-            f" status, created_at FROM agent_actions WHERE event_id IN ({placeholders})",
+            " status, created_at, model_suggested_action, policy_final_action,"
+            f" override_reason FROM agent_actions WHERE event_id IN ({placeholders})",
             tuple(event_ids),
         )
         rows = await cur.fetchall()
@@ -555,6 +683,17 @@ class AnalysisRepository:
             reason_code=ReasonCode(row["reason_code"]),
             status=row["status"],
             created_at=_dt(row["created_at"]),
+            model_suggested_action=(
+                CognitiveAction(row["model_suggested_action"])
+                if row["model_suggested_action"]
+                else None
+            ),
+            policy_final_action=(
+                CognitiveAction(row["policy_final_action"])
+                if row["policy_final_action"]
+                else None
+            ),
+            override_reason=row["override_reason"],
         )
 
 

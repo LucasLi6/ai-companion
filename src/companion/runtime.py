@@ -23,8 +23,8 @@ from companion.core.orchestrator import Orchestrator
 from companion.core.policy import Policy
 from companion.jobs.handlers import memory_consolidation
 from companion.jobs.worker import JobWorker
-from companion.memory.repository import MemoryRepository
-from companion.memory.service import MemoryService
+from companion.memory.consolidation import MemoryWriter
+from companion.memory.service import MemoryService, build_memory_service
 from companion.memory.store import SqliteMemoryStore
 from companion.people.registry import PersonRegistry
 from companion.providers.deepseek_client import (
@@ -87,12 +87,8 @@ def build_runtime(
     registry = PersonRegistry(repos.person, audit=repos.audit)
     conversations = ConversationManager(repos.conversation, repos.utterance)
     policy = Policy()
-    memory_repo = MemoryRepository(db)
-    memory_service = MemoryService(
-        memory_repo,
-        authorize_subject=registry.is_learning_authorized,
-        audit=repos.audit,
-    )
+    memory_service = build_memory_service(repos)
+    memory_writer = MemoryWriter(repos, memory_service, logger=logger)
     memory = SqliteMemoryStore(memory_service)
 
     context_builder: Optional[ContextBuilder] = None
@@ -140,6 +136,7 @@ def build_runtime(
         memory=memory,
         jobs=worker,
         context_builder=context_builder,
+        memory_writer=memory_writer,
         logger=logger,
     )
     return Runtime(

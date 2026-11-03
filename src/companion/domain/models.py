@@ -21,16 +21,20 @@ from pydantic import BaseModel, Field, model_validator
 
 from .enums import (
     AddresseeHint,
+    AssertionType,
+    CertaintyCategory,
     CognitiveAction,
     EventSource,
     JobStatus,
     JobType,
     MemoryCandidateStatus,
+    MemoryKind,
     MemoryOperation,
     PersonRole,
     ProcessingStatus,
     ReasonCode,
     RegistrationStatus,
+    ReplyNecessity,
 )
 
 
@@ -132,8 +136,11 @@ class UtteranceEvent(DomainModel):
 class MemoryCandidate(DomainModel):
     """A candidate memory proposed by a cognitive provider.
 
-    V0.0 only *stores* candidates; it never promotes them into trusted
-    long-term facts (that is the V0.2 memory-learning milestone).
+    The semantic fields (``assertion_type``, ``certainty_category``,
+    ``explicit_remember_request``, ``topic``) are *model suggestions*: the
+    trusted consolidation layer still decides whether a durable memory may be
+    written. ``candidate_id``, ``source_event_id`` and ``subject_person_id``
+    are always filled by the program, never by the model.
     """
 
     candidate_id: str = Field(min_length=1, max_length=128)
@@ -142,13 +149,22 @@ class MemoryCandidate(DomainModel):
     content: str = Field(min_length=1, max_length=4096)
     operation: MemoryOperation
     status: MemoryCandidateStatus = MemoryCandidateStatus.PENDING
+    assertion_type: AssertionType = AssertionType.UNKNOWN
+    certainty_category: CertaintyCategory = CertaintyCategory.UNKNOWN
+    explicit_remember_request: bool = False
+    topic: Optional[str] = Field(default=None, max_length=128)
+    kind: Optional[MemoryKind] = None
+    source_evidence_span: Optional[str] = Field(default=None, max_length=4096)
 
 
 class CognitiveResult(DomainModel):
     """Structured output of a cognitive provider.
 
     ``action`` is the provider's *suggestion*; the Policy layer owns the final
-    decision on whether that suggestion is allowed to execute.
+    decision on whether that suggestion is allowed to execute. The extra
+    structured fields (``intent``, ``addressed_to``, ``silence_requested``,
+    ``reply_necessity``, ``conversation_state``) exist so the policy can make
+    a deterministic decision rather than guessing from prose.
     """
 
     event_id: str = Field(min_length=1, max_length=128)
@@ -159,10 +175,20 @@ class CognitiveResult(DomainModel):
     memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
     response_style: str = Field(default="mock_plain", min_length=1, max_length=128)
     provider: str = Field(default="mock", min_length=1, max_length=128)
+    intent: str = Field(default="unknown", min_length=1, max_length=128)
+    addressed_to: Optional[str] = Field(default=None, max_length=32)
+    silence_requested: bool = False
+    reply_necessity: ReplyNecessity = ReplyNecessity.OPTIONAL
+    conversation_state: str = Field(default="unknown", min_length=1, max_length=128)
 
 
 class AgentAction(DomainModel):
-    """What the agent ultimately did for a single event."""
+    """What the agent ultimately did for a single event.
+
+    ``model_suggested_action`` and ``policy_final_action`` are recorded
+    separately so a mismatch is inspectable. ``override_reason`` explains a
+    local override; it never rewrites the model's original suggestion.
+    """
 
     action_id: str = Field(min_length=1, max_length=128)
     event_id: str = Field(min_length=1, max_length=128)
@@ -171,6 +197,9 @@ class AgentAction(DomainModel):
     reason_code: ReasonCode
     status: str = Field(default="COMPLETED", min_length=1, max_length=32)
     created_at: datetime
+    model_suggested_action: Optional[CognitiveAction] = None
+    policy_final_action: Optional[CognitiveAction] = None
+    override_reason: Optional[str] = Field(default=None, max_length=128)
 
 
 class ConversationContext(DomainModel):
@@ -222,6 +251,7 @@ class ProcessingReport(DomainModel):
     analysis_id: Optional[str] = None
     job_id: Optional[str] = None
     error: Optional[str] = None
+    memory_write_outcomes: list[dict] = Field(default_factory=list)
     steps: list[str] = Field(default_factory=list)
 
 

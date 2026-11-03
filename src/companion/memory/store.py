@@ -20,6 +20,7 @@ from typing import Optional
 
 from companion.memory.models import AccessContext
 from companion.memory.service import MemoryService
+from companion.memory.topics import detect_identity_query
 
 RETRIEVAL_KINDS = [
     "PERSONAL_FACT",
@@ -106,41 +107,85 @@ class SqliteMemoryStore:
         self.service = service
 
     async def retrieve(self, query: str, person_id: Optional[str]) -> list[dict]:
-        """Retrieve the person's ``ACTIVE`` memories matching any query keyword.
+        """Retrieve the person's ``ACTIVE`` memories matching the query.
 
-        ``person_id=None`` (unregistered speaker) returns nothing. Results are
-        merged across keywords (OR semantics), de-duplicated, re-sorted most
-        recently updated first, and capped.
+        Identity questions ("我叫什么名字？") are resolved *deterministically*
+        by subject + canonical topic before keyword search, so the answer does
+        not depend on the question sharing wording with the stored fact. All
+        other queries use keyword matching (OR semantics), de-duplicated,
+        most recently updated first, and capped.
         """
         if person_id is None:
             return []
         access = AccessContext(actor_id=person_id, is_admin=False, role="cognitive")
+
+        identity: list[dict] = []
+        identity_topics = detect_identity_query(query)
+        if identity_topics:
+            rows = await self.service.repo.list_subject_topic(
+                person_id,
+                identity_topics,
+                statuses=["ACTIVE"],
+                limit=_PER_KEYWORD_LIMIT,
+            )
+            for row in rows:
+                identity.append(
+                    {
+                        "memory_id": row["memory_id"],
+                        "kind": row["kind"],
+                        "content": row["content"],
+                        "status": row["status"],
+                        "visibility": row["visibility"],
+                        "created_by": row["created_by"],
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"],
+                        "version": row["version"],
+                        "human_confirmed": bool(row["human_confirmed"]),
+                        "source_supported": bool(row["source_supported"]),
+                        "self_reported": bool(row["self_reported"]),
+                        "third_party_reported": bool(row["third_party_reported"]),
+                        "model_inferred": bool(row["model_inferred"]),
+                        "subjects": [
+                            {"subject_type": "PERSON", "subject_id": person_id}
+                        ],
+                        "sources": [],
+                    }
+                )
+
         keywords = extract_keywords(query)
 
-        if not keywords:
-            return await self.service.search(
+        by_id: dict[str, dict] = {
+            memory["memory_id"]: memory for memory in identity
+        }
+        if keywords:
+            for keyword in keywords:
+                hits = await self.service.search(
+                    access=access,
+                    query=keyword,
+                    statuses=["ACTIVE"],
+                    kinds=RETRIEVAL_KINDS,
+                    limit=_PER_KEYWORD_LIMIT,
+                )
+                for memory in hits:
+                    by_id.setdefault(memory["memory_id"], memory)
+        elif not identity:
+            for memory in await self.service.search(
                 access=access,
                 query=None,
                 statuses=["ACTIVE"],
                 kinds=RETRIEVAL_KINDS,
                 limit=_RETRIEVAL_LIMIT,
-            )
-
-        by_id: dict[str, dict] = {}
-        for keyword in keywords:
-            hits = await self.service.search(
-                access=access,
-                query=keyword,
-                statuses=["ACTIVE"],
-                kinds=RETRIEVAL_KINDS,
-                limit=_PER_KEYWORD_LIMIT,
-            )
-            for memory in hits:
+            ):
                 by_id.setdefault(memory["memory_id"], memory)
 
+        identity_ids = {m["memory_id"] for m in identity}
         merged = list(by_id.values())
         merged.sort(
-            key=lambda m: (m.get("updated_at") or "", m.get("memory_id") or ""),
+            key=lambda m: (
+                1 if m.get("memory_id") in identity_ids else 0,
+                m.get("updated_at") or "",
+                m.get("memory_id") or "",
+            ),
             reverse=True,
         )
         return merged[:_RETRIEVAL_LIMIT]
