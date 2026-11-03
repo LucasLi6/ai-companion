@@ -20,6 +20,7 @@ from pathlib import Path
 from companion.config import Config, configure_logging, default_db_path
 from companion.domain.enums import AddresseeHint, EventSource
 from companion.domain.models import make_utterance_event
+from companion.recovery import RecoveryError, RecoveryManager
 from companion.runtime import build_runtime
 from companion.storage.database import Database
 
@@ -99,7 +100,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_repl = sub.add_parser("repl", parents=[_common_parser()], help="Start an interactive text session")
     p_repl.add_argument("--conversation", default=DEFAULT_CONVERSATION)
+    p_repl.add_argument("--person", default=None, help="Registered person id of the speaker")
     p_repl.set_defaults(func=cmd_repl)
+
+    p_recovery = sub.add_parser("recovery", parents=[_common_parser()], help="Recover unfinished events after a crash")
+    p_recovery_sub = p_recovery.add_subparsers(dest="recovery_command")
+    p_rec_list = p_recovery_sub.add_parser("list", parents=[_common_parser()], help="List unfinished events")
+    p_rec_list.set_defaults(func=cmd_recovery_list)
+    p_rec_retry = p_recovery_sub.add_parser("retry", parents=[_common_parser()], help="Safely resume one event")
+    p_rec_retry.add_argument("event_id")
+    p_rec_retry.set_defaults(func=cmd_recovery_retry)
 
     return parser
 
@@ -340,6 +350,41 @@ async def cmd_jobs_retry(args) -> int:
     return 0
 
 
+async def cmd_recovery_list(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        recovery = RecoveryManager(rt.repos, rt.orchestrator)
+        events = await recovery.list_unfinished()
+        if not events:
+            print("no unfinished events")
+        for e in events:
+            print(f"{e.event_id}  {e.processing_status.value}  {e.conversation_id}  {e.text}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_recovery_retry(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        recovery = RecoveryManager(rt.repos, rt.orchestrator)
+        try:
+            report = await recovery.retry(args.event_id)
+        except RecoveryError as exc:
+            print(f"recovery failed: {exc}")
+            return 1
+        for step in report.steps:
+            print(step)
+        if rt.worker is not None:
+            await rt.worker.run_once()
+        print(f"event {args.event_id} status={report.status}")
+    finally:
+        await db.close()
+    return 0
+
+
 async def cmd_demo(args) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "demo.db"
@@ -389,17 +434,37 @@ async def cmd_demo(args) -> int:
     return 0
 
 
+async def _select_repl_person(rt, person_id):
+    """Choose the REPL speaker without ever implicitly creating a new person.
+
+    Returns ``(person, error_message)``. ``error_message`` is ``None`` on
+    success. Display names are never used to merge people (duplicates are
+    allowed).
+    """
+    if person_id is not None:
+        person = await rt.registry.get(person_id)
+        if person is None:
+            return None, f"person not found: {person_id}"
+        return person, None
+    people = await rt.registry.list()
+    if not people:
+        return None, "no registered person — run `person add` first"
+    if len(people) > 1:
+        return None, "multiple people registered — pass --person <PERSON_ID>"
+    return people[0], None
+
+
 async def cmd_repl(args) -> int:
     db = await _connect(args.db)
     try:
         rt = build_runtime(db)
-        person = await rt.registry.register(
-            "repl-user", "owner",
-            allow_processing=True, allow_persistence=True, allow_memory_learning=True,
-        )
+        person, err = await _select_repl_person(rt, getattr(args, "person", None))
+        if person is None:
+            print(err)
+            return 1
         addressee = "agent"
         print("AI Companion REPL. Type /help for commands.")
-        print(f"speaking as {person.person_id}")
+        print(f"speaking as {person.person_id} ({person.display_name})")
         while True:
             try:
                 line = input("you> ").strip()

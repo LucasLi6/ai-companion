@@ -17,19 +17,32 @@ the architecture.
 
 - Multi-person registration with unique, stable ids (duplicate names allowed).
 - Explicit per-person consent: `allow_processing`, `allow_persistence`,
-  `allow_memory_learning` — **never defaulted on**.
+  `allow_memory_learning` — **never defaulted on** — plus a registration
+  status (`active`/`suspended`/`revoked`) that gates processing independently
+  of role.
 - A single validated `UtteranceEvent` per confirmed input, with deduplication
-  and conflict detection.
+  and conflict detection on a documented identity fingerprint.
 - A pluggable `CognitiveProvider` / `ResponseProvider` / `MemoryStore`
   interface; the orchestrator depends only on these, never on the mock.
 - A `Policy` layer that decides whether a cognitive *suggestion* may execute
   (V0.0 rule: quiet mode suppresses `RESPOND`).
+- A **resumable** processing pipeline: each durable stage leaves a database
+  record, so a retry re-uses an already-completed analysis, memory job and
+  action instead of clearing and re-running them.
+- Per-conversation serialization (`asyncio.Lock`) with cross-conversation
+  concurrency; serialized SQLite access via a re-entrant connection lock; and
+  atomic, conditional job claiming.
+- Strict no-persistence: an `allow_persistence=False` interaction writes *no*
+  utterance, analysis, action, candidate, job or conversation metadata.
 - Persistent conversation state (quiet mode, last action) that survives restarts.
 - A durable, deduplicated, recoverable background job queue backed by SQLite
-  (job type `MEMORY_CONSOLIDATION`).
+  (job type `MEMORY_CONSOLIDATION`), with authorisation re-checked at run time.
+- Event recovery (`recovery list` / `recovery retry`) for utterances left
+  `PROCESSING` by a crash.
+- Ordered, append-only schema migrations that refuse an unknown newer version.
 - Structured `key=value` logging for end-to-end traceability.
 - A full CLI (`init`, `person`, `say`, `inspect`, `history`, `quiet`, `jobs`,
-  `demo`, `repl`) and an automated test suite.
+  `recovery`, `demo`, `repl`) and an automated test suite.
 
 ## What V0.0 deliberately does **not** do
 
@@ -104,8 +117,10 @@ python -m companion person list
 python -m companion history --limit 50
 python -m companion jobs list
 python -m companion jobs retry job_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+python -m companion recovery list                 # events left unfinished by a crash
+python -m companion recovery retry evt_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 python -m companion demo      # scripted demo on an isolated temp database
-python -m companion repl      # interactive text session
+python -m companion repl --person person_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 `python -m companion --help` (or any subcommand `--help`) lists every option.
@@ -135,12 +150,18 @@ For a `--to human` utterance the same trace shows `[DECISION] IGNORE` and no
 .venv/bin/python -m pytest -q
 ```
 
-The suite (32 tests) covers: multi-person independence and duplicate names;
+The suite (74 tests) covers: multi-person independence and duplicate names;
 a decision for every allowed utterance; `IGNORE` still recording everything;
 idempotent re-submission and conflict rejection; database-restart persistence;
 background-job recovery (including a crashed `RUNNING` job); provider-exception
-retryability; consent denial; quiet-mode behaviour and persistence; and a
-100-event integration run.
+retryability; consent denial; person `SUSPENDED`/`REVOKED` denial; revoking
+learning consent after a job is queued; strict no-persistence (including no
+conversation metadata); response-failure retry that preserves the analysis and
+memory job; crash recovery at each pipeline stage; real async concurrency
+(gather, same/different conversations, competing workers and connections,
+transaction isolation); schema-version migration and refusal of unknown
+versions; model validation (UTC datetimes, non-empty ids, illegal statuses);
+REPL identity reuse; and a 100-event integration run.
 
 ---
 
@@ -150,14 +171,17 @@ retryability; consent denial; quiet-mode behaviour and persistence; and a
 CLI / test
    │  UtteranceEvent (pydantic-validated)
    ▼
-Orchestrator.process_utterance
-   1 validate person + consent   2 ensure conversation   3 deduplicate
-   4 persist input   5 retrieve permitted memories
-   6 CognitiveProvider.analyze (mock)   7 validate analysis
-   8 Policy.decide (quiet mode)   9 persist analysis + memory candidates
-   10 enqueue memory job   11 update conversation state
-   12 ResponseProvider.generate (only if RESPOND)   13 persist AgentAction
+Orchestrator.process_utterance  (per-conversation asyncio.Lock)
+   1 validate person + status + consent   2 load conversation (read-only if no persistence)
+   3 deduplicate / conflict / resume      4 persist input
+   5 retrieve permitted memories          6 CognitiveProvider.analyze (or reuse saved analysis)
+   7 Policy.decide (quiet mode)           8 persist analysis + candidates + job (one txn)
+   9 ResponseProvider.generate (only if RESPOND)   10 persist AgentAction (or reuse it)
+   11 record last action + mark COMPLETED
 ```
+
+Each durable stage leaves a database record, so a failed/partial event is
+**resumed**, not cleared and re-run.
 
 - `domain/` — pydantic models, enums, provider protocols.
 - `storage/` — SQLite schema (WAL, FK on, parameterised SQL), connection, repositories.
@@ -182,8 +206,11 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
   `UtteranceEvent`; `RESPOND` output is text, not TTS.
 - **No speaker recognition.** The caller supplies `speaker_person_id`
   explicitly; there is no voiceprint or diarization.
-- **Single-worker, single-process.** One ordered consumer per conversation;
-  no distributed queue or concurrency pool (intentional for V0.0).
+- **Single-process.** One ordered consumer per conversation, with a
+  re-entrant SQLite connection lock and atomic job claiming; no distributed
+  queue, no multi-process coordination, and no concurrency pool (intentional
+  for V0.0). Multiple independent processes sharing one SQLite file are not
+  coordinated beyond SQLite's own locking.
 
 ## Next steps
 

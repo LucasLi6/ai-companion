@@ -32,26 +32,6 @@ Conversation ids are caller-supplied strings (the CLI defaults to `default`).
 | `memory_facts`       | reserved for long-term facts; V0.0 never auto-populates it          |
 | `processing_jobs`    | durable, deduplicated, recoverable background jobs                  |
 
-## Consent semantics
-
-The three consent flags are **independent**:
-
-- `allow_processing` — may this person enter the cognitive flow at all? If
-  false, the input is rejected with `PERMISSION_DENIED` and *nothing* is
-  persisted.
-- `allow_persistence` — may their utterances be durably stored? If false, the
-  cognitive flow still runs (and a response may be produced) but nothing is
-  written to disk. *Processing does not imply persistence.*
-- `allow_memory_learning` — may memory candidates be created and consolidated?
-  If false, no candidates are saved and no memory job is enqueued.
-
-V0.0 **never defaults these to `True`**. The CLI sets them explicitly via
-`person add` flags.
-
-Unregistered speakers may carry a transient `speaker_label` within a single
-conversation, but they are never promoted to a permanent profile and never
-enter persistent processing.
-
 ## Event lifecycle
 
 ```
@@ -59,11 +39,68 @@ PENDING → PROCESSING → COMPLETED   (successful pipeline)
                  └──→ FAILED       (provider error; retryable)
 ```
 
-`processing_status` lives on `utterances`. A `FAILED` event can be re-submitted
-with the same id/content; stale cognitive outputs are cleared and the pipeline
-re-runs (idempotent by construction). Re-submitting a `COMPLETED` event returns
-`DUPLICATE`; re-submitting the same id with different content returns
-`CONFLICT`.
+`processing_status` lives on `utterances`. A `FAILED` (or crash-left
+`PROCESSING`) event can be re-submitted with the same id/content, and the
+pipeline **resumes** from the durable records already present instead of
+clearing them:
+
+- an existing `cognitive_analyses` row is reused (the provider is not called
+  again),
+- existing `memory_candidates` and their `processing_jobs` row are left intact
+  (so a completed job never strands new candidates),
+- an existing `agent_actions` row is reused and its response is **not**
+  re-emitted.
+
+Re-submitting a `COMPLETED` event returns `DUPLICATE`; re-submitting the same id
+with a different identity fingerprint returns `CONFLICT`. `recovery list` /
+`recovery retry` expose this resume behaviour for events left by a crash.
+
+### Event identity fingerprint
+
+`UtteranceEvent.identity_fingerprint()` returns the immutable content fields
+that define an event's identity:
+
+```
+(conversation_id, speaker_person_id, speaker_label, text, source, addressee_hint)
+```
+
+`event_id` is the primary key; `occurred_at` and `processing_status` are *not*
+part of identity (the former is caller timing, the latter is lifecycle state).
+Two submissions with the same id and a different fingerprint are a `CONFLICT`.
+
+## Schema versioning
+
+`schema_version` records the applied version (V0.0 = 1). `schema.py` holds an
+ordered, append-only `MIGRATIONS` list; `Database.initialize` applies missing
+versions in order, is a no-op when already current, and refuses to open a
+database stamped with a newer, unknown version. A database is never deleted to
+"fix" a version mismatch.
+
+## Consent semantics
+
+The three consent flags are **independent**, and are gated by the person's
+`registration_status` (`active`/`suspended`/`revoked`):
+
+- `allow_processing` — may this person enter the cognitive flow at all? If
+  false, the input is rejected with `PERMISSION_DENIED` and *nothing* is
+  persisted.
+- `allow_persistence` — may their utterances be durably stored? If false, the
+  cognitive flow still runs (and a response may be produced) but nothing is
+  written to disk — not the utterance, analysis, action, candidate, job, or any
+  conversation metadata. *Processing does not imply persistence.*
+- `allow_memory_learning` — may memory candidates be created and consolidated?
+  If false, no candidates are saved and no memory job is enqueued.
+
+A person must be `active` *and* hold `allow_processing=True` to be processed.
+`SUSPENDED` and `REVOKED` deny new input regardless of prior consent; `owner`
+role does not bypass consent or status. The consolidation job re-checks
+authorisation at run time, so revoking learning consent (or suspending/revoking
+the person) after a job is queued causes the candidate to be `SKIPPED` rather
+than consolidated. Revoking authorisation never deletes existing history.
+
+Unregistered speakers may carry a transient `speaker_label` within a single
+conversation, but they are never promoted to a permanent profile and never
+enter persistent processing.
 
 ## Cognitive results vs. final decisions
 

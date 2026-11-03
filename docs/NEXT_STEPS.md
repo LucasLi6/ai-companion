@@ -56,6 +56,15 @@ Keep `MockResponseProvider`, or add `DeepSeekResponseProvider` behind the same
 `ResponseProvider` protocol. The orchestrator already calls `generate` only on
 `RESPOND`.
 
+> **Response-emit ordering.** The orchestrator persists the `AgentAction`
+> immediately after `generate()` returns, and a retry re-uses an already-saved
+> action instead of re-generating it. There is still a narrow window — a crash
+> after `generate()` returns but before `save_action` commits — in which a
+> *non-deterministic* provider would produce a different text on retry. The
+> deterministic mock is unaffected. A real DeepSeek response provider should
+> either persist the response text before emitting it (a two-phase emit) or
+> accept this window; document which in V0.1.
+
 ## What must NOT change
 
 - `Orchestrator.process_utterance` (it depends only on the protocols).

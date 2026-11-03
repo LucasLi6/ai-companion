@@ -21,6 +21,7 @@ src/companion/
 ├── cli.py               argparse surface; thin async command handlers
 ├── config.py            Config dataclass, default DB path, logging setup
 ├── runtime.py           composition root (wires every component)
+├── recovery.py          RecoveryManager (resume unfinished events after a crash)
 ├── domain/
 │   ├── models.py        pydantic models + id/time factories
 │   ├── enums.py         string enums shared across layers
@@ -43,36 +44,53 @@ src/companion/
 
 ## The processing pipeline
 
-`Orchestrator.process_utterance(event)` runs these steps in order:
+`Orchestrator.process_utterance(event)` acquires a per-conversation
+`asyncio.Lock` and then runs these steps in order:
 
-1. **Validate person & consent.** If `speaker_person_id` is `None`, the person
-   is unknown, or `allow_processing` is false, the event is **rejected** with
-   `PERMISSION_DENIED` and *nothing* is written (not the text, not a log line
-   carrying the text).
-2. **Ensure the conversation exists** (the utterance row has an FK to it) and
-   load its persistent state (quiet mode, last action) plus recent utterance ids.
-3. **Deduplicate.** Same `event_id` + same content that already `COMPLETED`
-   returns `DUPLICATE` without re-running. Same `event_id` + *different* content
-   returns `CONFLICT` and never overwrites. A previously `FAILED`/partial event
-   is cleared of stale cognitive outputs and retried.
+1. **Validate person, status & consent.** If `speaker_person_id` is `None`, the
+   person is unknown, their `registration_status` is not `ACTIVE`
+   (`suspended`/`revoked`), or `allow_processing` is false, the event is
+   **rejected** with `PERMISSION_DENIED` and *nothing* is written. Role is a
+   descriptive label and never bypasses consent or status.
+2. **Load the conversation.** With `allow_persistence` the conversation is
+   created/loaded (quiet mode, last action, recent ids). Without it the
+   conversation is read-only: an existing quiet mode is still honoured but no
+   conversation row is created or updated.
+3. **Deduplicate / conflict / resume.** Same `event_id` + same identity
+   fingerprint that already `COMPLETED` returns `DUPLICATE`. Same id +
+   *different* fingerprint returns `CONFLICT`. A partial (`PROCESSING`/
+   `FAILED`) event is *resumed*, never cleared.
 4. **Persist input** (only when `allow_persistence`).
-5. **Retrieve permitted memories** from `MemoryStore` (hand-authored facts).
-6. **Call the cognitive provider** — a *suggestion*, not a decision.
-7. **Validate the analysis** (`event_id` must match).
-8. **Apply policy.** The `Policy` layer owns the final decision. V0.0 rule:
-   a `RESPOND` suggestion is downgraded to `WAIT` with reason `quiet_mode`
-   while the conversation is quiet.
-9. **Persist analysis + memory candidates** (candidates only when
-   `allow_memory_learning`).
-10. **Enqueue a memory job** (`MEMORY_CONSOLIDATION`, keyed by event id, so
-    re-submission never duplicates it).
-11. **Update conversation state** (last action).
-12. **Generate a response** only when the final decision is `RESPOND`.
-13. **Persist the `AgentAction`** and mark the event `COMPLETED`.
+5. **Retrieve permitted memories** from `MemoryStore`.
+6. **Cognitive analysis — reuse or compute.** If a saved analysis exists it is
+   reused without calling the provider again; otherwise the provider is called
+   and the result validated (`event_id` must match).
+7. **Apply policy.** `Policy.decide` finalises the action (V0.0: quiet mode
+   downgrades `RESPOND` to `WAIT`).
+8. **Persist analysis + candidates + memory job in one short transaction.**
+   Candidates are written only when `allow_memory_learning`; the job only when
+   a worker is wired. The transaction never spans a provider call.
+9. **Generate a response** only when the final decision is `RESPOND` *and* no
+   action has been saved yet.
+10. **Persist the `AgentAction`** (or reuse an already-saved one), record the
+    conversation's last action, and mark the event `COMPLETED`.
 
-`IGNORE` never skips steps 4–10; `WAIT` is a normal decision, not an error; a
-provider exception leaves the event `FAILED` (retryable) rather than
-`COMPLETED`.
+The pipeline is **resumable**: every durable stage leaves a database record
+(utterance → analysis → candidates/job → action), so a retry or recovery
+re-uses whatever already succeeded. A `ResponseProvider` failure therefore never
+discards a valid analysis or strands a memory job, and an already-persisted
+action is never re-emitted. `IGNORE` never skips persistence; `WAIT` is a
+normal decision; a provider exception leaves the event `FAILED` (retryable)
+rather than `COMPLETED`.
+
+### Ordering
+
+Within a conversation, events are processed strictly in **submission order** —
+the order in which `process_utterance` acquires that conversation's lock.
+`occurred_at` is caller-supplied timing, not a scheduling guarantee: a late
+event (an older `occurred_at` arriving after newer ones) is processed when it
+arrives, not re-ordered by timestamp. Different conversations run concurrently
+under the shared SQLite connection lock.
 
 ### Why policy is separate from cognition
 
@@ -102,12 +120,23 @@ say --person P --to agent --text "你好"
 
 ## Storage
 
-- SQLite via `aiosqlite`, with `PRAGMA foreign_keys=ON` and
-  `PRAGMA journal_mode=WAL`.
-- All SQL is parameterised; the schema is idempotent (`CREATE … IF NOT
-  EXISTS`) and never drops or truncates data.
+- SQLite via `aiosqlite`, with `PRAGMA foreign_keys=ON`,
+  `PRAGMA journal_mode=WAL`, and `PRAGMA busy_timeout=5000`.
+- All SQL is parameterised; the schema is append-only migrations (`CREATE …
+  IF NOT EXISTS`) that never drop or truncate data.
+- **Concurrency.** All access to a `Database` is serialised through a
+  re-entrant async lock: `execute` holds it for one statement, `transaction`
+  holds it for the whole `BEGIN … COMMIT/ROLLBACK` span. A statement can
+  therefore never be injected into another task's open transaction. The lock is
+  per-connection; correctness across *separate* connections (or processes)
+  relies on database-level `UNIQUE` constraints and atomic `UPDATE … WHERE`
+  statements (e.g. job claiming).
 - Transactions are short and local; they are **never** held across a provider
   call (which may be slow or remote).
+- **Migrations.** `schema.py` holds an ordered, append-only `MIGRATIONS` list.
+  `Database.initialize` applies any missing versions in order, is a no-op when
+  already current, and **refuses** to open a database stamped with a newer,
+  unknown version.
 - All persisted timestamps are timezone-aware UTC ISO-8601; durations use
   `time.monotonic()` and are only logged, never persisted as wall-clock deltas.
 
@@ -115,11 +144,27 @@ say --person P --to agent --text "你好"
 
 Jobs live in `processing_jobs`, not an `asyncio.Queue`. Each has a unique
 `job_key` (deduplication), an attempt counter, a max attempt count, and a
-status (`PENDING`/`RUNNING`/`COMPLETED`/`FAILED`). On startup the worker resets
-leftover `RUNNING` jobs to `PENDING`; idempotent handlers guarantee this never
-duplicates side effects. A failing job is requeued automatically until
-`max_attempts`, then marked `FAILED` with `last_error`; `jobs retry` requeues it
-with attempts reset.
+status (`PENDING`/`RUNNING`/`COMPLETED`/`FAILED`). Claiming is an atomic,
+conditional `UPDATE … WHERE status = 'PENDING' AND attempts < max_attempts`;
+a worker runs a handler only if its claim won `rowcount == 1`, so concurrent
+workers (even on separate connections) never both run the same job. On startup
+the worker resets leftover `RUNNING` jobs to `PENDING`; idempotent handlers
+guarantee this never duplicates side effects. A failing job is requeued
+automatically until `max_attempts`, then marked `FAILED` with `last_error`;
+`jobs retry` requeues it with attempts reset.
+
+The `MEMORY_CONSOLIDATION` handler re-checks the subject's *current*
+authorisation at run time: if learning consent was revoked or the person was
+suspended/revoked after the job was queued, the candidate is marked `SKIPPED`
+rather than `CONSOLIDATED` — no new long-term fact is learned.
+
+## Event recovery
+
+A crash can leave an utterance in `PROCESSING` after some durable stages
+completed. `RecoveryManager` (`recovery list` / `recovery retry EVENT_ID`)
+finds those events and re-submits them through the orchestrator, which resumes
+from the records already present. It never blindly resets every `PROCESSING`
+event to `PENDING` and re-runs the whole pipeline.
 
 ## Observability
 

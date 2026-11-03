@@ -121,3 +121,10 @@ CREATE INDEX IF NOT EXISTS idx_utterances_speaker ON utterances(speaker_person_i
 CREATE INDEX IF NOT EXISTS idx_candidates_event ON memory_candidates(source_event_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON processing_jobs(status);
 """
+
+# Ordered, append-only migrations. Each entry is ``(version, sql)`` and is
+# applied once, in order, by ``Database.initialize``. Never edit an existing
+# entry — append a new one with the next version number. V0.0 = version 1.
+MIGRATIONS: list[tuple[int, str]] = [
+    (1, SCHEMA_SQL),
+]

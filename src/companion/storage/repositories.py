@@ -136,6 +136,17 @@ class PersonRepository:
             ),
         )
 
+    async def set_registration_status(
+        self, person_id: str, status: RegistrationStatus
+    ) -> None:
+        from companion.domain.models import utcnow
+
+        await self.db.execute(
+            "UPDATE persons SET registration_status = ?, updated_at = ?"
+            " WHERE person_id = ?",
+            (status.value, _iso(utcnow()), person_id),
+        )
+
     async def get_consent(self, person_id: str) -> Consent | None:
         cur = await self.db.execute(
             "SELECT person_id, allow_processing, allow_persistence,"
@@ -306,6 +317,33 @@ class UtteranceRepository:
             for r in rows
         ]
 
+    async def list_by_status(
+        self, status: ProcessingStatus, limit: int = 1000
+    ) -> list[UtteranceEvent]:
+        """Return events in a given lifecycle status, oldest first."""
+        cur = await self.db.execute(
+            "SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
+            " text, source, addressee_hint, occurred_at, processing_status"
+            " FROM utterances WHERE processing_status = ?"
+            " ORDER BY occurred_at ASC LIMIT ?",
+            (status.value, limit),
+        )
+        rows = await cur.fetchall()
+        return [
+            UtteranceEvent(
+                event_id=r["event_id"],
+                conversation_id=r["conversation_id"],
+                speaker_person_id=r["speaker_person_id"],
+                speaker_label=r["speaker_label"],
+                text=r["text"],
+                source=EventSource(r["source"]),
+                addressee_hint=AddresseeHint(r["addressee_hint"]),
+                occurred_at=_dt(r["occurred_at"]),
+                processing_status=ProcessingStatus(r["processing_status"]),
+            )
+            for r in rows
+        ]
+
 
 class AnalysisRepository:
     def __init__(self, db: Database) -> None:
@@ -348,6 +386,14 @@ class AnalysisRepository:
             response_style=row["response_style"],
             provider=row["provider"],
         )
+
+    async def get_analysis_id(self, event_id: str) -> Optional[str]:
+        cur = await self.db.execute(
+            "SELECT analysis_id FROM cognitive_analyses WHERE event_id = ?",
+            (event_id,),
+        )
+        row = await cur.fetchone()
+        return row["analysis_id"] if row is not None else None
 
     async def save_candidate(self, candidate: MemoryCandidate) -> None:
         await self.db.execute(
@@ -425,23 +471,6 @@ class AnalysisRepository:
             status=row["status"],
             created_at=_dt(row["created_at"]),
         )
-
-    async def clear_outputs(self, event_id: str) -> None:
-        """Remove prior partial cognitive outputs before a retry.
-
-        Only ever called for an event that previously failed (same id, same
-        content); never for a conflicting, different payload.
-        """
-        async with self.db.transaction():
-            await self.db.conn.execute(
-                "DELETE FROM memory_candidates WHERE source_event_id = ?", (event_id,)
-            )
-            await self.db.conn.execute(
-                "DELETE FROM agent_actions WHERE event_id = ?", (event_id,)
-            )
-            await self.db.conn.execute(
-                "DELETE FROM cognitive_analyses WHERE event_id = ?", (event_id,)
-            )
 
 
 class MemoryFactRepository:
@@ -565,14 +594,22 @@ class JobRepository:
         rows = await cur.fetchall()
         return [self._to_job(r) for r in rows]
 
-    async def claim(self, job_id: str) -> None:
+    async def claim(self, job_id: str) -> bool:
+        """Atomically claim a ``PENDING`` job, returning ``True`` on success.
+
+        The ``WHERE status = 'PENDING'`` guard plus SQLite's write lock means
+        that, of any number of concurrent workers (even on separate
+        connections), at most one sees ``rowcount == 1``.
+        """
         from companion.domain.models import utcnow
 
-        await self.db.execute(
+        cur = await self.db.execute(
             "UPDATE processing_jobs SET status = 'RUNNING', attempts = attempts + 1,"
-            " started_at = ?, last_error = NULL WHERE job_id = ?",
+            " started_at = ?, last_error = NULL"
+            " WHERE job_id = ? AND status = 'PENDING' AND attempts < max_attempts",
             (_iso(utcnow()), job_id),
         )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
 
     async def complete(self, job_id: str) -> None:
         from companion.domain.models import utcnow
@@ -640,6 +677,7 @@ class JobRepository:
 class Repositories:
     """Convenience container holding every repository for a single database."""
 
+    db: Database
     person: PersonRepository
     conversation: ConversationRepository
     utterance: UtteranceRepository
@@ -647,9 +685,37 @@ class Repositories:
     memory_fact: MemoryFactRepository
     job: JobRepository
 
+    async def persist_cognitive_outcome(
+        self,
+        analysis: CognitiveResult,
+        analysis_id: str,
+        *,
+        candidates: list[MemoryCandidate],
+        job_key: str | None,
+        job_payload: dict,
+    ) -> str | None:
+        """Atomically persist an analysis, its memory candidates and the job.
+
+        This is one short, local transaction: either the analysis, all the
+        given candidates and the deduplicated memory job are all committed, or
+        none are. It never spans an external provider call.
+        """
+        from companion.domain.enums import JobType
+
+        async with self.db.transaction():
+            await self.analysis.save_analysis(analysis, analysis_id)
+            for cand in candidates:
+                await self.analysis.save_candidate(cand)
+            if job_key is None:
+                return None
+            return await self.job.enqueue(
+                JobType.MEMORY_CONSOLIDATION, job_key, job_payload
+            )
+
 
 def make_repositories(db: Database) -> Repositories:
     return Repositories(
+        db=db,
         person=PersonRepository(db),
         conversation=ConversationRepository(db),
         utterance=UtteranceRepository(db),

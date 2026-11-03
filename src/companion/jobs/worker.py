@@ -1,9 +1,12 @@
-"""A single-worker, durable background job processor.
+"""A durable background job processor.
 
 Jobs live in SQLite (``processing_jobs``), not in an ``asyncio.Queue``, so a
 restart can recover them. On startup, leftover ``RUNNING`` jobs are reset to
 ``PENDING``; idempotent handlers ensure this never duplicates side effects.
-V0.0 deliberately uses one worker and no complex concurrency pool.
+Claiming is atomic and conditional (``UPDATE … WHERE status='PENDING'`` with a
+``rowcount`` check), so multiple workers — even on separate connections — can
+compete for jobs safely and at most one runs each handler. V0.0 deliberately
+runs one worker by default and no complex concurrency pool.
 """
 
 from __future__ import annotations
@@ -63,7 +66,10 @@ class JobWorker:
         return total
 
     async def _process(self, job) -> None:
-        await self.job_repo.claim(job.job_id)
+        claimed = await self.job_repo.claim(job.job_id)
+        if not claimed:
+            # Another worker claimed it first (or attempts exhausted).
+            return
         handler = self.handlers.get(job.job_type.value)
         t0 = time.monotonic()
         if handler is None:
