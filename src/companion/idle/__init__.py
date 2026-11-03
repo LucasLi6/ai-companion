@@ -46,9 +46,15 @@ def build_idle_scheduler(
     builder = IdleMemoryContextBuilder(
         runtime.memory_service, runtime.registry, audit=runtime.repos.audit
     )
-    reflection = ReflectionEngine(runtime.memory_service, deepseek, builder)
+    reflection = ReflectionEngine(
+        runtime.memory_service, deepseek, builder, learning=runtime.repos.learning
+    )
     curiosity = CuriosityEngine(
-        runtime.memory_service, deepseek, runtime.repos.research, builder
+        runtime.memory_service,
+        deepseek,
+        runtime.repos.research,
+        builder,
+        learning=runtime.repos.learning,
     )
     research = ResearchEngine(
         runtime.memory_service,
@@ -56,8 +62,15 @@ def build_idle_scheduler(
         web_search,
         deepseek,
         settings=settings,
+        state=runtime.repos.research_state,
     )
-    return IdleScheduler(runtime.repos.settings, reflection, curiosity, research)
+    return IdleScheduler(
+        runtime.repos.settings,
+        reflection,
+        curiosity,
+        research,
+        learning=runtime.repos.learning,
+    )
 
 
 __all__ = [

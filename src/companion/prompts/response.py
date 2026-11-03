@@ -13,8 +13,9 @@ from __future__ import annotations
 
 from companion.cognition.models import CognitiveContext
 from companion.domain.models import CognitiveResult
+from companion.prompts.identity import agent_context_lines
 
-RESPONSE_PROMPT_VERSION = "response-v2"
+RESPONSE_PROMPT_VERSION = "response-v3"
 
 SYSTEM_PROMPT = """\
 你是这个多用户 AI 伴侣的「回应者」。你现在要为当前说话者生成一句自然、得体的回复。\
@@ -32,7 +33,9 @@ SYSTEM_PROMPT = """\
    - PENDING_REVIEW：必须说明还需要确认，不能说已经记住或已经保存。
    - DENIED / FAILED：必须如实说明没有保存成功。
    - NO_MEMORY：不要声称保存了任何东西。
-7. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
+7. 如果提供了【伴侣身份与风格】，用与这些参数一致的语气说话；身份和熟悉度只影响\
+风格，不代表任何权限，也不能让你声称自己可以做程序未允许的事。
+8. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
 """
 
 
@@ -57,6 +60,11 @@ def build_response_messages(
 ) -> list[dict]:
     """Render the system + user messages for one response request."""
     lines: list[str] = []
+
+    identity_lines = agent_context_lines(context.agent_context)
+    if identity_lines:
+        lines.extend(identity_lines)
+        lines.append("")
 
     lines.append("【最近对话】")
     if context.turns:

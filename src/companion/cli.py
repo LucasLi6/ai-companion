@@ -18,6 +18,18 @@ import tempfile
 from pathlib import Path
 
 from companion.config import configure_logging, default_db_path
+from companion.agent.constants import (
+    FAMILIARITY_TIERS,
+    PERSONA_TRAITS,
+    PersonalityValidationError,
+    RelationshipValidationError,
+)
+from companion.cmf.service import (
+    CmfError,
+    CmfFileExistsError,
+    CmfFileService,
+    CmfValidationError,
+)
 from companion.core.policy import (
     INTERRUPTION_THRESHOLD_VALUES,
     RESPONSE_CONSERVATISM_VALUES,
@@ -253,7 +265,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_idle = sub.add_parser("idle", parents=[_common_parser()], help="Run idle cognitive learning")
     p_idle_sub = p_idle.add_subparsers(dest="idle_command")
     p_ir = p_idle_sub.add_parser("run", parents=[_common_parser()], help="Run one idle cycle")
+    p_ir.add_argument(
+        "--real-provider",
+        action="store_true",
+        help="Use the real DeepSeek idle provider (also requires"
+        " idle.real_deepseek.enabled=true and DEEPSEEK_API_KEY)",
+    )
     p_ir.set_defaults(func=cmd_idle_run)
+
+    p_goal = sub.add_parser("goal", parents=[_common_parser()], help="Manage durable goals")
+    p_goal_sub = p_goal.add_subparsers(dest="goal_command")
+    p_ga = p_goal_sub.add_parser("add", parents=[_common_parser()], help="Create a goal")
+    p_ga.add_argument("title")
+    p_ga.add_argument("--description", default=None)
+    p_ga.add_argument("--priority", type=int, default=0)
+    p_ga.add_argument("--next", dest="next_action", default=None)
+    p_ga.set_defaults(func=cmd_goal_add)
+    p_gl = p_goal_sub.add_parser("list", parents=[_common_parser()], help="List goals")
+    p_gl.add_argument("--status", choices=["OPEN", "IN_PROGRESS", "BLOCKED", "DONE", "CANCELLED"], default=None)
+    p_gl.set_defaults(func=cmd_goal_list)
+    p_gs = p_goal_sub.add_parser("show", parents=[_common_parser()], help="Show a goal")
+    p_gs.add_argument("goal_id")
+    p_gs.set_defaults(func=cmd_goal_show)
+    p_gst = p_goal_sub.add_parser("set-status", parents=[_common_parser()], help="Set a goal's status")
+    p_gst.add_argument("goal_id")
+    p_gst.add_argument("status", choices=["OPEN", "IN_PROGRESS", "BLOCKED", "DONE", "CANCELLED"])
+    p_gst.add_argument("--next", dest="next_action", default=None)
+    p_gst.set_defaults(func=cmd_goal_set_status)
+    p_gc = p_goal_sub.add_parser("checkpoint", parents=[_common_parser()], help="Record a goal checkpoint")
+    p_gc.add_argument("goal_id")
+    p_gc.add_argument("--status", choices=["OPEN", "IN_PROGRESS", "BLOCKED", "DONE", "CANCELLED"], default="IN_PROGRESS")
+    p_gc.add_argument("--summary", default=None)
+    p_gc.set_defaults(func=cmd_goal_checkpoint)
+    p_gd = p_goal_sub.add_parser("depend", parents=[_common_parser()], help="Declare a goal dependency")
+    p_gd.add_argument("goal_id")
+    p_gd.add_argument("--on", dest="depends_on", required=True)
+    p_gd.set_defaults(func=cmd_goal_depend)
+    p_gr = p_goal_sub.add_parser("ready", parents=[_common_parser()], help="List goals whose dependencies are done")
+    p_gr.set_defaults(func=cmd_goal_ready)
 
     p_demo = sub.add_parser("demo", parents=[_common_parser()], help="Run a scripted demo on an isolated database")
     _add_provider_arg(p_demo)
@@ -287,6 +336,88 @@ def build_parser() -> argparse.ArgumentParser:
         help="Make exactly one minimal API call to verify the key (costs tokens)",
     )
     p_ds_check.set_defaults(func=cmd_deepseek_check)
+
+    p_mf = sub.add_parser(
+        "memory-file",
+        parents=[_common_parser()],
+        help="Create, inspect, validate, export or clone a CMF memory file",
+    )
+    p_mf_sub = p_mf.add_subparsers(dest="memory_file_command")
+    p_mfc = p_mf_sub.add_parser("create", parents=[_common_parser()], help="Create a new .memory file")
+    p_mfc.add_argument("path")
+    p_mfc.add_argument("--name", default="Companion")
+    p_mfc.add_argument("--overwrite", action="store_true", default=False)
+    p_mfc.set_defaults(func=cmd_memory_file_create)
+    p_mfi = p_mf_sub.add_parser("info", parents=[_common_parser()], help="Show a memory file summary")
+    p_mfi.add_argument("path")
+    p_mfi.set_defaults(func=cmd_memory_file_info)
+    p_mfv = p_mf_sub.add_parser("validate", parents=[_common_parser()], help="Validate integrity, schema and manifest")
+    p_mfv.add_argument("path")
+    p_mfv.set_defaults(func=cmd_memory_file_validate)
+    p_mfe = p_mf_sub.add_parser("export", parents=[_common_parser()], help="Write a consistent copy")
+    p_mfe.add_argument("source")
+    p_mfe.add_argument("destination")
+    p_mfe.add_argument("--overwrite", action="store_true", default=False)
+    p_mfe.set_defaults(func=cmd_memory_file_export)
+    p_mfcl = p_mf_sub.add_parser("clone", parents=[_common_parser()], help="Clone with a new agent_id and lineage")
+    p_mfcl.add_argument("source")
+    p_mfcl.add_argument("destination")
+    p_mfcl.add_argument("--name", default=None)
+    p_mfcl.add_argument("--overwrite", action="store_true", default=False)
+    p_mfcl.set_defaults(func=cmd_memory_file_clone)
+    p_mfm = p_mf_sub.add_parser("migrate", parents=[_common_parser()], help="Upgrade a legacy .db in place")
+    p_mfm.add_argument("path")
+    p_mfm.set_defaults(func=cmd_memory_file_migrate)
+
+    p_agent = sub.add_parser("agent", parents=[_common_parser()], help="Manage agent identity and personality")
+    p_agent_sub = p_agent.add_subparsers(dest="agent_command")
+    p_as = p_agent_sub.add_parser("show", parents=[_common_parser()], help="Show identity and persona")
+    p_as.set_defaults(func=cmd_agent_show)
+    p_asn = p_agent_sub.add_parser("set-name", parents=[_common_parser()], help="Set the agent display name")
+    p_asn.add_argument("name")
+    p_asn.add_argument("--pronouns", default=None)
+    p_asn.add_argument("--description", default=None)
+    p_asn.add_argument("--reason", default=None)
+    p_asn.set_defaults(func=cmd_agent_set_name)
+    p_asp = p_agent_sub.add_parser("set-persona", parents=[_common_parser()], help="Set one personality trait")
+    p_asp.add_argument("field", choices=list(PERSONA_TRAITS))
+    p_asp.add_argument("value", type=int)
+    p_asp.add_argument("--reason", default=None)
+    p_asp.set_defaults(func=cmd_agent_set_persona)
+    p_aset = p_agent_sub.add_parser("set", parents=[_common_parser()], help="Alias for set-persona")
+    p_aset.add_argument("field", choices=list(PERSONA_TRAITS))
+    p_aset.add_argument("value", type=int)
+    p_aset.add_argument("--reason", default=None)
+    p_aset.set_defaults(func=cmd_agent_set_persona)
+    p_ar = p_agent_sub.add_parser("revisions", parents=[_common_parser()], help="List persona revisions")
+    p_ar.add_argument("--limit", type=int, default=20)
+    p_ar.set_defaults(func=cmd_agent_revisions)
+    p_ae = p_agent_sub.add_parser("effective", parents=[_common_parser()], help="Show the effective context for one person")
+    p_ae.add_argument("--person", required=True)
+    p_ae.set_defaults(func=cmd_agent_effective)
+
+    p_rel = sub.add_parser("relationship", parents=[_common_parser()], help="Manage familiarity and per-person style")
+    p_rel_sub = p_rel.add_subparsers(dest="relationship_command")
+    p_rs = p_rel_sub.add_parser("show", parents=[_common_parser()], help="Show one relationship")
+    p_rs.add_argument("person_id")
+    p_rs.set_defaults(func=cmd_relationship_show)
+    p_rset = p_rel_sub.add_parser("set", parents=[_common_parser()], help="Set familiarity tier")
+    p_rset.add_argument("person_id")
+    p_rset.add_argument("tier", type=lambda value: value.upper(), choices=list(FAMILIARITY_TIERS))
+    p_rset.add_argument("--reason", default=None)
+    p_rset.set_defaults(func=cmd_relationship_set)
+    p_rov = p_rel_sub.add_parser("override", parents=[_common_parser()], help="Absolute per-person trait override")
+    p_rov.add_argument("person_id")
+    p_rov.add_argument("field", choices=list(PERSONA_TRAITS))
+    p_rov.add_argument("value", type=int)
+    p_rov.set_defaults(func=cmd_relationship_override)
+    p_rcl = p_rel_sub.add_parser("clear-override", parents=[_common_parser()], help="Remove a per-person override")
+    p_rcl.add_argument("person_id")
+    p_rcl.add_argument("field", choices=list(PERSONA_TRAITS))
+    p_rcl.set_defaults(func=cmd_relationship_clear_override)
+    p_rh = p_rel_sub.add_parser("history", parents=[_common_parser()], help="Show relationship history")
+    p_rh.add_argument("person_id")
+    p_rh.set_defaults(func=cmd_relationship_history)
 
     return parser
 
@@ -836,20 +967,40 @@ def cmd_ui(args) -> int:
     return 0
 
 
-async def _build_idle_scheduler(rt):
-    """Build the idle scheduler with a settings-aware (mock-first) web search."""
+async def _build_idle_scheduler(rt, *, real_provider: bool = False):
+    """Build the idle scheduler with a settings-aware (mock-first) web search.
+
+    The real DeepSeek idle provider is constructed only when explicitly
+    requested; it also re-checks ``idle.real_deepseek.enabled`` on every call.
+    """
     from companion.idle import build_idle_scheduler
     from companion.providers.websearch import make_web_search
 
     web_search = await make_web_search(rt.repos.settings)
-    return build_idle_scheduler(rt, web_search=web_search)
+    deepseek = None
+    if real_provider:
+        from companion.providers.deepseek_client import (
+            build_deepseek_client,
+            load_deepseek_config,
+        )
+        from companion.providers.deepseek_idle import DeepSeekIdleProvider
+
+        client = build_deepseek_client(load_deepseek_config())
+        deepseek = DeepSeekIdleProvider(client, gate=rt.repos.settings)
+    return build_idle_scheduler(rt, web_search=web_search, deepseek=deepseek)
 
 
 async def cmd_idle_run(args) -> int:
     db = await _connect(args.db)
     try:
         rt = build_runtime(db)
-        scheduler = await _build_idle_scheduler(rt)
+        try:
+            scheduler = await _build_idle_scheduler(
+                rt, real_provider=bool(getattr(args, "real_provider", False))
+            )
+        except Exception as exc:  # missing key / unauthorised real provider
+            print(f"error: {exc}")
+            return 1
         result = await scheduler.run_cycle()
         if result["skipped"]:
             print("idle learning is disabled (set idle.enabled=true to enable)")
@@ -1153,4 +1304,397 @@ async def cmd_deepseek_check(args) -> int:
         f" tokens={response.total_tokens}"
         f" reply={response.content[:20]!r}"
     )
+    return 0
+
+
+# -- CMF memory-file commands -------------------------------------------------
+
+
+async def cmd_memory_file_create(args) -> int:
+    try:
+        info = await CmfFileService.create(
+            args.path, display_name=args.name, overwrite=args.overwrite
+        )
+    except CmfError as exc:
+        print(f"memory-file create failed: {exc}")
+        return 1
+    print(f"created {info.path}")
+    print(f"agent_id: {info.agent_id}")
+    print(f"format: {info.format_version}  schema: {info.schema_version}")
+    print(f"display_name: {info.display_name}")
+    return 0
+
+
+async def cmd_memory_file_info(args) -> int:
+    info = await CmfFileService.inspect(args.path)
+    print(f"path: {info.path}")
+    print(f"valid: {info.ok}")
+    print(f"agent_id: {info.agent_id}")
+    print(f"display_name: {info.display_name}")
+    print(f"format_version: {info.format_version}")
+    print(f"schema_version: {info.schema_version}")
+    print(f"lineage_id: {info.lineage_id}")
+    print(f"lineage_parent_agent_id: {info.lineage_parent_agent_id}")
+    for name, count in sorted(info.counts.items()):
+        print(f"{name}: {count}")
+    for error in info.errors:
+        print(f"error: {error}")
+    return 0 if info.ok else 1
+
+
+async def cmd_memory_file_validate(args) -> int:
+    result = await CmfFileService.validate(args.path)
+    print(f"valid: {result.ok}")
+    for key in ("agent_id", "display_name", "format_version", "schema_version"):
+        if key in result.info:
+            print(f"{key}: {result.info[key]}")
+    for error in result.errors:
+        print(f"error: {error}")
+    for warning in result.warnings:
+        print(f"warning: {warning}")
+    return 0 if result.ok else 1
+
+
+async def cmd_memory_file_export(args) -> int:
+    try:
+        result = await CmfFileService.export(
+            args.source, args.destination, overwrite=args.overwrite
+        )
+    except CmfError as exc:
+        print(f"memory-file export failed: {exc}")
+        return 1
+    print(f"exported {args.source} -> {args.destination}")
+    print(f"agent_id: {result.info.get('agent_id')}  valid: {result.ok}")
+    return 0 if result.ok else 1
+
+
+async def cmd_memory_file_clone(args) -> int:
+    try:
+        info = await CmfFileService.clone(
+            args.source,
+            args.destination,
+            display_name=args.name,
+            overwrite=args.overwrite,
+        )
+    except CmfError as exc:
+        print(f"memory-file clone failed: {exc}")
+        return 1
+    print(f"cloned {args.source} -> {args.destination}")
+    print(f"agent_id: {info.agent_id}")
+    print(f"lineage_parent_agent_id: {info.lineage_parent_agent_id}")
+    print(f"display_name: {info.display_name}")
+    return 0 if info.ok else 1
+
+
+async def cmd_memory_file_migrate(args) -> int:
+    try:
+        result = await CmfFileService.migrate(args.path)
+    except (CmfError, RuntimeError) as exc:
+        print(f"memory-file migrate failed: {exc}")
+        return 1
+    print(f"migrated {result['path']}")
+    print(f"schema: {result['from_schema_version']} -> {result['to_schema_version']}")
+    print(f"format_version: {result['format_version']}")
+    print(f"agent_id: {result['agent_id']}")
+    print(f"changed: {result['migrated']}")
+    return 0
+
+
+# -- Agent Core / relationship commands --------------------------------------
+
+
+async def cmd_agent_show(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        data = await rt.agent_service.show()
+        print(f"agent_id: {data['agent_id']}")
+        print(f"format_version: {data['format_version']}")
+        print(f"lineage_id: {data['lineage_id']}")
+        print(f"lineage_parent_agent_id: {data['lineage_parent_agent_id']}")
+        print(f"display_name: {data['display_name']}")
+        print(f"pronouns: {data['pronouns']}")
+        print(f"description: {data['description']}")
+        print(f"identity_revision: {data['identity_revision']}")
+        print(f"persona_revision: {data['persona_revision']}")
+        for name, value in data["persona"].items():
+            print(f"persona.{name}: {value}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_agent_set_name(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        result = await rt.agent_service.set_name(
+            args.name,
+            pronouns=args.pronouns,
+            description=args.description,
+            reason=args.reason,
+        )
+        print(f"display_name = {result['display_name']} (revision {result['revision']})")
+    except PersonalityValidationError as exc:
+        print(f"invalid name: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_agent_set_persona(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        result = await rt.agent_service.set_persona(
+            {args.field: args.value}, reason=args.reason
+        )
+        print(
+            f"persona.{args.field} = {result[args.field]}"
+            f" (revision {result['revision']})"
+        )
+    except PersonalityValidationError as exc:
+        print(f"invalid persona: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_agent_revisions(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        for revision in await rt.agent_service.revision_history(args.limit):
+            print(
+                f"revision={revision['revision']} changed_by={revision['changed_by']}"
+                f" changes={revision['changes']} reason={revision.get('reason')}"
+            )
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_agent_effective(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        config = await load_policy_config(rt.repos.settings)
+        effective = await rt.agent_service.effective(args.person, policy=config)
+        data = effective.as_dict()
+        print(f"agent_id: {data['agent_id']}")
+        print(f"display_name: {data['display_name']}")
+        print(f"familiarity: {data['familiarity']}")
+        print(f"response_conservatism: {data['response_conservatism']}")
+        print(f"interruption_threshold: {data['interruption_threshold']}")
+        print(f"curiosity_level: {data['curiosity_level']}")
+        for name, value in data["traits"].items():
+            print(f"effective.{name}: {value}")
+    except RelationshipValidationError as exc:
+        print(f"invalid person: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_relationship_show(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        data = await rt.agent_service.relationship(args.person_id)
+        print(f"person_id: {data['person_id']}")
+        print(f"familiarity: {data['familiarity']}")
+        print(f"tier: {data['tier']}")
+        print(f"style_overrides: {data['style_overrides']}")
+    except RelationshipValidationError as exc:
+        print(f"invalid person: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_relationship_set(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        result = await rt.agent_service.set_relationship(
+            args.person_id, args.tier, reason=args.reason
+        )
+        print(f"{result['person_id']}: {result['old_tier']} -> {result['new_tier']}")
+    except RelationshipValidationError as exc:
+        print(f"invalid relationship: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_relationship_override(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        overrides = await rt.agent_service.set_override(
+            args.person_id, args.field, args.value
+        )
+        print(f"{args.person_id} overrides: {overrides}")
+    except (PersonalityValidationError, RelationshipValidationError) as exc:
+        print(f"invalid override: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_relationship_clear_override(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        overrides = await rt.agent_service.set_override(
+            args.person_id, args.field, None
+        )
+        print(f"{args.person_id} overrides: {overrides}")
+    except (PersonalityValidationError, RelationshipValidationError) as exc:
+        print(f"invalid override: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_relationship_history(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        data = await rt.agent_service.relationship(args.person_id)
+        for row in data["history"]:
+            print(
+                f"{row['created_at']}: {row['old_tier']} -> {row['new_tier']}"
+                f" by={row['actor']} reason={row.get('reason')}"
+            )
+    except RelationshipValidationError as exc:
+        print(f"invalid person: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_goal_add(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        goal_id = await rt.repos.goals.create(
+            args.title,
+            description=args.description,
+            priority=args.priority,
+            next_action=args.next_action,
+        )
+        print(goal_id)
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_goal_list(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        goals = await rt.repos.goals.list(status=args.status)
+        for g in goals:
+            print(
+                f"{g['goal_id']}  {g['status']}  p={g['priority']}  {g['title']}"
+                f"  next={g['next_action'] or '-'}"
+            )
+        if not goals:
+            print("no goals")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_goal_show(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        goal = await rt.repos.goals.get(args.goal_id)
+        if goal is None:
+            print("goal not found")
+            return 1
+        print(f"goal:     {goal['goal_id']}")
+        print(f"title:    {goal['title']}")
+        print(f"status:   {goal['status']}")
+        print(f"priority: {goal['priority']}")
+        print(f"next:     {goal['next_action'] or '-'}")
+        print(f"due:      {goal['due_at'] or '-'}")
+        deps = await rt.repos.goals.list_dependencies(args.goal_id)
+        print(f"depends:  {', '.join(deps) if deps else '-'}")
+        print("checkpoints:")
+        for c in await rt.repos.goals.list_checkpoints(args.goal_id):
+            print(f"  {c['created_at']}: {c['status']} {c['summary'] or ''}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_goal_set_status(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        if await rt.repos.goals.get(args.goal_id) is None:
+            print("goal not found")
+            return 1
+        await rt.repos.goals.set_status(
+            args.goal_id, args.status, next_action=args.next_action
+        )
+        print(f"{args.goal_id} -> {args.status}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_goal_checkpoint(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        if await rt.repos.goals.get(args.goal_id) is None:
+            print("goal not found")
+            return 1
+        checkpoint_id = await rt.repos.goals.add_checkpoint(
+            args.goal_id, args.status, summary=args.summary
+        )
+        print(checkpoint_id)
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_goal_depend(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        try:
+            await rt.repos.goals.add_dependency(args.goal_id, args.depends_on)
+        except ValueError as exc:
+            print(f"invalid dependency: {exc}")
+            return 1
+        print(f"{args.goal_id} depends on {args.depends_on}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_goal_ready(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        goals = await rt.repos.goals.ready()
+        for g in goals:
+            print(f"{g['goal_id']}  {g['title']}  next={g['next_action'] or '-'}")
+        if not goals:
+            print("no ready goals")
+    finally:
+        await db.close()
     return 0

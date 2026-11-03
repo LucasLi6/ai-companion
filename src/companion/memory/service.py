@@ -180,6 +180,7 @@ class MemoryService:
         links = await self.repo.get_links(memory_id)
         revisions = await self.repo.list_revisions(memory_id)
         provenance = await self.repo.get_provenance(memory_id)
+        provenance_events = await self.repo.list_provenance_events(memory_id)
         assignments = await self.repo.list_assignments(memory_id)
         return {
             "item": self._item_dict(item),
@@ -188,6 +189,7 @@ class MemoryService:
             "links": links,
             "assignments": assignments,
             "provenance": provenance,
+            "provenance_events": provenance_events,
             "revisions": [
                 {
                     "revision_id": r.revision_id,

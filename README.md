@@ -135,6 +135,29 @@ python -m companion policy show
 python -m companion policy set policy.response_conservatism conservative
 python -m companion policy set policy.interruption_threshold high
 python -m companion policy set policy.curiosity_level low
+
+# 10. Memory files, identity and relationships (CMF 1.0)
+python -m companion memory-file create ava.memory --name Ava
+python -m companion memory-file info ava.memory
+python -m companion memory-file validate ava.memory
+python -m companion memory-file export ava.memory ava-backup.memory
+python -m companion memory-file clone ava.memory ava-clone.memory --name "Ava 2"
+python -m companion memory-file migrate legacy.db
+
+python -m companion agent show
+python -m companion agent set-name Ava
+python -m companion agent set humor 75
+python -m companion agent set warmth 80
+python -m companion agent revisions
+python -m companion agent effective --person person_xxx
+
+python -m companion relationship set person_xxx familiar
+python -m companion relationship override person_xxx humor 30
+python -m companion relationship history person_xxx
+
+python -m companion goal add "设计底盘" --next "画图"
+python -m companion goal list
+python -m companion goal ready
 ```
 
 `python -m companion --help` (or any subcommand `--help`) lists every option.
@@ -386,6 +409,18 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
 
 ## Known limitations
 
+- **CMF 1.0 is the portable file format** (see
+  [docs/CMF_SPEC.md](docs/CMF_SPEC.md), [docs/CMF_SCHEMA.md](docs/CMF_SCHEMA.md),
+  [docs/CMF_SECURITY.md](docs/CMF_SECURITY.md),
+  [docs/CMF_PORTABILITY.md](docs/CMF_PORTABILITY.md) and
+  [docs/CMF_MIGRATION_PLAN.md](docs/CMF_MIGRATION_PLAN.md)). The media model
+  (`media_assets`/`media_annotations`/`media_links`) and semantic embeddings
+  (`embedding_models`/`memory_embeddings`/`embedding_index_metadata`/
+  `retrieval_feedback`) are reserved in the schema but not built.
+- **Real DeepSeek idle learning is not tested against the live API.** The
+  opt-in `DeepSeekIdleProvider` is gated behind `idle.real_deepseek.enabled`
+  and `--real-provider`; there is no silent fallback, but no real key/request
+  was used in CI. Idle learning remains disabled by default.
 - **Mock has no real understanding.** The default mock provider decides purely
   from `addressee_hint` and records `provider=mock` with explicit reason codes.
   Real understanding requires `--provider deepseek`; it is never simulated.
@@ -393,9 +428,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
   trusted local layer (self-reports may become `ACTIVE`; uncertain and
   third-party candidates stay `CANDIDATE`), but there is no vector search, no
   semantic merging and no autonomous promotion of raw model output.
-- **Conservative correction handling.** Only unambiguous same-topic corrections
-  update a current-state memory; anything else creates a review item rather
-  than guessing.
+- **Conservative correction handling.** Only unambiguous same-attribute
+  corrections update a current-state memory; anything else creates a review
+  item rather than guessing.
 - **No speech.** CLI text input stands in for a future ASR-generated
   `UtteranceEvent`; `RESPOND` output is text, not TTS.
 - **No speaker recognition.** The caller supplies `speaker_person_id`
@@ -408,11 +443,12 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
 
 ## Next steps
 
-V0.2A durable memory write-through and the structured reply policy are
-implemented (see “V0.2A — durable memory writes and reply policy” above).
-Still deliberately out of scope: ASR/TTS and voiceprints, real DeepSeek idle
-reflection, autonomous web research, a vector database, automatic semantic
-merging, the Memory Board drag-and-drop UI, and a React UI. A likely V0.2B
-focus is real-model acceptance testing, a manual review/approval workflow for
-`NEEDS_REVIEW` items, and richer assignment management in the existing manager
-UI.
+V0.2A durable memory write-through, the structured reply policy and CMF 1.0
+(the portable single-file memory format with the Agent Core, relationships,
+durable research/learning state and goals) are implemented. Still
+deliberately out of scope: ASR/TTS and voiceprints, a live real-DeepSeek idle
+cycle, autonomous web research, the semantic vector index, automatic semantic
+merging, the full media system, the Memory Board drag-and-drop UI, and a React
+UI. A likely V0.2B focus is real-model acceptance testing, a manual
+review/approval workflow for `NEEDS_REVIEW` items, and richer assignment
+management in the existing manager UI.

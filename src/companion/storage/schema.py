@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -482,6 +482,455 @@ MIGRATIONS: list[tuple[int, str]] = [
                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         FROM memory_candidates;
+        """,
+    ),
+    # Version 9 (CMF 1.0): portable memory-file foundation, agent core,
+    # relationships, append-only provenance, research/learning durability,
+    # goals, media reservations and embedding reservations.
+    #
+    # Every table lives in the same SQLite file. The manifest is a singleton
+    # (``singleton = 1``) holding the stable agent_id and the CMF format
+    # version, which is deliberately independent of the schema version.
+    # Seeded rows are inserted only when absent, so a legacy database upgraded
+    # from version 8 receives one default identity without losing any data.
+    (
+        9,
+        """
+        CREATE TABLE IF NOT EXISTS cmf_manifest (
+            singleton                INTEGER PRIMARY KEY CHECK (singleton = 1),
+            format_version           TEXT NOT NULL,
+            agent_id                 TEXT NOT NULL UNIQUE,
+            display_name             TEXT,
+            created_at               TEXT NOT NULL,
+            updated_at               TEXT NOT NULL,
+            lineage_id               TEXT,
+            lineage_parent_agent_id  TEXT,
+            clone_of                 TEXT,
+            notes                    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_identity (
+            agent_id     TEXT PRIMARY KEY
+                         REFERENCES cmf_manifest(agent_id) ON DELETE CASCADE,
+            display_name TEXT NOT NULL,
+            pronouns     TEXT,
+            description  TEXT,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            revision     INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_persona (
+            agent_id             TEXT PRIMARY KEY
+                                 REFERENCES cmf_manifest(agent_id) ON DELETE CASCADE,
+            humor                INTEGER NOT NULL DEFAULT 50
+                                 CHECK (humor BETWEEN 0 AND 100),
+            warmth               INTEGER NOT NULL DEFAULT 60
+                                 CHECK (warmth BETWEEN 0 AND 100),
+            curiosity            INTEGER NOT NULL DEFAULT 60
+                                 CHECK (curiosity BETWEEN 0 AND 100),
+            formality            INTEGER NOT NULL DEFAULT 45
+                                 CHECK (formality BETWEEN 0 AND 100),
+            verbosity            INTEGER NOT NULL DEFAULT 45
+                                 CHECK (verbosity BETWEEN 0 AND 100),
+            assertiveness        INTEGER NOT NULL DEFAULT 45
+                                 CHECK (assertiveness BETWEEN 0 AND 100),
+            empathy              INTEGER NOT NULL DEFAULT 65
+                                 CHECK (empathy BETWEEN 0 AND 100),
+            playfulness          INTEGER NOT NULL DEFAULT 50
+                                 CHECK (playfulness BETWEEN 0 AND 100),
+            patience             INTEGER NOT NULL DEFAULT 65
+                                 CHECK (patience BETWEEN 0 AND 100),
+            updated_at           TEXT NOT NULL,
+            revision             INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS persona_revisions (
+            revision_id TEXT PRIMARY KEY,
+            agent_id    TEXT NOT NULL,
+            revision    INTEGER NOT NULL,
+            changes     TEXT NOT NULL DEFAULT '{}',
+            changed_by  TEXT NOT NULL,
+            changed_at  TEXT NOT NULL,
+            reason      TEXT,
+            UNIQUE (agent_id, revision)
+        );
+
+        CREATE TABLE IF NOT EXISTS person_profiles (
+            person_id   TEXT PRIMARY KEY
+                        REFERENCES persons(person_id) ON DELETE CASCADE,
+            familiarity TEXT NOT NULL DEFAULT 'STRANGER'
+                        CHECK (familiarity IN ('STRANGER', 'ACQUAINTANCE', 'FAMILIAR', 'CLOSE')),
+            notes       TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS relationship_presets (
+            tier        TEXT PRIMARY KEY,
+            label       TEXT NOT NULL,
+            description TEXT,
+            style_deltas TEXT NOT NULL DEFAULT '{}',
+            created_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS person_interaction_profiles (
+            person_id        TEXT PRIMARY KEY
+                             REFERENCES persons(person_id) ON DELETE CASCADE,
+            relationship_tier TEXT NOT NULL DEFAULT 'STRANGER'
+                             REFERENCES relationship_presets(tier),
+            style_overrides  TEXT NOT NULL DEFAULT '{}',
+            updated_at       TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS relationship_history (
+            history_id TEXT PRIMARY KEY,
+            person_id  TEXT NOT NULL REFERENCES persons(person_id) ON DELETE CASCADE,
+            old_tier   TEXT,
+            new_tier   TEXT NOT NULL,
+            actor      TEXT NOT NULL,
+            reason     TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_relationship_history_person
+            ON relationship_history(person_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS memory_provenance_events (
+            event_id          TEXT PRIMARY KEY,
+            memory_id         TEXT NOT NULL
+                              REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            source_event_id   TEXT,
+            candidate_id      TEXT,
+            speaker_person_id TEXT,
+            subject_person_id TEXT,
+            old_version       INTEGER,
+            new_version       INTEGER,
+            event_type        TEXT NOT NULL,
+            reason            TEXT,
+            payload           TEXT NOT NULL DEFAULT '{}',
+            created_at        TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provenance_events_memory
+            ON memory_provenance_events(memory_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_provenance_events_candidate
+            ON memory_provenance_events(candidate_id);
+
+        ALTER TABLE memory_provenance ADD COLUMN entity_key TEXT;
+        ALTER TABLE memory_provenance ADD COLUMN attribute_key TEXT;
+
+        CREATE INDEX IF NOT EXISTS idx_provenance_claim
+            ON memory_provenance(subject_person_id, entity_key, attribute_key);
+
+        CREATE TABLE IF NOT EXISTS research_projects (
+            project_id TEXT PRIMARY KEY,
+            title      TEXT NOT NULL,
+            question   TEXT NOT NULL,
+            status     TEXT NOT NULL DEFAULT 'OPEN',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            extra      TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS research_runs (
+            run_id       TEXT PRIMARY KEY,
+            project_id   TEXT NOT NULL
+                         REFERENCES research_projects(project_id) ON DELETE CASCADE,
+            task_id      TEXT,
+            status       TEXT NOT NULL,
+            provider     TEXT,
+            started_at   TEXT,
+            completed_at TEXT,
+            error        TEXT,
+            budget_used  TEXT NOT NULL DEFAULT '{}',
+            extra        TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_research_runs_project
+            ON research_runs(project_id, started_at);
+
+        CREATE TABLE IF NOT EXISTS search_queries (
+            query_id     TEXT PRIMARY KEY,
+            run_id       TEXT NOT NULL
+                         REFERENCES research_runs(run_id) ON DELETE CASCADE,
+            query_text   TEXT NOT NULL,
+            provider     TEXT,
+            executed_at  TEXT NOT NULL,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            extra        TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS web_sources (
+            source_id    TEXT PRIMARY KEY,
+            url          TEXT,
+            title        TEXT,
+            publisher    TEXT,
+            published_at TEXT,
+            retrieved_at TEXT NOT NULL,
+            source_kind  TEXT NOT NULL DEFAULT 'web',
+            trust_level  TEXT NOT NULL DEFAULT 'UNVERIFIED',
+            extra        TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_web_sources_url ON web_sources(url);
+
+        CREATE TABLE IF NOT EXISTS source_excerpts (
+            excerpt_id  TEXT PRIMARY KEY,
+            source_id   TEXT NOT NULL
+                        REFERENCES web_sources(source_id) ON DELETE CASCADE,
+            run_id      TEXT,
+            excerpt     TEXT NOT NULL,
+            char_count  INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS knowledge_claims (
+            claim_id           TEXT PRIMARY KEY,
+            project_id         TEXT,
+            claim_text         TEXT NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'PROPOSED',
+            confidence         REAL NOT NULL DEFAULT 0,
+            verification_level TEXT NOT NULL DEFAULT 'UNVERIFIED',
+            created_at         TEXT NOT NULL,
+            updated_at         TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS claim_evidence (
+            claim_id   TEXT NOT NULL
+                       REFERENCES knowledge_claims(claim_id) ON DELETE CASCADE,
+            source_id  TEXT NOT NULL
+                       REFERENCES web_sources(source_id) ON DELETE CASCADE,
+            excerpt_id TEXT NOT NULL DEFAULT '',
+            relation   TEXT NOT NULL DEFAULT 'supports',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (claim_id, source_id, excerpt_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS research_findings (
+            finding_id  TEXT PRIMARY KEY,
+            project_id  TEXT NOT NULL
+                        REFERENCES research_projects(project_id) ON DELETE CASCADE,
+            run_id      TEXT,
+            summary     TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'DRAFT',
+            created_at  TEXT NOT NULL,
+            extra       TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS source_refresh_rules (
+            rule_id          TEXT PRIMARY KEY,
+            source_id        TEXT NOT NULL
+                             REFERENCES web_sources(source_id) ON DELETE CASCADE,
+            next_check_at    TEXT,
+            interval_seconds INTEGER NOT NULL DEFAULT 86400,
+            last_checked_at  TEXT,
+            active           INTEGER NOT NULL DEFAULT 1,
+            extra            TEXT NOT NULL DEFAULT '{}'
+        );
+
+        ALTER TABLE research_tasks ADD COLUMN project_id TEXT;
+        ALTER TABLE research_tasks ADD COLUMN run_id TEXT;
+
+        CREATE TABLE IF NOT EXISTS curiosity_queue (
+            item_id      TEXT PRIMARY KEY,
+            question     TEXT NOT NULL,
+            source_kind  TEXT NOT NULL DEFAULT 'curiosity',
+            source_ref   TEXT,
+            priority     INTEGER NOT NULL DEFAULT 0,
+            status       TEXT NOT NULL DEFAULT 'PENDING',
+            created_at   TEXT NOT NULL,
+            scheduled_at TEXT,
+            extra        TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS reflection_records (
+            reflection_id     TEXT PRIMARY KEY,
+            subject_memory_id TEXT,
+            reflection_text   TEXT NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'PROPOSED',
+            source_access     TEXT,
+            created_at        TEXT NOT NULL,
+            extra             TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS learning_runs (
+            run_id       TEXT PRIMARY KEY,
+            job_id       TEXT,
+            kind         TEXT NOT NULL,
+            status       TEXT NOT NULL,
+            started_at   TEXT,
+            completed_at TEXT,
+            budget_json  TEXT NOT NULL DEFAULT '{}',
+            provider     TEXT,
+            error        TEXT,
+            extra        TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS learning_checkpoints (
+            checkpoint_id TEXT PRIMARY KEY,
+            run_id        TEXT NOT NULL
+                          REFERENCES learning_runs(run_id) ON DELETE CASCADE,
+            stage         TEXT NOT NULL,
+            payload       TEXT NOT NULL DEFAULT '{}',
+            created_at    TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS knowledge_refresh_jobs (
+            job_id       TEXT PRIMARY KEY,
+            source_id    TEXT,
+            claim_id     TEXT,
+            status       TEXT NOT NULL DEFAULT 'PENDING',
+            scheduled_at TEXT,
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            last_error   TEXT,
+            extra        TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS goals (
+            goal_id     TEXT PRIMARY KEY,
+            title       TEXT NOT NULL,
+            description TEXT,
+            status      TEXT NOT NULL DEFAULT 'OPEN',
+            priority    INTEGER NOT NULL DEFAULT 0,
+            next_action TEXT,
+            due_at      TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            extra       TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS goal_checkpoints (
+            checkpoint_id TEXT PRIMARY KEY,
+            goal_id       TEXT NOT NULL
+                          REFERENCES goals(goal_id) ON DELETE CASCADE,
+            status        TEXT NOT NULL,
+            summary       TEXT,
+            created_at    TEXT NOT NULL,
+            extra         TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS goal_dependencies (
+            goal_id         TEXT NOT NULL
+                            REFERENCES goals(goal_id) ON DELETE CASCADE,
+            depends_on_goal_id TEXT NOT NULL
+                            REFERENCES goals(goal_id) ON DELETE CASCADE,
+            created_at      TEXT NOT NULL,
+            PRIMARY KEY (goal_id, depends_on_goal_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS media_assets (
+            asset_id   TEXT PRIMARY KEY,
+            media_type TEXT NOT NULL,
+            path       TEXT NOT NULL,
+            mime_type  TEXT,
+            sha256     TEXT,
+            created_at TEXT NOT NULL,
+            extra      TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS media_annotations (
+            annotation_id   TEXT PRIMARY KEY,
+            asset_id        TEXT NOT NULL
+                            REFERENCES media_assets(asset_id) ON DELETE CASCADE,
+            annotation_type TEXT NOT NULL,
+            content         TEXT NOT NULL,
+            created_at      TEXT NOT NULL,
+            extra           TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS media_links (
+            asset_id  TEXT NOT NULL
+                      REFERENCES media_assets(asset_id) ON DELETE CASCADE,
+            memory_id TEXT NOT NULL
+                      REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            link_type TEXT NOT NULL,
+            PRIMARY KEY (asset_id, memory_id, link_type)
+        );
+
+        CREATE TABLE IF NOT EXISTS embedding_models (
+            model_id    TEXT PRIMARY KEY,
+            provider    TEXT NOT NULL,
+            model_name  TEXT NOT NULL,
+            dimensions  INTEGER NOT NULL,
+            created_at  TEXT NOT NULL,
+            extra       TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_embeddings (
+            memory_id  TEXT NOT NULL
+                       REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            model_id   TEXT NOT NULL
+                       REFERENCES embedding_models(model_id) ON DELETE CASCADE,
+            vector     BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (memory_id, model_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS embedding_index_metadata (
+            singleton     INTEGER PRIMARY KEY CHECK (singleton = 1),
+            model_id      TEXT,
+            status        TEXT NOT NULL DEFAULT 'EMPTY',
+            last_built_at TEXT,
+            extra         TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS retrieval_feedback (
+            feedback_id TEXT PRIMARY KEY,
+            memory_id   TEXT,
+            person_id   TEXT,
+            query       TEXT,
+            signal      TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            extra       TEXT NOT NULL DEFAULT '{}'
+        );
+
+        INSERT OR IGNORE INTO relationship_presets(tier, label, description, style_deltas, created_at)
+        VALUES
+            ('STRANGER', 'Stranger', 'Polite, reserved, low familiarity',
+             '{"humor": -5, "warmth": -5, "formality": 10, "verbosity": -10}',
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            ('ACQUAINTANCE', 'Acquaintance', 'Friendly but still polite',
+             '{"warmth": 5, "formality": 5}',
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            ('FAMILIAR', 'Familiar', 'Relaxed, conversational, some shared humour',
+             '{"humor": 10, "warmth": 15, "formality": -10, "verbosity": 5}',
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            ('CLOSE', 'Close', 'Warm, playful, informal',
+             '{"humor": 15, "warmth": 25, "formality": -20, "verbosity": 10, "playfulness": 10}',
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+        INSERT OR IGNORE INTO cmf_manifest(
+            singleton, format_version, agent_id, display_name, created_at,
+            updated_at, lineage_id
+        )
+        SELECT 1, '1.0', 'agent_' || lower(hex(randomblob(8))), 'Companion',
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+               'lineage_' || lower(hex(randomblob(8)))
+        WHERE NOT EXISTS (SELECT 1 FROM cmf_manifest);
+
+        INSERT OR IGNORE INTO agent_identity(
+            agent_id, display_name, pronouns, description, created_at, updated_at, revision
+        )
+        SELECT agent_id, COALESCE(display_name, 'Companion'), NULL,
+               'A persistent AI companion identity stored in this memory file.',
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1
+        FROM cmf_manifest;
+
+        INSERT OR IGNORE INTO agent_persona(agent_id, updated_at)
+        SELECT agent_id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now') FROM cmf_manifest;
+
+        INSERT OR IGNORE INTO persona_revisions(
+            revision_id, agent_id, revision, changes, changed_by, changed_at, reason
+        )
+        SELECT 'persona_seed_' || agent_id, agent_id, 1, '{}', 'system',
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'initial_defaults'
+        FROM cmf_manifest;
+
+        INSERT OR IGNORE INTO embedding_index_metadata(singleton, status, extra)
+        VALUES (1, 'EMPTY', '{}');
         """,
     ),
 ]

@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from companion.core.policy import load_policy_config
 from companion.domain.models import UtteranceEvent
 from companion.people.registry import PersonRegistry
 from companion.storage.repositories import Repositories
@@ -43,6 +44,7 @@ class ContextBuilder:
         repos: Repositories,
         registry: PersonRegistry,
         privacy_gateway=None,
+        agent_service=None,
         history_limit: int = DEFAULT_HISTORY_LIMIT,
         max_turns: Optional[int] = DEFAULT_MAX_TURNS,
         max_chars: Optional[int] = DEFAULT_MAX_CHARS,
@@ -51,6 +53,7 @@ class ContextBuilder:
         self.repos = repos
         self.registry = registry
         self.privacy_gateway = privacy_gateway
+        self.agent_service = agent_service
         self.history_limit = history_limit
         self.max_turns = max_turns
         self.max_chars = max_chars
@@ -87,6 +90,13 @@ class ContextBuilder:
         current_label = labels.get(
             event.speaker_person_id, event.speaker_label or "unknown"
         )
+        agent_context = None
+        if self.agent_service is not None:
+            policy_config = await load_policy_config(self.repos.settings)
+            effective = await self.agent_service.effective(
+                event.speaker_person_id, policy=policy_config
+            )
+            agent_context = effective.as_dict()
         return CognitiveContext(
             conversation_id=event.conversation_id,
             current_event_id=event.event_id,
@@ -97,6 +107,7 @@ class ContextBuilder:
             quiet_mode=False,
             turns=turns,
             memories=memories,
+            agent_context=agent_context,
         )
 
     # -- internals ----------------------------------------------------------

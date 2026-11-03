@@ -41,6 +41,10 @@ from companion.domain.models import (
     utcnow,
 )
 
+from companion.learning.state import LearningRepository
+from companion.research.state import ResearchStateRepository
+from companion.goals.state import GoalRepository
+
 from .database import Database
 
 
@@ -974,6 +978,9 @@ class Repositories:
     settings: "SettingsRepository"
     audit: "AuditRepository"
     research: "ResearchRepository"
+    research_state: ResearchStateRepository
+    learning: LearningRepository
+    goals: GoalRepository
 
     async def persist_cognitive_outcome(
         self,
@@ -1015,6 +1022,9 @@ def make_repositories(db: Database) -> Repositories:
         settings=SettingsRepository(db),
         audit=AuditRepository(db),
         research=ResearchRepository(db),
+        research_state=ResearchStateRepository(db),
+        learning=LearningRepository(db),
+        goals=GoalRepository(db),
     )
 
 
@@ -1123,7 +1133,7 @@ class ResearchRepository:
     _COLUMNS = (
         "task_id, question, status, priority, source_kind, source_ref, result,"
         " error, created_at, started_at, completed_at, owner_id, lease_expires_at,"
-        " attempts, max_attempts, memory_id"
+        " attempts, max_attempts, memory_id, project_id, run_id"
     )
 
     def __init__(self, db: Database) -> None:

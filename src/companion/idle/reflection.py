@@ -14,6 +14,7 @@ import logging
 from typing import Optional
 
 from companion.memory.service import MemoryService
+from companion.learning.state import LearningRepository
 
 from . import IDLE_AGENT, SYSTEM_ADMIN
 
@@ -25,11 +26,14 @@ class ReflectionEngine:
         provider,
         context_builder,
         logger: Optional[logging.Logger] = None,
+        *,
+        learning: LearningRepository | None = None,
     ) -> None:
         self.memory_service = memory_service
         self.provider = provider
         self.context_builder = context_builder
         self.logger = logger or logging.getLogger("companion.idle.reflection")
+        self.learning = learning or LearningRepository(memory_service.repo.db)
 
     async def run(self, limit: int = 50) -> list:
         """Reflect over externally-authorised memories and record proposals."""
@@ -44,6 +48,12 @@ class ReflectionEngine:
                 conflicts_with=p.get("conflicts_with"),
                 source_ids=[m["memory_id"] for m in memories],
                 source_access=SYSTEM_ADMIN,
+            )
+            await self.learning.record_reflection(
+                p["content"],
+                subject_memory_id=memories[0]["memory_id"] if memories else None,
+                status="PROPOSED",
+                source_access="SYSTEM_ADMIN",
             )
             results.append(item)
             self.logger.info("reflection_proposed memory_id=%s", item.memory_id)

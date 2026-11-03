@@ -32,6 +32,12 @@ from typing import AsyncIterator
 
 import aiosqlite
 
+from companion.cmf.constants import (
+    APPLICATION_ID,
+    CMF_FORMAT_MAJOR,
+    format_major,
+)
+
 from .schema import MIGRATIONS, SCHEMA_VERSION
 
 
@@ -91,10 +97,18 @@ class Database:
         # attribute-style setters on it would hit SQLite's same-thread check.
         # Set row_factory through the worker thread instead; isolation_level
         # is supplied at connect time (autocommit) above.
-        await self._conn._execute(setattr, self._conn._conn, "row_factory", aiosqlite.Row)
-        await self._conn.execute("PRAGMA foreign_keys = ON")
-        await self._conn.execute("PRAGMA journal_mode = WAL")
-        await self._conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            await self._conn._execute(setattr, self._conn._conn, "row_factory", aiosqlite.Row)
+            await self._conn.execute("PRAGMA foreign_keys = ON")
+            await self._conn.execute("PRAGMA journal_mode = WAL")
+            await self._conn.execute("PRAGMA busy_timeout = 5000")
+        except BaseException:
+            # A corrupt/unreadable file can fail partway through the PRAGMAs.
+            # Close the connection so its worker thread is never leaked; the
+            # caller's ``open()`` has no Database to close yet.
+            await self._conn.close()
+            self._conn = None
+            raise
         return self
 
     async def close(self) -> None:
@@ -120,7 +134,12 @@ class Database:
         - A fresh database gets every migration applied in order.
         - A database already at ``SCHEMA_VERSION`` is left untouched.
         - A database at a *higher* version is refused without modification.
+        - An arbitrary non-empty SQLite database is refused: a corrupt or
+          unrelated file must never silently become a new, empty companion.
+        - A CMF file declaring a newer *format* major version is refused.
         """
+        await self._refuse_foreign_database()
+
         # The version table must exist before we can read the current version.
         await self.conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_version ("
@@ -158,6 +177,69 @@ class Database:
                         "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
                         (version, utcnow().isoformat()),
                     )
+
+        await self._ensure_application_id()
+        await self._refuse_newer_format()
+
+    async def _refuse_foreign_database(self) -> None:
+        """Refuse a non-empty SQLite file that is not a Companion database.
+
+        A legacy Companion database has a ``schema_version`` table even before
+        it gains the CMF manifest. An unrelated SQLite file has tables but no
+        such table, and is left untouched.
+        """
+        cur = await self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+            " AND name NOT LIKE 'sqlite_%'"
+        )
+        tables = {row["name"] for row in await cur.fetchall()}
+        if tables and "schema_version" not in tables:
+            raise RuntimeError(
+                "refusing to open: this SQLite file is not a Companion memory"
+                " database (no schema_version table); it has not been modified"
+            )
+
+        cur = await self.conn.execute("PRAGMA application_id")
+        row = await cur.fetchone()
+        app_id = int(row[0]) if row is not None else 0
+        if app_id not in (0, APPLICATION_ID):
+            raise RuntimeError(
+                f"refusing to open: SQLite application_id {app_id} is not a"
+                f" Companion/CMF file (expected {APPLICATION_ID})"
+            )
+
+    async def _ensure_application_id(self) -> None:
+        """Stamp the CMF application id on a fresh or legacy database.
+
+        SQLite's ``application_id`` is a header field, not a table row, so it
+        is written here rather than in a migration. A pre-CMF Companion file
+        (application_id 0) is stamped in place after its migrations commit.
+        """
+        cur = await self.conn.execute("PRAGMA application_id")
+        row = await cur.fetchone()
+        if row is not None and int(row[0]) == APPLICATION_ID:
+            return
+        await self.conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+
+    async def _refuse_newer_format(self) -> None:
+        """Refuse a file written by a newer major CMF format."""
+        cur = await self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cmf_manifest'"
+        )
+        if await cur.fetchone() is None:
+            return
+        cur = await self.conn.execute(
+            "SELECT format_version FROM cmf_manifest WHERE singleton = 1"
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return
+        major = format_major(row["format_version"])
+        if major is not None and major > CMF_FORMAT_MAJOR:
+            raise RuntimeError(
+                f"memory file format {row['format_version']} is newer than the"
+                f" supported CMF {CMF_FORMAT_MAJOR}.x; refusing to open it"
+            )
 
     async def execute(self, sql: str, params: tuple = ()) -> aiosqlite.Cursor:
         async with self._lock:

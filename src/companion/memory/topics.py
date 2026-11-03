@@ -140,6 +140,11 @@ _OCCUPATION_CONTENT = re.compile(
     r"(?:工程师|老师|学生|医生|设计师|程序员|经理|律师|会计|研究员))"
 )
 _HEALTH_CONTENT = re.compile(r"我(?:对[^\s，。！？,.!?；;]{1,16})?过敏")
+_PROJECT_CONTENT = re.compile(
+    r"我(?:正在|正|在|目前|现在|最近|一直)?"
+    r"(?:开发|研发|研究|编写|构建|搭建|制作|做|设计)"
+    r"[^\s，。！？,.!?；;]{1,32}"
+)
 
 
 def canonicalize_topic(topic: str | None, content: str | None = None) -> str | None:
@@ -167,6 +172,8 @@ def canonicalize_topic(topic: str | None, content: str | None = None) -> str | N
         return AGE
     if _OCCUPATION_CONTENT.search(content):
         return OCCUPATION
+    if _PROJECT_CONTENT.search(content):
+        return PROJECT_STATE
     if _HEALTH_CONTENT.search(content):
         return HEALTH
     return None

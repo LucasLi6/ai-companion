@@ -5,12 +5,22 @@ a *non-admin* :class:`AccessContext` for the speaking person, so it sees only
 that person's own subjects plus public world knowledge — never another
 person's private facts.
 
-Retrieval (Phase 4) is keyword-based rather than a raw-text substring match:
-the query is split into keywords (CJK/ASCII, on punctuation and whitespace)
-and a memory matches if it matches *any* keyword, so a sentence like
-"你好，今天怎么样？" retrieves on both "你好" and "今天怎么样" instead of
-requiring the whole sentence to appear verbatim. Only ``ACTIVE`` memories are
-ever returned.
+Retrieval combines three permitted sources:
+
+- deterministic identity lookup (subject + canonical topic) for questions such
+  as "what is my name?";
+- keyword search (CJK/ASCII, OR semantics);
+- memories *assigned* to the speaker.
+
+Assignment is an association, not access: every assigned memory is re-checked
+through :meth:`MemoryService.get_item` with the same non-admin access context.
+An assignment therefore helps recall a memory the speaker could already see;
+it can never reveal a private memory about someone else. Identity results now
+carry their *real* subject associations (loaded from ``memory_subjects``)
+instead of a fabricated ``PERSON:speaker`` entry, so the privacy gateway can
+correctly drop a memory whose other subject has not authorised external AI.
+
+Only ``ACTIVE`` memories are ever returned.
 """
 
 from __future__ import annotations
@@ -18,7 +28,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from companion.memory.models import AccessContext
+from companion.memory.models import AccessContext, MemoryItem
 from companion.memory.service import MemoryService
 from companion.memory.topics import detect_identity_query
 
@@ -35,7 +45,7 @@ _MIN_KEYWORD_LEN = 2
 _MAX_KEYWORD_LEN = 64
 _PER_KEYWORD_LIMIT = 20
 _RETRIEVAL_LIMIT = 50
-_CJK_RE = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
+_CJK_RE = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
 
 
 def _has_cjk(text: str) -> bool:
@@ -107,13 +117,14 @@ class SqliteMemoryStore:
         self.service = service
 
     async def retrieve(self, query: str, person_id: Optional[str]) -> list[dict]:
-        """Retrieve the person's ``ACTIVE`` memories matching the query.
+        """Retrieve the person's permitted ``ACTIVE`` memories.
 
         Identity questions ("我叫什么名字？") are resolved *deterministically*
         by subject + canonical topic before keyword search, so the answer does
         not depend on the question sharing wording with the stored fact. All
-        other queries use keyword matching (OR semantics), de-duplicated,
-        most recently updated first, and capped.
+        other queries use keyword matching (OR semantics). Assigned memories
+        are included only after the same visibility check. Results are
+        de-duplicated, most recently updated first, and capped.
         """
         if person_id is None:
             return []
@@ -129,28 +140,9 @@ class SqliteMemoryStore:
                 limit=_PER_KEYWORD_LIMIT,
             )
             for row in rows:
-                identity.append(
-                    {
-                        "memory_id": row["memory_id"],
-                        "kind": row["kind"],
-                        "content": row["content"],
-                        "status": row["status"],
-                        "visibility": row["visibility"],
-                        "created_by": row["created_by"],
-                        "created_at": row["created_at"],
-                        "updated_at": row["updated_at"],
-                        "version": row["version"],
-                        "human_confirmed": bool(row["human_confirmed"]),
-                        "source_supported": bool(row["source_supported"]),
-                        "self_reported": bool(row["self_reported"]),
-                        "third_party_reported": bool(row["third_party_reported"]),
-                        "model_inferred": bool(row["model_inferred"]),
-                        "subjects": [
-                            {"subject_type": "PERSON", "subject_id": person_id}
-                        ],
-                        "sources": [],
-                    }
-                )
+                result = await self._visible_result(row["memory_id"], access)
+                if result is not None:
+                    identity.append(result)
 
         keywords = extract_keywords(query)
 
@@ -178,6 +170,15 @@ class SqliteMemoryStore:
             ):
                 by_id.setdefault(memory["memory_id"], memory)
 
+        # Associations help recall, never grant access. Each id is re-checked
+        # through the access-controlled service before being added.
+        for memory_id in await self.service.repo.list_assigned_memory_ids(person_id):
+            if memory_id in by_id:
+                continue
+            result = await self._visible_result(memory_id, access)
+            if result is not None and result["status"] == "ACTIVE":
+                by_id[memory_id] = result
+
         identity_ids = {m["memory_id"] for m in identity}
         merged = list(by_id.values())
         merged.sort(
@@ -189,3 +190,40 @@ class SqliteMemoryStore:
             reverse=True,
         )
         return merged[:_RETRIEVAL_LIMIT]
+
+    async def _visible_result(
+        self, memory_id: str, access: AccessContext
+    ) -> dict | None:
+        """Load one memory's real associations, applying access control."""
+        item = await self.service.get_item(memory_id, access)
+        if item is None:
+            return None
+        subjects = await self.service.repo.get_subjects(memory_id)
+        sources = await self.service.repo.get_sources(memory_id)
+        return self._result(item, subjects, sources)
+
+    @staticmethod
+    def _result(
+        item: MemoryItem, subjects: list[tuple[str, str]], sources: list[dict]
+    ) -> dict:
+        return {
+            "memory_id": item.memory_id,
+            "kind": item.kind.value,
+            "content": item.content,
+            "status": item.status.value,
+            "visibility": item.visibility.value,
+            "created_by": item.created_by,
+            "created_at": item.created_at.isoformat(),
+            "updated_at": item.updated_at.isoformat(),
+            "version": item.version,
+            "human_confirmed": item.human_confirmed,
+            "source_supported": item.source_supported,
+            "self_reported": item.self_reported,
+            "third_party_reported": item.third_party_reported,
+            "model_inferred": item.model_inferred,
+            "subjects": [
+                {"subject_type": subject_type, "subject_id": subject_id}
+                for subject_type, subject_id in subjects
+            ],
+            "sources": sources,
+        }

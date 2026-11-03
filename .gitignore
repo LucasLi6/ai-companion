@@ -20,3 +20,8 @@ data/*.db-shm
 *.db
 *.db-wal
 *.db-shm
+
+# CMF portable memory files (contain private identity/memory)
+*.memory
+*.memory-wal
+*.memory-shm

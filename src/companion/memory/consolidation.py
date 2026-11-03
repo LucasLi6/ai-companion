@@ -41,6 +41,7 @@ from companion.domain.enums import (
 )
 from companion.domain.models import MemoryCandidate, UtteranceEvent
 from companion.memory.candidates import normalize_candidate_content
+from companion.memory.keys import ClaimKey, claim_is_grounded, extract_claim_key
 from companion.memory.models import AccessContext, MemoryItem
 from companion.memory.repository import MemoryRepository
 from companion.memory.service import MemoryService
@@ -68,6 +69,7 @@ class _Plan:
     assertion: AssertionType = AssertionType.UNKNOWN
     certainty: CertaintyCategory = CertaintyCategory.UNKNOWN
     topic: Optional[str] = None
+    key: Optional[ClaimKey] = None
     self_reported: bool = False
     third_party_reported: bool = False
     model_inferred: bool = False
@@ -168,6 +170,7 @@ class MemoryWriter:
         assertion = candidate.assertion_type
         certainty = candidate.certainty_category
         topic = canonicalize_topic(candidate.topic, content)
+        key = extract_claim_key(content)
         kind = candidate.kind or (
             MemoryKind.PROJECT_STATE
             if topic is not None and topic.startswith("project")
@@ -234,6 +237,7 @@ class MemoryWriter:
                 assertion=AssertionType.THIRD_PARTY_REPORT,
                 certainty=certainty,
                 topic=topic,
+                key=key,
                 third_party_reported=True,
                 model_inferred=True,
             )
@@ -249,6 +253,7 @@ class MemoryWriter:
                 assertion=assertion,
                 certainty=certainty,
                 topic=topic,
+                key=key,
                 self_reported=assertion in _SELF_ASSERTIONS,
                 model_inferred=True,
             )
@@ -272,6 +277,7 @@ class MemoryWriter:
                     else CertaintyCategory.DIRECT
                 ),
                 topic=topic,
+                key=key,
                 self_reported=True,
                 model_inferred=False,
             )
@@ -289,6 +295,7 @@ class MemoryWriter:
                 else CertaintyCategory.UNCERTAIN
             ),
             topic=topic,
+            key=key,
             self_reported=is_self_report,
             model_inferred=True,
         )
@@ -298,18 +305,35 @@ class MemoryWriter:
     ) -> bool:
         """Whether the utterance itself directly supports the candidate.
 
-        A model-supplied evidence span counts only if it is a verbatim substring
-        of the event text. Without one, the candidate's own wording must appear
-        verbatim in the utterance. Loose keyword overlap is deliberately *not*
-        enough to support an authoritative self-report -- it would let a
-        third-party sentence be re-attributed to the speaker.
+        A model-supplied evidence span is not sufficient by itself: quoting a
+        real sentence does not prove the proposed claim follows from it. The
+        claim's own wording (or, for preference/project/identity claims, the
+        same entity plus the matching predicate) must be grounded in the
+        utterance. This is what stops "今天写了代码" from becoming an
+        authoritative "特别喜欢编程" memory.
         """
-        span = (candidate.source_evidence_span or "").strip()
-        if span and span in event.text:
-            return True
-        return normalize_candidate_content(content) in normalize_candidate_content(
-            event.text
+        return claim_is_grounded(
+            content,
+            event.text,
+            evidence_span=candidate.source_evidence_span,
         )
+
+    @staticmethod
+    def _same_claim(key: ClaimKey, row: dict) -> bool:
+        """Whether an existing memory describes the same attribute/entity.
+
+        Stored provenance keys are authoritative when present. Rows written
+        before the keys existed are parsed from their content on the fly, so a
+        legacy memory participates correctly without a destructive backfill.
+        """
+        entity = row.get("entity_key")
+        attribute = row.get("attribute_key")
+        if entity is None or attribute is None:
+            existing = extract_claim_key(row.get("content") or "")
+            if existing is None:
+                return False
+            entity, attribute = existing.entity_key, existing.attribute_key
+        return key.entity_key == entity and key.attribute_key == attribute
 
     # -- writes ------------------------------------------------------------
 
@@ -341,13 +365,13 @@ class MemoryWriter:
                 return await self._handle_existing(candidate, same, plan, access)
 
             conflict = None
-            if plan.topic:
+            if plan.key is not None:
                 conflict = next(
                     (
                         row
                         for row in existing
-                        if row.get("topic") == plan.topic
-                        and normalize_candidate_content(row["content"]) != norm
+                        if normalize_candidate_content(row["content"]) != norm
+                        and self._same_claim(plan.key, row)
                     ),
                     None,
                 )
@@ -370,12 +394,24 @@ class MemoryWriter:
         ):
             # The same fact is now directly supported: promote the candidate
             # rather than duplicating it.
-            await self.service.update(
+            updated = await self.service.update(
                 row["memory_id"],
                 access=access,
                 expected_version=row["version"],
                 status=MemoryStatus.ACTIVE,
                 reason="promoted_by_direct_self_report",
+            )
+            await self.mem_repo.add_provenance_event(
+                row["memory_id"],
+                event_type="promoted",
+                source_event_id=candidate.source_event_id,
+                candidate_id=candidate.candidate_id,
+                speaker_person_id=None,
+                subject_person_id=access.actor_id,
+                old_version=row["version"],
+                new_version=updated.version,
+                reason="promoted_by_direct_self_report",
+                payload={"from_status": row["status"], "to_status": "ACTIVE"},
             )
             return await self._finish(
                 candidate,
@@ -427,7 +463,7 @@ class MemoryWriter:
         )
         if genuine_self_update:
             try:
-                await self.service.update(
+                updated = await self.service.update(
                     row["memory_id"],
                     access=access,
                     expected_version=row["version"],
@@ -438,6 +474,31 @@ class MemoryWriter:
                         if plan.assertion == AssertionType.CORRECTION
                         else "self_report_update"
                     ),
+                )
+                await self.mem_repo.add_provenance_event(
+                    row["memory_id"],
+                    event_type=(
+                        "corrected"
+                        if plan.assertion == AssertionType.CORRECTION
+                        else "updated"
+                    ),
+                    source_event_id=event.event_id,
+                    candidate_id=candidate.candidate_id,
+                    speaker_person_id=event.speaker_person_id,
+                    subject_person_id=event.speaker_person_id,
+                    old_version=row["version"],
+                    new_version=updated.version,
+                    reason=(
+                        "explicit_correction"
+                        if plan.assertion == AssertionType.CORRECTION
+                        else "self_report_update"
+                    ),
+                    payload={
+                        "old_content": row["content"],
+                        "new_content": plan.content,
+                        "entity_key": plan.key.entity_key if plan.key else None,
+                        "attribute_key": plan.key.attribute_key if plan.key else None,
+                    },
                 )
             except Exception as exc:  # permission/version race: review instead
                 self.logger.warning(
@@ -487,7 +548,7 @@ class MemoryWriter:
             model_inferred=plan.model_inferred,
         )
         await self._record_provenance(
-            item.memory_id, candidate, event, plan
+            item.memory_id, candidate, event, plan, new_version=item.version
         )
         if not plan.third_party_reported:
             await self._auto_assign(item.memory_id, speaker_id)
@@ -520,7 +581,9 @@ class MemoryWriter:
             model_inferred=True,
         )
         await self.mem_repo.add_link(item.memory_id, conflicts_with, "conflicts_with")
-        await self._record_provenance(item.memory_id, candidate, event, plan)
+        await self._record_provenance(
+            item.memory_id, candidate, event, plan, new_version=item.version
+        )
         return item
 
     async def _record_provenance(
@@ -529,6 +592,8 @@ class MemoryWriter:
         candidate: MemoryCandidate,
         event: UtteranceEvent,
         plan: _Plan,
+        *,
+        new_version: int | None = None,
     ) -> None:
         await self.mem_repo.add_provenance(
             memory_id,
@@ -542,10 +607,13 @@ class MemoryWriter:
             assertion_type=plan.assertion.value,
             certainty_category=plan.certainty.value,
             topic=plan.topic,
+            entity_key=plan.key.entity_key if plan.key else None,
+            attribute_key=plan.key.attribute_key if plan.key else None,
             explicit_remember_request=candidate.explicit_remember_request,
             self_reported=plan.self_reported,
             third_party_reported=plan.third_party_reported,
             model_inferred=plan.model_inferred,
+            new_version=new_version,
         )
 
     async def _auto_assign(self, memory_id: str, person_id: str) -> None:

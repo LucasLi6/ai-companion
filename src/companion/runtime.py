@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from companion.agent.service import AgentService
 from companion.cognition.context_builder import ContextBuilder
 from companion.cognition.privacy import ForegroundPrivacyGateway
 from companion.core.conversation import ConversationManager
@@ -52,6 +53,7 @@ class Runtime:
     response: object
     memory: SqliteMemoryStore
     memory_service: MemoryService
+    agent_service: AgentService
     worker: Optional[JobWorker]
     orchestrator: Orchestrator
     provider: str = "mock"
@@ -90,6 +92,9 @@ def build_runtime(
     memory_service = build_memory_service(repos)
     memory_writer = MemoryWriter(repos, memory_service, logger=logger)
     memory = SqliteMemoryStore(memory_service)
+    agent_service = AgentService(
+        repos=repos, registry=registry, audit=repos.audit, logger=logger
+    )
 
     context_builder: Optional[ContextBuilder] = None
     gateway: Optional[ForegroundPrivacyGateway] = None
@@ -109,6 +114,7 @@ def build_runtime(
             repos=repos,
             registry=registry,
             privacy_gateway=gateway,
+            agent_service=agent_service,
             logger=logger,
         )
         cognitive = cognitive or DeepSeekCognitiveProvider(
@@ -149,6 +155,7 @@ def build_runtime(
         response=response,
         memory=memory,
         memory_service=memory_service,
+        agent_service=agent_service,
         worker=worker,
         orchestrator=orchestrator,
         provider=provider,

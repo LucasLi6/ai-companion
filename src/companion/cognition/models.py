@@ -40,6 +40,10 @@ class CognitiveContext(BaseModel):
     quiet_mode: bool = False
     turns: list[CognitiveTurn] = Field(default_factory=list)
     memories: list[dict] = Field(default_factory=list)
+    # Immutable snapshot of the Agent Core for this turn: identity, personality
+    # and (for the current speaker) relationship tier. Trusted application data,
+    # never written by a model.
+    agent_context: Optional[dict] = Field(default=None)
     # Truthful results of the memory write-through for this turn. These are
     # trusted application data (the provider never fills them) so the response
     # can acknowledge only what was actually committed.

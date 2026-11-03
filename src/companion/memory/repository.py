@@ -17,7 +17,7 @@ from companion.domain.enums import (
     MemoryStatus,
     MemoryVisibility,
 )
-from companion.domain.models import utcnow
+from companion.domain.models import new_id, utcnow
 from companion.storage.database import Database
 
 from .models import MemoryEvidence, MemoryItem, MemoryRevision, MemorySource
@@ -224,19 +224,23 @@ class MemoryRepository:
         assertion_type: str = "UNKNOWN",
         certainty_category: str = "UNKNOWN",
         topic: str | None = None,
+        entity_key: str | None = None,
+        attribute_key: str | None = None,
         explicit_remember_request: bool = False,
         self_reported: bool = False,
         third_party_reported: bool = False,
         model_inferred: bool = False,
+        new_version: int | None = None,
     ) -> None:
         now = _iso(utcnow())
         await self.db.execute(
             "INSERT OR REPLACE INTO memory_provenance("
             " memory_id, source_event_id, candidate_id, speaker_person_id,"
             " subject_person_id, source_type, assertion_type, certainty_category,"
-            " topic, explicit_remember_request, self_reported, third_party_reported,"
-            " model_inferred, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " topic, entity_key, attribute_key, explicit_remember_request,"
+            " self_reported, third_party_reported, model_inferred, created_at,"
+            " updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 memory_id,
                 source_event_id,
@@ -247,6 +251,8 @@ class MemoryRepository:
                 assertion_type,
                 certainty_category,
                 topic,
+                entity_key,
+                attribute_key,
                 int(explicit_remember_request),
                 int(self_reported),
                 int(third_party_reported),
@@ -255,6 +261,81 @@ class MemoryRepository:
                 now,
             ),
         )
+        await self.add_provenance_event(
+            memory_id,
+            event_type="created",
+            source_event_id=source_event_id,
+            candidate_id=candidate_id,
+            speaker_person_id=speaker_person_id,
+            subject_person_id=subject_person_id,
+            new_version=new_version,
+            reason=None,
+            payload={
+                "assertion_type": assertion_type,
+                "certainty_category": certainty_category,
+                "topic": topic,
+                "entity_key": entity_key,
+                "attribute_key": attribute_key,
+            },
+        )
+
+    async def add_provenance_event(
+        self,
+        memory_id: str,
+        *,
+        event_type: str,
+        source_event_id: str | None = None,
+        candidate_id: str | None = None,
+        speaker_person_id: str | None = None,
+        subject_person_id: str | None = None,
+        old_version: int | None = None,
+        new_version: int | None = None,
+        reason: str | None = None,
+        payload: dict | None = None,
+    ) -> None:
+        """Append one immutable provenance event.
+
+        ``memory_provenance`` keeps the *current* origin for fast lookup; this
+        table keeps every correction/promotion/retraction, including the
+        versions involved, so later corrections never discard earlier history.
+        """
+        await self.db.execute(
+            "INSERT INTO memory_provenance_events("
+            " event_id, memory_id, source_event_id, candidate_id,"
+            " speaker_person_id, subject_person_id, old_version, new_version,"
+            " event_type, reason, payload, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                new_id("provev"),
+                memory_id,
+                source_event_id,
+                candidate_id,
+                speaker_person_id,
+                subject_person_id,
+                old_version,
+                new_version,
+                event_type,
+                reason,
+                json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+                _iso(utcnow()),
+            ),
+        )
+
+    async def list_provenance_events(self, memory_id: str) -> list[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM memory_provenance_events WHERE memory_id = ?"
+            " ORDER BY created_at ASC, rowid ASC",
+            (memory_id,),
+        )
+        rows = []
+        for row in await cur.fetchall():
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.get("payload") or "{}")
+            except (TypeError, ValueError):
+                item["payload"] = {}
+            rows.append(item)
+        return rows
 
     async def get_provenance(self, memory_id: str) -> dict | None:
         cur = await self.db.execute(
@@ -299,7 +380,8 @@ class MemoryRepository:
             "SELECT m.memory_id, m.kind, m.content, m.status, m.visibility,"
             " m.created_by, m.created_at, m.updated_at, m.version, m.human_confirmed,"
             " m.source_supported, m.self_reported, m.third_party_reported,"
-            " m.model_inferred, p.topic, p.assertion_type"
+            " m.model_inferred, p.topic, p.assertion_type, p.entity_key,"
+            " p.attribute_key"
             " FROM memory_items m"
             " JOIN memory_subjects s ON s.memory_id = m.memory_id"
             " LEFT JOIN memory_provenance p ON p.memory_id = m.memory_id"
