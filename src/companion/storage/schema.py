@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -125,6 +125,185 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON processing_jobs(status);
 # Ordered, append-only migrations. Each entry is ``(version, sql)`` and is
 # applied once, in order, by ``Database.initialize``. Never edit an existing
 # entry — append a new one with the next version number. V0.0 = version 1.
+#
+# Each migration's SQL must be plain DDL/DML (no ``PRAGMA`` and no string
+# literal containing a semicolon) so ``Database.initialize`` can split it into
+# statements and run them inside a single transaction (see A2: migration
+# atomicity).
 MIGRATIONS: list[tuple[int, str]] = [
     (1, SCHEMA_SQL),
+    # Version 2 (Phase A): job lease / ownership columns for safe multi-worker
+    # claiming, time-limited leases and scheduled runs. All are NULL-able so
+    # existing rows keep their old (lease-less) semantics.
+    (
+        2,
+        """
+        ALTER TABLE processing_jobs ADD COLUMN owner_id TEXT;
+        ALTER TABLE processing_jobs ADD COLUMN lease_expires_at TEXT;
+        ALTER TABLE processing_jobs ADD COLUMN heartbeat_at TEXT;
+        ALTER TABLE processing_jobs ADD COLUMN next_run_at TEXT;
+        """,
+    ),
+    # Version 3 (Phase B): the unified memory foundation. ``memory_facts`` and
+    # the legacy ``memory_candidates`` table are left intact; existing facts are
+    # copied into ``memory_items`` once, idempotently (this migration runs at
+    # most once because it is version-gated).
+    (
+        3,
+        """
+        CREATE TABLE IF NOT EXISTS memory_items (
+            memory_id            TEXT PRIMARY KEY,
+            kind                 TEXT NOT NULL,
+            content              TEXT NOT NULL,
+            status               TEXT NOT NULL,
+            visibility           TEXT NOT NULL,
+            created_by           TEXT NOT NULL,
+            created_at           TEXT NOT NULL,
+            updated_at           TEXT NOT NULL,
+            version              INTEGER NOT NULL DEFAULT 1,
+            valid_from           TEXT,
+            valid_until          TEXT,
+            human_confirmed      INTEGER NOT NULL DEFAULT 0,
+            source_supported     INTEGER NOT NULL DEFAULT 0,
+            self_reported        INTEGER NOT NULL DEFAULT 0,
+            third_party_reported INTEGER NOT NULL DEFAULT 0,
+            model_inferred       INTEGER NOT NULL DEFAULT 0,
+            extra                TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_subjects (
+            memory_id    TEXT NOT NULL REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            subject_type TEXT NOT NULL,
+            subject_id   TEXT NOT NULL,
+            PRIMARY KEY (memory_id, subject_type, subject_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_sources (
+            source_id    TEXT PRIMARY KEY,
+            source_type  TEXT NOT NULL,
+            source_ref   TEXT,
+            title        TEXT,
+            url          TEXT,
+            retrieved_at TEXT,
+            published_at TEXT,
+            extra        TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_evidence (
+            memory_id          TEXT NOT NULL REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            source_id          TEXT NOT NULL REFERENCES memory_sources(source_id) ON DELETE CASCADE,
+            evidence_span      TEXT,
+            verification_level TEXT NOT NULL DEFAULT 'UNVERIFIED',
+            retrieved_at       TEXT,
+            PRIMARY KEY (memory_id, source_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_links (
+            memory_id        TEXT NOT NULL REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            linked_memory_id TEXT NOT NULL REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            link_type        TEXT NOT NULL,
+            PRIMARY KEY (memory_id, linked_memory_id, link_type)
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_revisions (
+            revision_id TEXT PRIMARY KEY,
+            memory_id   TEXT NOT NULL REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+            version     INTEGER NOT NULL,
+            kind        TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            changed_by  TEXT NOT NULL,
+            changed_at  TEXT NOT NULL,
+            reason      TEXT,
+            snapshot    TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(
+            content,
+            memory_id UNINDEXED,
+            tokenize='unicode61'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_items_kind ON memory_items(kind);
+        CREATE INDEX IF NOT EXISTS idx_memory_items_status ON memory_items(status);
+        CREATE INDEX IF NOT EXISTS idx_memory_items_visibility ON memory_items(visibility);
+        CREATE INDEX IF NOT EXISTS idx_memory_subjects_lookup
+            ON memory_subjects(subject_type, subject_id);
+
+        -- Migrate existing hand-authored facts into the unified store (idempotent
+        -- because this migration is applied exactly once). Old ids are preserved.
+        INSERT OR IGNORE INTO memory_items(
+            memory_id, kind, content, status, visibility, created_by, created_at,
+            updated_at, version, human_confirmed, source_supported, self_reported,
+            third_party_reported, model_inferred, extra
+        )
+        SELECT
+            fact_id,
+            'PERSONAL_FACT',
+            content,
+            CASE WHEN status = 'manual' THEN 'ACTIVE' ELSE 'CANDIDATE' END,
+            'PRIVATE',
+            COALESCE(subject_person_id, 'system'),
+            created_at,
+            updated_at,
+            1,
+            1, 0, 1, 0, 0,
+            '{}'
+        FROM memory_facts;
+
+        INSERT OR IGNORE INTO memory_subjects(memory_id, subject_type, subject_id)
+        SELECT fact_id, 'PERSON', subject_person_id
+        FROM memory_facts
+        WHERE subject_person_id IS NOT NULL;
+
+        INSERT INTO memory_items_fts(content, memory_id)
+        SELECT content, fact_id FROM memory_facts;
+        """,
+    ),
+    # Version 4 (Phase C/D): management UI support and idle research.
+    # - app_settings holds runtime configuration toggles (idle/research/web
+    #   search), edited from the Settings page.
+    # - audit_log is the append-only, cross-entity activity trail shown on the
+    #   Activity/Audit Log page. Rows are written by the memory service and the
+    #   person registry, never deleted.
+    # - research_tasks is the durable store for the idle research planner
+    #   (Phase D); the Research Manager page reads and schedules it.
+    (
+        4,
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_log (
+            audit_id    TEXT PRIMARY KEY,
+            actor       TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id   TEXT,
+            detail      TEXT,
+            created_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS research_tasks (
+            task_id      TEXT PRIMARY KEY,
+            question     TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'PENDING',
+            priority     INTEGER NOT NULL DEFAULT 0,
+            source_kind  TEXT NOT NULL DEFAULT 'curiosity',
+            source_ref   TEXT,
+            result       TEXT,
+            error        TEXT,
+            created_at   TEXT NOT NULL,
+            started_at   TEXT,
+            completed_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);
+        CREATE INDEX IF NOT EXISTS idx_research_tasks_status ON research_tasks(status);
+        """,
+    ),
 ]

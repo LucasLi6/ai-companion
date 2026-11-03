@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from companion.domain.enums import (
@@ -283,6 +283,50 @@ class UtteranceRepository:
         rows = await cur.fetchall()
         return [r["event_id"] for r in rows]
 
+    async def recent_context(
+        self,
+        conversation_id: str,
+        exclude_event_id: str | None,
+        limit: int = 20,
+    ) -> list[UtteranceEvent]:
+        """Return recent utterances for a conversation, oldest first.
+
+        ``exclude_event_id`` is dropped from the result: the current event is
+        already persisted before context is built, so it must not also appear
+        as "history" when a future cognitive engine assembles a chat context.
+        """
+        if exclude_event_id is None:
+            cur = await self.db.execute(
+                "SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
+                " text, source, addressee_hint, occurred_at, processing_status"
+                " FROM utterances WHERE conversation_id = ?"
+                " ORDER BY occurred_at ASC, event_id ASC LIMIT ?",
+                (conversation_id, limit),
+            )
+        else:
+            cur = await self.db.execute(
+                "SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
+                " text, source, addressee_hint, occurred_at, processing_status"
+                " FROM utterances WHERE conversation_id = ? AND event_id != ?"
+                " ORDER BY occurred_at ASC, event_id ASC LIMIT ?",
+                (conversation_id, exclude_event_id, limit),
+            )
+        rows = await cur.fetchall()
+        return [
+            UtteranceEvent(
+                event_id=r["event_id"],
+                conversation_id=r["conversation_id"],
+                speaker_person_id=r["speaker_person_id"],
+                speaker_label=r["speaker_label"],
+                text=r["text"],
+                source=EventSource(r["source"]),
+                addressee_hint=AddresseeHint(r["addressee_hint"]),
+                occurred_at=_dt(r["occurred_at"]),
+                processing_status=ProcessingStatus(r["processing_status"]),
+            )
+            for r in rows
+        ]
+
     async def list_events(
         self, person_id: str | None = None, limit: int = 100
     ) -> list[UtteranceEvent]:
@@ -515,11 +559,22 @@ class MemoryFactRepository:
 
 
 class JobRepository:
+    _COLUMNS = (
+        "job_id, job_key, job_type, payload, status, attempts, max_attempts,"
+        " last_error, created_at, started_at, completed_at, owner_id,"
+        " lease_expires_at, heartbeat_at, next_run_at"
+    )
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
     async def enqueue(
-        self, job_type: JobType, job_key: str, payload: dict, max_attempts: int = 3
+        self,
+        job_type: JobType,
+        job_key: str,
+        payload: dict,
+        max_attempts: int = 3,
+        next_run_at: Optional[datetime] = None,
     ) -> str:
         """Enqueue a job, deduplicating on ``job_key``.
 
@@ -534,7 +589,8 @@ class JobRepository:
         job_id = new_id("job")
         await self.db.execute(
             "INSERT INTO processing_jobs(job_id, job_key, job_type, payload, status,"
-            " attempts, max_attempts, created_at) VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?)",
+            " attempts, max_attempts, created_at, next_run_at)"
+            " VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)",
             (
                 job_id,
                 job_key,
@@ -542,15 +598,14 @@ class JobRepository:
                 json.dumps(payload),
                 max_attempts,
                 _iso(utcnow()),
+                _iso(next_run_at) if next_run_at is not None else None,
             ),
         )
         return job_id
 
     async def get(self, job_id: str) -> ProcessingJob | None:
         cur = await self.db.execute(
-            "SELECT job_id, job_key, job_type, payload, status, attempts, max_attempts,"
-            " last_error, created_at, started_at, completed_at FROM processing_jobs"
-            " WHERE job_id = ?",
+            f"SELECT {self._COLUMNS} FROM processing_jobs WHERE job_id = ?",
             (job_id,),
         )
         row = await cur.fetchone()
@@ -560,9 +615,7 @@ class JobRepository:
 
     async def get_by_key(self, job_key: str) -> ProcessingJob | None:
         cur = await self.db.execute(
-            "SELECT job_id, job_key, job_type, payload, status, attempts, max_attempts,"
-            " last_error, created_at, started_at, completed_at FROM processing_jobs"
-            " WHERE job_key = ?",
+            f"SELECT {self._COLUMNS} FROM processing_jobs WHERE job_key = ?",
             (job_key,),
         )
         row = await cur.fetchone()
@@ -572,8 +625,7 @@ class JobRepository:
 
     async def pending(self, limit: int = 100) -> list[ProcessingJob]:
         cur = await self.db.execute(
-            "SELECT job_id, job_key, job_type, payload, status, attempts, max_attempts,"
-            " last_error, created_at, started_at, completed_at FROM processing_jobs"
+            f"SELECT {self._COLUMNS} FROM processing_jobs"
             " WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT ?",
             (limit,),
         )
@@ -581,10 +633,7 @@ class JobRepository:
         return [self._to_job(r) for r in rows]
 
     async def list_jobs(self, status: JobStatus | None = None) -> list[ProcessingJob]:
-        sql = (
-            "SELECT job_id, job_key, job_type, payload, status, attempts, max_attempts,"
-            " last_error, created_at, started_at, completed_at FROM processing_jobs"
-        )
+        sql = f"SELECT {self._COLUMNS} FROM processing_jobs"
         params: tuple = ()
         if status is not None:
             sql += " WHERE status = ?"
@@ -594,20 +643,54 @@ class JobRepository:
         rows = await cur.fetchall()
         return [self._to_job(r) for r in rows]
 
-    async def claim(self, job_id: str) -> bool:
+    async def claim(
+        self, job_id: str, owner_id: str = "worker", lease_seconds: int = 300
+    ) -> bool:
         """Atomically claim a ``PENDING`` job, returning ``True`` on success.
 
         The ``WHERE status = 'PENDING'`` guard plus SQLite's write lock means
         that, of any number of concurrent workers (even on separate
         connections), at most one sees ``rowcount == 1``.
+
+        The claim records an ``owner_id`` and a time-limited lease so a crashed
+        worker's in-flight job can be reclaimed once its lease lapses, without
+        ever resetting another *live* worker's job.
         """
         from companion.domain.models import utcnow
 
+        now = utcnow()
+        lease = now + timedelta(seconds=lease_seconds) if lease_seconds else None
         cur = await self.db.execute(
             "UPDATE processing_jobs SET status = 'RUNNING', attempts = attempts + 1,"
-            " started_at = ?, last_error = NULL"
+            " owner_id = ?, lease_expires_at = ?, heartbeat_at = ?,"
+            " started_at = COALESCE(started_at, ?), last_error = NULL"
             " WHERE job_id = ? AND status = 'PENDING' AND attempts < max_attempts",
-            (_iso(utcnow()), job_id),
+            (
+                owner_id,
+                _iso(lease) if lease is not None else None,
+                _iso(now),
+                _iso(now),
+                job_id,
+            ),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
+
+    async def heartbeat(
+        self, job_id: str, owner_id: str, lease_seconds: int = 300
+    ) -> bool:
+        """Extend the lease of a job we still own, proving we are alive.
+
+        Returns ``True`` only if this ``owner_id`` still holds the ``RUNNING``
+        job — a worker that has lost its lease cannot extend it.
+        """
+        from companion.domain.models import utcnow
+
+        now = utcnow()
+        lease = now + timedelta(seconds=lease_seconds)
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET heartbeat_at = ?, lease_expires_at = ?"
+            " WHERE job_id = ? AND status = 'RUNNING' AND owner_id = ?",
+            (_iso(now), _iso(lease), job_id, owner_id),
         )
         return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
 
@@ -615,8 +698,8 @@ class JobRepository:
         from companion.domain.models import utcnow
 
         await self.db.execute(
-            "UPDATE processing_jobs SET status = 'COMPLETED', completed_at = ?"
-            " WHERE job_id = ?",
+            "UPDATE processing_jobs SET status = 'COMPLETED', completed_at = ?,"
+            " owner_id = NULL, lease_expires_at = NULL WHERE job_id = ?",
             (_iso(utcnow()), job_id),
         )
 
@@ -625,18 +708,30 @@ class JobRepository:
 
         await self.db.execute(
             "UPDATE processing_jobs SET status = 'FAILED', last_error = ?,"
-            " completed_at = ? WHERE job_id = ?",
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE job_id = ?",
             (error, _iso(utcnow()), job_id),
         )
 
-    async def recover_running(self) -> int:
-        """Reset leftover ``RUNNING`` jobs to ``PENDING`` so they are retried.
+    async def recover_running(self, now: datetime | None = None) -> int:
+        """Reset *expired* ``RUNNING`` jobs to ``PENDING``.
 
-        Idempotent handlers guarantee this never duplicates side effects.
+        Only jobs whose lease has lapsed (or was never set, i.e. jobs claimed
+        by an older build) are reset. A live worker holding an unexpired lease
+        is left untouched, so starting one worker never steals another
+        worker's in-flight job. Idempotent handlers guarantee this never
+        duplicates side effects.
         """
+        from companion.domain.models import utcnow
+
+        if now is None:
+            now = utcnow()
         cur = await self.db.execute(
-            "UPDATE processing_jobs SET status = 'PENDING', started_at = NULL"
+            "UPDATE processing_jobs SET status = 'PENDING', owner_id = NULL,"
+            " lease_expires_at = NULL, heartbeat_at = NULL, started_at = NULL"
             " WHERE status = 'RUNNING'"
+            " AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
+            (_iso(now),),
         )
         return cur.rowcount if hasattr(cur, "rowcount") else 0
 
@@ -644,15 +739,23 @@ class JobRepository:
         """Requeue a job for automatic retry, keeping its attempt count."""
         await self.db.execute(
             "UPDATE processing_jobs SET status = 'PENDING', last_error = ?,"
-            " started_at = NULL WHERE job_id = ?",
+            " started_at = NULL, owner_id = NULL, lease_expires_at = NULL,"
+            " heartbeat_at = NULL WHERE job_id = ?",
             (error, job_id),
         )
 
     async def retry(self, job_id: str) -> bool:
-        """Requeue a failed or completed-able job; reset attempts for a clean run."""
+        """Requeue a *failed* job for a clean manual retry.
+
+        Only ``FAILED`` jobs may be retried: a ``RUNNING`` job may be owned by
+        another worker, and a ``COMPLETED`` job may already have produced
+        external side effects, so neither is blindly reset.
+        """
         cur = await self.db.execute(
             "UPDATE processing_jobs SET status = 'PENDING', last_error = NULL,"
-            " started_at = NULL, completed_at = NULL, attempts = 0 WHERE job_id = ?",
+            " started_at = NULL, completed_at = NULL, attempts = 0,"
+            " owner_id = NULL, lease_expires_at = NULL, heartbeat_at = NULL"
+            " WHERE job_id = ? AND status = 'FAILED'",
             (job_id,),
         )
         return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
@@ -670,6 +773,10 @@ class JobRepository:
             created_at=_dt(row["created_at"]),
             started_at=_dt(row["started_at"]),
             completed_at=_dt(row["completed_at"]),
+            owner_id=row["owner_id"],
+            lease_expires_at=_dt(row["lease_expires_at"]),
+            heartbeat_at=_dt(row["heartbeat_at"]),
+            next_run_at=_dt(row["next_run_at"]),
         )
 
 
@@ -684,6 +791,9 @@ class Repositories:
     analysis: AnalysisRepository
     memory_fact: MemoryFactRepository
     job: JobRepository
+    settings: "SettingsRepository"
+    audit: "AuditRepository"
+    research: "ResearchRepository"
 
     async def persist_cognitive_outcome(
         self,
@@ -722,4 +832,161 @@ def make_repositories(db: Database) -> Repositories:
         analysis=AnalysisRepository(db),
         memory_fact=MemoryFactRepository(db),
         job=JobRepository(db),
+        settings=SettingsRepository(db),
+        audit=AuditRepository(db),
+        research=ResearchRepository(db),
     )
+
+
+class SettingsRepository:
+    """Key/value application settings (idle, research, web search toggles)."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def get(self, key: str, default: str | None = None) -> str | None:
+        cur = await self.db.execute(
+            "SELECT value FROM app_settings WHERE key = ?", (key,)
+        )
+        row = await cur.fetchone()
+        return row["value"] if row is not None else default
+
+    async def get_bool(self, key: str, default: bool = False) -> bool:
+        value = await self.get(key)
+        if value is None:
+            return default
+        return value.strip().lower() in ("1", "true", "yes", "on")
+
+    async def set(self, key: str, value: str) -> None:
+        await self.db.execute(
+            "INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value,"
+            " updated_at = excluded.updated_at",
+            (key, value, _iso(utcnow())),
+        )
+
+    async def all(self) -> dict[str, str]:
+        cur = await self.db.execute(
+            "SELECT key, value FROM app_settings ORDER BY key ASC"
+        )
+        return {r["key"]: r["value"] for r in await cur.fetchall()}
+
+
+class AuditRepository:
+    """Append-only audit trail for cross-entity activity.
+
+    Rows are written (never updated or deleted) by the memory service and the
+    person registry, and surfaced on the Activity/Audit Log page.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def record(
+        self,
+        actor: str,
+        action: str,
+        entity_type: str,
+        entity_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        from companion.domain.models import new_id
+
+        await self.db.execute(
+            "INSERT INTO audit_log(audit_id, actor, action, entity_type, entity_id,"
+            " detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                new_id("audit"),
+                actor,
+                action,
+                entity_type,
+                entity_id,
+                detail,
+                _iso(utcnow()),
+            ),
+        )
+
+    async def list(
+        self, limit: int = 200, entity_type: str | None = None, actor: str | None = None
+    ) -> list[dict]:
+        sql = (
+            "SELECT audit_id, actor, action, entity_type, entity_id, detail, created_at"
+            " FROM audit_log"
+        )
+        conditions: list[str] = []
+        params: list = []
+        if entity_type is not None:
+            conditions.append("entity_type = ?")
+            params.append(entity_type)
+        if actor is not None:
+            conditions.append("actor = ?")
+            params.append(actor)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        cur = await self.db.execute(sql, tuple(params))
+        return [dict(r) for r in await cur.fetchall()]
+
+
+class ResearchRepository:
+    """Durable store for idle research tasks (populated by the Phase D engine)."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def create(
+        self,
+        question: str,
+        *,
+        source_kind: str = "curiosity",
+        source_ref: str | None = None,
+        priority: int = 0,
+    ) -> str:
+        from companion.domain.models import new_id
+
+        task_id = new_id("research")
+        await self.db.execute(
+            "INSERT INTO research_tasks(task_id, question, status, priority,"
+            " source_kind, source_ref, created_at) VALUES (?, ?, 'PENDING', ?, ?, ?, ?)",
+            (task_id, question, priority, source_kind, source_ref, _iso(utcnow())),
+        )
+        return task_id
+
+    async def get(self, task_id: str) -> dict | None:
+        cur = await self.db.execute(
+            "SELECT task_id, question, status, priority, source_kind, source_ref,"
+            " result, error, created_at, started_at, completed_at FROM research_tasks"
+            " WHERE task_id = ?",
+            (task_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row is not None else None
+
+    async def list(self, status: str | None = None, limit: int = 100) -> list[dict]:
+        sql = (
+            "SELECT task_id, question, status, priority, source_kind, source_ref,"
+            " result, error, created_at, started_at, completed_at FROM research_tasks"
+        )
+        params: tuple = ()
+        if status is not None:
+            sql += " WHERE status = ?"
+            params = (status,)
+        sql += " ORDER BY priority DESC, created_at ASC LIMIT ?"
+        params = (*params, limit)
+        cur = await self.db.execute(sql, params)
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def set_status(self, task_id: str, status: str, error: str | None = None) -> None:
+        await self.db.execute(
+            "UPDATE research_tasks SET status = ?, error = ?, started_at ="
+            " COALESCE(started_at, ?) WHERE task_id = ?",
+            (status, error, _iso(utcnow()), task_id),
+        )
+
+    async def complete(self, task_id: str, result: str) -> None:
+        await self.db.execute(
+            "UPDATE research_tasks SET status = 'COMPLETED', result = ?,"
+            " completed_at = ? WHERE task_id = ?",
+            (result, _iso(utcnow()), task_id),
+        )

@@ -193,6 +193,13 @@ class ProcessingJob(DomainModel):
     created_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    # Lease/ownership (Phase A): which worker owns an in-flight job, when the
+    # lease expires (so a crashed worker's job can be reclaimed), the last
+    # heartbeat, and an optional scheduled next-run time.
+    owner_id: Optional[str] = None
+    lease_expires_at: Optional[datetime] = None
+    heartbeat_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = None
 
 
 class ProcessingReport(DomainModel):

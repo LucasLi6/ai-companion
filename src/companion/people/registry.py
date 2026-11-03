@@ -7,16 +7,22 @@ used as a privacy access rule. Access is governed solely by the explicit
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from companion.domain.enums import PersonRole, RegistrationStatus
 from companion.domain.models import Consent, Person, new_id, utcnow
 from companion.storage.repositories import PersonRepository
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from companion.storage.repositories import AuditRepository
+
 
 class PersonRegistry:
-    def __init__(self, repo: PersonRepository) -> None:
+    def __init__(
+        self, repo: PersonRepository, *, audit: Optional["AuditRepository"] = None
+    ) -> None:
         self.repo = repo
+        self.audit = audit
 
     async def register(
         self,
@@ -46,6 +52,14 @@ class PersonRegistry:
             updated_at=now,
         )
         await self.repo.register(person, consent)
+        if self.audit is not None:
+            await self.audit.record(
+                actor="app",
+                action="register",
+                entity_type="person",
+                entity_id=pid,
+                detail=f"role={person.role.value} learning={int(allow_memory_learning)}",
+            )
         return person
 
     async def get(self, person_id: str) -> Optional[Person]:
@@ -56,12 +70,32 @@ class PersonRegistry:
 
     async def set_consent(self, consent: Consent) -> None:
         await self.repo.set_consent(consent)
+        if self.audit is not None:
+            await self.audit.record(
+                actor="app",
+                action="set_consent",
+                entity_type="person",
+                entity_id=consent.person_id,
+                detail=(
+                    f"processing={int(consent.allow_processing)}"
+                    f" persistence={int(consent.allow_persistence)}"
+                    f" learning={int(consent.allow_memory_learning)}"
+                ),
+            )
 
     async def set_status(
         self, person_id: str, status: RegistrationStatus
     ) -> None:
         """Suspend or revoke a person; this never deletes existing data."""
         await self.repo.set_registration_status(person_id, status)
+        if self.audit is not None:
+            await self.audit.record(
+                actor="app",
+                action="set_status",
+                entity_type="person",
+                entity_id=person_id,
+                detail=f"status={status.value}",
+            )
 
     async def list(self) -> list[Person]:
         return await self.repo.list()
@@ -78,3 +112,17 @@ class PersonRegistry:
             return False
         consent = await self.repo.get_consent(person_id)
         return consent is not None and consent.allow_processing
+
+    async def is_learning_authorized(self, person_id: str | None) -> bool:
+        """Return True only for an ACTIVE person who currently allows learning.
+
+        Used by the unified memory service to gate writing personal records
+        about a person (subject privacy).
+        """
+        if person_id is None:
+            return False
+        person = await self.repo.get(person_id)
+        if person is None or person.registration_status != RegistrationStatus.ACTIVE:
+            return False
+        consent = await self.repo.get_consent(person_id)
+        return consent is not None and consent.allow_memory_learning

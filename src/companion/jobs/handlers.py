@@ -1,13 +1,12 @@
 """Job handlers.
 
 V0.0 ships exactly one handler, ``memory_consolidation``. It validates the
-source event and its candidate associations, re-checks the subject's *current*
-authorisation (a person whose learning consent was revoked, or who was
-suspended/revoked, must not have new long-term facts produced from an already
-queued job), then marks the remaining candidates as consolidated. It does
-**not** promote candidates into long-term facts — that is the V0.2
-memory-learning milestone. The handler is idempotent: re-running it never
-duplicates side effects.
+source event and its candidate associations, re-checks the *current*
+authorisation of both the speaker (source of the statement) and the subject
+(the person described) before consolidating, and refuses to turn a third-party
+statement into a confirmed fact about its subject. It does **not** promote
+candidates into long-term facts — that is the V0.2 memory-learning milestone.
+The handler is idempotent: re-running it never duplicates side effects.
 """
 
 from __future__ import annotations
@@ -59,23 +58,42 @@ async def memory_consolidation(
                     f" {cand.subject_person_id}"
                 )
 
+    # The speaker is the *source* of the statement; the subject is the person
+    # the statement is about. Both must currently authorise learning, and a
+    # third-party statement (speaker != subject) must never auto-become a
+    # confirmed fact about its subject.
+    speaker_id = event.speaker_person_id
+    source_authorized = await _learning_authorized(repos, speaker_id)
+
     for cand in candidates:
-        subject_id = cand.subject_person_id or event.speaker_person_id
-        if await _learning_authorized(repos, subject_id):
+        subject_id = cand.subject_person_id or speaker_id
+        subject_authorized = await _learning_authorized(repos, subject_id)
+
+        if source_authorized and subject_authorized and speaker_id == subject_id:
             await repos.analysis.update_candidate_status(
                 cand.candidate_id, MemoryCandidateStatus.CONSOLIDATED
             )
+            continue
+
+        if not source_authorized:
+            reason = "source_authorization_revoked"
+        elif not subject_authorized:
+            reason = "subject_privacy_denied"
         else:
-            # Consent was revoked / person suspended after the job was queued:
-            # do not learn, and don't leave the candidate PENDING forever.
-            await repos.analysis.update_candidate_status(
-                cand.candidate_id, MemoryCandidateStatus.SKIPPED
-            )
-            logger.warning(
-                "memory_candidate_skipped_unauthorized candidate_id=%s subject_person_id=%s",
-                cand.candidate_id,
-                subject_id,
-            )
+            # speaker != subject: a third-party report, not a self-reported fact.
+            reason = "third_party_report_not_confirmed"
+
+        await repos.analysis.update_candidate_status(
+            cand.candidate_id, MemoryCandidateStatus.SKIPPED
+        )
+        logger.warning(
+            "memory_candidate_skipped candidate_id=%s speaker_person_id=%s"
+            " subject_person_id=%s reason=%s",
+            cand.candidate_id,
+            speaker_id,
+            subject_id,
+            reason,
+        )
 
     logger.info(
         "memory_consolidation_done event_id=%s candidates=%d",

@@ -18,13 +18,28 @@ import tempfile
 from pathlib import Path
 
 from companion.config import Config, configure_logging, default_db_path
-from companion.domain.enums import AddresseeHint, EventSource
+from companion.domain.enums import (
+    AddresseeHint,
+    EventSource,
+    MemoryKind,
+    MemoryStatus,
+    MemoryVisibility,
+)
 from companion.domain.models import make_utterance_event
+from companion.memory.models import (
+    AccessContext,
+    MemoryNotFoundError,
+    MemoryPermissionDeniedError,
+    MemoryVersionConflictError,
+)
 from companion.recovery import RecoveryError, RecoveryManager
 from companion.runtime import build_runtime
 from companion.storage.database import Database
 
 DEFAULT_CONVERSATION = "default"
+
+# Memory-management commands act as the trusted local admin, not as a person.
+ADMIN = AccessContext("admin", is_admin=True, role="cli")
 
 
 def _common_parser() -> argparse.ArgumentParser:
@@ -95,6 +110,66 @@ def build_parser() -> argparse.ArgumentParser:
     p_jr.add_argument("job_id")
     p_jr.set_defaults(func=cmd_jobs_retry)
 
+    p_memory = sub.add_parser("memory", parents=[_common_parser()], help="Manage the unified memory store")
+    p_mem_sub = p_memory.add_subparsers(dest="memory_command")
+    p_ma = p_mem_sub.add_parser("add", parents=[_common_parser()], help="Create a memory")
+    p_ma.add_argument("--kind", choices=[k.value for k in MemoryKind], default="PERSONAL_FACT")
+    p_ma.add_argument("--content", required=True)
+    p_ma.add_argument("--status", choices=[s.value for s in MemoryStatus], default="ACTIVE")
+    p_ma.add_argument("--visibility", choices=[v.value for v in MemoryVisibility], default="PRIVATE")
+    p_ma.add_argument("--human-confirmed", action="store_true", default=False)
+    p_ma.add_argument("--subject", action="append", default=None, metavar="TYPE:id",
+                      help="Associate a subject (repeatable), e.g. PERSON:person_123")
+    p_ma.set_defaults(func=cmd_memory_add)
+    p_ms = p_mem_sub.add_parser("search", parents=[_common_parser()], help="Search memories")
+    p_ms.add_argument("--query", default=None)
+    p_ms.add_argument("--kind", choices=[k.value for k in MemoryKind], default=None)
+    p_ms.add_argument("--status", choices=[s.value for s in MemoryStatus], default=None)
+    p_ms.add_argument("--include-retracted", action="store_true", default=False)
+    p_ms.add_argument("--limit", type=int, default=50)
+    p_ms.set_defaults(func=cmd_memory_search)
+    p_mv = p_mem_sub.add_parser("show", parents=[_common_parser()], help="Show one memory in full")
+    p_mv.add_argument("memory_id")
+    p_mv.set_defaults(func=cmd_memory_show)
+    p_mc = p_mem_sub.add_parser("confirm", parents=[_common_parser()], help="Human-confirm a candidate memory")
+    p_mc.add_argument("memory_id")
+    p_mc.set_defaults(func=cmd_memory_confirm)
+    p_mr = p_mem_sub.add_parser("retract", parents=[_common_parser()], help="Retract a memory (kept, excluded from search)")
+    p_mr.add_argument("memory_id")
+    p_mr.set_defaults(func=cmd_memory_retract)
+    p_md = p_mem_sub.add_parser("delete", parents=[_common_parser()], help="Permanently delete a memory")
+    p_md.add_argument("memory_id")
+    p_md.set_defaults(func=cmd_memory_delete)
+    p_ml = p_mem_sub.add_parser("link", parents=[_common_parser()], help="Link two memories")
+    p_ml.add_argument("memory_id")
+    p_ml.add_argument("other_id")
+    p_ml.add_argument("--type", default="related_to")
+    p_ml.set_defaults(func=cmd_memory_link)
+
+    p_ui = sub.add_parser("ui", parents=[_common_parser()], help="Start the management web UI (NiceGUI)")
+    p_ui.add_argument("--host", default="127.0.0.1")
+    p_ui.add_argument("--port", type=int, default=8080)
+    p_ui.set_defaults(func=cmd_ui)
+
+    p_research = sub.add_parser("research", parents=[_common_parser()], help="Manage idle research tasks")
+    p_res_sub = p_research.add_subparsers(dest="research_command")
+    p_rl = p_res_sub.add_parser("list", parents=[_common_parser()], help="List research tasks")
+    p_rl.add_argument("--status", choices=["PENDING", "RUNNING", "COMPLETED", "FAILED"], default=None)
+    p_rl.set_defaults(func=cmd_research_list)
+    p_rq = p_res_sub.add_parser("queue", parents=[_common_parser()], help="Queue a research question")
+    p_rq.add_argument("--question", required=True)
+    p_rq.add_argument("--priority", type=int, default=0)
+    p_rq.add_argument("--source-kind", choices=["curiosity", "manual", "reflection"], default="manual")
+    p_rq.set_defaults(func=cmd_research_queue)
+    p_rr = p_res_sub.add_parser("run", parents=[_common_parser()], help="Execute pending research tasks")
+    p_rr.add_argument("--limit", type=int, default=3)
+    p_rr.set_defaults(func=cmd_research_run)
+
+    p_idle = sub.add_parser("idle", parents=[_common_parser()], help="Run idle cognitive learning")
+    p_idle_sub = p_idle.add_subparsers(dest="idle_command")
+    p_ir = p_idle_sub.add_parser("run", parents=[_common_parser()], help="Run one idle cycle")
+    p_ir.set_defaults(func=cmd_idle_run)
+
     sub.add_parser("demo", parents=[_common_parser()], help="Run a scripted demo on an isolated database").set_defaults(
         func=cmd_demo
     )
@@ -125,6 +200,9 @@ def main(argv=None) -> int:
     if not getattr(args, "func", None):
         parser.print_help()
         return 0
+    # The UI server owns its own event loop; run it synchronously.
+    if args.command == "ui":
+        return args.func(args)
     return asyncio.run(args.func(args))
 
 
@@ -338,13 +416,246 @@ async def cmd_jobs_retry(args) -> int:
     db = await _connect(args.db)
     try:
         rt = build_runtime(db)
+        existing = await rt.repos.job.get(args.job_id)
+        if existing is None:
+            print(f"job not found: {args.job_id}")
+            return 1
         ok = await rt.repos.job.retry(args.job_id)
         if not ok:
-            print(f"job not found: {args.job_id}")
+            print(
+                f"job {args.job_id} status={existing.status.value} is not retryable"
+                " (only FAILED jobs can be retried)"
+            )
             return 1
         await rt.worker.run_once()
         j = await rt.repos.job.get(args.job_id)
         print(f"job {j.job_id} status={j.status.value}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_memory_add(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        subjects = []
+        for spec in args.subject or []:
+            if ":" in spec:
+                subject_type, subject_id = spec.split(":", 1)
+            else:
+                subject_type, subject_id = "PERSON", spec
+            subjects.append((subject_type, subject_id))
+        item = await rt.memory_service.create(
+            kind=args.kind,
+            content=args.content,
+            access=ADMIN,
+            status=args.status,
+            visibility=args.visibility,
+            human_confirmed=args.human_confirmed,
+            subjects=subjects,
+        )
+        print(item.memory_id)
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_memory_search(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        results = await rt.memory_service.search(
+            access=ADMIN,
+            query=args.query,
+            kinds=[args.kind] if args.kind else None,
+            statuses=[args.status] if args.status else None,
+            include_retracted=args.include_retracted,
+            limit=args.limit,
+        )
+        for r in results:
+            print(
+                f"{r['memory_id']}  {r['kind']}  {r['status']}  {r['visibility']}"
+                f"  {r['content'][:60]}"
+            )
+        if not results:
+            print("no memories match")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_memory_show(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        view = await rt.memory_service.get_view(args.memory_id, ADMIN)
+        if view is None:
+            print(f"memory not found: {args.memory_id}")
+            return 1
+        item = view["item"]
+        print(f"memory_id: {item['memory_id']}")
+        print(f"kind: {item['kind']}")
+        print(f"status: {item['status']}")
+        print(f"visibility: {item['visibility']}")
+        print(f"version: {item['version']}")
+        print(f"created_by: {item['created_by']}")
+        print(f"human_confirmed: {item['human_confirmed']}")
+        print(f"source_supported: {item['source_supported']}")
+        print(f"self_reported: {item['self_reported']}")
+        print(f"third_party_reported: {item['third_party_reported']}")
+        print(f"model_inferred: {item['model_inferred']}")
+        print(f"content: {item['content']}")
+        for s in view["subjects"]:
+            print(f"subject: {s['subject_type']}:{s['subject_id']}")
+        for s in view["sources"]:
+            print(f"source: {s['source_id']} type={s['source_type']} title={s['title']}")
+        for l in view["links"]:
+            print(f"link: {l['memory_id']} -> {l['linked_memory_id']} ({l['link_type']})")
+        for r in view["revisions"]:
+            print(f"revision: v{r['version']} {r['status']} by={r['changed_by']} {r['reason'] or ''}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def _memory_action(args, action: str) -> int:
+    """Shared driver for confirm / retract / delete, mapping errors to messages."""
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        try:
+            if action == "confirm":
+                await rt.memory_service.confirm(args.memory_id, access=ADMIN)
+            elif action == "retract":
+                await rt.memory_service.retract(args.memory_id, access=ADMIN)
+            else:  # delete
+                await rt.memory_service.delete(args.memory_id, access=ADMIN)
+        except MemoryNotFoundError:
+            print(f"memory not found: {args.memory_id}")
+            return 1
+        except MemoryPermissionDeniedError as exc:
+            print(f"permission denied: {exc}")
+            return 1
+        except MemoryVersionConflictError as exc:
+            print(f"version conflict: {exc}")
+            return 1
+        print(f"{action} {args.memory_id}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_memory_confirm(args) -> int:
+    return await _memory_action(args, "confirm")
+
+
+async def cmd_memory_retract(args) -> int:
+    return await _memory_action(args, "retract")
+
+
+async def cmd_memory_delete(args) -> int:
+    return await _memory_action(args, "delete")
+
+
+async def cmd_memory_link(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        try:
+            await rt.memory_service.link(args.memory_id, args.other_id, args.type, ADMIN)
+        except MemoryNotFoundError:
+            print(f"memory not found: {args.memory_id} or {args.other_id}")
+            return 1
+        except MemoryPermissionDeniedError as exc:
+            print(f"permission denied: {exc}")
+            return 1
+        print(f"linked {args.memory_id} -> {args.other_id} ({args.type})")
+    finally:
+        await db.close()
+    return 0
+
+
+def cmd_ui(args) -> int:
+    """Start the management UI.
+
+    NiceGUI owns its own event loop, so this runs synchronously (the ``ui``
+    command is dispatched without ``asyncio.run`` in :func:`main`).
+    """
+    from companion.ui.app import serve
+
+    args.db.parent.mkdir(parents=True, exist_ok=True)
+    serve(args.db, host=args.host, port=args.port)
+    return 0
+
+
+async def _build_idle_scheduler(rt):
+    """Build the idle scheduler with a settings-aware (mock-first) web search."""
+    from companion.idle import build_idle_scheduler
+    from companion.providers.websearch import make_web_search
+
+    web_search = await make_web_search(rt.repos.settings)
+    return build_idle_scheduler(rt, web_search=web_search)
+
+
+async def cmd_idle_run(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        scheduler = await _build_idle_scheduler(rt)
+        result = await scheduler.run_cycle()
+        if result["skipped"]:
+            print("idle learning is disabled (set idle.enabled=true to enable)")
+        else:
+            print(
+                f"reflections={result['reflections']} questions={result['questions']}"
+                f" research={result['research']}"
+            )
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_research_list(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        tasks = await rt.repos.research.list(status=args.status)
+        for t in tasks:
+            print(
+                f"{t['task_id']}  {t['status']}  p={t['priority']}"
+                f"  {t['source_kind']}  {t['question']}"
+            )
+        if not tasks:
+            print("no research tasks")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_research_queue(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        task_id = await rt.repos.research.create(
+            args.question, source_kind=args.source_kind, priority=args.priority
+        )
+        print(task_id)
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_research_run(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        scheduler = await _build_idle_scheduler(rt)
+        tasks = await scheduler.research.run_all(limit=args.limit)
+        for t in tasks:
+            print(f"{t['task_id']}  {t['status']}  {t['question']}")
+        if not tasks:
+            print("no pending research tasks")
     finally:
         await db.close()
     return 0

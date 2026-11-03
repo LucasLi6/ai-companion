@@ -49,7 +49,9 @@ async def test_running_job_recovered_after_crash(tmp_path, register, say, rt):
     p = await register("Speaker")
     report = await say(p.person_id, "agent", "hello")
     job = await rt.repos.job.get_by_key(f"memory:{report.event_id}")
-    await rt.repos.job.claim(job.job_id)  # worker "crashed" mid-processing
+    # Worker "crashed" mid-processing with no lease (an older build), or its
+    # lease has since lapsed — either way it is reclaimable.
+    await rt.repos.job.claim(job.job_id, "dead-worker", lease_seconds=0)
 
     path = rt.db.path
     await rt.db.close()

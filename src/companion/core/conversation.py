@@ -29,6 +29,21 @@ class ConversationManager:
         )
         return context
 
+    async def get_recent_context(
+        self,
+        conversation_id: str,
+        exclude_event_id: str | None,
+        limit: int | None = None,
+    ):
+        """Return recent utterances for a conversation, excluding the current one.
+
+        The current event is already persisted before context is built, so it
+        must never be re-included as "history" for the same input.
+        """
+        return await self.utterance_repo.recent_context(
+            conversation_id, exclude_event_id, limit or self.recent_limit
+        )
+
     async def set_quiet_mode(self, conversation_id: str, enabled: bool) -> bool:
         await self.repo.set_quiet_mode(conversation_id, enabled)
         return enabled

@@ -16,6 +16,8 @@ from companion.core.orchestrator import Orchestrator
 from companion.core.policy import Policy
 from companion.jobs.handlers import memory_consolidation
 from companion.jobs.worker import JobWorker
+from companion.memory.repository import MemoryRepository
+from companion.memory.service import MemoryService
 from companion.memory.store import SqliteMemoryStore
 from companion.people.registry import PersonRegistry
 from companion.providers.mock import MockCognitiveProvider, MockResponseProvider
@@ -33,6 +35,7 @@ class Runtime:
     cognitive: MockCognitiveProvider
     response: MockResponseProvider
     memory: SqliteMemoryStore
+    memory_service: MemoryService
     worker: Optional[JobWorker]
     orchestrator: Orchestrator
 
@@ -50,10 +53,16 @@ def build_runtime(
     ``cognitive``/``response`` let tests inject failing or custom providers.
     """
     repos = make_repositories(db)
-    registry = PersonRegistry(repos.person)
+    registry = PersonRegistry(repos.person, audit=repos.audit)
     conversations = ConversationManager(repos.conversation, repos.utterance)
     policy = Policy()
-    memory = SqliteMemoryStore(repos.memory_fact)
+    memory_repo = MemoryRepository(db)
+    memory_service = MemoryService(
+        memory_repo,
+        authorize_subject=registry.is_learning_authorized,
+        audit=repos.audit,
+    )
+    memory = SqliteMemoryStore(memory_service)
     cognitive = cognitive or MockCognitiveProvider()
     response = response or MockResponseProvider()
 
@@ -82,6 +91,7 @@ def build_runtime(
         cognitive=cognitive,
         response=response,
         memory=memory,
+        memory_service=memory_service,
         worker=worker,
         orchestrator=orchestrator,
     )

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import Awaitable, Callable, Optional
 
 from companion.domain.enums import JobType
@@ -29,12 +30,19 @@ class JobWorker:
         handlers: dict[str, Handler],
         logger: Optional[logging.Logger] = None,
         poll_interval: float = 0.5,
+        lease_seconds: int = 300,
+        owner_id: Optional[str] = None,
     ) -> None:
         self.repos = repos
         self.job_repo: JobRepository = repos.job
         self.handlers = handlers
         self.logger = logger or logging.getLogger("companion.jobs")
         self.poll_interval = poll_interval
+        self.lease_seconds = lease_seconds
+        # Each worker instance has a stable owner id. A claim records it, and a
+        # lease guards against another worker (or a restarted process) stealing
+        # an in-flight job while this one is still alive.
+        self.owner_id = owner_id or f"worker-{uuid.uuid4().hex[:12]}"
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
@@ -66,7 +74,9 @@ class JobWorker:
         return total
 
     async def _process(self, job) -> None:
-        claimed = await self.job_repo.claim(job.job_id)
+        claimed = await self.job_repo.claim(
+            job.job_id, self.owner_id, self.lease_seconds
+        )
         if not claimed:
             # Another worker claimed it first (or attempts exhausted).
             return

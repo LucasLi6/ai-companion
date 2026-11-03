@@ -65,11 +65,25 @@ class _ReentrantAsyncLock:
         return False
 
 
+def _statements(sql: str) -> list[str]:
+    """Split a migration script into individual SQL statements.
+
+    Full-line ``--`` comments and blank lines are dropped, then the remainder
+    is split on ``;``. This is deliberately simple: migrations must not contain
+    ``PRAGMA`` statements, string literals with embedded semicolons, or
+    ``BEGIN … END`` trigger bodies (none of the shipped migrations do).
+    """
+    lines = [line for line in sql.splitlines() if not line.strip().startswith("--")]
+    body = "\n".join(lines)
+    return [part.strip() for part in body.split(";") if part.strip()]
+
+
 class Database:
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         self._conn: aiosqlite.Connection | None = None
         self._lock = _ReentrantAsyncLock()
+        self._tx_depth = 0
 
     async def connect(self) -> "Database":
         self._conn = await aiosqlite.connect(self.path, isolation_level=None)
@@ -130,11 +144,20 @@ class Database:
 
         for version, sql in MIGRATIONS:
             if version > applied:
-                await self.conn.executescript(sql)
-                await self.conn.execute(
-                    "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
-                    (version, utcnow().isoformat()),
-                )
+                # Each migration is atomic: every one of its statements and its
+                # schema-version stamp commit together or not at all. SQLite
+                # DDL is transactional, so a mid-migration error rolls back the
+                # partial DDL *and* leaves the version unchanged. This replaces
+                # the old ``executescript`` approach, which committed outside a
+                # transaction and could leave half-applied DDL without a
+                # matching version record.
+                async with self.transaction():
+                    for statement in _statements(sql):
+                        await self.conn.execute(statement)
+                    await self.conn.execute(
+                        "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+                        (version, utcnow().isoformat()),
+                    )
 
     async def execute(self, sql: str, params: tuple = ()) -> aiosqlite.Cursor:
         async with self._lock:
@@ -143,6 +166,18 @@ class Database:
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
         async with self._lock:
+            if self._tx_depth > 0:
+                # Already inside a transaction on this connection (the lock is
+                # re-entrant per task). A nested transaction is a no-op: the
+                # *outermost* block owns BEGIN/COMMIT/ROLLBACK, so any inner
+                # failure rolls the whole thing back atomically.
+                self._tx_depth += 1
+                try:
+                    yield self.conn
+                finally:
+                    self._tx_depth -= 1
+                return
+            self._tx_depth = 1
             conn = self.conn
             await conn.execute("BEGIN")
             try:
@@ -151,3 +186,5 @@ class Database:
             except BaseException:
                 await conn.execute("ROLLBACK")
                 raise
+            finally:
+                self._tx_depth = 0

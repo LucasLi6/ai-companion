@@ -87,6 +87,67 @@ class JobStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class MemoryKind(str, Enum):
+    """The unified memory taxonomy.
+
+    ``WORLD_KNOWLEDGE`` (externally-sourced facts) is distinct from
+    ``PERSONAL_FACT`` (facts about a person), and ``REFLECTION`` / ``HYPOTHESIS``
+    are never treated as verified facts.
+    """
+
+    PERSONAL_FACT = "PERSONAL_FACT"
+    EPISODE = "EPISODE"
+    RELATIONSHIP = "RELATIONSHIP"
+    PROJECT_STATE = "PROJECT_STATE"
+    WORLD_KNOWLEDGE = "WORLD_KNOWLEDGE"
+    REFLECTION = "REFLECTION"
+    HYPOTHESIS = "HYPOTHESIS"
+
+
+class MemoryStatus(str, Enum):
+    """Lifecycle/trust state of a memory item.
+
+    ``ACTIVE`` means "currently used", *not* "absolutely correct".
+    """
+
+    CANDIDATE = "CANDIDATE"
+    ACTIVE = "ACTIVE"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+    CONFLICTED = "CONFLICTED"
+    RETRACTED = "RETRACTED"
+    OUTDATED = "OUTDATED"
+
+
+class MemoryVisibility(str, Enum):
+    PRIVATE = "PRIVATE"
+    SHARED = "SHARED"
+    PUBLIC = "PUBLIC"
+
+
+class SubjectType(str, Enum):
+    PERSON = "PERSON"
+    PROJECT = "PROJECT"
+    ENTITY = "ENTITY"
+
+
+class VerificationLevel(str, Enum):
+    """Evidence-based verification, *not* a model's self-reported confidence."""
+
+    UNVERIFIED = "UNVERIFIED"
+    SINGLE_SOURCE = "SINGLE_SOURCE"
+    SUPPORTED = "SUPPORTED"
+    CONFLICTED = "CONFLICTED"
+    OUTDATED = "OUTDATED"
+
+
+class MemorySourceType(str, Enum):
+    UTTERANCE = "utterance"
+    WEB = "web"
+    MANUAL = "manual"
+    REFLECTION = "reflection"
+    RESEARCH = "research"
+
+
 class ReportStatus(str, Enum):
     """Top-level result of ``Orchestrator.process_utterance``."""
 
