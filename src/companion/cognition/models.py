@@ -48,3 +48,12 @@ class CognitiveContext(BaseModel):
     # trusted application data (the provider never fills them) so the response
     # can acknowledge only what was actually committed.
     memory_write_outcomes: list[dict] = Field(default_factory=list)
+    # Trusted, locally computed emotional state for this turn (valence, arousal,
+    # intensity, categorical label). Optional: present only when the emotion
+    # framework is wired in. It is the companion's own simulated affect, never
+    # an assertion about a human's real feelings.
+    emotion_state: Optional[dict] = Field(default=None)
+    # Provider-neutral delivery plan (delivery instruction, speaking rate, voice
+    # profile) shaping *how* a reply is spoken. It never changes *whether* a
+    # reply is sent, and it never authorises anything.
+    speech_plan: Optional[dict] = Field(default=None)

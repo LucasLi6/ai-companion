@@ -158,6 +158,22 @@ python -m companion relationship history person_xxx
 python -m companion goal add "设计底盘" --next "画图"
 python -m companion goal list
 python -m companion goal ready
+
+# 11. Hybrid vector retrieval (V0.3) — offline fake provider, or the real
+#     `intfloat/multilingual-e5-small` model when `pip install -e '.[embedding]'`
+#     ACTIVE memory writes queue indexing automatically; `backfill` repairs gaps.
+python -m companion memory index status
+python -m companion memory index backfill --fake-provider
+python -m companion memory index rebuild --fake-provider
+python -m companion memory search --query "机器学习" --mode hybrid --fake-provider
+
+# 12. Companion emotion framework (V0.3) — the agent's own simulated affect
+python -m companion emotion show
+python -m companion emotion inspect --person person_xxx
+python -m companion emotion rules list
+python -m companion emotion config show
+python -m companion emotion config set baseline_valence 0.2
+python -m companion emotion simulate --person person_xxx --elapsed-seconds 3600
 ```
 
 `python -m companion --help` (or any subcommand `--help`) lists every option.
@@ -400,12 +416,19 @@ Each durable stage leaves a database record, so a failed/partial event is
 - `providers/` — mock providers, DeepSeek client, cognitive and response providers.
 - `prompts/` — versioned cognitive/response prompt builders.
 - `memory/` — `MemoryStore` (keyword/CJK + deterministic identity retrieval),
-  `MemoryService` (the policy-enforcing gateway), candidate preparation and
-  durable write-through/consolidation.
-- `jobs/` — durable `JobWorker` + `MEMORY_CONSOLIDATION` handler.
+  `MemoryService` (the policy-enforcing gateway), candidate preparation,
+  durable write-through/consolidation, and the V0.3 embedding/hybrid layer
+  (`embeddings`, `embedding_repository`, `embedding_service`, `vector_index`,
+  `hybrid_retriever`).
+- `emotion/` — the V0.3 persistent emotion framework (profile, appraisal rules,
+  decaying state, emotion-aware speech planning).
+- `jobs/` — durable `JobWorker` + `MEMORY_CONSOLIDATION` and `EMBEDDING` handlers.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
-[docs/DATA_MODEL.md](docs/DATA_MODEL.md) for the data model.
+[docs/DATA_MODEL.md](docs/DATA_MODEL.md) for the data model. V0.3 hybrid vector
+retrieval and the emotion framework are documented in
+[docs/V03_VECTOR_AND_EMOTION.md](docs/V03_VECTOR_AND_EMOTION.md) with the
+implementation report in [docs/V03_REPORT.md](docs/V03_REPORT.md).
 
 ## Known limitations
 
@@ -414,9 +437,15 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
   [docs/CMF_SECURITY.md](docs/CMF_SECURITY.md),
   [docs/CMF_PORTABILITY.md](docs/CMF_PORTABILITY.md) and
   [docs/CMF_MIGRATION_PLAN.md](docs/CMF_MIGRATION_PLAN.md)). The media model
-  (`media_assets`/`media_annotations`/`media_links`) and semantic embeddings
-  (`embedding_models`/`memory_embeddings`/`embedding_index_metadata`/
-  `retrieval_feedback`) are reserved in the schema but not built.
+  (`media_assets`/`media_annotations`/`media_links`) is reserved in the schema
+  but not built.
+- **Hybrid vector retrieval is opt-in and offline by default.** The vector
+  index (`embedding_models`/`memory_embeddings`/`embedding_index_metadata`)
+  lives in the same SQLite file with a pure-Python fallback; a real semantic
+  model requires the optional `[embedding]` extra
+  (`intfloat/multilingual-e5-small`, downloaded once on first use). CI and the
+  default suite use a deterministic *fake* provider that is **not** semantic —
+  it only exercises the retrieval plumbing.
 - **Real DeepSeek idle learning is not tested against the live API.** The
   opt-in `DeepSeekIdleProvider` is gated behind `idle.real_deepseek.enabled`
   and `--real-provider`; there is no silent fallback, but no real key/request
@@ -426,13 +455,23 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
   Real understanding requires `--provider deepseek`; it is never simulated.
 - **No autonomous semantic memory.** Memory *candidates* are consolidated by the
   trusted local layer (self-reports may become `ACTIVE`; uncertain and
-  third-party candidates stay `CANDIDATE`), but there is no vector search, no
-  semantic merging and no autonomous promotion of raw model output.
+  third-party candidates stay `CANDIDATE`), and there is no semantic merging or
+  autonomous promotion of raw model output. Hybrid vector retrieval (above)
+  ranks already-authorised memories by similarity — it never promotes a
+  candidate into a fact.
+- **Emotion is the agent's own simulated affect, not a claim about a human.**
+  The V0.3 emotion framework (profile, appraisal rules, decaying state,
+  emotion-aware reply tone) is fully deterministic and local; it never asserts
+  how a person really feels, and it can only shape *how* a reply is delivered —
+  never *whether* a reply is sent, never permission/privacy/silence.
 - **Conservative correction handling.** Only unambiguous same-attribute
   corrections update a current-state memory; anything else creates a review
   item rather than guessing.
-- **No speech.** CLI text input stands in for a future ASR-generated
-  `UtteranceEvent`; `RESPOND` output is text, not TTS.
+- **No speech (real TTS).** CLI text input stands in for a future
+  ASR-generated `UtteranceEvent`; `RESPOND` output is text. The emotion layer
+  produces a provider-neutral `SpeechStylePlan` (delivery instruction, speaking
+  rate, voice profile id) as a future Qwen-TTS adapter contract, but no real
+  TTS call is made.
 - **No speaker recognition.** The caller supplies `speaker_person_id`
   explicitly; there is no voiceprint or diarization.
 - **Single-process.** One ordered consumer per conversation, with a
@@ -445,10 +484,11 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full flow and
 
 V0.2A durable memory write-through, the structured reply policy and CMF 1.0
 (the portable single-file memory format with the Agent Core, relationships,
-durable research/learning state and goals) are implemented. Still
-deliberately out of scope: ASR/TTS and voiceprints, a live real-DeepSeek idle
-cycle, autonomous web research, the semantic vector index, automatic semantic
-merging, the full media system, the Memory Board drag-and-drop UI, and a React
-UI. A likely V0.2B focus is real-model acceptance testing, a manual
-review/approval workflow for `NEEDS_REVIEW` items, and richer assignment
-management in the existing manager UI.
+durable research/learning state and goals) are implemented, and V0.3 adds
+hybrid vector retrieval and the persistent emotion framework. Still
+deliberately out of scope: real ASR/TTS and voiceprints, a live real-DeepSeek
+idle cycle, autonomous web research, automatic semantic merging, the full media
+system, the Memory Board drag-and-drop UI, and a React UI. A likely next focus
+is real-model acceptance testing for embeddings, a manual review/approval
+workflow for `NEEDS_REVIEW` items, and richer assignment management in the
+existing manager UI.

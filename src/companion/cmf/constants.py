@@ -57,7 +57,15 @@ REQUIRED_TABLES = frozenset(
         "goals",
         "media_assets",
         "embedding_models",
+        "memory_embeddings",
+        "embedding_index_metadata",
         "retrieval_feedback",
+        "emotion_profiles",
+        "emotion_appraisal_rules",
+        "emotion_events",
+        "emotion_state_snapshots",
+        "emotion_feedback",
+        "voice_profiles",
     }
 )
 

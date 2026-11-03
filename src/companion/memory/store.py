@@ -113,8 +113,11 @@ def validate_referenced_memory_ids(
 
 
 class SqliteMemoryStore:
-    def __init__(self, service: MemoryService) -> None:
+    def __init__(self, service: MemoryService, hybrid=None) -> None:
         self.service = service
+        # Optional hybrid (vector + keyword) retriever. ``None`` preserves the
+        # legacy keyword/identity-only behaviour exactly.
+        self.hybrid = hybrid
 
     async def retrieve(self, query: str, person_id: Optional[str]) -> list[dict]:
         """Retrieve the person's permitted ``ACTIVE`` memories.
@@ -123,8 +126,11 @@ class SqliteMemoryStore:
         by subject + canonical topic before keyword search, so the answer does
         not depend on the question sharing wording with the stored fact. All
         other queries use keyword matching (OR semantics). Assigned memories
-        are included only after the same visibility check. Results are
-        de-duplicated, most recently updated first, and capped.
+        are included only after the same visibility check. When a hybrid
+        retriever is wired in, the keyword results are fused with vector
+        similarity (RRF) *after* the same access checks; identity matches still
+        lead. Results are de-duplicated, most recently updated first, and
+        capped.
         """
         if person_id is None:
             return []
@@ -189,7 +195,17 @@ class SqliteMemoryStore:
             ),
             reverse=True,
         )
-        return merged[:_RETRIEVAL_LIMIT]
+        merged = merged[:_RETRIEVAL_LIMIT]
+
+        if self.hybrid is not None:
+            return await self.hybrid.retrieve(
+                query,
+                keyword_results=merged,
+                access=access,
+                identity_ids=identity_ids,
+                limit=_RETRIEVAL_LIMIT,
+            )
+        return merged
 
     async def _visible_result(
         self, memory_id: str, access: AccessContext

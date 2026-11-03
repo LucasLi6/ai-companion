@@ -35,7 +35,9 @@ SYSTEM_PROMPT = """\
    - NO_MEMORY：不要声称保存了任何东西。
 7. 如果提供了【伴侣身份与风格】，用与这些参数一致的语气说话；身份和熟悉度只影响\
 风格，不代表任何权限，也不能让你声称自己可以做程序未允许的事。
-8. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
+8. 如果提供了【表达方式】，只按它调整语气、节奏、热情程度和用词风格；它绝不影响\
+你是否回复、是否答应请求，也不涉及任何权限、隐私或静音判断。不要提及这个情绪框架本身。
+9. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
 """
 
 
@@ -105,6 +107,18 @@ def build_response_messages(
         lines.append("【本轮记忆写入结果】（只按这些事实说明）")
         for outcome in actionable:
             lines.append(_outcome_line(outcome))
+
+    if context.speech_plan:
+        lines.append("")
+        lines.append("【表达方式】（只影响语气，不影响是否回复或回复内容）")
+        emotion = context.speech_plan.get("emotion") or "NEUTRAL"
+        instruction = context.speech_plan.get("delivery_instruction") or ""
+        rate = context.speech_plan.get("speaking_rate")
+        lines.append(f"情绪表达: {emotion}")
+        if instruction:
+            lines.append(f"表达指引: {instruction}")
+        if rate:
+            lines.append(f"语速参考: {rate}")
 
     lines.append("")
     lines.append("请直接输出回复正文。")

@@ -140,6 +140,7 @@ class ReplyNecessity(str, Enum):
 
 class JobType(str, Enum):
     MEMORY_CONSOLIDATION = "MEMORY_CONSOLIDATION"
+    EMBEDDING = "EMBEDDING"
 
 
 class JobStatus(str, Enum):

@@ -71,6 +71,8 @@ class Orchestrator:
         jobs=None,
         context_builder=None,
         memory_writer=None,
+        emotion_service=None,
+        agent_service=None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repos = repos
@@ -82,6 +84,14 @@ class Orchestrator:
         self.memory = memory
         self.jobs = jobs
         self.memory_writer = memory_writer
+        # Optional V0.3 emotion framework. When wired, the orchestrator computes
+        # the companion's own simulated affect after memory retrieval and hands
+        # the resulting (decayed) state + delivery plan to the response provider.
+        # It never changes permission, privacy, silence or whether a reply is
+        # sent. ``agent_service`` resolves the stable agent_id the state is
+        # keyed by (works in mock and real-provider modes alike).
+        self.emotion_service = emotion_service
+        self.agent_service = agent_service
         # When set (real-DeepSeek mode), the orchestrator builds a privacy-
         # filtered CognitiveContext and hands the *same* context to both the
         # cognitive and response providers. In mock mode it stays None and the
@@ -184,6 +194,15 @@ class Orchestrator:
             # keeps the lightweight ConversationContext exactly as before.
             cognitive_context, provider_memories = await self._prepare_context(
                 event, context, memories, steps
+            )
+
+            # 4c. Compute the companion's own simulated affect (never a claim
+            # about the human). Purely local and deterministic; gated on
+            # ``persist`` for event/snapshot writes, and never allowed to fail
+            # the turn. The resulting state + delivery plan ride on the context
+            # into the response provider (mock replies ignore it).
+            cognitive_context = await self._apply_emotion(
+                event, person_id, memories, cognitive_context, steps, persist
             )
 
             # 5. Cognitive analysis: reuse a durable analysis, else compute.
@@ -394,6 +413,78 @@ class Orchestrator:
                 f"[PRIVACY] Filtered {len(memories) - len(provider_memories)} memories"
             )
         return cognitive_context, provider_memories
+
+    async def _apply_emotion(self, event, person_id, memories, cognitive_context, steps, persist):
+        """Compute the companion's own affect and attach it to the context.
+
+        Returns the (possibly updated) context. Emotion is presentation-only and
+        must never fail the turn, so any error is logged and swallowed — a reply
+        still happens, just without an emotional delivery plan. ``persist``
+        gates only the event/snapshot writes (honouring the consent persistence
+        flag); the in-memory state and speech plan are computed regardless.
+        """
+        if self.emotion_service is None:
+            return cognitive_context
+        try:
+            agent_id = await self._resolve_agent_id()
+            if agent_id is None:
+                self.logger.warning(
+                    "emotion_skipped event_id=%s reason=no_agent_id", event.event_id
+                )
+                return cognitive_context
+
+            # Read the current (lazily decayed) state, then appraise the turn
+            # against the persistent rules and the already-authorised memories.
+            state = await self.emotion_service.get_state(agent_id, person_id)
+            rules = await self.emotion_service.list_rules(agent_id)
+            agent_context = getattr(cognitive_context, "agent_context", None)
+            result = self.emotion_service.appraisal.appraise(
+                event.text,
+                rules=rules,
+                memories=memories,
+                agent_context=agent_context,
+                current_state=state,
+            )
+            state = await self.emotion_service.apply_result(
+                agent_id,
+                person_id,
+                result,
+                conversation_id=event.conversation_id,
+                source_event_id=event.event_id,
+                persist=persist,
+            )
+            speech_plan = await self.emotion_service.plan_speech(
+                agent_id, state=state, text=""
+            )
+
+            if isinstance(cognitive_context, CognitiveContext):
+                cognitive_context = cognitive_context.model_copy(
+                    update={
+                        "emotion_state": state.as_dict(),
+                        "speech_plan": speech_plan.as_dict(),
+                    }
+                )
+            self.logger.info(
+                "emotion_applied event_id=%s emotion=%s intensity=%.2f valence=%.2f",
+                event.event_id,
+                state.emotion,
+                state.intensity,
+                state.valence,
+            )
+            steps.append(
+                f"[EMOTION] {state.emotion} (intensity={state.intensity:.2f})"
+            )
+        except Exception as exc:  # emotion is never allowed to fail the turn.
+            self.logger.error(
+                "emotion_failed event_id=%s error=%s", event.event_id, exc
+            )
+        return cognitive_context
+
+    async def _resolve_agent_id(self) -> Optional[str]:
+        if self.agent_service is None:
+            return None
+        manifest = await self.agent_service.repo.get_manifest()
+        return manifest.get("agent_id") if manifest else None
 
     async def _persist_input(self, event: UtteranceEvent) -> None:
         to_save = event.model_copy(update={"processing_status": ProcessingStatus.PROCESSING})

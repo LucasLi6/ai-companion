@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -931,6 +931,141 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         INSERT OR IGNORE INTO embedding_index_metadata(singleton, status, extra)
         VALUES (1, 'EMPTY', '{}');
+        """,
+    ),
+    # Version 10 (V0.3): hybrid vector retrieval. Extends the Schema-9
+    # embedding reservations (never rebuilds or drops them). All additions are
+    # NULL-able or DEFAULT-ed so any existing Schema-9 rows keep working; an
+    # existing vector row without provenance is conservatively marked
+    # UNVERIFIED so the backfill rebuilds it rather than trusting it.
+    (
+        10,
+        """
+        ALTER TABLE embedding_models ADD COLUMN model_revision TEXT;
+        ALTER TABLE embedding_models ADD COLUMN normalization TEXT NOT NULL DEFAULT 'l2';
+        ALTER TABLE embedding_models ADD COLUMN query_prefix TEXT;
+        ALTER TABLE embedding_models ADD COLUMN document_prefix TEXT;
+        ALTER TABLE embedding_models ADD COLUMN distance_metric TEXT NOT NULL DEFAULT 'cosine';
+        ALTER TABLE embedding_models ADD COLUMN max_input_tokens INTEGER;
+        ALTER TABLE embedding_models ADD COLUMN configuration_hash TEXT;
+
+        ALTER TABLE memory_embeddings ADD COLUMN memory_version INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE memory_embeddings ADD COLUMN content_hash TEXT;
+        ALTER TABLE memory_embeddings ADD COLUMN embedding_status TEXT NOT NULL DEFAULT 'UNVERIFIED';
+        ALTER TABLE memory_embeddings ADD COLUMN updated_at TEXT;
+        ALTER TABLE memory_embeddings ADD COLUMN last_error TEXT;
+
+        CREATE INDEX IF NOT EXISTS idx_memory_embeddings_status
+            ON memory_embeddings(embedding_status);
+        CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model_status
+            ON memory_embeddings(model_id, embedding_status);
+        CREATE INDEX IF NOT EXISTS idx_embedding_models_hash
+            ON embedding_models(configuration_hash);
+        """,
+    ),
+    # Version 11 (V0.3): persistent emotion framework. Stable personality,
+    # persistent appraisal rules, durable emotion events, temporary state
+    # snapshots, feedback/audit and provider-neutral voice profiles. Emotion
+    # state decays lazily; event memory and rules are never dropped by decay.
+    (
+        11,
+        """
+        CREATE TABLE IF NOT EXISTS emotion_profiles (
+            agent_id TEXT PRIMARY KEY,
+            baseline_valence REAL NOT NULL DEFAULT 0
+                CHECK (baseline_valence BETWEEN -1 AND 1),
+            baseline_arousal REAL NOT NULL DEFAULT 0
+                CHECK (baseline_arousal BETWEEN 0 AND 1),
+            default_half_life_seconds INTEGER NOT NULL DEFAULT 3600
+                CHECK (default_half_life_seconds > 0),
+            responsiveness REAL NOT NULL DEFAULT 0.5
+                CHECK (responsiveness BETWEEN 0 AND 1),
+            expression_style TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS emotion_appraisal_rules (
+            rule_id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            trigger_type TEXT NOT NULL,
+            pattern TEXT NOT NULL DEFAULT '{}',
+            emotion TEXT NOT NULL,
+            valence_delta REAL NOT NULL DEFAULT 0
+                CHECK (valence_delta BETWEEN -2 AND 2),
+            arousal_delta REAL NOT NULL DEFAULT 0
+                CHECK (arousal_delta BETWEEN -1 AND 1),
+            intensity REAL NOT NULL DEFAULT 0.5
+                CHECK (intensity BETWEEN 0 AND 1),
+            priority INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            source TEXT NOT NULL DEFAULT 'system',
+            evidence_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS emotion_events (
+            emotion_event_id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            conversation_id TEXT,
+            person_id TEXT,
+            source_event_id TEXT,
+            appraisal_rule_id TEXT,
+            memory_id TEXT,
+            emotion TEXT NOT NULL,
+            valence REAL NOT NULL,
+            arousal REAL NOT NULL,
+            intensity REAL NOT NULL,
+            appraisal_reason TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_emotion_events_source
+            ON emotion_events(source_event_id)
+            WHERE source_event_id IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS emotion_state_snapshots (
+            agent_id TEXT NOT NULL,
+            person_id TEXT NOT NULL,
+            valence REAL NOT NULL,
+            arousal REAL NOT NULL,
+            intensity REAL NOT NULL,
+            emotion TEXT NOT NULL,
+            half_life_seconds REAL NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (agent_id, person_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS emotion_feedback (
+            feedback_id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            person_id TEXT,
+            conversation_id TEXT,
+            source_event_id TEXT,
+            feedback_text TEXT NOT NULL,
+            suggestion_type TEXT,
+            suggestion_payload TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS voice_profiles (
+            voice_profile_id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'none',
+            voice_id TEXT,
+            language TEXT NOT NULL DEFAULT 'zh-CN',
+            speaking_rate REAL NOT NULL DEFAULT 1.0
+                CHECK (speaking_rate > 0),
+            pitch REAL,
+            extra TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """,
     ),
 ]

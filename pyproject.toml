@@ -31,6 +31,17 @@ web = [
 deepseek = [
     "openai>=1.40",
 ]
+# embedding: the real local semantic model (intfloat/multilingual-e5-small).
+#   Weights are downloaded once at runtime and never stored in the .memory file;
+#   the default install keeps using the keyword path and CI stays offline.
+# vec: optional sqlite-vec acceleration for the vector index. The pure-Python
+#   fallback means this is never required.
+embedding = [
+    "sentence-transformers>=2.7",
+]
+vec = [
+    "sqlite-vec>=0.1",
+]
 
 [project.scripts]
 companion = "companion.cli:main"

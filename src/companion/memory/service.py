@@ -49,6 +49,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 AuthorizeSubject = Callable[[str], Awaitable[bool]]
 PersonExists = Callable[[str], Awaitable[bool]]
+# (action, memory_id, version, status) — action is created/updated/confirmed/
+# retracted/deleted. status is the new status, or "DELETED" after a delete.
+MemoryChangeHook = Callable[[str, str, int, str], Awaitable[None]]
 
 
 class MemoryService:
@@ -59,13 +62,38 @@ class MemoryService:
         authorize_subject: Optional[AuthorizeSubject] = None,
         person_exists: Optional[PersonExists] = None,
         audit: Optional["AuditRepository"] = None,
+        on_change: Optional["MemoryChangeHook"] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repo = repo
         self.authorize_subject = authorize_subject
         self.person_exists = person_exists
         self.audit = audit
+        # Optional observer called after a memory write commits (used by the
+        # runtime to enqueue vector indexing). It can never fail the write.
+        self.on_change = on_change
         self.logger = logger or logging.getLogger("companion.memory")
+
+    async def _notify(
+        self, action: str, memory_id: str, version: int, status: str
+    ) -> None:
+        """Tell the observer about a committed write; swallow observer errors.
+
+        Indexing is a derived concern: a broken hook must never roll back or
+        raise out of a memory write. A missed notification is recoverable with
+        ``memory index backfill``.
+        """
+        if self.on_change is None:
+            return
+        try:
+            await self.on_change(action, memory_id, version, status)
+        except Exception as exc:  # never let a derived layer break memory writes
+            self.logger.warning(
+                "memory_change_hook_failed action=%s memory_id=%s error=%s",
+                action,
+                memory_id,
+                exc,
+            )
 
     async def _audit(
         self, access: AccessContext, action: str, entity_id: str, detail: str | None = None
@@ -161,6 +189,7 @@ class MemoryService:
         await self._audit(
             access, "create", item.memory_id, f"kind={kind.value} status={status.value}"
         )
+        await self._notify("created", item.memory_id, item.version, status.value)
         return item
 
     # -- read --------------------------------------------------------------
@@ -306,6 +335,9 @@ class MemoryService:
             access.actor_id,
         )
         await self._audit(access, "update", memory_id, f"version={new_item.version}")
+        await self._notify(
+            "updated", memory_id, new_item.version, new_item.status.value
+        )
         return new_item
 
     # -- human actions -----------------------------------------------------
@@ -344,6 +376,9 @@ class MemoryService:
                 self._snapshot(new_item),
             )
         await self._audit(access, "confirm", memory_id, "human_confirmed")
+        await self._notify(
+            "confirmed", memory_id, new_item.version, new_item.status.value
+        )
         return new_item
 
     async def retract(
@@ -381,6 +416,7 @@ class MemoryService:
             )
         self.logger.info("memory_retracted memory_id=%s by=%s", memory_id, access.actor_id)
         await self._audit(access, "retract", memory_id, reason)
+        await self._notify("retracted", memory_id, new_item.version, new_item.status.value)
         return new_item
 
     async def delete(self, memory_id: str, *, access: AccessContext) -> None:
@@ -398,6 +434,7 @@ class MemoryService:
         await self.repo.delete(memory_id)
         self.logger.info("memory_deleted memory_id=%s by=%s", memory_id, access.actor_id)
         await self._audit(access, "delete", memory_id)
+        await self._notify("deleted", memory_id, 0, "DELETED")
 
     # -- AI proposal -------------------------------------------------------
 

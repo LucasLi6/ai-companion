@@ -22,9 +22,16 @@ from companion.cognition.privacy import ForegroundPrivacyGateway
 from companion.core.conversation import ConversationManager
 from companion.core.orchestrator import Orchestrator
 from companion.core.policy import Policy
+from companion.domain.enums import JobType
+from companion.emotion.repository import EmotionRepository
+from companion.emotion.service import EmotionService
+from companion.jobs.embedding_handler import build_embedding_handler
 from companion.jobs.handlers import memory_consolidation
 from companion.jobs.worker import JobWorker
 from companion.memory.consolidation import MemoryWriter
+from companion.memory.embedding_repository import EmbeddingRepository
+from companion.memory.embedding_service import EmbeddingService
+from companion.memory.hybrid_retriever import HybridRetriever
 from companion.memory.service import MemoryService, build_memory_service
 from companion.memory.store import SqliteMemoryStore
 from companion.people.registry import PersonRegistry
@@ -59,6 +66,9 @@ class Runtime:
     provider: str = "mock"
     context_builder: Optional[ContextBuilder] = None
     privacy_gateway: Optional[ForegroundPrivacyGateway] = None
+    embedding_service: Optional[EmbeddingService] = None
+    emotion_service: Optional[EmotionService] = None
+    hybrid_retriever: Optional[HybridRetriever] = None
 
 
 def build_runtime(
@@ -72,6 +82,7 @@ def build_runtime(
     deepseek_client=None,
     deepseek_config=None,
     allow_mixed_providers: bool = False,
+    embedding_provider=None,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
 
@@ -91,9 +102,61 @@ def build_runtime(
     policy = Policy()
     memory_service = build_memory_service(repos)
     memory_writer = MemoryWriter(repos, memory_service, logger=logger)
-    memory = SqliteMemoryStore(memory_service)
+
+    # Optional hybrid vector retrieval. When no embedding provider is wired in
+    # (the default), retrieval stays keyword/identity-only and nothing here
+    # loads a model or makes a network call. A provider is explicit opt-in.
+    embedding_service: Optional[EmbeddingService] = None
+    hybrid_retriever = None
+    if embedding_provider is not None:
+        embedding_service = EmbeddingService(
+            EmbeddingRepository(db), embedding_provider, logger=logger
+        )
+
+        async def _load_visible(memory_id: str, access, _service=memory_service) -> dict | None:
+            item = await _service.get_item(memory_id, access)
+            if item is None:
+                return None
+            subjects = await _service.repo.get_subjects(memory_id)
+            sources = await _service.repo.get_sources(memory_id)
+            return SqliteMemoryStore._result(item, subjects, sources)
+
+        hybrid_retriever = HybridRetriever(
+            embedding_service, load_memory=_load_visible, logger=logger
+        )
+
+        async def _index_on_change(
+            action: str, memory_id: str, version: int, status: str,
+            _service=embedding_service,
+        ) -> None:
+            """Enqueue vector indexing after a memory write (automatic lifecycle).
+
+            Only ACTIVE memories are worth embedding; a retract/delete is
+            handled by retrieval (which requires ACTIVE) and by the embedding
+            table's cascade, so it enqueues nothing. The idempotency key keeps
+            repeated writes from creating duplicate work.
+            """
+            if status != "ACTIVE" or action == "deleted":
+                return
+            key = f"embed:{memory_id}:{_service.model_id}:{version}"
+            await repos.job.enqueue(
+                JobType.EMBEDDING,
+                key,
+                {"memory_id": memory_id, "memory_version": version},
+            )
+
+        memory_service.on_change = _index_on_change
+
+    memory = SqliteMemoryStore(memory_service, hybrid=hybrid_retriever)
     agent_service = AgentService(
         repos=repos, registry=registry, audit=repos.audit, logger=logger
+    )
+
+    # Persistent emotion framework (V0.3). Local and deterministic — no model,
+    # no network, no real TTS. It rides on the same SQLite file and is always
+    # built so emotion works identically in mock and real-provider modes.
+    emotion_service = EmotionService(
+        EmotionRepository(db), audit=repos.audit, logger=logger
     )
 
     context_builder: Optional[ContextBuilder] = None
@@ -130,6 +193,8 @@ def build_runtime(
     worker = None
     if with_worker:
         handlers = {"MEMORY_CONSOLIDATION": memory_consolidation}
+        if embedding_service is not None:
+            handlers["EMBEDDING"] = build_embedding_handler(embedding_service)
         worker = JobWorker(repos, handlers, logger=logger)
 
     orchestrator = Orchestrator(
@@ -143,6 +208,8 @@ def build_runtime(
         jobs=worker,
         context_builder=context_builder,
         memory_writer=memory_writer,
+        emotion_service=emotion_service,
+        agent_service=agent_service,
         logger=logger,
     )
     return Runtime(
@@ -161,4 +228,7 @@ def build_runtime(
         provider=provider,
         context_builder=context_builder,
         privacy_gateway=gateway,
+        embedding_service=embedding_service,
+        emotion_service=emotion_service,
+        hybrid_retriever=hybrid_retriever,
     )

@@ -188,6 +188,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_ms.add_argument("--status", choices=[s.value for s in MemoryStatus], default=None)
     p_ms.add_argument("--include-retracted", action="store_true", default=False)
     p_ms.add_argument("--limit", type=int, default=50)
+    p_ms.add_argument(
+        "--mode",
+        choices=["keyword", "hybrid"],
+        default="keyword",
+        help="hybrid fuses keyword + vector ranking (requires an embedding provider)",
+    )
+    p_ms.add_argument(
+        "--fake-provider",
+        action="store_true",
+        default=False,
+        help="Use the deterministic offline embedding provider (no model download)",
+    )
     p_ms.set_defaults(func=cmd_memory_search)
     p_mv = p_mem_sub.add_parser("show", parents=[_common_parser()], help="Show one memory in full")
     p_mv.add_argument("memory_id")
@@ -226,6 +238,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_mal.add_argument("memory_id")
     p_mal.set_defaults(func=cmd_memory_assignments)
+
+    p_mix = p_mem_sub.add_parser(
+        "index", parents=[_common_parser()],
+        help="Manage the semantic (vector) index for hybrid retrieval",
+    )
+    p_mix_sub = p_mix.add_subparsers(dest="index_command")
+    p_mix_status = p_mix_sub.add_parser(
+        "status", parents=[_common_parser()], help="Show index model + vector counts"
+    )
+    p_mix_status.set_defaults(func=cmd_memory_index_status)
+    p_mix_backfill = p_mix_sub.add_parser(
+        "backfill", parents=[_common_parser()],
+        help="Embed every ACTIVE memory missing an up-to-date vector",
+    )
+    p_mix_backfill.add_argument(
+        "--fake-provider", action="store_true", default=False,
+        help="Use the deterministic offline embedding provider (no model download)",
+    )
+    p_mix_backfill.set_defaults(func=cmd_memory_index_backfill)
+    p_mix_rebuild = p_mix_sub.add_parser(
+        "rebuild", parents=[_common_parser()],
+        help="Mark all vectors stale and re-embed every ACTIVE memory",
+    )
+    p_mix_rebuild.add_argument(
+        "--fake-provider", action="store_true", default=False,
+        help="Use the deterministic offline embedding provider (no model download)",
+    )
+    p_mix_rebuild.set_defaults(func=cmd_memory_index_rebuild)
 
     p_policy = sub.add_parser("policy", parents=[_common_parser()], help="Show or set behaviour policy")
     p_policy_sub = p_policy.add_subparsers(dest="policy_command")
@@ -418,6 +458,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_rh = p_rel_sub.add_parser("history", parents=[_common_parser()], help="Show relationship history")
     p_rh.add_argument("person_id")
     p_rh.set_defaults(func=cmd_relationship_history)
+
+    p_emotion = sub.add_parser("emotion", parents=[_common_parser()], help="Inspect or configure the companion's emotion framework")
+    p_emotion_sub = p_emotion.add_subparsers(dest="emotion_command")
+    p_es = p_emotion_sub.add_parser("show", parents=[_common_parser()], help="Show the emotion profile")
+    p_es.set_defaults(func=cmd_emotion_show)
+    p_ei = p_emotion_sub.add_parser("inspect", parents=[_common_parser()], help="Inspect events, snapshots and feedback")
+    p_ei.add_argument("--person", default=None, help="Filter snapshots/events to one person id")
+    p_ei.add_argument("--limit", type=int, default=100)
+    p_ei.set_defaults(func=cmd_emotion_inspect)
+    p_er = p_emotion_sub.add_parser("rules", parents=[_common_parser()], help="List appraisal rules")
+    p_er_sub = p_er.add_subparsers(dest="rules_command")
+    p_erl = p_er_sub.add_parser("list", parents=[_common_parser()], help="List appraisal rules")
+    p_erl.set_defaults(func=cmd_emotion_rules_list)
+    p_ec = p_emotion_sub.add_parser("config", parents=[_common_parser()], help="Show or set the emotion profile")
+    p_ec_sub = p_ec.add_subparsers(dest="config_command")
+    p_ecs = p_ec_sub.add_parser("show", parents=[_common_parser()], help="Show the emotion profile config")
+    p_ecs.set_defaults(func=cmd_emotion_config_show)
+    p_ecset = p_ec_sub.add_parser("set", parents=[_common_parser()], help="Update one profile field")
+    p_ecset.add_argument(
+        "field",
+        choices=["baseline_valence", "baseline_arousal", "default_half_life_seconds", "responsiveness"],
+    )
+    p_ecset.add_argument("value")
+    p_ecset.set_defaults(func=cmd_emotion_config_set)
+    p_esim = p_emotion_sub.add_parser(
+        "simulate", parents=[_common_parser()],
+        help="Show the decayed state for one person at an injected clock time",
+    )
+    p_esim.add_argument("--person", required=True, help="Person id to scope the state to")
+    p_esim.add_argument("--elapsed-seconds", type=int, required=True,
+                        help="Seconds to advance the clock before decaying")
+    p_esim.set_defaults(func=cmd_emotion_simulate)
 
     return parser
 
@@ -725,10 +797,22 @@ async def cmd_memory_add(args) -> int:
 
 
 async def cmd_memory_search(args) -> int:
+    mode = getattr(args, "mode", "keyword")
+    if mode == "hybrid" and not args.query:
+        print("hybrid search requires --query")
+        return 1
     db = await _connect(args.db)
     try:
-        rt = build_runtime(db)
-        results = await rt.memory_service.search(
+        if mode == "hybrid":
+            rt = _build_embedding_runtime(db, args)
+            if rt is None:
+                return 1
+            if rt.hybrid_retriever is None:
+                print("internal error: hybrid retriever was not wired")
+                return 1
+        else:
+            rt = build_runtime(db)
+        keyword_results = await rt.memory_service.search(
             access=ADMIN,
             query=args.query,
             kinds=[args.kind] if args.kind else None,
@@ -736,13 +820,33 @@ async def cmd_memory_search(args) -> int:
             include_retracted=args.include_retracted,
             limit=args.limit,
         )
-        for r in results:
-            print(
-                f"{r['memory_id']}  {r['kind']}  {r['status']}  {r['visibility']}"
-                f"  {r['content'][:60]}"
+        if mode == "hybrid":
+            results = await rt.hybrid_retriever.retrieve(
+                args.query,
+                keyword_results=keyword_results,
+                access=ADMIN,
+                identity_ids=set(),
+                limit=args.limit,
             )
-        if not results:
-            print("no memories match")
+            for r in results:
+                diag = (
+                    f" kw={r.get('keyword_rank')} vec={r.get('vector_rank')}"
+                    f" fusion={r.get('fusion_score')} idx={r.get('index_status')}"
+                )
+                print(
+                    f"{r['memory_id']}  {r['kind']}  {r['status']}  {r['visibility']}"
+                    f"  {r['content'][:40]}{diag}"
+                )
+            if not results:
+                print("no memories match")
+        else:
+            for r in keyword_results:
+                print(
+                    f"{r['memory_id']}  {r['kind']}  {r['status']}  {r['visibility']}"
+                    f"  {r['content'][:60]}"
+                )
+            if not keyword_results:
+                print("no memories match")
     finally:
         await db.close()
     return 0
@@ -1695,6 +1799,252 @@ async def cmd_goal_ready(args) -> int:
             print(f"{g['goal_id']}  {g['title']}  next={g['next_action'] or '-'}")
         if not goals:
             print("no ready goals")
+    finally:
+        await db.close()
+    return 0
+
+
+# -- embedding index + hybrid search helpers ---------------------------------
+
+
+def _build_embedding_provider(args):
+    """Build a CLI embedding provider (opt-in, never silently faked).
+
+    The real local model is the default and requires the ``[embedding]`` extra;
+    if it is missing the command prints a clear error and returns ``None``.
+    ``--fake-provider`` selects the deterministic offline provider.
+    """
+    from companion.memory.embeddings import (
+        EmbeddingBackendUnavailable,
+        FakeEmbeddingProvider,
+        LocalSentenceTransformerProvider,
+    )
+
+    if getattr(args, "fake_provider", False):
+        return FakeEmbeddingProvider()
+    try:
+        return LocalSentenceTransformerProvider()
+    except EmbeddingBackendUnavailable as exc:
+        print(f"embedding error: {exc}")
+        return None
+
+
+def _build_embedding_runtime(db, args):
+    provider = _build_embedding_provider(args)
+    if provider is None:
+        return None
+    return build_runtime(db, embedding_provider=provider)
+
+
+async def cmd_memory_index_status(args) -> int:
+    db = await _connect(args.db)
+    try:
+        from companion.memory.embedding_repository import EmbeddingRepository
+        from companion.memory.vector_index import VectorIndex
+
+        repo = EmbeddingRepository(db)
+        index = VectorIndex(repo)
+        print(f"sqlite_vec_available: {index.using_sqlite_vec}")
+        print(
+            "backend: "
+            + ("sqlite-vec (vec0)" if index.using_sqlite_vec else "pure-python fallback")
+        )
+        models = await repo.list_models()
+        if not models:
+            print("no embedding model registered (run `memory index backfill`)")
+            return 0
+        for m in models:
+            mid = m["model_id"]
+            counts = await repo.counts(mid)
+            print(f"model: {mid}")
+            print(f"  provider: {m['provider']}  model_name: {m['model_name']}")
+            print(f"  dimensions: {m['dimensions']}  metric: {m['distance_metric']}")
+            print(f"  normalization: {m['normalization']}")
+            print(f"  counts: {counts}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_memory_index_backfill(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = _build_embedding_runtime(db, args)
+        if rt is None:
+            return 1
+        results = await rt.embedding_service.backfill()
+        by_status: dict[str, int] = {}
+        for r in results:
+            by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+        print(f"backfilled {len(results)} ACTIVE memory rows: {by_status}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_memory_index_rebuild(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = _build_embedding_runtime(db, args)
+        if rt is None:
+            return 1
+        result = await rt.embedding_service.rebuild()
+        print(f"rebuilt model {result['model_id']}: {result['counts']}")
+    finally:
+        await db.close()
+    return 0
+
+
+# -- emotion commands --------------------------------------------------------
+
+
+async def _emotion_agent_id(rt) -> str | None:
+    manifest = await rt.agent_service.repo.get_manifest()
+    return manifest.get("agent_id") if manifest else None
+
+
+async def cmd_emotion_show(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        agent_id = await _emotion_agent_id(rt)
+        if agent_id is None:
+            print("no agent identity; run `agent` first")
+            return 1
+        profile = await rt.emotion_service.get_profile(agent_id)
+        if profile is None:
+            profile = await rt.emotion_service.ensure_defaults(agent_id)
+        print(f"agent_id: {agent_id}")
+        print(f"baseline_valence: {profile.baseline_valence}")
+        print(f"baseline_arousal: {profile.baseline_arousal}")
+        print(f"default_half_life_seconds: {profile.default_half_life_seconds}")
+        print(f"responsiveness: {profile.responsiveness}")
+        print(f"revision: {profile.revision}")
+        print(f"expression_style: {profile.expression_style}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_emotion_inspect(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        agent_id = await _emotion_agent_id(rt)
+        if agent_id is None:
+            print("no agent identity; run `agent` first")
+            return 1
+        snapshots = await rt.emotion_service.list_snapshots(agent_id)
+        if args.person:
+            snapshots = [s for s in snapshots if s.get("person_id") == args.person]
+        print(f"== state snapshots: {len(snapshots)} ==")
+        for s in snapshots:
+            print(
+                f"  {s['person_id']}  {s['emotion']}  v={s['valence']}"
+                f" a={s['arousal']} i={s['intensity']}  at={s['updated_at']}"
+            )
+        events = await rt.emotion_service.list_events(agent_id, limit=args.limit)
+        if args.person:
+            events = [e for e in events if e.get("person_id") == args.person]
+        print(f"== events: {len(events)} ==")
+        for e in events:
+            print(
+                f"  {e['emotion_event_id']}  {e['emotion']}"
+                f"  rule={e['appraisal_rule_id'] or '-'}"
+                f"  reason={e['appraisal_reason'] or '-'}"
+            )
+        feedback = await rt.emotion_service.list_feedback(agent_id)
+        print(f"== feedback: {len(feedback)} ==")
+        for f in feedback:
+            print(f"  {f['feedback_id']}  status={f['status']}  {f['feedback_text'][:60]}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_emotion_rules_list(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        agent_id = await _emotion_agent_id(rt)
+        if agent_id is None:
+            print("no agent identity; run `agent` first")
+            return 1
+        rules = await rt.emotion_service.list_rules(agent_id)
+        for r in rules:
+            print(
+                f"{r.rule_id}  {r.name}  {r.status}  pri={r.priority}"
+                f"  {r.emotion}  v={r.valence_delta} a={r.arousal_delta}"
+                f"  i={r.intensity}  source={r.source}"
+            )
+        if not rules:
+            print("no rules")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_emotion_config_show(args) -> int:
+    return await cmd_emotion_show(args)
+
+
+async def cmd_emotion_config_set(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        agent_id = await _emotion_agent_id(rt)
+        if agent_id is None:
+            print("no agent identity; run `agent` first")
+            return 1
+        field = args.field
+        if field in ("baseline_valence", "baseline_arousal", "responsiveness"):
+            try:
+                value = float(args.value)
+            except ValueError:
+                print(f"invalid value {args.value!r} for {field}")
+                return 1
+        else:
+            try:
+                value = int(args.value)
+            except ValueError:
+                print(f"invalid value {args.value!r} for {field}")
+                return 1
+        profile = await rt.emotion_service.update_profile(agent_id, **{field: value})
+        print(f"{field} = {getattr(profile, field)} (revision {profile.revision})")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_emotion_simulate(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        agent_id = await _emotion_agent_id(rt)
+        if agent_id is None:
+            print("no agent identity; run `agent` first")
+            return 1
+        from datetime import datetime, timedelta
+
+        from companion.emotion.repository import EmotionRepository
+        from companion.emotion.service import EmotionService
+
+        repo = EmotionRepository(db)
+        snap = await repo.get_snapshot(agent_id, args.person)
+        if snap is None:
+            print("no snapshot for this person (say something to the agent first)")
+            return 0
+        stored_at = datetime.fromisoformat(snap["updated_at"])
+        fake_now = stored_at + timedelta(seconds=args.elapsed_seconds)
+        svc = EmotionService(repo, audit=None, logger=None, clock=lambda: fake_now)
+        state = await svc.get_state(agent_id, args.person)
+        print(f"person: {args.person}")
+        print(f"stored_at: {snap['updated_at']}")
+        print(f"simulated_now: {fake_now.isoformat()} (+{args.elapsed_seconds}s)")
+        print(f"emotion: {state.emotion}")
+        print(f"valence: {state.valence:.4f}")
+        print(f"arousal: {state.arousal:.4f}")
+        print(f"intensity: {state.intensity:.4f}")
     finally:
         await db.close()
     return 0
