@@ -196,15 +196,6 @@ class Orchestrator:
                 event, context, memories, steps
             )
 
-            # 4c. Compute the companion's own simulated affect (never a claim
-            # about the human). Purely local and deterministic; gated on
-            # ``persist`` for event/snapshot writes, and never allowed to fail
-            # the turn. The resulting state + delivery plan ride on the context
-            # into the response provider (mock replies ignore it).
-            cognitive_context = await self._apply_emotion(
-                event, person_id, memories, cognitive_context, steps, persist
-            )
-
             # 5. Cognitive analysis: reuse a durable analysis, else compute.
             analysis = None
             analysis_id: Optional[str] = None
@@ -285,6 +276,21 @@ class Orchestrator:
                     memory_outcomes = (
                         await self.repos.analysis.list_candidate_writes(event.event_id)
                     )
+
+            # 6b. Emotion runs only after the analysis exists (fresh or reused)
+            # and before any response is generated. It reads the model's
+            # locally-validated affect hint and the *privacy-filtered* provider
+            # memories, so a retry reuses the persisted analysis without another
+            # model call. Purely presentational; it can never change the action.
+            cognitive_context = await self._apply_emotion(
+                event,
+                person_id,
+                provider_memories,
+                cognitive_context,
+                analysis,
+                steps,
+                persist,
+            )
 
             # 7. Policy decides the final action from the (reused or fresh)
             # analysis. Hard local rules (permission, explicit silence, quiet
@@ -414,14 +420,29 @@ class Orchestrator:
             )
         return cognitive_context, provider_memories
 
-    async def _apply_emotion(self, event, person_id, memories, cognitive_context, steps, persist):
+    async def _apply_emotion(
+        self,
+        event,
+        person_id,
+        provider_memories,
+        cognitive_context,
+        analysis,
+        steps,
+        persist,
+    ):
         """Compute the companion's own affect and attach it to the context.
 
-        Returns the (possibly updated) context. Emotion is presentation-only and
-        must never fail the turn, so any error is logged and swallowed — a reply
-        still happens, just without an emotional delivery plan. ``persist``
-        gates only the event/snapshot writes (honouring the consent persistence
-        flag); the in-memory state and speech plan are computed regardless.
+        Called only after a *persisted* analysis exists. ``provider_memories``
+        is the privacy-filtered list that already reached the model, never the
+        raw retrieval set. ``process_turn`` appraises, applies and records the
+        turn in one transaction, so a retry reuses the analysis and the receipt
+        rather than double-applying the shift.
+
+        Emotion is presentation-only and must never fail the turn, so any error
+        is logged and swallowed — a reply still happens, just without an
+        emotional delivery plan. ``persist`` gates only the event/snapshot
+        writes (honouring the consent persistence flag); the in-memory state and
+        speech plan are computed regardless.
         """
         if self.emotion_service is None:
             return cognitive_context
@@ -433,22 +454,14 @@ class Orchestrator:
                 )
                 return cognitive_context
 
-            # Read the current (lazily decayed) state, then appraise the turn
-            # against the persistent rules and the already-authorised memories.
-            state = await self.emotion_service.get_state(agent_id, person_id)
-            rules = await self.emotion_service.list_rules(agent_id)
             agent_context = getattr(cognitive_context, "agent_context", None)
-            result = self.emotion_service.appraisal.appraise(
-                event.text,
-                rules=rules,
-                memories=memories,
-                agent_context=agent_context,
-                current_state=state,
-            )
-            state = await self.emotion_service.apply_result(
+            state = await self.emotion_service.process_turn(
                 agent_id,
                 person_id,
-                result,
+                text=event.text,
+                signal=getattr(analysis, "affective_signal", None),
+                memories=provider_memories,
+                agent_context=agent_context,
                 conversation_id=event.conversation_id,
                 source_event_id=event.event_id,
                 persist=persist,

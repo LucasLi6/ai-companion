@@ -1,23 +1,21 @@
 """Vector similarity search over ``memory_embeddings``.
 
-The index lives in the same SQLite file as everything else. Two backends are
-supported behind one interface:
+Ranking currently runs in pure Python over the READY vectors for one model.
+That is deliberate and honest: ``sqlite-vec`` may be installed, but this
+project does **not** maintain a ``vec0`` shadow table, so it cannot claim that
+KNN executes inside SQLite. :meth:`VectorIndex.backend_status` therefore
+reports installation/loadability separately from the *active* backend.
 
-- **Pure-Python fallback** (always available): load the READY vectors for a
-  model and rank them with cosine/dot/L2. This is bounded (the backfill is
-  idempotent and capped), requires no native extension, and is what runs when
-  ``sqlite-vec`` is absent.
-- **``sqlite-vec`` acceleration** (optional): a ``vec0`` virtual table that
-  keeps the ranking inside SQLite. It is probed at *runtime*, never imported
-  unconditionally, so startup succeeds without it and CMF validation never
-  reports corruption just because the optional extension is missing.
+Only vectors that still match their current ACTIVE memory are ranked — the
+repository's ``list_ready`` re-checks memory status, version and content hash,
+so a stale vector can never surface content the keyword layer would not show.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import struct
+import sqlite3
 from typing import Optional
 
 from companion.memory.embeddings import (
@@ -29,21 +27,58 @@ from companion.memory.embeddings import (
 from companion.memory.embedding_repository import EmbeddingRepository
 
 
-def _sqlite_vec_available() -> bool:
-    """Probe whether the optional ``sqlite-vec`` extension can be loaded."""
-    try:
-        import sqlite3
+def _probe_sqlite_vec() -> dict[str, bool]:
+    """Probe the optional extension without importing it unconditionally.
 
+    ``installed`` means the Python package or a loadable extension was found;
+    ``loadable`` additionally means a fresh connection could call
+    ``vec_version()``. Neither implies this project uses it for search.
+    """
+    installed = False
+    try:  # pragma: no cover - depends on the optional native package
+        import sqlite_vec  # noqa: F401
+
+        installed = True
+    except Exception:
+        sqlite_vec = None
+
+    loadable = False
+    try:
         conn = sqlite3.connect(":memory:")
         try:
-            conn.enable_load_extension(True)
-            conn.load_extension("vec0")
-        except Exception:
-            return False
-        conn.execute("SELECT vec_version()")
-        return True
+            try:
+                conn.enable_load_extension(True)
+            except Exception:
+                pass
+            loaded = False
+            if installed:
+                try:  # pragma: no cover - optional native package
+                    sqlite_vec.load(conn)
+                    loaded = True
+                except Exception:
+                    loaded = False
+            if not loaded:
+                try:
+                    conn.load_extension("vec0")
+                    loaded = True
+                except Exception:
+                    loaded = False
+            if loaded:
+                try:
+                    conn.execute("SELECT vec_version()")
+                    loadable = True
+                except Exception:
+                    loadable = False
+        finally:
+            conn.close()
     except Exception:
-        return False
+        loadable = False
+    return {"installed": installed or loadable, "loadable": loadable}
+
+
+def _sqlite_vec_available() -> bool:
+    """Backwards-compatible probe: whether vec0 is loadable (not in use)."""
+    return _probe_sqlite_vec()["loadable"]
 
 
 class VectorIndex:
@@ -57,17 +92,34 @@ class VectorIndex:
     ) -> None:
         self.repo = repo
         self.logger = logger or logging.getLogger("companion.memory.vector")
-        self._vec_available: Optional[bool] = None
+        self._probe: Optional[dict[str, bool]] = None
+
+    def backend_status(self, requested: str = "python") -> dict:
+        """Honest backend report: available vs. actually used.
+
+        ``sqlite_vec_enabled`` is always ``False`` because no ``vec0`` index is
+        maintained; the active backend is the Python fallback. If a future
+        change implements real KNN, it must flip this based on a successful
+        in-database query, not merely on the extension being loadable.
+        """
+        if self._probe is None:
+            self._probe = _probe_sqlite_vec()
+        return {
+            "sqlite_vec_installed": self._probe["installed"],
+            "sqlite_vec_loadable": self._probe["loadable"],
+            "sqlite_vec_enabled": False,
+            "active_backend": "python",
+            "requested_backend": requested,
+        }
+
+    @property
+    def using_sqlite_vec(self) -> bool:
+        """Whether search runs in sqlite-vec (never, currently)."""
+        return bool(self.backend_status()["sqlite_vec_enabled"])
 
     async def available(self) -> bool:
         """Whether READY vectors exist for ranking (pure fallback always can)."""
         return True
-
-    @property
-    def using_sqlite_vec(self) -> bool:
-        if self._vec_available is None:
-            self._vec_available = _sqlite_vec_available()
-        return self._vec_available
 
     async def search(
         self,
@@ -79,6 +131,7 @@ class VectorIndex:
     ) -> list[tuple[str, float]]:
         """Return ``(memory_id, similarity)`` pairs, most similar first.
 
+        Only current ACTIVE vectors are considered (see ``list_ready``).
         Similarity is higher-is-better for every metric (cosine in [-1, 1]; dot
         on L2-normalised vectors in [-1, 1]; L2 distance negated).
         """

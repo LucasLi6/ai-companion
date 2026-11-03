@@ -93,6 +93,61 @@ class EmotionRepository:
             ),
         )
 
+    async def insert_profile_if_absent(self, profile: EmotionProfile) -> bool:
+        """Insert the default profile only if no row exists (concurrent-safe).
+
+        Unlike :meth:`upsert_profile`, this never bumps ``revision``: seeding a
+        missing profile is not a user edit. Returns True when it inserted.
+        """
+        now = _iso(utcnow())
+        cur = await self.db.execute(
+            "INSERT INTO emotion_profiles(agent_id, baseline_valence,"
+            " baseline_arousal, default_half_life_seconds, responsiveness,"
+            " expression_style, created_at, updated_at, revision)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(agent_id) DO NOTHING",
+            (
+                profile.agent_id,
+                profile.baseline_valence,
+                profile.baseline_arousal,
+                profile.default_half_life_seconds,
+                profile.responsiveness,
+                json.dumps(profile.expression_style, ensure_ascii=False),
+                now,
+                now,
+                profile.revision,
+            ),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
+
+    async def update_profile_optimistic(
+        self, profile: EmotionProfile, expected_revision: int
+    ) -> bool:
+        """Update a profile with an explicit revision check.
+
+        Returns False (no rows changed) if another writer advanced the revision
+        first. The caller decides whether to retry or report a conflict.
+        """
+        now = _iso(utcnow())
+        cur = await self.db.execute(
+            "UPDATE emotion_profiles SET"
+            " baseline_valence = ?, baseline_arousal = ?,"
+            " default_half_life_seconds = ?, responsiveness = ?,"
+            " expression_style = ?, updated_at = ?, revision = revision + 1"
+            " WHERE agent_id = ? AND revision = ?",
+            (
+                profile.baseline_valence,
+                profile.baseline_arousal,
+                profile.default_half_life_seconds,
+                profile.responsiveness,
+                json.dumps(profile.expression_style, ensure_ascii=False),
+                now,
+                profile.agent_id,
+                expected_revision,
+            ),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
+
     # -- appraisal rules ----------------------------------------------------
 
     async def list_rules(
@@ -182,6 +237,7 @@ class EmotionRepository:
         arousal: float,
         intensity: float,
         appraisal_reason: str | None,
+        created_at: datetime | None = None,
     ) -> str:
         event_id = new_id("emoev")
         await self.db.execute(
@@ -202,7 +258,7 @@ class EmotionRepository:
                 arousal,
                 intensity,
                 appraisal_reason,
-                _iso(utcnow()),
+                _iso(created_at or utcnow()),
             ),
         )
         return event_id
@@ -259,8 +315,9 @@ class EmotionRepository:
         intensity: float,
         emotion: str,
         half_life_seconds: float,
+        updated_at: datetime | None = None,
     ) -> None:
-        now = _iso(utcnow())
+        now = _iso(updated_at or utcnow())
         await self.db.execute(
             "INSERT INTO emotion_state_snapshots(agent_id, person_id, valence,"
             " arousal, intensity, emotion, half_life_seconds, updated_at)"
@@ -288,6 +345,38 @@ class EmotionRepository:
             (agent_id,),
         )
         return [dict(r) for r in await cur.fetchall()]
+
+    # -- turn receipts (idempotency) ----------------------------------------
+
+    async def get_receipt(self, source_event_id: str) -> dict | None:
+        cur = await self.db.execute(
+            "SELECT source_event_id, agent_id, person_id, outcome, processed_at"
+            " FROM emotion_turn_receipts WHERE source_event_id = ?",
+            (source_event_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row is not None else None
+
+    async def insert_receipt(
+        self,
+        *,
+        source_event_id: str,
+        agent_id: str,
+        person_id: str,
+        outcome: str,
+        processed_at: datetime | None = None,
+    ) -> None:
+        await self.db.execute(
+            "INSERT OR IGNORE INTO emotion_turn_receipts(source_event_id, agent_id,"
+            " person_id, outcome, processed_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                source_event_id,
+                agent_id,
+                person_id,
+                outcome,
+                _iso(processed_at or utcnow()),
+            ),
+        )
 
     # -- feedback / audit ---------------------------------------------------
 

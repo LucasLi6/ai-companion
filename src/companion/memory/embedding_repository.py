@@ -11,8 +11,9 @@ from __future__ import annotations
 import json
 from typing import Optional
 
+from companion.domain.enums import MemoryStatus
 from companion.domain.models import utcnow
-from companion.memory.embeddings import EmbeddingModelSpec
+from companion.memory.embeddings import EmbeddingModelSpec, content_hash
 from companion.storage.database import Database
 
 
@@ -75,6 +76,16 @@ class EmbeddingRepository:
 
     # -- embeddings ---------------------------------------------------------
 
+    async def get_memory(self, memory_id: str) -> dict | None:
+        """The authoritative current memory row for an embedding job."""
+        cur = await self.db.execute(
+            "SELECT memory_id, kind, content, version, status, updated_at"
+            " FROM memory_items WHERE memory_id = ?",
+            (memory_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row is not None else None
+
     async def get_embedding(self, memory_id: str, model_id: str) -> dict | None:
         cur = await self.db.execute(
             "SELECT memory_id, model_id, vector, memory_version, content_hash,"
@@ -105,7 +116,11 @@ class EmbeddingRepository:
             " vector = excluded.vector, memory_version = excluded.memory_version,"
             " content_hash = excluded.content_hash,"
             " embedding_status = excluded.embedding_status,"
-            " updated_at = excluded.updated_at, last_error = excluded.last_error",
+            " updated_at = excluded.updated_at, last_error = excluded.last_error"
+            # Belt-and-braces at the storage layer: an older job can never
+            # replace a vector written for a newer memory revision, even if a
+            # caller bypassed the service's re-check.
+            " WHERE excluded.memory_version >= memory_embeddings.memory_version",
             (
                 memory_id,
                 model_id,
@@ -142,7 +157,12 @@ class EmbeddingRepository:
             " memory_version = excluded.memory_version,"
             " content_hash = excluded.content_hash,"
             " embedding_status = 'FAILED', updated_at = excluded.updated_at,"
-            " last_error = excluded.last_error",
+            " last_error = excluded.last_error"
+            # A failure may replace an older attempt, but never a READY vector
+            # for the same or a newer revision.
+            " WHERE excluded.memory_version >= memory_embeddings.memory_version"
+            " AND NOT (memory_embeddings.embedding_status = 'READY'"
+            "          AND memory_embeddings.memory_version >= excluded.memory_version)",
             (memory_id, model_id, b"", memory_version, content_hash, now, error, now),
         )
 
@@ -154,13 +174,33 @@ class EmbeddingRepository:
         )
 
     async def list_ready(self, model_id: str) -> list[dict]:
-        """Return every READY vector row for a model (id + unpacked vector)."""
+        """Return READY vectors that still match their current ACTIVE memory.
+
+        A vector is searchable only when the memory is ACTIVE, the vector's
+        ``memory_version`` equals the memory's current version, and its
+        ``content_hash`` equals the hash of the current kind/content. Anything
+        else is stale and is silently excluded; retrieval then falls back to
+        the keyword layer.
+        """
         cur = await self.db.execute(
-            "SELECT memory_id, vector, memory_version, content_hash FROM memory_embeddings"
-            " WHERE model_id = ? AND embedding_status = 'READY'",
+            "SELECT e.memory_id, e.vector, e.memory_version, e.content_hash,"
+            " m.kind, m.content, m.version, m.status"
+            " FROM memory_embeddings e"
+            " JOIN memory_items m ON m.memory_id = e.memory_id"
+            " WHERE e.model_id = ? AND e.embedding_status = 'READY'",
             (model_id,),
         )
-        return [dict(r) for r in await cur.fetchall()]
+        out: list[dict] = []
+        for row in await cur.fetchall():
+            item = dict(row)
+            if item["status"] != MemoryStatus.ACTIVE.value:
+                continue
+            if int(item["memory_version"]) != int(item["version"]):
+                continue
+            if content_hash(item["kind"], item["content"]) != item["content_hash"]:
+                continue
+            out.append(item)
+        return out
 
     async def list_all(self, model_id: str | None = None) -> list[dict]:
         sql = (

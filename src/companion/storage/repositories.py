@@ -30,6 +30,7 @@ from companion.domain.enums import (
     ReplyNecessity,
 )
 from companion.domain.models import (
+    AffectiveSignal,
     AgentAction,
     CognitiveResult,
     Consent,
@@ -417,11 +418,17 @@ class AnalysisRepository:
         self.db = db
 
     async def save_analysis(self, analysis: CognitiveResult, analysis_id: str) -> None:
+        signal_json = (
+            json.dumps(analysis.affective_signal.model_dump(), ensure_ascii=False)
+            if analysis.affective_signal is not None
+            else None
+        )
         await self.db.execute(
             "INSERT INTO cognitive_analyses(analysis_id, event_id, meaning, action,"
             " reason_code, provider, referenced_memory_ids, response_style, created_at,"
-            " intent, addressed_to, silence_requested, reply_necessity, conversation_state)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " intent, addressed_to, silence_requested, reply_necessity, conversation_state,"
+            " affective_signal_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 analysis_id,
                 analysis.event_id,
@@ -437,6 +444,7 @@ class AnalysisRepository:
                 int(analysis.silence_requested),
                 analysis.reply_necessity.value,
                 analysis.conversation_state,
+                signal_json,
             ),
         )
 
@@ -444,13 +452,22 @@ class AnalysisRepository:
         cur = await self.db.execute(
             "SELECT analysis_id, event_id, meaning, action, reason_code, provider,"
             " referenced_memory_ids, response_style, intent, addressed_to,"
-            " silence_requested, reply_necessity, conversation_state"
+            " silence_requested, reply_necessity, conversation_state,"
+            " affective_signal_json"
             " FROM cognitive_analyses WHERE event_id = ?",
             (event_id,),
         )
         row = await cur.fetchone()
         if row is None:
             return None
+        signal = None
+        if row["affective_signal_json"]:
+            try:
+                signal = AffectiveSignal.model_validate(
+                    json.loads(row["affective_signal_json"])
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                signal = None
         return CognitiveResult(
             event_id=row["event_id"],
             meaning=row["meaning"],
@@ -464,6 +481,7 @@ class AnalysisRepository:
             silence_requested=bool(row["silence_requested"]),
             reply_necessity=ReplyNecessity(row["reply_necessity"] or "OPTIONAL"),
             conversation_state=row["conversation_state"] or "unknown",
+            affective_signal=signal,
         )
 
     async def get_analysis_id(self, event_id: str) -> Optional[str]:

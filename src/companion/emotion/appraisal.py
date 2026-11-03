@@ -4,33 +4,69 @@ Appraisal is *local and deterministic*. It never calls an external model and
 never asserts anything about a human's real feelings — it decides the
 companion's own simulated affect from:
 
-- the current utterance text;
-- the retrieved memories (which may carry a matched ``memory_id``);
-- the agent persona/identity;
-- the relationship tier to the current speaker;
-- the persisted appraisal rules (most specific, highest priority first);
-- the current decayed emotion state.
+- a locally validated :class:`AffectiveSignal` (the model's semantic event hint);
+- the current utterance text (checked for negation/hypothesis/quotation when no
+  signal is available);
+- the retrieved, already-authorised memories;
+- the agent persona/relationship;
+- the persisted ACTIVE appraisal rules;
+- the current decayed emotion state and profile.
 
-A rule's ``pattern`` is a small JSON schema validated against those inputs. The
-default rules handle the common situations directly (milestone, setback,
-explicit request, clarification); a model may only *suggest* a new rule through
-the reflection engine, and it is never applied to the active profile without
-human approval. The ``reason`` string on the result records exactly which rule
-fired so every emotional shift is auditable.
+The model's signal is a *suggestion*, never authority: this engine re-checks
+its whitelist values, confidence, subject, factuality and evidence span before
+using it. A rule's ``pattern`` is a small JSON schema validated against those
+inputs. A model may only suggest a new rule through reflection; it is stored
+DISABLED and never applied without human approval.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Mapping, Optional
 
-from companion.emotion.dynamics import clamp, label_for
+from companion.emotion.dynamics import (
+    apply_emotional_stimulus,
+    clamp,
+    label_for,
+    reaction_gain,
+)
 from companion.emotion.models import (
     AppraisalResult,
     AppraisalRule,
+    EmotionProfile,
     EmotionState,
 )
+
+# A signal below this confidence is ignored (conservative initial threshold,
+# deliberately a named constant so it can be tuned from data later).
+SIGNAL_MIN_CONFIDENCE = 0.75
+
+# Semantic event -> the persisted default rule that expresses it. A custom rule
+# may instead declare ``pattern.event_type`` (or trigger_type="semantic_event").
+EVENT_TO_RULE = {
+    "achievement": "milestone_joy",
+    "setback": "setback_concern",
+    "gratitude": "explicit_gratitude",
+    "urgency": "urgent_concern",
+    "question": "curiosity_question",
+}
+
+# Words whose "asserted" status is particularly easy to get wrong: seeing them
+# inside a question or a negation must not create a positive/negative event.
+_AFFECT_WORDS = {
+    "开心", "高兴", "快乐", "幸福", "难过", "伤心", "成功", "失败",
+    "完成", "搞定", "赢了", "输", "恭喜",
+}
+_NEGATION_MARKERS = (
+    "没有", "没", "未", "不", "别", "尚未", "还没", "并不", "从没",
+    "不想", "不愿", "不要", "避免", "害怕", "担心", "差点", "差一点", "几乎",
+)
+_HYPOTHETICAL_MARKERS = ("如果", "假如", "要是", "若是", "万一", "希望", "梦想", "想要")
+_REPORT_MARKERS = ("他说", "她说", "他说过", "她说过", "据说", "听说", "别人说", "转述", "引用")
+_UNCERTAIN_MARKERS = ("好像", "似乎", "可能", "也许", "大概", "不确定")
+_QUESTION_MARKERS = re.compile(r"[?？]|吗$|呢$|为什么|怎么|是不是|觉得|认为")
 
 # Default, evidence-free rules seeded for every agent. They encode only the
 # most ordinary, reversible situations and are the baseline every profile
@@ -103,54 +139,130 @@ class AppraisalEngine:
         text: str,
         *,
         rules: list[AppraisalRule],
+        signal=None,
         memories: list[dict] = (),
         agent_context: Optional[Mapping] = None,
         current_state: Optional[EmotionState] = None,
+        profile: Optional[EmotionProfile] = None,
+        traits: Optional[Mapping[str, int]] = None,
+        now: Optional[datetime] = None,
     ) -> AppraisalResult:
-        """Choose the best-matching ACTIVE rule and compute the resulting state.
+        """Choose the eligible rule and compute the resulting emotional state.
 
-        ``memories`` are the already-authorised, retrieved memories for this
-        turn (list of dicts with at least ``memory_id`` and ``content``).
-        ``agent_context`` supplies the persona/relationship for expression
-        tuning. ``current_state`` (decayed) seeds the intensity/valence, so the
-        new state composes with what the companion is already feeling.
+        A *valid* signal is authoritative: none/negated/hypothetical/quoted/
+        third-party/low-confidence signals hold the current state. Only when no
+        signal exists at all does the legacy keyword path run, and that path
+        applies local negation/hypothesis/quotation guards.
         """
         active = sorted(
             (r for r in rules if r.status == "ACTIVE"),
             key=lambda r: (r.priority, r.updated_at),
             reverse=True,
         )
-        matched = next((r for r in active if self._matches(r, text, memories)), None)
-
-        if matched is None:
-            # No rule fired: hold the decayed state (drift toward baseline).
-            state = current_state or EmotionState()
-            return AppraisalResult(
-                emotion=state.emotion,
-                valence=state.valence,
-                arousal=state.arousal,
-                intensity=state.intensity,
-                reason="no_rule_matched",
-            )
-
         base = current_state or EmotionState(
             valence=0.0, arousal=0.0, intensity=0.0, emotion="NEUTRAL"
         )
-        valence = clamp(base.valence + matched.valence_delta, -1.0, 1.0)
-        arousal = clamp(base.arousal + matched.arousal_delta, 0.0, 1.0)
-        intensity = clamp(matched.intensity, 0.0, 1.0)
 
-        matched_memory_id = self._first_matched_memory(matched, memories)
+        if signal is not None:
+            if not self._signal_actionable(signal, text):
+                return self._unchanged(base, "signal_not_actionable")
+            matched = self._resolve_semantic_rule(signal.event_type, active)
+            if matched is None:
+                return self._unchanged(base, "no_semantic_rule")
+            return self._stimulate(
+                base, matched, profile, traits, now, memories=memories
+            )
 
-        return AppraisalResult(
-            emotion=matched.emotion,
-            valence=valence,
-            arousal=arousal,
-            intensity=intensity,
-            trigger_rule_id=matched.rule_id,
-            reason=matched.name,
-            matched_memory_id=matched_memory_id,
+        matched = next(
+            (r for r in active if self._matches(r, text, memories)), None
         )
+        if matched is None:
+            return self._unchanged(base, "no_rule_matched")
+        return self._stimulate(
+            base, matched, profile, traits, now, memories=memories
+        )
+
+    # -- signal handling ----------------------------------------------------
+
+    @staticmethod
+    def _signal_actionable(signal, text: str) -> bool:
+        if getattr(signal, "event_type", "none") == "none":
+            return False
+        if getattr(signal, "factuality", "uncertain") != "asserted":
+            return False
+        if getattr(signal, "subject", "unknown") != "speaker":
+            return False
+        try:
+            confidence = float(getattr(signal, "confidence", 0.0))
+        except (TypeError, ValueError):
+            return False
+        if not (confidence >= SIGNAL_MIN_CONFIDENCE):
+            return False
+        evidence = getattr(signal, "evidence_span", None)
+        return bool(evidence) and evidence in text
+
+    @staticmethod
+    def _resolve_semantic_rule(
+        event_type: str, active: list[AppraisalRule]
+    ) -> Optional[AppraisalRule]:
+        expected_name = EVENT_TO_RULE.get(event_type)
+        candidates = [
+            rule
+            for rule in active
+            if rule.name == expected_name
+            or (rule.pattern or {}).get("event_type") == event_type
+            or (
+                rule.trigger_type == "semantic_event"
+                and (rule.pattern or {}).get("event") == event_type
+            )
+        ]
+        # ``active`` is already priority-ordered; a DISABLED rule is absent.
+        return candidates[0] if candidates else None
+
+    # -- state calculation --------------------------------------------------
+
+    def _stimulate(
+        self,
+        base: EmotionState,
+        rule: AppraisalRule,
+        profile: Optional[EmotionProfile],
+        traits: Optional[Mapping[str, int]],
+        now: Optional[datetime],
+        *,
+        memories: list[dict],
+    ) -> AppraisalResult:
+        gain, empathy = reaction_gain(profile, traits)
+        empathy_factor = (
+            0.8 + 0.4 * empathy if rule.emotion in ("CONCERN", "SADNESS") else 1.0
+        )
+        effective_gain = clamp(gain * empathy_factor, 0.0, 2.0)
+        if effective_gain <= 0.0:
+            # A completely unresponsive profile produces no emotional stimulus.
+            return self._unchanged(base, "no_reaction")
+
+        moment = now or base.updated_at or datetime.now(timezone.utc)
+        state = apply_emotional_stimulus(base, rule, profile, traits, moment)
+        return AppraisalResult(
+            emotion=state.emotion,
+            valence=state.valence,
+            arousal=state.arousal,
+            intensity=state.intensity,
+            trigger_rule_id=rule.rule_id,
+            reason=rule.name,
+            matched_memory_id=self._first_matched_memory(rule, memories),
+        )
+
+    @staticmethod
+    def _unchanged(state: EmotionState, reason: str) -> AppraisalResult:
+        return AppraisalResult(
+            emotion=state.emotion,
+            valence=state.valence,
+            arousal=state.arousal,
+            intensity=state.intensity,
+            reason=reason,
+        )
+
+    # -- legacy keyword matching -------------------------------------------
 
     def _matches(
         self, rule: AppraisalRule, text: str, memories: list[dict]
@@ -164,23 +276,109 @@ class AppraisalEngine:
             return self._matches_memory(pattern, memories)
         return False
 
-    @staticmethod
-    def _matches_utterance(pattern: dict, text: str) -> bool:
+    @classmethod
+    def _matches_utterance(cls, pattern: dict, text: str) -> bool:
         keywords = pattern.get("keywords") or []
-        if keywords and not any(k.lower() in text.lower() for k in keywords):
+        if keywords and not any(
+            cls._keyword_is_asserted(text, keyword) for keyword in keywords
+        ):
             return False
-        if pattern.get("question") and not re.search(r"[?？]|吗$|呢$|什么|怎么|为什么", text):
+        if pattern.get("question") and not _QUESTION_MARKERS.search(text):
             return False
         if pattern.get("exclamation") and not re.search(r"[!！]", text):
             return False
         return bool(keywords or pattern.get("question") or pattern.get("exclamation"))
 
+    @classmethod
+    def _keyword_is_asserted(cls, text: str, keyword: str) -> bool:
+        """Whether ``keyword`` occurs as a genuine first-person assertion.
+
+        Small and deliberately conservative: it rejects occurrences inside
+        quotes, after negation/hypothetical/report/uncertainty markers, and
+        affect words inside interrogative framing. When in doubt it does *not*
+        claim an event happened.
+        """
+        if not keyword:
+            return False
+        lowered = text.lower()
+        needle = keyword.lower()
+        start = lowered.find(needle)
+        while start != -1:
+            end = start + len(needle)
+            prefix = text[max(0, start - 8) : start]
+            suffix = text[end : end + 5]
+
+            if cls._inside_quotes(text, start):
+                start = lowered.find(needle, start + 1)
+                continue
+            if any(marker in prefix for marker in _NEGATION_MARKERS):
+                start = lowered.find(needle, start + 1)
+                continue
+            if any(marker in prefix for marker in _HYPOTHETICAL_MARKERS):
+                start = lowered.find(needle, start + 1)
+                continue
+            if any(marker in prefix for marker in _REPORT_MARKERS):
+                start = lowered.find(needle, start + 1)
+                continue
+            if cls._has_other_subject(text, start):
+                start = lowered.find(needle, start + 1)
+                continue
+            if any(marker in prefix for marker in _UNCERTAIN_MARKERS):
+                start = lowered.find(needle, start + 1)
+                continue
+            if any(marker in suffix for marker in ("就好了", "的话", "就好了")):
+                start = lowered.find(needle, start + 1)
+                continue
+            if (
+                keyword in _AFFECT_WORDS
+                and _QUESTION_MARKERS.search(text)
+                and not re.search(r"[!！]", text)
+            ):
+                start = lowered.find(needle, start + 1)
+                continue
+            return True
+        return False
+
+    @staticmethod
+    def _has_other_subject(text: str, start: int) -> bool:
+        """Whether the clause's last explicit subject is a third party.
+
+        "他成功了" must not become the companion's JOY, while
+        "我告诉他我成功了" still refers to the speaker. A clause boundary resets
+        the check, and a later first-person pronoun wins.
+        """
+        boundary = max(
+            (text.rfind(mark, 0, start) for mark in "，。！？；,.!?;"), default=-1
+        )
+        clause = text[boundary + 1 : start]
+        last_first = max(clause.rfind(m) for m in ("我", "我们"))
+        last_third = max(
+            clause.rfind(m) for m in ("他", "她", "它", "别人", "对方", "那个人")
+        )
+        return last_third != -1 and last_third > last_first
+
+    @staticmethod
+    def _inside_quotes(text: str, start: int) -> bool:
+        for opening, closing in (("“", "”"), ("「", "」"), ("『", "』")):
+            if text.rfind(opening, 0, start) > text.rfind(closing, 0, start):
+                return True
+        # ASCII double quotes use the same character for both ends.
+        return text.count('"', 0, start) % 2 == 1
+
     @staticmethod
     def _matches_memory(pattern: dict, memories: list[dict]) -> bool:
-        kinds = pattern.get("kinds") or []
-        if not kinds:
+        """A memory rule needs an explicit, verified memory association.
+
+        Matching by ``kind`` alone cannot prove the memory caused this turn, so
+        it is no longer accepted. A rule must name the memory ids it applies to.
+        """
+        memory_ids = set(pattern.get("memory_ids") or [])
+        if not memory_ids:
             return False
-        return any(m.get("kind") in kinds for m in memories)
+        return any(
+            memory.get("memory_id") in memory_ids and memory.get("status") == "ACTIVE"
+            for memory in memories
+        )
 
     @staticmethod
     def _first_matched_memory(
@@ -188,9 +386,12 @@ class AppraisalEngine:
     ) -> Optional[str]:
         if rule.trigger_type != "memory":
             return None
-        kinds = (rule.pattern or {}).get("kinds") or []
+        memory_ids = set((rule.pattern or {}).get("memory_ids") or [])
         for memory in memories:
-            if memory.get("kind") in kinds:
+            if (
+                memory.get("memory_id") in memory_ids
+                and memory.get("status") == "ACTIVE"
+            ):
                 return memory.get("memory_id")
         return None
 

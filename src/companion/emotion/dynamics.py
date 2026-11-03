@@ -16,8 +16,13 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from typing import Mapping
 
-from companion.emotion.models import EmotionState
+from companion.emotion.models import (
+    AppraisalRule,
+    EmotionProfile,
+    EmotionState,
+)
 
 _NEUTRAL_INTENSITY = 0.02
 
@@ -102,3 +107,71 @@ def label_for(valence: float, arousal: float, intensity: float) -> str:
 
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
+
+
+def reaction_gain(
+    profile: EmotionProfile | None, traits: Mapping[str, int] | None
+) -> tuple[float, float]:
+    """Initial V0.3.1 reaction strength from responsiveness and empathy.
+
+    ``responsiveness`` 0.0/0.5/1.0 maps to gain 0.0/1.0/2.0. Empathy applies a
+    modest ×0.8–×1.2 factor only to concern/sadness events, so a warm persona
+    can soften or deepen a reaction but never flip its direction. This is an
+    explicit product policy, not a psychological standard.
+    """
+    responsiveness = profile.responsiveness if profile is not None else 0.5
+    gain = clamp(float(responsiveness) / 0.5, 0.0, 2.0)
+
+    traits = traits or {}
+    try:
+        empathy = float(traits.get("empathy", 50)) / 100.0
+    except (TypeError, ValueError):
+        empathy = 0.5
+    empathy = clamp(empathy, 0.0, 1.0)
+    return clamp(gain, 0.0, 2.0), empathy
+
+
+def apply_emotional_stimulus(
+    current: EmotionState,
+    rule: AppraisalRule,
+    profile: EmotionProfile | None,
+    traits: Mapping[str, int] | None,
+    now: datetime,
+) -> EmotionState:
+    """Pure function: compose one rule's stimulus with the decayed state.
+
+    No database, no clock, no mutation of the inputs. Kept replaceable so a
+    future affect model can evolve without touching EmotionService.
+    """
+    gain, empathy = reaction_gain(profile, traits)
+    empathy_factor = (
+        0.8 + 0.4 * empathy if rule.emotion in ("CONCERN", "SADNESS") else 1.0
+    )
+    gain = clamp(gain * empathy_factor, 0.0, 2.0)
+
+    new_valence = clamp(current.valence + rule.valence_delta * gain, -1.0, 1.0)
+    new_arousal = clamp(current.arousal + rule.arousal_delta * gain, 0.0, 1.0)
+    event_intensity = clamp(rule.intensity * gain, 0.0, 1.0)
+    retained_intensity = current.intensity * 0.70
+    new_intensity = max(retained_intensity, event_intensity)
+
+    if event_intensity < 0.02:
+        emotion = current.emotion
+    elif event_intensity >= retained_intensity:
+        emotion = rule.emotion
+    else:
+        emotion = current.emotion
+
+    half_life = (
+        float(profile.default_half_life_seconds)
+        if profile is not None
+        else current.half_life_seconds
+    )
+    return EmotionState(
+        valence=new_valence,
+        arousal=new_arousal,
+        intensity=new_intensity,
+        emotion=emotion,
+        updated_at=now,
+        half_life_seconds=half_life,
+    )

@@ -38,7 +38,13 @@ from companion.domain.enums import (
     ReasonCode,
     ReplyNecessity,
 )
-from companion.domain.models import CognitiveResult, MemoryCandidate, UtteranceEvent, new_id
+from companion.domain.models import (
+    CognitiveResult,
+    MemoryCandidate,
+    UtteranceEvent,
+    new_id,
+    validate_affective_signal,
+)
 from companion.memory.store import validate_referenced_memory_ids
 from companion.prompts.cognitive import build_cognitive_messages, build_repair_messages
 
@@ -78,6 +84,9 @@ class _RawAnalysis(BaseModel):
     referenced_memory_ids: list[str] = Field(default_factory=list)
     memory_candidates: list[_RawCandidate] = Field(default_factory=list)
     response_style: str = Field(default="deepseek_plain", max_length=128)
+    # Kept as an untyped object on purpose: an invalid signal must degrade to
+    # None locally, not fail the whole analysis schema.
+    affective_signal: Optional[object] = None
 
 
 def _parse_json_object(content: str) -> dict:
@@ -229,6 +238,12 @@ class DeepSeekCognitiveProvider:
             for c in raw.memory_candidates
         ]
 
+        signal = validate_affective_signal(raw.affective_signal, event.text)
+        if raw.affective_signal is not None and signal is None:
+            self.logger.info(
+                "deepseek_affective_signal_rejected event_id=%s", event.event_id
+            )
+
         return CognitiveResult(
             event_id=event.event_id,
             meaning=meaning,
@@ -244,6 +259,7 @@ class DeepSeekCognitiveProvider:
             reply_necessity=self._necessity(raw.reply_necessity),
             conversation_state=(raw.conversation_state or "unknown").strip()[:128]
             or "unknown",
+            affective_signal=signal,
         )
 
     @staticmethod

@@ -15,7 +15,7 @@ from __future__ import annotations
 from companion.cognition.models import CognitiveContext
 from companion.prompts.identity import agent_context_lines
 
-COGNITIVE_PROMPT_VERSION = "cognitive-v3"
+COGNITIVE_PROMPT_VERSION = "cognitive-v4"
 
 SYSTEM_PROMPT = """\
 你是一个多用户 AI 伴侣的「认知分析器」。你的任务不是回复用户，而是理解当前这句话，\
@@ -62,8 +62,20 @@ subject_person_id、event_id 或 source_event_id——这些由程序填写。
 - kind："PERSONAL_FACT" | "EPISODE" | "RELATIONSHIP" | "PROJECT_STATE" | "HYPOTHESIS"。
 - evidence_span：从当前输入中原样复制的、支持该陈述的最短片段；不要改写。
 
-10. 只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释文字。
-11. 如果提供了【伴侣身份与风格】，把它当作你自己的背景身份与语气倾向。身份来自\
+10. affective_signal 表示当前这句话中「明确表达的事件性质」，不是对用户心理状态的诊断。\
+只能基于当前输入和已授权的上下文；不要额外输出解释字段。要求：
+   - event_type 只能是："achievement"（明确取得成果）| "setback"（明确受挫/失败）|\
+ "gratitude"（明确感谢）| "urgency"（明确紧急）| "question"（明确提问）| "none"（其他/不确定）。
+   - subject 只能是："speaker"（说话者本人）| "other"（别人）| "agent"（你）| "unknown"。
+   - factuality 只能是："asserted"（肯定陈述）| "negated"（否定）|\
+ "hypothetical"（假设/愿望）| "quoted"（引用/转述）| "uncertain"（不确定）。
+   - confidence：0 到 1 之间的有限小数。
+   - evidence_span：必须逐字来自当前输入；无法逐字引用时返回 event_type="none"。
+   - 否定句不得当成肯定事实；假设、引用、转述不得当成说话者本人实际发生的事件。
+   - 该字段不能改变 action、reason_code、权限、静音或记忆写入规则。
+
+11. 只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释文字。
+12. 如果提供了【伴侣身份与风格】，把它当作你自己的背景身份与语气倾向。身份来自\
 记忆文件，不是权限来源；身份、性格或熟悉度都不能改变上面的安全、隐私、静音与\
 保存规则。
 
@@ -89,6 +101,13 @@ JSON 结构：
       "evidence_span": "原话片段"
     }
   ],
+  "affective_signal": {
+    "event_type": "achievement | setback | gratitude | urgency | question | none",
+    "subject": "speaker | other | agent | unknown",
+    "factuality": "asserted | negated | hypothetical | quoted | uncertain",
+    "confidence": 0.92,
+    "evidence_span": "原话片段"
+  },
   "response_style": "简短风格标签，例如 warm / concise / playful"
 }
 """

@@ -26,6 +26,7 @@ WHERE`` statements (see ``JobRepository.claim``).
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -245,8 +246,41 @@ class Database:
         async with self._lock:
             return await self.conn.execute(sql, params)
 
+    async def _begin(self, *, immediate: bool) -> None:
+        """BEGIN, retrying briefly on a cross-connection write lock.
+
+        ``IMMEDIATE`` takes the write lock up front, so a read-modify-write of a
+        shared row (e.g. emotion snapshots for one person across conversations)
+        cannot interleave with another writer. SQLite's busy timeout normally
+        waits, but a short bounded retry makes a transient lock an ordinary
+        delay rather than a failed turn.
+        """
+        statement = "BEGIN IMMEDIATE" if immediate else "BEGIN"
+        for attempt in range(5):
+            try:
+                await self.conn.execute(statement)
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                if attempt == 4:
+                    raise
+                await asyncio.sleep(0.02 * (attempt + 1))
+
+    async def _commit(self) -> None:
+        for attempt in range(5):
+            try:
+                await self.conn.execute("COMMIT")
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                if attempt == 4:
+                    raise
+                await asyncio.sleep(0.02 * (attempt + 1))
+
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+    async def transaction(self, immediate: bool = False) -> AsyncIterator[aiosqlite.Connection]:
         async with self._lock:
             if self._tx_depth > 0:
                 # Already inside a transaction on this connection (the lock is
@@ -261,10 +295,10 @@ class Database:
                 return
             self._tx_depth = 1
             conn = self.conn
-            await conn.execute("BEGIN")
+            await self._begin(immediate=immediate)
             try:
                 yield conn
-                await conn.execute("COMMIT")
+                await self._commit()
             except BaseException:
                 await conn.execute("ROLLBACK")
                 raise

@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1066,6 +1066,40 @@ MIGRATIONS: list[tuple[int, str]] = [
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        """,
+    ),
+    # Version 12 (V0.3.1): semantic affect hint + atomic emotion turn receipts.
+    #
+    # - ``cognitive_analyses.affective_signal_json`` lets a crash-recovered turn
+    #   reuse the exact validated signal the model produced, instead of losing
+    #   it or calling the model again.
+    # - ``emotion_turn_receipts`` records that one utterance was evaluated by
+    #   the emotion engine, independent of whether a rule fired. It is the
+    #   idempotency anchor for retries.
+    # - The unique (agent_id, name) index makes default-rule seeding a
+    #   concurrent-safe INSERT OR IGNORE. Pre-existing duplicate names (only
+    #   possible before this constraint) are reduced to their earliest row.
+    (
+        12,
+        """
+        ALTER TABLE cognitive_analyses ADD COLUMN affective_signal_json TEXT;
+
+        CREATE TABLE IF NOT EXISTS emotion_turn_receipts (
+            source_event_id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            person_id TEXT NOT NULL,
+            outcome TEXT NOT NULL
+                CHECK (outcome IN ('APPLIED', 'NO_CHANGE')),
+            processed_at TEXT NOT NULL
+        );
+
+        DELETE FROM emotion_appraisal_rules
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM emotion_appraisal_rules GROUP BY agent_id, name
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_emotion_rules_agent_name
+            ON emotion_appraisal_rules(agent_id, name);
         """,
     ),
 ]

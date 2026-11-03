@@ -41,6 +41,10 @@ from companion.storage.repositories import AuditRepository
 DEFAULT_VOICE_NAME = "default"
 
 
+class EmotionProfileConflict(RuntimeError):
+    """Raised when a profile update loses an optimistic revision check."""
+
+
 class EmotionService:
     def __init__(
         self,
@@ -61,31 +65,40 @@ class EmotionService:
     # -- profile ------------------------------------------------------------
 
     async def ensure_defaults(self, agent_id: str) -> EmotionProfile:
-        """Seed a default profile and rules for an agent that lacks them."""
-        profile = await self.repo.get_profile(agent_id)
-        if profile is None:
-            now = self.clock()
-            profile = EmotionProfile(
-                agent_id=agent_id,
-                baseline_valence=0.0,
-                baseline_arousal=0.0,
-                default_half_life_seconds=3600,
-                responsiveness=0.5,
-                expression_style={},
-                revision=1,
-                created_at=now,
-                updated_at=now,
-            )
-            await self.repo.upsert_profile(profile)
-        if await self.repo.count_rules(agent_id) == 0:
-            await self.seed_default_rules(agent_id)
-        return profile
+        """Seed a default profile and rules for an agent that lacks them.
 
-    async def seed_default_rules(self, agent_id: str) -> None:
+        Concurrent-safe: the profile insert is ``ON CONFLICT DO NOTHING`` and
+        each default rule is ``INSERT OR IGNORE`` against the unique
+        ``(agent_id, name)`` index. Existing rows — including user-disabled
+        rules — are never overwritten or re-enabled. Everything happens in one
+        immediate transaction so two first turns cannot interleave their seeds.
+        """
+        now = self.clock()
+        default = EmotionProfile(
+            agent_id=agent_id,
+            baseline_valence=0.0,
+            baseline_arousal=0.0,
+            default_half_life_seconds=3600,
+            responsiveness=0.5,
+            expression_style={},
+            revision=1,
+            created_at=now,
+            updated_at=now,
+        )
+        async with self.repo.db.transaction(immediate=True):
+            await self.repo.insert_profile_if_absent(default)
+            await self.seed_default_rules(agent_id, now=now)
+            profile = await self.repo.get_profile(agent_id)
+        return profile or default
+
+    async def seed_default_rules(
+        self, agent_id: str, *, now: datetime | None = None
+    ) -> None:
+        """Insert any missing default rules without touching existing ones."""
         from companion.domain.models import new_id
         from companion.emotion.appraisal import DEFAULT_RULES
 
-        now = self.clock()
+        moment = now or self.clock()
         for spec in DEFAULT_RULES:
             await self.repo.insert_rule(
                 AppraisalRule(
@@ -101,12 +114,10 @@ class EmotionService:
                     priority=spec["priority"],
                     status="ACTIVE",
                     source="system",
-                    created_at=now,
-                    updated_at=now,
+                    created_at=moment,
+                    updated_at=moment,
                 )
             )
-        self.logger.info("emotion_defaults_seeded agent_id=%s rules=%d",
-                         agent_id, len(DEFAULT_RULES))
 
     async def get_profile(self, agent_id: str) -> EmotionProfile | None:
         return await self.repo.get_profile(agent_id)
@@ -121,13 +132,17 @@ class EmotionService:
         responsiveness: float | None = None,
         changed_by: str = "admin",
     ) -> EmotionProfile:
-        """Update the stable profile, versioned and audited."""
-        profile = await self.repo.get_profile(agent_id) or EmotionProfile(
-            agent_id=agent_id,
-            created_at=self.clock(),
-            updated_at=self.clock(),
-            revision=0,
-        )
+        """Update the stable profile, versioned and audited.
+
+        The write is guarded by an optimistic revision check
+        (``WHERE agent_id=? AND revision=?``): if another writer advanced the
+        revision between our read and our write, this raises
+        :class:`EmotionProfileConflict` instead of silently overwriting it.
+        """
+        await self.ensure_defaults(agent_id)
+        profile = await self.repo.get_profile(agent_id)
+        if profile is None:  # pragma: no cover - ensure_defaults creates it
+            raise EmotionProfileConflict(f"profile for {agent_id!r} is missing")
         new_valence = (
             profile.baseline_valence
             if baseline_valence is None
@@ -158,7 +173,14 @@ class EmotionService:
                 "revision": profile.revision + 1,
             }
         )
-        await self.repo.upsert_profile(updated)
+        written = await self.repo.update_profile_optimistic(
+            updated, expected_revision=profile.revision
+        )
+        if not written:
+            raise EmotionProfileConflict(
+                f"profile for {agent_id!r} changed concurrently"
+                f" (expected revision {profile.revision})"
+            )
         await self._audit(agent_id, "emotion_profile_update", agent_id,
                           f"revision={updated.revision}")
         self.logger.info(
@@ -276,6 +298,131 @@ class EmotionService:
             await self._checkpoint(agent_id, person_id, state)
         return state
 
+    async def process_turn(
+        self,
+        agent_id: str,
+        person_id: str,
+        *,
+        text: str,
+        signal=None,
+        memories: list[dict] | None = None,
+        agent_context: dict | None = None,
+        conversation_id: str | None = None,
+        source_event_id: str | None = None,
+        persist: bool = True,
+    ) -> EmotionState:
+        """Appraise and apply one turn atomically, idempotently, at one instant.
+
+        The whole read-modify-write happens inside one ``BEGIN IMMEDIATE``
+        transaction: the receipt is checked, profile and snapshot are read, the
+        state is decayed at a single captured ``now``, the local appraisal runs,
+        and then either the emotion event + snapshot + ``APPLIED`` receipt are
+        written together, or only a ``NO_CHANGE`` receipt is written. A crash at
+        any point leaves no half-applied turn. No external model is called here.
+
+        ``persist=False`` performs the same computation with no writes at all.
+        """
+        memories = memories or []
+        traits = None
+        if isinstance(agent_context, dict):
+            traits = agent_context.get("traits")
+        await self.ensure_defaults(agent_id)
+        now = self._now()
+
+        if not persist:
+            profile = await self.repo.get_profile(agent_id)
+            snapshot = await self.repo.get_snapshot(agent_id, person_id)
+            current = self._decayed_state(profile, snapshot, now)
+            rules = await self.repo.list_rules(agent_id)
+            result = self.appraisal.appraise(
+                text,
+                rules=rules,
+                signal=signal,
+                memories=memories,
+                agent_context=agent_context,
+                current_state=current,
+                profile=profile,
+                traits=traits,
+                now=now,
+            )
+            return self._state_from_result(result, profile, now)
+
+        async with self.repo.db.transaction(immediate=True):
+            if source_event_id is not None:
+                receipt = await self.repo.get_receipt(source_event_id)
+                if receipt is None and await self.repo.has_event_for_source(
+                    source_event_id
+                ):
+                    # A pre-V0.3.1 event without a receipt: adopt it rather than
+                    # applying the same shift again.
+                    await self.repo.insert_receipt(
+                        source_event_id=source_event_id,
+                        agent_id=agent_id,
+                        person_id=person_id,
+                        outcome="APPLIED",
+                        processed_at=now,
+                    )
+                    receipt = await self.repo.get_receipt(source_event_id)
+                if receipt is not None:
+                    profile = await self.repo.get_profile(agent_id)
+                    snapshot = await self.repo.get_snapshot(agent_id, person_id)
+                    return self._decayed_state(profile, snapshot, now)
+
+            profile = await self.repo.get_profile(agent_id)
+            snapshot = await self.repo.get_snapshot(agent_id, person_id)
+            current = self._decayed_state(profile, snapshot, now)
+            rules = await self.repo.list_rules(agent_id)
+            result = self.appraisal.appraise(
+                text,
+                rules=rules,
+                signal=signal,
+                memories=memories,
+                agent_context=agent_context,
+                current_state=current,
+                profile=profile,
+                traits=traits,
+                now=now,
+            )
+
+            if result.trigger_rule_id is None:
+                if source_event_id is not None:
+                    await self.repo.insert_receipt(
+                        source_event_id=source_event_id,
+                        agent_id=agent_id,
+                        person_id=person_id,
+                        outcome="NO_CHANGE",
+                        processed_at=now,
+                    )
+                return current
+
+            state = self._state_from_result(result, profile, now)
+            await self.repo.insert_event(
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                person_id=person_id,
+                source_event_id=source_event_id,
+                appraisal_rule_id=result.trigger_rule_id,
+                memory_id=result.matched_memory_id,
+                emotion=state.emotion,
+                valence=state.valence,
+                arousal=state.arousal,
+                intensity=state.intensity,
+                appraisal_reason=result.reason,
+                created_at=now,
+            )
+            await self._checkpoint(
+                agent_id, person_id, state, updated_at=now
+            )
+            if source_event_id is not None:
+                await self.repo.insert_receipt(
+                    source_event_id=source_event_id,
+                    agent_id=agent_id,
+                    person_id=person_id,
+                    outcome="APPLIED",
+                    processed_at=now,
+                )
+            return state
+
     async def apply_result(
         self,
         agent_id: str,
@@ -286,39 +433,34 @@ class EmotionService:
         source_event_id: str | None = None,
         persist: bool = True,
     ) -> EmotionState:
-        """Apply an appraisal result: persist the event + snapshot, return state.
+        """Compatibility path for an already-computed :class:`AppraisalResult`.
 
-        ``persist=False`` computes the state in memory without writing events or
-        snapshots (strict no-persistence); the caller is responsible for not
-        claiming anything was saved.
+        Uses the same single transaction and receipt semantics as
+        :meth:`process_turn`, so callers cannot double-apply a result.
         """
         await self.ensure_defaults(agent_id)
-
-        # Idempotency anchor: re-processing a turn must not apply the same
-        # emotional shift twice. If a previous (possibly crashed) attempt already
-        # recorded an event for this source utterance, return the current decayed
-        # state instead of re-adding the appraisal delta.
-        if persist and source_event_id is not None:
-            if await self.repo.has_event_for_source(source_event_id):
-                return await self.get_state(agent_id, person_id)
-
+        now = self._now()
         profile = await self.repo.get_profile(agent_id)
         half_life = profile.default_half_life_seconds if profile else 3600.0
-
         state = EmotionState(
             valence=result.valence,
             arousal=result.arousal,
             intensity=result.intensity,
             emotion=result.emotion,
-            updated_at=self.clock(),
+            updated_at=now,
             half_life_seconds=float(half_life),
         )
+        if not persist:
+            return state
 
-        if persist:
-            # Only a real appraisal (a rule actually fired) is recorded as a
-            # durable emotion event. A turn where nothing matched carries no
-            # emotional shift, so writing an event for it would only bloat the
-            # history; the decayed state is still checkpointed below.
+        async with self.repo.db.transaction(immediate=True):
+            if source_event_id is not None:
+                if await self.repo.get_receipt(source_event_id) is not None or (
+                    await self.repo.has_event_for_source(source_event_id)
+                ):
+                    snapshot = await self.repo.get_snapshot(agent_id, person_id)
+                    return self._decayed_state(profile, snapshot, now)
+
             if result.trigger_rule_id is not None:
                 await self.repo.insert_event(
                     agent_id=agent_id,
@@ -327,16 +469,94 @@ class EmotionService:
                     source_event_id=source_event_id,
                     appraisal_rule_id=result.trigger_rule_id,
                     memory_id=result.matched_memory_id,
-                    emotion=result.emotion,
-                    valence=result.valence,
-                    arousal=result.arousal,
-                    intensity=result.intensity,
+                    emotion=state.emotion,
+                    valence=state.valence,
+                    arousal=state.arousal,
+                    intensity=state.intensity,
                     appraisal_reason=result.reason,
+                    created_at=now,
                 )
-            await self._checkpoint(agent_id, person_id, state)
-        return state
+                await self._checkpoint(agent_id, person_id, state, updated_at=now)
+            if source_event_id is not None:
+                await self.repo.insert_receipt(
+                    source_event_id=source_event_id,
+                    agent_id=agent_id,
+                    person_id=person_id,
+                    outcome=(
+                        "APPLIED"
+                        if result.trigger_rule_id is not None
+                        else "NO_CHANGE"
+                    ),
+                    processed_at=now,
+                )
+            return state
 
-    async def _checkpoint(self, agent_id: str, person_id: str, state: EmotionState) -> None:
+    def _now(self) -> datetime:
+        now = self.clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now
+
+    def _decayed_state(
+        self,
+        profile: EmotionProfile | None,
+        snapshot: dict | None,
+        now: datetime,
+    ) -> EmotionState:
+        baseline_valence = profile.baseline_valence if profile else 0.0
+        baseline_arousal = profile.baseline_arousal if profile else 0.0
+        if snapshot is None:
+            state = EmotionState(
+                valence=baseline_valence,
+                arousal=baseline_arousal,
+                intensity=0.0,
+                emotion="NEUTRAL",
+                updated_at=now,
+                half_life_seconds=(
+                    profile.default_half_life_seconds if profile else 3600.0
+                ),
+            )
+        else:
+            state = EmotionState(
+                valence=snapshot["valence"],
+                arousal=snapshot["arousal"],
+                intensity=snapshot["intensity"],
+                emotion=snapshot["emotion"],
+                updated_at=datetime.fromisoformat(snapshot["updated_at"]),
+                half_life_seconds=snapshot["half_life_seconds"],
+            )
+        return decay(
+            state,
+            now=now,
+            baseline_valence=baseline_valence,
+            baseline_arousal=baseline_arousal,
+        )
+
+    @staticmethod
+    def _state_from_result(
+        result: AppraisalResult,
+        profile: EmotionProfile | None,
+        now: datetime,
+    ) -> EmotionState:
+        return EmotionState(
+            valence=result.valence,
+            arousal=result.arousal,
+            intensity=result.intensity,
+            emotion=result.emotion,
+            updated_at=now,
+            half_life_seconds=(
+                float(profile.default_half_life_seconds) if profile else 3600.0
+            ),
+        )
+
+    async def _checkpoint(
+        self,
+        agent_id: str,
+        person_id: str,
+        state: EmotionState,
+        *,
+        updated_at: datetime | None = None,
+    ) -> None:
         await self.repo.upsert_snapshot(
             agent_id=agent_id,
             person_id=person_id,
@@ -345,6 +565,7 @@ class EmotionService:
             intensity=state.intensity,
             emotion=state.emotion,
             half_life_seconds=state.half_life_seconds,
+            updated_at=updated_at,
         )
 
     # -- speech plan --------------------------------------------------------

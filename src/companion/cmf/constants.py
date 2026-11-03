@@ -66,6 +66,7 @@ REQUIRED_TABLES = frozenset(
         "emotion_state_snapshots",
         "emotion_feedback",
         "voice_profiles",
+        "emotion_turn_receipts",
     }
 )
 

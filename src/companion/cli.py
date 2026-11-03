@@ -83,17 +83,43 @@ def _add_provider_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _build_foreground_runtime(db, provider: str):
+async def _build_foreground_runtime(db, provider: str):
     """Build a runtime for utterance-processing commands.
 
-    A missing key for ``--provider deepseek`` prints a clear error and returns
-    ``None`` — it never falls back to mock and never makes a network call.
+    Embedding follows the persistent ``memory.embedding.*`` settings: disabled
+    by default, and only ``enabled=true`` with an explicit backend wires the
+    hybrid retriever. A requested-but-unavailable backend is a clear error, not
+    a silent fallback. A missing key for ``--provider deepseek`` likewise prints
+    an error and returns ``None`` — never a mock fallback, never a network call.
     """
+    from companion.memory.embeddings import (
+        EmbeddingBackendUnavailable,
+        build_embedding_provider_from_settings,
+    )
+
+    settings = make_repositories(db).settings
     try:
-        return build_runtime(db, provider=provider)
+        embedding_provider = await build_embedding_provider_from_settings(settings)
+    except EmbeddingBackendUnavailable as exc:
+        print(f"embedding error: {exc}")
+        return None
+    try:
+        return build_runtime(
+            db, provider=provider, embedding_provider=embedding_provider
+        )
     except DeepSeekConfigError as exc:
         print(f"deepseek error: {exc}")
         return None
+
+
+async def _get_foreground_runtime(db, provider: str):
+    """Await the builder, tolerating a synchronous test double."""
+    import inspect
+
+    result = _build_foreground_runtime(db, provider)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 def _common_parser() -> argparse.ArgumentParser:
@@ -597,7 +623,7 @@ async def cmd_person_show(args) -> int:
 async def cmd_say(args) -> int:
     db = await _connect(args.db)
     try:
-        rt = _build_foreground_runtime(db, getattr(args, "provider", "mock"))
+        rt = await _get_foreground_runtime(db, getattr(args, "provider", "mock"))
         if rt is None:
             return 1
         event = make_utterance_event(
@@ -1184,7 +1210,7 @@ async def cmd_recovery_list(args) -> int:
 async def cmd_recovery_retry(args) -> int:
     db = await _connect(args.db)
     try:
-        rt = _build_foreground_runtime(db, getattr(args, "provider", "mock"))
+        rt = await _get_foreground_runtime(db, getattr(args, "provider", "mock"))
         if rt is None:
             return 1
         recovery = RecoveryManager(rt.repos, rt.orchestrator)
@@ -1208,7 +1234,7 @@ async def cmd_demo(args) -> int:
         db_path = Path(tmp) / "demo.db"
         db = await _connect(db_path)
         try:
-            rt = _build_foreground_runtime(db, getattr(args, "provider", "mock"))
+            rt = await _get_foreground_runtime(db, getattr(args, "provider", "mock"))
             if rt is None:
                 return 1
             external_ai = getattr(args, "provider", "mock") == "deepseek"
@@ -1281,7 +1307,7 @@ async def cmd_repl(args) -> int:
     db = await _connect(args.db)
     try:
         provider = getattr(args, "provider", "mock")
-        rt = _build_foreground_runtime(db, provider)
+        rt = await _get_foreground_runtime(db, provider)
         if rt is None:
             return 1
         person, err = await _select_repl_person(rt, getattr(args, "person", None))
@@ -1816,14 +1842,12 @@ def _build_embedding_provider(args):
     """
     from companion.memory.embeddings import (
         EmbeddingBackendUnavailable,
-        FakeEmbeddingProvider,
-        LocalSentenceTransformerProvider,
+        create_embedding_provider,
     )
 
-    if getattr(args, "fake_provider", False):
-        return FakeEmbeddingProvider()
+    backend = "fake" if getattr(args, "fake_provider", False) else "local"
     try:
-        return LocalSentenceTransformerProvider()
+        return create_embedding_provider(backend)
     except EmbeddingBackendUnavailable as exc:
         print(f"embedding error: {exc}")
         return None
@@ -1839,15 +1863,25 @@ def _build_embedding_runtime(db, args):
 async def cmd_memory_index_status(args) -> int:
     db = await _connect(args.db)
     try:
+        from companion.memory.embeddings import SETTING_VECTOR_BACKEND
         from companion.memory.embedding_repository import EmbeddingRepository
         from companion.memory.vector_index import VectorIndex
 
         repo = EmbeddingRepository(db)
         index = VectorIndex(repo)
-        print(f"sqlite_vec_available: {index.using_sqlite_vec}")
+        requested = (
+            await make_repositories(db).settings.get(SETTING_VECTOR_BACKEND, "python")
+            or "python"
+        )
+        backend = index.backend_status(requested)
+        print(f"sqlite_vec_installed: {backend['sqlite_vec_installed']}")
+        print(f"sqlite_vec_loadable: {backend['sqlite_vec_loadable']}")
+        print(f"sqlite_vec_enabled: {backend['sqlite_vec_enabled']}")
+        print(f"active_backend: {backend['active_backend']}")
+        print(f"requested_backend: {backend['requested_backend']}")
         print(
             "backend: "
-            + ("sqlite-vec (vec0)" if index.using_sqlite_vec else "pure-python fallback")
+            + ("sqlite-vec (vec0)" if backend["sqlite_vec_enabled"] else "pure-python fallback")
         )
         models = await repo.list_models()
         if not models:

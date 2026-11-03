@@ -18,6 +18,7 @@ import json
 import math
 import re
 import struct
+import threading
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -82,6 +83,16 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 def dot_product(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
+
+
+def content_hash(kind: str, content: str) -> str:
+    """Deterministic hash of the fields a memory vector must reflect.
+
+    Defined with the embedding primitives (not the service) so the vector
+    index and repository can verify that a stored vector belongs to the
+    *current* memory without importing the write-side service.
+    """
+    return hashlib.sha256(f"{kind}\0{content}".encode("utf-8")).hexdigest()
 
 
 # -- model identity ----------------------------------------------------------
@@ -233,9 +244,13 @@ class FakeEmbeddingProvider:
 class LocalSentenceTransformerProvider:
     """Lazy sentence-transformers adapter for a local, real embedding model.
 
-    Constructing it requires the ``[embedding]`` extra. It is the *only* real
-    provider: it loads weights from the local cache (or downloads them once),
-    so it is explicitly opt-in and never runs in CI or the default suite.
+    The constructor is *cheap*: it records configuration and performs no import
+    and no model load. Weights are loaded on first use, inside whichever worker
+    thread the service launches (``asyncio.to_thread``), so building a runtime
+    never blocks the event loop and a configured-but-unused index costs nothing.
+
+    Requires the optional ``[embedding]`` extra. It is the only real provider;
+    it is never selected for the deterministic fake automatically.
     """
 
     def __init__(
@@ -250,15 +265,8 @@ class LocalSentenceTransformerProvider:
         self.model_name = model_name
         self.model_revision = model_revision
         self.dimensions = dimensions
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as exc:  # pragma: no cover - requires optional extra
-            raise EmbeddingBackendUnavailable(
-                "the [embedding] extra is not installed; run "
-                "`pip install -e '.[embedding]'` to enable local embeddings"
-            ) from exc
-
-        self._model = SentenceTransformer(model_name, revision=model_revision)
+        self._model = None
+        self._load_lock = threading.Lock()
         self.spec = EmbeddingModelSpec(
             provider="sentence-transformers",
             model_name=model_name,
@@ -272,14 +280,32 @@ class LocalSentenceTransformerProvider:
         )
         self.model_id = self.spec.model_id()
 
+    def _ensure_model(self):
+        """Import and load the model once, off the event loop."""
+        if self._model is not None:
+            return self._model
+        with self._load_lock:
+            if self._model is None:
+                try:
+                    from sentence_transformers import SentenceTransformer
+                except ImportError as exc:  # pragma: no cover - optional extra
+                    raise EmbeddingBackendUnavailable(
+                        "the [embedding] extra is not installed; run "
+                        "`pip install -e '.[embedding]'` to enable local embeddings"
+                    ) from exc
+                self._model = SentenceTransformer(
+                    self.model_name, revision=self.model_revision
+                )
+        return self._model
+
     def embed_query(self, text: str) -> list[float]:
-        return self._normalize(self._model.encode(self.spec.query_prefix + text))
+        return self._normalize(
+            self._ensure_model().encode(self.spec.query_prefix + text)
+        )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return [
-            self._normalize(self._model.encode(self.spec.document_prefix + t))
-            for t in texts
-        ]
+        model = self._ensure_model()
+        return [self._normalize(model.encode(self.spec.document_prefix + t)) for t in texts]
 
     def _normalize(self, vector) -> list[float]:
         values = [float(x) for x in vector]
@@ -288,3 +314,64 @@ class LocalSentenceTransformerProvider:
                 f"model produced {len(values)} dims, expected {self.dimensions}"
             )
         return normalize_l2(values)
+
+
+# -- runtime configuration ---------------------------------------------------
+
+# These are application settings (``app_settings``), never environment
+# variables and never a model-chosen option. Embedding is OFF unless the user
+# explicitly enables it and chooses a backend.
+SETTING_EMBEDDING_ENABLED = "memory.embedding.enabled"
+SETTING_EMBEDDING_BACKEND = "memory.embedding.backend"
+SETTING_EMBEDDING_MODEL = "memory.embedding.model"
+SETTING_VECTOR_BACKEND = "memory.embedding.vector_backend"
+
+EMBEDDING_BACKENDS = ("local", "fake")
+VECTOR_BACKENDS = ("python", "sqlite_vec")
+DEFAULT_LOCAL_MODEL = "intfloat/multilingual-e5-small"
+
+
+def create_embedding_provider(
+    backend: str = "local",
+    *,
+    model_name: str | None = None,
+    dimensions: int = 384,
+) -> EmbeddingProvider:
+    """The single provider factory used by settings and CLI commands.
+
+    ``fake`` is only ever returned when explicitly requested; an unknown
+    backend raises rather than falling back.
+    """
+    backend = (backend or "local").strip().lower()
+    if backend == "fake":
+        return FakeEmbeddingProvider()
+    if backend == "local":
+        return LocalSentenceTransformerProvider(
+            model_name=model_name or DEFAULT_LOCAL_MODEL, dimensions=dimensions
+        )
+    raise EmbeddingBackendUnavailable(
+        f"unknown embedding backend {backend!r}; expected one of"
+        f" {EMBEDDING_BACKENDS}"
+    )
+
+
+async def build_embedding_provider_from_settings(
+    settings,
+    *,
+    dimensions: int = 384,
+) -> EmbeddingProvider | None:
+    """Resolve the configured embedding provider (or ``None`` when disabled).
+
+    ``settings`` is anything with async ``get``/``get_bool`` (normally
+    :class:`SettingsRepository`). The default — no setting row — is *disabled*:
+    a normal REPL/say therefore never loads a model or fakes one. ``fake`` must
+    be selected explicitly (tests/offline demos) and an unknown backend is a
+    clear configuration error, not a silent fallback.
+    """
+    if not await settings.get_bool(SETTING_EMBEDDING_ENABLED, False):
+        return None
+    backend = (await settings.get(SETTING_EMBEDDING_BACKEND, "local") or "local")
+    model_name = await settings.get(SETTING_EMBEDDING_MODEL, None)
+    return create_embedding_provider(
+        backend, model_name=model_name, dimensions=dimensions
+    )

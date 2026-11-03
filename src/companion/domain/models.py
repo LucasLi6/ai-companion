@@ -13,9 +13,10 @@ back on read.
 
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -157,6 +158,103 @@ class MemoryCandidate(DomainModel):
     source_evidence_span: Optional[str] = Field(default=None, max_length=4096)
 
 
+class AffectiveSignal(DomainModel):
+    """A minimal, locally validated semantic affect hint from the model.
+
+    The model may describe what the *current utterance explicitly asserts* —
+    never a diagnosis of the speaker's mental state. Every field is checked by
+    trusted code before use:
+
+    - whitelisted ``event_type`` / ``subject`` / ``factuality``;
+    - ``confidence`` a finite float in [0, 1];
+    - ``evidence_span`` a verbatim substring of the current input.
+
+    A missing or invalid signal is ignored (``None``) rather than failing the
+    conversation. This signal can never write a memory or authorise an action.
+    """
+
+    event_type: Literal[
+        "achievement",
+        "setback",
+        "gratitude",
+        "urgency",
+        "question",
+        "none",
+    ] = "none"
+    subject: Literal["speaker", "other", "agent", "unknown"] = "unknown"
+    factuality: Literal[
+        "asserted",
+        "negated",
+        "hypothetical",
+        "quoted",
+        "uncertain",
+    ] = "uncertain"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_span: Optional[str] = Field(default=None, max_length=512)
+
+
+_AFT_EVENT_TYPES = {"achievement", "setback", "gratitude", "urgency", "question", "none"}
+_AFT_SUBJECTS = {"speaker", "other", "agent", "unknown"}
+_AFT_FACTUALITIES = {"asserted", "negated", "hypothetical", "quoted", "uncertain"}
+
+
+def validate_affective_signal(raw, text: str) -> Optional[AffectiveSignal]:
+    """Validate a model-supplied signal locally; return ``None`` when invalid.
+
+    The model's ids, confidence and prose are never trusted on their own. The
+    evidence span must be a real substring of the current input, and ``none``
+    is allowed without evidence (it is an explicit "no event" answer).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, AffectiveSignal):
+        data = raw.model_dump()
+    elif isinstance(raw, dict):
+        data = dict(raw)
+    else:
+        return None
+
+    event_type = data.get("event_type")
+    subject = data.get("subject")
+    factuality = data.get("factuality")
+    if event_type not in _AFT_EVENT_TYPES:
+        return None
+    if subject not in _AFT_SUBJECTS:
+        return None
+    if factuality not in _AFT_FACTUALITIES:
+        return None
+
+    try:
+        confidence = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        return None
+
+    evidence = data.get("evidence_span")
+    if evidence is not None and not isinstance(evidence, str):
+        return None
+    if event_type == "none":
+        return AffectiveSignal(
+            event_type="none",
+            subject=subject,
+            factuality=factuality,
+            confidence=confidence,
+            evidence_span=None,
+        )
+    if not evidence or not evidence.strip():
+        return None
+    if len(evidence) > 512 or evidence not in text:
+        return None
+    return AffectiveSignal(
+        event_type=event_type,
+        subject=subject,
+        factuality=factuality,
+        confidence=confidence,
+        evidence_span=evidence,
+    )
+
+
 class CognitiveResult(DomainModel):
     """Structured output of a cognitive provider.
 
@@ -180,6 +278,9 @@ class CognitiveResult(DomainModel):
     silence_requested: bool = False
     reply_necessity: ReplyNecessity = ReplyNecessity.OPTIONAL
     conversation_state: str = Field(default="unknown", min_length=1, max_length=128)
+    # Optional, locally validated semantic event hint. None for older records,
+    # mock providers and invalid model output.
+    affective_signal: Optional[AffectiveSignal] = None
 
 
 class AgentAction(DomainModel):
