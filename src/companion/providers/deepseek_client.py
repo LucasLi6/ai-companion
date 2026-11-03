@@ -60,8 +60,12 @@ class DeepSeekConfig:
     retry_backoff_seconds: float = 1.0
     analysis_max_tokens: int = 1024
     response_max_tokens: int = 2048
-    analysis_reasoning_effort: Optional[str] = None
-    response_reasoning_effort: Optional[str] = None
+    # V0.4: Thinking Mode is OFF by default for both request types. The
+    # explicit "none" is sent on the wire (not omitted) so the provider cannot
+    # silently apply a reasoning default. An environment override to "high"
+    # remains possible for both request types.
+    analysis_reasoning_effort: Optional[str] = "none"
+    response_reasoning_effort: Optional[str] = "none"
 
 
 def _env_bool(value: str | None, default: bool) -> bool:
@@ -110,10 +114,10 @@ def load_deepseek_config(environ: dict | None = None) -> DeepSeekConfig:
         analysis_max_tokens=_env_int(env.get("DEEPSEEK_ANALYSIS_MAX_TOKENS"), 1024),
         response_max_tokens=_env_int(env.get("DEEPSEEK_RESPONSE_MAX_TOKENS"), 2048),
         analysis_reasoning_effort=_env_str(
-            env.get("DEEPSEEK_ANALYSIS_REASONING_EFFORT"), None
+            env.get("DEEPSEEK_ANALYSIS_REASONING_EFFORT"), "none"
         ),
         response_reasoning_effort=_env_str(
-            env.get("DEEPSEEK_RESPONSE_REASONING_EFFORT"), None
+            env.get("DEEPSEEK_RESPONSE_REASONING_EFFORT"), "none"
         ),
     )
 

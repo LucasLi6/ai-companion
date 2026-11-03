@@ -305,6 +305,234 @@ def validate_nonresponse_motive(
     )
 
 
+_SCENE_TOPIC_CHANGES = {"CONTINUE", "SHIFT", "RETURN", "UNCERTAIN"}
+_SCENE_MODES = {"CONVERSATION", "TASK", "PLAY", "SUPPORT", "UNKNOWN"}
+_SCENE_PHASES = {
+    "OPENING",
+    "EXPLORING",
+    "DEEPENING",
+    "WRAPPING_UP",
+    "CLOSED",
+    "UNCERTAIN",
+}
+_SCENE_TONES = {
+    "NEUTRAL",
+    "WARM",
+    "PLAYFUL",
+    "SERIOUS",
+    "TENSE",
+    "SAD",
+    "CELEBRATORY",
+    "UNCERTAIN",
+}
+_SCENE_PRESENCE = {"YES", "NO", "UNCERTAIN"}
+
+
+class SceneEnvironmentProposal(BaseModel):
+    """An environment observation the model claims the input literally supports.
+
+    Only fields backed by a verbatim evidence span are ever retained. There is
+    no sensor data in this system, so "location" and "other people present" are
+    never inferred; they must be stated explicitly by the speaker.
+    """
+
+    location: Optional[str] = Field(default=None, max_length=120)
+    other_people_present: Optional[Literal["YES", "NO", "UNCERTAIN"]] = None
+    evidence_span: Optional[str] = Field(default=None, max_length=512)
+
+
+class SceneOpenLoopProposal(BaseModel):
+    """A proposed unfinished thread. It is only persisted when the local trace
+    also says there is a pending follow-up."""
+
+    topic: Optional[str] = Field(default=None, max_length=120)
+    summary: str = Field(min_length=1, max_length=300)
+    evidence_span: Optional[str] = Field(default=None, max_length=512)
+
+
+class SceneProposal(DomainModel):
+    """A *proposal* about the conversational scene, not a trusted fact.
+
+    The model may suggest a topic change, discourse phase, tone, a pending
+    thread or an explicitly stated environment detail. Trusted code revalidates
+    every evidence span and decides what is merged into :class:`SceneState`.
+    Model-supplied ids are ignored.
+    """
+
+    topic_change: Literal["CONTINUE", "SHIFT", "RETURN", "UNCERTAIN"] = "UNCERTAIN"
+    topic: Optional[str] = Field(default=None, max_length=200)
+    mode: Literal[
+        "CONVERSATION", "TASK", "PLAY", "SUPPORT", "UNKNOWN"
+    ] = "UNKNOWN"
+    discourse_phase: Literal[
+        "OPENING",
+        "EXPLORING",
+        "DEEPENING",
+        "WRAPPING_UP",
+        "CLOSED",
+        "UNCERTAIN",
+    ] = "UNCERTAIN"
+    tone: Literal[
+        "NEUTRAL",
+        "WARM",
+        "PLAYFUL",
+        "SERIOUS",
+        "TENSE",
+        "SAD",
+        "CELEBRATORY",
+        "UNCERTAIN",
+    ] = "UNCERTAIN"
+    environment: Optional[SceneEnvironmentProposal] = None
+    open_loop: Optional[SceneOpenLoopProposal] = None
+    resolve_loop_topics: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_span: Optional[str] = Field(default=None, max_length=512)
+
+
+def _clean_text(value, limit: int) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split()).strip()
+    if not text or len(text) > limit:
+        return None
+    return text
+
+
+def _valid_evidence(value, allowed_texts) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    span = value.strip()
+    if not span or len(span) > 512:
+        return None
+    if not any(span in text for text in allowed_texts if text):
+        return None
+    return span
+
+
+def validate_scene_proposal(
+    raw, *, current_text: str, authorized_texts=()
+) -> Optional[SceneProposal]:
+    """Locally validate a model's scene proposal.
+
+    Returns ``None`` when the payload is malformed or contains no usable,
+    evidence-supported signal. Invalid individual fields are dropped rather
+    than failing the turn. Topic changes, environment claims and open loops all
+    require a verbatim evidence span from the current input or an authorized
+    recent turn; model ids and confidence never make a claim true.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, SceneProposal):
+        data = raw.model_dump()
+    elif isinstance(raw, dict):
+        data = dict(raw)
+    else:
+        return None
+
+    allowed = [current_text, *list(authorized_texts or ())]
+
+    try:
+        confidence = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        confidence = 0.0
+
+    evidence = _valid_evidence(data.get("evidence_span"), allowed)
+
+    topic_change = str(data.get("topic_change") or "UNCERTAIN").strip().upper()
+    if topic_change not in _SCENE_TOPIC_CHANGES:
+        topic_change = "UNCERTAIN"
+    topic = _clean_text(data.get("topic"), 200)
+    if topic is None or evidence is None:
+        topic = None
+        if topic_change in ("SHIFT", "RETURN"):
+            topic_change = "UNCERTAIN"
+
+    mode = str(data.get("mode") or "UNKNOWN").strip().upper()
+    if mode not in _SCENE_MODES:
+        mode = "UNKNOWN"
+    phase = str(data.get("discourse_phase") or "UNCERTAIN").strip().upper()
+    if phase not in _SCENE_PHASES:
+        phase = "UNCERTAIN"
+    tone = str(data.get("tone") or "UNCERTAIN").strip().upper()
+    if tone not in _SCENE_TONES:
+        tone = "UNCERTAIN"
+
+    environment = None
+    env_raw = data.get("environment")
+    if isinstance(env_raw, dict):
+        env_evidence = _valid_evidence(env_raw.get("evidence_span"), allowed)
+        location = _clean_text(env_raw.get("location"), 120)
+        presence = str(
+            env_raw.get("other_people_present") or "UNCERTAIN"
+        ).strip().upper()
+        if presence not in _SCENE_PRESENCE:
+            presence = "UNCERTAIN"
+        if env_evidence is None:
+            location = None
+            presence = "UNCERTAIN"
+        elif location is not None:
+            # A verbatim span must at least contain the claimed place. This
+            # prevents pairing a real sentence ("我一个人在家") with an
+            # unrelated inferred location ("办公室"). Semantic entailment is
+            # still the model's job; absence of a lexical anchor is dropped.
+            if location.casefold() not in env_evidence.casefold():
+                location = None
+        if location is not None or presence != "UNCERTAIN":
+            environment = SceneEnvironmentProposal(
+                location=location,
+                other_people_present=presence,
+                evidence_span=env_evidence,
+            )
+
+    open_loop = None
+    loop_raw = data.get("open_loop")
+    if isinstance(loop_raw, dict):
+        loop_evidence = _valid_evidence(loop_raw.get("evidence_span"), allowed)
+        summary = _clean_text(loop_raw.get("summary"), 300)
+        loop_topic = _clean_text(loop_raw.get("topic"), 120)
+        if summary is not None and loop_evidence is not None:
+            open_loop = SceneOpenLoopProposal(
+                topic=loop_topic,
+                summary=summary,
+                evidence_span=loop_evidence,
+            )
+
+    resolve_topics: list[str] = []
+    raw_resolve = data.get("resolve_loop_topics")
+    if isinstance(raw_resolve, list):
+        for item in raw_resolve[:5]:
+            cleaned = _clean_text(item, 120)
+            if cleaned and cleaned not in resolve_topics:
+                resolve_topics.append(cleaned)
+
+    if (
+        topic is None
+        and environment is None
+        and open_loop is None
+        and not resolve_topics
+        and mode == "UNKNOWN"
+        and phase == "UNCERTAIN"
+        and tone == "UNCERTAIN"
+        and topic_change == "UNCERTAIN"
+    ):
+        return None
+
+    return SceneProposal(
+        topic_change=topic_change,
+        topic=topic,
+        mode=mode,
+        discourse_phase=phase,
+        tone=tone,
+        environment=environment,
+        open_loop=open_loop,
+        resolve_loop_topics=resolve_topics,
+        confidence=confidence,
+        evidence_span=evidence,
+    )
+
+
 def validate_affective_signal(raw, text: str) -> Optional[AffectiveSignal]:
     """Validate a model-supplied signal locally; return ``None`` when invalid.
 
@@ -392,6 +620,10 @@ class CognitiveResult(DomainModel):
     # the final action or final reason; ``derive_nonresponse_trace`` records
     # whether local policy overrode it.
     nonresponse_motive: Optional[NonresponseMotive] = None
+    # Optional, locally validated scene proposal. It describes a candidate
+    # conversational scene; SceneManager decides what, if anything, is merged
+    # into the persisted state. None for older records and mock providers.
+    scene_proposal: Optional[SceneProposal] = None
 
 
 class AgentAction(DomainModel):

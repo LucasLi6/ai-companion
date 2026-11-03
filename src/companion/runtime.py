@@ -16,8 +16,11 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from companion.agent.personality_compiler import PersonalityCompiler
 from companion.agent.service import AgentService
+from companion.agent.style_examples import StyleExampleRepository
 from companion.cognition.context_builder import ContextBuilder
+from companion.cognition.scene_manager import SceneManager
 from companion.cognition.privacy import ForegroundPrivacyGateway
 from companion.core.conversation import ConversationManager
 from companion.core.orchestrator import Orchestrator
@@ -69,6 +72,9 @@ class Runtime:
     embedding_service: Optional[EmbeddingService] = None
     emotion_service: Optional[EmotionService] = None
     hybrid_retriever: Optional[HybridRetriever] = None
+    scene_manager: Optional[SceneManager] = None
+    style_repo: Optional[StyleExampleRepository] = None
+    personality_compiler: Optional[PersonalityCompiler] = None
 
 
 def build_runtime(
@@ -83,6 +89,8 @@ def build_runtime(
     deepseek_config=None,
     allow_mixed_providers: bool = False,
     embedding_provider=None,
+    scene_enabled: Optional[bool] = None,
+    personality_generation_enabled: Optional[bool] = None,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
 
@@ -159,6 +167,28 @@ def build_runtime(
         EmotionRepository(db), audit=repos.audit, logger=logger
     )
 
+    # V0.4 scene/personality is enabled by default for the real DeepSeek path,
+    # and stays off for the plain mock path unless a caller opts in. The
+    # per-turn app_settings flags can disable it later without a code change.
+    if scene_enabled is None:
+        scene_enabled = provider == "deepseek"
+    if personality_generation_enabled is None:
+        personality_generation_enabled = provider == "deepseek"
+    style_repo = StyleExampleRepository(db)
+    scene_manager = (
+        SceneManager(
+            repos=repos,
+            registry=registry,
+            require_external_ai=(provider == "deepseek"),
+            logger=logger,
+        )
+        if scene_enabled
+        else None
+    )
+    personality_compiler = (
+        PersonalityCompiler() if personality_generation_enabled else None
+    )
+
     context_builder: Optional[ContextBuilder] = None
     gateway: Optional[ForegroundPrivacyGateway] = None
 
@@ -210,6 +240,9 @@ def build_runtime(
         memory_writer=memory_writer,
         emotion_service=emotion_service,
         agent_service=agent_service,
+        scene_manager=scene_manager,
+        personality_compiler=personality_compiler,
+        style_repo=style_repo,
         logger=logger,
     )
     return Runtime(
@@ -231,4 +264,7 @@ def build_runtime(
         embedding_service=embedding_service,
         emotion_service=emotion_service,
         hybrid_retriever=hybrid_retriever,
+        scene_manager=scene_manager,
+        style_repo=style_repo,
+        personality_compiler=personality_compiler,
     )

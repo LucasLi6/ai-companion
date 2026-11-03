@@ -74,6 +74,50 @@ def test_say_inspect_quiet_jobs(tmp_path, capsys):
     assert "MEMORY_CONSOLIDATION" in capsys.readouterr().out
 
 
+def test_agent_style_example_add_list_disable(tmp_path, capsys):
+    db = str(tmp_path / "style.db")
+    assert main(["--db", db, "init"]) == 0
+    assert main([
+        "--db", db, "person", "add", "--name", "Owner", "--role", "owner",
+        "--allow-processing", "--allow-persistence", "--allow-memory-learning",
+    ]) == 0
+    person_id = capsys.readouterr().out.strip().splitlines()[-1]
+
+    assert main([
+        "--db", db, "agent", "style-example", "add",
+        "--scenario", "技术排查",
+        "--user", "这个 bug 怎么查？",
+        "--response", "先看复现路径。",
+        "--person", person_id,
+    ]) == 0
+    out = capsys.readouterr().out
+    example_id = next(
+        line.split(": ", 1)[1]
+        for line in out.splitlines()
+        if line.startswith("example_id: ")
+    )
+    assert f"scope: {person_id}" in out
+
+    assert main(["--db", db, "agent", "style-example", "list", "--person", person_id]) == 0
+    listed = capsys.readouterr().out
+    assert example_id in listed
+    assert "status=ACTIVE" in listed
+    assert "scenario=技术排查" in listed
+
+    assert main(["--db", db, "agent", "style-example", "disable", example_id]) == 0
+    assert "status=DISABLED" in capsys.readouterr().out
+    assert main(["--db", db, "agent", "style-example", "list", "--person", person_id]) == 0
+    assert example_id not in capsys.readouterr().out
+
+    # A bad person scope is a clean CLI error, not an FK traceback.
+    assert main([
+        "--db", db, "agent", "style-example", "add",
+        "--scenario", "x", "--user", "y", "--response", "z",
+        "--person", "person_missing",
+    ]) == 1
+    assert "unknown person" in capsys.readouterr().out
+
+
 def test_demo_runs_on_isolated_db(capsys):
     assert main(["demo"]) == 0
     out = capsys.readouterr().out

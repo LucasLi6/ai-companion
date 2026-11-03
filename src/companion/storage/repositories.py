@@ -292,6 +292,33 @@ class UtteranceRepository:
             (status.value, event_id),
         )
 
+    async def get_many(self, event_ids: list[str]) -> dict[str, UtteranceEvent]:
+        """Return the requested events in one query, keyed by event id."""
+        if not event_ids:
+            return {}
+        placeholders = ",".join("?" for _ in event_ids)
+        cur = await self.db.execute(
+            "SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
+            " text, source, addressee_hint, occurred_at, processing_status"
+            f" FROM utterances WHERE event_id IN ({placeholders})",
+            tuple(event_ids),
+        )
+        rows = await cur.fetchall()
+        return {
+            r["event_id"]: UtteranceEvent(
+                event_id=r["event_id"],
+                conversation_id=r["conversation_id"],
+                speaker_person_id=r["speaker_person_id"],
+                speaker_label=r["speaker_label"],
+                text=r["text"],
+                source=EventSource(r["source"]),
+                addressee_hint=AddresseeHint(r["addressee_hint"]),
+                occurred_at=_dt(r["occurred_at"]),
+                processing_status=ProcessingStatus(r["processing_status"]),
+            )
+            for r in rows
+        }
+
     async def recent(self, conversation_id: str, limit: int = 20) -> list[str]:
         cur = await self.db.execute(
             "SELECT event_id FROM utterances WHERE conversation_id = ?"
@@ -432,12 +459,20 @@ class AnalysisRepository:
             if analysis.nonresponse_motive is not None
             else None
         )
+        scene_json = (
+            json.dumps(
+                analysis.scene_proposal.model_dump(mode="json"),
+                ensure_ascii=False,
+            )
+            if analysis.scene_proposal is not None
+            else None
+        )
         await self.db.execute(
             "INSERT INTO cognitive_analyses(analysis_id, event_id, meaning, action,"
             " reason_code, provider, referenced_memory_ids, response_style, created_at,"
             " intent, addressed_to, silence_requested, reply_necessity, conversation_state,"
-            " affective_signal_json, nonresponse_motive_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " affective_signal_json, nonresponse_motive_json, scene_proposal_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 analysis_id,
                 analysis.event_id,
@@ -455,6 +490,7 @@ class AnalysisRepository:
                 analysis.conversation_state,
                 signal_json,
                 motive_json,
+                scene_json,
             ),
         )
 
@@ -463,7 +499,7 @@ class AnalysisRepository:
             "SELECT analysis_id, event_id, meaning, action, reason_code, provider,"
             " referenced_memory_ids, response_style, intent, addressed_to,"
             " silence_requested, reply_necessity, conversation_state,"
-            " affective_signal_json, nonresponse_motive_json"
+            " affective_signal_json, nonresponse_motive_json, scene_proposal_json"
             " FROM cognitive_analyses WHERE event_id = ?",
             (event_id,),
         )
@@ -486,6 +522,16 @@ class AnalysisRepository:
                 )
             except (ValueError, TypeError, json.JSONDecodeError):
                 motive = None
+        scene_proposal = None
+        if row["scene_proposal_json"]:
+            from companion.domain.models import SceneProposal
+
+            try:
+                scene_proposal = SceneProposal.model_validate(
+                    json.loads(row["scene_proposal_json"])
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                scene_proposal = None
         return CognitiveResult(
             event_id=row["event_id"],
             meaning=row["meaning"],
@@ -501,6 +547,7 @@ class AnalysisRepository:
             conversation_state=row["conversation_state"] or "unknown",
             affective_signal=signal,
             nonresponse_motive=motive,
+            scene_proposal=scene_proposal,
         )
 
     async def get_analysis_id(self, event_id: str) -> Optional[str]:

@@ -114,8 +114,8 @@ def test_load_config_defaults():
     assert cfg.max_retries == 2
     assert cfg.analysis_max_tokens == 1024
     assert cfg.response_max_tokens == 2048
-    assert cfg.analysis_reasoning_effort is None
-    assert cfg.response_reasoning_effort is None
+    assert cfg.analysis_reasoning_effort == "none"
+    assert cfg.response_reasoning_effort == "none"
 
 
 def test_load_config_reads_env():
@@ -139,7 +139,7 @@ def test_load_config_reads_env():
     assert cfg.analysis_max_tokens == 512
     assert cfg.response_max_tokens == 4096
     assert cfg.analysis_reasoning_effort == "high"
-    assert cfg.response_reasoning_effort is None
+    assert cfg.response_reasoning_effort == "none"
 
 
 def test_build_client_requires_key():
@@ -183,6 +183,17 @@ async def test_response_defaults_plain_and_tokens():
     kwargs = fake.calls[0]
     assert "response_format" not in kwargs
     assert kwargs["max_tokens"] == 2048
+
+
+async def test_thinking_mode_is_off_by_default_on_both_requests():
+    client, fake = _make_client(_config(), _ok)
+    await client.complete([{"role": "user", "content": "x"}], request_type="analysis")
+    await client.complete([{"role": "user", "content": "x"}], request_type="response")
+    assert fake.calls[0]["reasoning_effort"] == "none"
+    assert fake.calls[1]["reasoning_effort"] == "none"
+    # No contradictory thinking switch is ever sent alongside it.
+    assert "thinking" not in fake.calls[0]
+    assert "thinking" not in fake.calls[1]
 
 
 async def test_reasoning_effort_passed_when_configured():

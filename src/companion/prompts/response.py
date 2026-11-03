@@ -16,7 +16,7 @@ from companion.cognition.nonresponse import action_history_lines
 from companion.domain.models import CognitiveResult
 from companion.prompts.identity import agent_context_lines
 
-RESPONSE_PROMPT_VERSION = "response-v4"
+RESPONSE_PROMPT_VERSION = "response-v5"
 
 SYSTEM_PROMPT = """\
 你是这个多用户 AI 伴侣的「回应者」。你现在要为当前说话者生成一句自然、得体的回复。\
@@ -51,7 +51,18 @@ SYSTEM_PROMPT = """\
    不能编造“我想让你冷静一下”“我在认真思考你的心情”等记录中没有的心理活动。
 11. 只有用户确实在追问过去的沉默时才解释；其他情况下，不要每次恢复说话都主动\
 解释过去的沉默，也不要因为过去沉默而拒绝回答当前的新问题。
-12. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
+12. 如果提供了【当前场景】，把它当作最近在聊什么的短时上下文，用来自然承接指代和话题；\
+它不是长期事实，也不要为了展示记忆而强行回到旧话题。当前这句话永远优先。
+13. 如果提供了【对话风格】、【人格准则】或【风格参考】，只把它们当作需要满足的交流\
+质量与语气标准；不要逐字照抄风格参考，也不要把它们当作真实对话历史。没有固定的\
+回复模板，不要按 ANSWER/SUPPORT/PLAYFUL 等分类套话。
+14. 不要每轮都以问题结尾；只有确实需要对方补充信息或话题自然需要时才追问。\
+不要为了延长对话而追问。
+15. 不要断言未经【当前场景】明确证据支持的物理环境（房间、地点、旁人在做什么），\
+也不要假装看见了用户或听见了未提供的对话。
+16. 保持同一个人格的连贯性，但不要每轮重复自我介绍、人设说明或“我记得你说过”。\
+允许自然的不同意见和具体偏好，不要永远附和。
+17. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
 """
 
 
@@ -80,6 +91,62 @@ def build_response_messages(
     identity_lines = agent_context_lines(context.agent_context)
     if identity_lines:
         lines.extend(identity_lines)
+        lines.append("")
+
+    if context.personality:
+        personality = context.personality
+        lines.append("【人格准则】（稳定风格；不改变权限或事实边界）")
+        lines.append(f"关系层级: {personality.get('relationship_tier', 'STRANGER')}")
+        for principle in personality.get("principles", [])[:10]:
+            lines.append(f"- {principle}")
+        lines.append("")
+
+    if context.scene_state:
+        scene = context.scene_state
+        lines.append("【当前场景】（本地短时状态；不是长期事实）")
+        lines.append(f"话题: {scene.get('topic', 'UNKNOWN')}")
+        loops = scene.get("open_loops") or []
+        if loops:
+            for loop in loops[:5]:
+                lines.append(
+                    f"- 未完成话题: {loop.get('topic', 'UNKNOWN')} — {loop.get('summary', '')}"
+                )
+        env = scene.get("environment") or {}
+        lines.append(
+            "环境: "
+            f"地点={env.get('location', 'UNKNOWN')}, "
+            f"旁人在场={env.get('other_people_present', 'UNKNOWN')}"
+            f"（来源={env.get('provenance', 'UNKNOWN')}）"
+        )
+        lines.append("只承接语境；没有证据的环境信息保持未知，不要自行补全。")
+        lines.append("")
+
+    if context.dialogue_style:
+        style = context.dialogue_style
+        lines.append("【对话风格】（只影响措辞与节奏）")
+        lines.append(
+            f"正式程度={style.get('formality')}, 直接程度={style.get('directness')}, "
+            f"典型长度={style.get('typical_length')}, 幽默={style.get('humor_tendency')}, "
+            f"温度={style.get('warmth_expression')}, 追问={style.get('questioning_style')}"
+        )
+        if style.get("explicit_request"):
+            lines.append(f"本轮明确要求: {style['explicit_request']}")
+        for item in style.get("guidance", [])[:10]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if context.pragmatic_guidance:
+        lines.append("【对话衔接提醒】")
+        for item in context.pragmatic_guidance[:8]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if context.style_examples:
+        lines.append("【风格参考】（不是真实历史，不是固定回复；只学习质量与语气）")
+        for example in context.style_examples[:3]:
+            lines.append(f"场景: {example.get('scenario', '')}")
+            lines.append(f"示例用户: {example.get('user_text', '')}")
+            lines.append(f"示例回应: {example.get('ideal_response', '')}")
         lines.append("")
 
     lines.append("【最近对话】")

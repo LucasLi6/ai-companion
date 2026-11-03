@@ -45,6 +45,7 @@ from companion.domain.models import (
     new_id,
     validate_affective_signal,
     validate_nonresponse_motive,
+    validate_scene_proposal,
 )
 from companion.memory.store import validate_referenced_memory_ids
 from companion.prompts.cognitive import build_cognitive_messages, build_repair_messages
@@ -89,6 +90,7 @@ class _RawAnalysis(BaseModel):
     # locally, not fail the whole analysis schema.
     affective_signal: Optional[object] = None
     nonresponse_motive: Optional[object] = None
+    scene_proposal: Optional[object] = None
 
 
 def _parse_json_object(content: str) -> dict:
@@ -261,6 +263,22 @@ class DeepSeekCognitiveProvider:
         if action == CognitiveAction.RESPOND:
             motive = None
 
+        # Scene proposals are untrusted. Evidence may come from the current
+        # input or this speaker's authorized history; another speaker's words
+        # can never support this person's scene.
+        authorized_texts = [
+            turn.text
+            for turn in ctx.turns
+            if turn.role == "human"
+            and turn.speaker_person_id is not None
+            and turn.speaker_person_id == event.speaker_person_id
+        ]
+        scene_proposal = validate_scene_proposal(
+            raw.scene_proposal,
+            current_text=event.text,
+            authorized_texts=authorized_texts,
+        )
+
         return CognitiveResult(
             event_id=event.event_id,
             meaning=meaning,
@@ -278,6 +296,7 @@ class DeepSeekCognitiveProvider:
             or "unknown",
             affective_signal=signal,
             nonresponse_motive=motive,
+            scene_proposal=scene_proposal,
         )
 
     @staticmethod

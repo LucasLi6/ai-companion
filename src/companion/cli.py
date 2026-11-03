@@ -24,6 +24,7 @@ from companion.agent.constants import (
     PersonalityValidationError,
     RelationshipValidationError,
 )
+from companion.agent.style_examples import StyleExampleError
 from companion.cmf.service import (
     CmfError,
     CmfFileExistsError,
@@ -461,6 +462,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_ae = p_agent_sub.add_parser("effective", parents=[_common_parser()], help="Show the effective context for one person")
     p_ae.add_argument("--person", required=True)
     p_ae.set_defaults(func=cmd_agent_effective)
+    p_style = p_agent_sub.add_parser(
+        "style-example", parents=[_common_parser()],
+        help="Manage trusted style references (never fixed replies)",
+    )
+    p_style_sub = p_style.add_subparsers(dest="style_command")
+    p_sa = p_style_sub.add_parser("add", parents=[_common_parser()], help="Add a style reference")
+    p_sa.add_argument("--scenario", required=True)
+    p_sa.add_argument("--user", required=True, dest="user_text")
+    p_sa.add_argument("--response", required=True, dest="ideal_response")
+    p_sa.add_argument("--person", default=None, help="Optional person scope; omit for global")
+    p_sa.set_defaults(func=cmd_agent_style_add)
+    p_sl = p_style_sub.add_parser("list", parents=[_common_parser()], help="List style references")
+    p_sl.add_argument("--person", default=None)
+    p_sl.add_argument("--include-disabled", action="store_true", default=False)
+    p_sl.add_argument("--limit", type=int, default=100)
+    p_sl.set_defaults(func=cmd_agent_style_list)
+    p_sd = p_style_sub.add_parser("disable", parents=[_common_parser()], help="Disable a style reference")
+    p_sd.add_argument("example_id")
+    p_sd.set_defaults(func=cmd_agent_style_disable)
 
     p_rel = sub.add_parser("relationship", parents=[_common_parser()], help="Manage familiarity and per-person style")
     p_rel_sub = p_rel.add_subparsers(dest="relationship_command")
@@ -1623,6 +1643,67 @@ async def cmd_agent_effective(args) -> int:
             print(f"effective.{name}: {value}")
     except RelationshipValidationError as exc:
         print(f"invalid person: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_agent_style_add(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        manifest = await rt.agent_service.repo.get_manifest() or {}
+        example = await rt.style_repo.add(
+            agent_id=manifest.get("agent_id", ""),
+            scenario=args.scenario,
+            user_text=args.user_text,
+            ideal_response=args.ideal_response,
+            person_id=args.person,
+            created_by="admin",
+        )
+        scope = "global" if example.get("person_id") is None else example["person_id"]
+        print(f"example_id: {example['example_id']}")
+        print(f"scope: {scope}")
+        print(f"scenario: {example['scenario']}")
+    except StyleExampleError as exc:
+        print(f"invalid style example: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_agent_style_list(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        manifest = await rt.agent_service.repo.get_manifest() or {}
+        rows = await rt.style_repo.list(
+            agent_id=manifest.get("agent_id"),
+            person_id=args.person,
+            include_disabled=args.include_disabled,
+            limit=args.limit,
+        )
+        for row in rows:
+            scope = "global" if row.get("person_id") is None else row["person_id"]
+            print(
+                f"{row['example_id']} status={row['status']} scope={scope}"
+                f" scenario={row['scenario']}"
+            )
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_agent_style_disable(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        row = await rt.style_repo.disable(args.example_id)
+        print(f"{row['example_id']} status={row['status']}")
+    except StyleExampleError as exc:
+        print(f"style example error: {exc}")
         return 1
     finally:
         await db.close()

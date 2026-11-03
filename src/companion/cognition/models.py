@@ -76,3 +76,19 @@ class CognitiveContext(BaseModel):
     # profile) shaping *how* a reply is spoken. It never changes *whether* a
     # reply is sent, and it never authorises anything.
     speech_plan: Optional[dict] = Field(default=None)
+    # Trusted current scene produced locally by SceneManager. It is a
+    # short-horizon description of this conversation with this person, never a
+    # long-term fact and never a claim about physical reality without evidence.
+    scene_state: Optional[dict] = Field(default=None)
+    # Locally compiled delivery style (thresholds and short guidance). It is
+    # derived from the existing persona/relationship data, not a new source of
+    # identity, and it never changes permissions or reply necessity.
+    dialogue_style: Optional[dict] = Field(default=None)
+    # Compiled personality section for the response prompt. It only contains
+    # stylistic guidance.
+    personality: Optional[dict] = Field(default=None)
+    # Trusted, admin-authored style references (max 3). These are style
+    # standards, not real conversation history and never fixed replies.
+    style_examples: list[dict] = Field(default_factory=list)
+    # Short pragmatic reminders assembled from scene/action history.
+    pragmatic_guidance: list[str] = Field(default_factory=list)

@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1116,6 +1116,68 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE cognitive_analyses ADD COLUMN nonresponse_motive_json TEXT;
 
         ALTER TABLE agent_actions ADD COLUMN nonresponse_trace_json TEXT;
+        """,
+    ),
+    # Version 14 (V0.4): continuous scene awareness and personality-driven
+    # dialogue.
+    #
+    # - ``scene_snapshots`` holds one optimistic-concurrency scene per
+    #   (conversation, person) scope. ``revision`` is the CAS token.
+    # - ``scene_transition_receipts`` is the idempotency anchor: a source event
+    #   can advance the scene at most once, even across retries/crashes.
+    # - ``cognitive_analyses.scene_proposal_json`` preserves the locally
+    #   validated proposal so an action recovered without a receipt can be
+    #   finalised idempotently instead of re-running model semantics.
+    # - ``dialogue_style_examples`` stores trusted, admin-authored style
+    #   references. ``person_id IS NULL`` means global; a person-scoped example
+    #   is never shown to another person. The model can never insert here.
+    (
+        14,
+        """
+        ALTER TABLE cognitive_analyses ADD COLUMN scene_proposal_json TEXT;
+
+        CREATE TABLE IF NOT EXISTS scene_snapshots (
+            conversation_id        TEXT NOT NULL,
+            person_id              TEXT NOT NULL,
+            revision               INTEGER NOT NULL DEFAULT 0,
+            state_json             TEXT NOT NULL,
+            source_event_ids_json  TEXT NOT NULL DEFAULT '[]',
+            last_committed_event_id TEXT,
+            updated_at             TEXT NOT NULL,
+            PRIMARY KEY (conversation_id, person_id),
+            FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
+            FOREIGN KEY (person_id) REFERENCES persons(person_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS scene_transition_receipts (
+            source_event_id   TEXT PRIMARY KEY
+                              REFERENCES utterances(event_id) ON DELETE CASCADE,
+            conversation_id   TEXT NOT NULL,
+            person_id         TEXT NOT NULL,
+            result_revision   INTEGER NOT NULL,
+            transition_json   TEXT NOT NULL,
+            applied_at        TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_scene_receipts_scope
+            ON scene_transition_receipts(conversation_id, person_id);
+
+        CREATE TABLE IF NOT EXISTS dialogue_style_examples (
+            example_id    TEXT PRIMARY KEY,
+            agent_id      TEXT NOT NULL,
+            person_id     TEXT REFERENCES persons(person_id) ON DELETE CASCADE,
+            scenario      TEXT NOT NULL,
+            user_text     TEXT NOT NULL,
+            ideal_response TEXT NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'ACTIVE'
+                          CHECK (status IN ('ACTIVE', 'DISABLED')),
+            created_by    TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_style_examples_scope
+            ON dialogue_style_examples(agent_id, person_id, status);
         """,
     ),
 ]

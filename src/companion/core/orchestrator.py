@@ -29,8 +29,11 @@ import logging
 import time
 from typing import Optional
 
+from companion.agent.dialogue_style import compile_dialogue_style
+from companion.agent.models import EffectiveAgentContext
 from companion.cognition.models import CognitiveContext
-from companion.cognition.nonresponse import derive_nonresponse_trace
+from companion.cognition.nonresponse import NonresponseTrace, derive_nonresponse_trace
+from companion.cognition.scene_repository import SceneRevisionConflict
 from companion.cognition.silence import (
     detect_explicit_remember,
     detect_explicit_silence,
@@ -74,6 +77,9 @@ class Orchestrator:
         memory_writer=None,
         emotion_service=None,
         agent_service=None,
+        scene_manager=None,
+        personality_compiler=None,
+        style_repo=None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repos = repos
@@ -93,6 +99,11 @@ class Orchestrator:
         # keyed by (works in mock and real-provider modes alike).
         self.emotion_service = emotion_service
         self.agent_service = agent_service
+        # V0.4: optional, local-only scene and personality layer. When absent
+        # (old mock wiring) the pipeline is byte-for-byte the V0.3.2 flow.
+        self.scene_manager = scene_manager
+        self.personality_compiler = personality_compiler
+        self.style_repo = style_repo
         # When set (real-DeepSeek mode), the orchestrator builds a privacy-
         # filtered CognitiveContext and hands the *same* context to both the
         # cognitive and response providers. In mock mode it stays None and the
@@ -196,6 +207,39 @@ class Orchestrator:
             cognitive_context, provider_memories = await self._prepare_context(
                 event, context, memories, steps
             )
+
+            # 4c. Load the short-horizon scene and compile this turn's local
+            # style/personality. Scene data is only attached to the rich
+            # CognitiveContext that the real providers receive; the mock path
+            # keeps its lightweight context unchanged. Any failure here is
+            # stylistic and must never fail the turn.
+            scene_enabled = await self._scene_enabled()
+            personality_enabled = await self._personality_enabled()
+            scene_record = None
+            if not persist and self.scene_manager is not None:
+                # A non-persistence turn cannot reuse or write scene state. It
+                # is still the right moment to enforce a withdrawn grant: load
+                # revalidates consent and deletes any derived snapshot without
+                # sending it anywhere.
+                try:
+                    await self.scene_manager.load(
+                        event.conversation_id, event.speaker_person_id
+                    )
+                except Exception as exc:
+                    self.logger.error(
+                        "scene_invalidation_failed event_id=%s error=%s",
+                        event.event_id,
+                        exc,
+                    )
+            if persist:
+                cognitive_context, scene_record = await self._prepare_dialogue(
+                    event,
+                    cognitive_context,
+                    provider_memories,
+                    steps,
+                    scene_enabled=scene_enabled,
+                    personality_enabled=personality_enabled,
+                )
 
             # 5. Cognitive analysis: reuse a durable analysis, else compute.
             analysis = None
@@ -316,16 +360,21 @@ class Orchestrator:
                 else None
             )
             response_text: Optional[str] = None
+            trace = None
+            action_obj = None
             if existing_action is not None:
                 final_action = existing_action.action_type
                 final_reason = existing_action.reason_code
                 response_text = existing_action.response_text
+                action_obj = existing_action
+                trace = self._stored_trace(existing_action)
                 steps.append("[ACTION] Reused existing action")
             else:
-                # Derive the final, explainable silence reason only when this
-                # event has no persisted action. A retry reuses the existing
-                # action (and therefore the original trace) above; it must not
-                # invent a new reason for a past WAIT/IGNORE.
+                # Derive the final, explainable silence reason before any
+                # response. The scene uses it as the only local signal that a
+                # WAIT may represent an unfinished thread. A retry reuses the
+                # existing action (and therefore the original trace) above; it
+                # never invents a new reason for a past WAIT/IGNORE.
                 trace = derive_nonresponse_trace(
                     event=event,
                     analysis=analysis,
@@ -344,33 +393,39 @@ class Orchestrator:
                         event, analysis, response_context
                     )
                     steps.append(f"[RESPONSE] {response_text}")
-                if persist:
-                    await self.repos.analysis.save_action(
-                        AgentAction(
-                            action_id=new_id("act"),
-                            event_id=event.event_id,
-                            action_type=final_action,
-                            response_text=response_text,
-                            reason_code=final_reason,
-                            status="COMPLETED",
-                            created_at=utcnow(),
-                            model_suggested_action=decision.model_action,
-                            policy_final_action=decision.action,
-                            override_reason=decision.override_reason,
-                            nonresponse_trace=(
-                                trace.model_dump() if trace is not None else None
-                            ),
-                        )
-                    )
+                action_obj = AgentAction(
+                    action_id=new_id("act"),
+                    event_id=event.event_id,
+                    action_type=final_action,
+                    response_text=response_text,
+                    reason_code=final_reason,
+                    status="COMPLETED",
+                    created_at=utcnow(),
+                    model_suggested_action=decision.model_action,
+                    policy_final_action=decision.action,
+                    override_reason=decision.override_reason,
+                    nonresponse_trace=(
+                        trace.model_dump() if trace is not None else None
+                    ),
+                )
 
-            # 9. Finalise the durable conversation + event state.
+            # 9. Persist the action, scene transition/receipt, conversation
+            # state and event status in one transaction. The scene has a CAS
+            # revision and one receipt per source event, so a retry or a crash
+            # boundary cannot double-apply it or overwrite newer state.
             if persist:
-                await self.conversations.record_last_action(
-                    event.conversation_id, final_action.value
+                await self._commit_turn(
+                    event=event,
+                    action=action_obj,
+                    existing_action=existing_action is not None,
+                    trace=trace,
+                    scene_enabled=scene_enabled,
+                    previous_scene=scene_record,
+                    analysis=analysis,
+                    cognitive_context=cognitive_context,
                 )
-                await self.repos.utterance.update_status(
-                    event.event_id, ProcessingStatus.COMPLETED
-                )
+                if scene_enabled and action_obj is not None:
+                    steps.append("[SCENE] Transition committed")
 
             if job_id is not None:
                 steps.append("[MEMORY_JOB] Queued")
@@ -514,6 +569,331 @@ class Orchestrator:
             return None
         manifest = await self.agent_service.repo.get_manifest()
         return manifest.get("agent_id") if manifest else None
+
+    async def _scene_enabled(self) -> bool:
+        if self.scene_manager is None:
+            return False
+        return await self.repos.settings.get_bool("dialogue.scene.enabled", True)
+
+    async def _personality_enabled(self) -> bool:
+        if self.personality_compiler is None:
+            return False
+        return await self.repos.settings.get_bool(
+            "dialogue.personality_generation.enabled", True
+        )
+
+    async def _prepare_dialogue(
+        self,
+        event,
+        cognitive_context,
+        provider_memories,
+        steps,
+        *,
+        scene_enabled: bool,
+        personality_enabled: bool,
+    ):
+        """Load scene state and compile local style/personality for this turn.
+
+        This is intentionally non-fatal: a style or scene-loading error must
+        not lose an otherwise valid turn. The scene *write* is separate and is
+        transactional with the action.
+        """
+        scene_record = None
+        if scene_enabled and self.scene_manager is not None:
+            try:
+                scene_record = await self.scene_manager.load(
+                    event.conversation_id, event.speaker_person_id
+                )
+                if isinstance(cognitive_context, CognitiveContext):
+                    cognitive_context = cognitive_context.model_copy(
+                        update={
+                            "scene_state": (
+                                scene_record.state.prompt_dict()
+                                if scene_record is not None
+                                else None
+                            )
+                        }
+                    )
+                steps.append(
+                    "[SCENE] Loaded" if scene_record is not None else "[SCENE] New"
+                )
+            except Exception as exc:
+                self.logger.error(
+                    "scene_load_failed event_id=%s error=%s", event.event_id, exc
+                )
+
+        if not personality_enabled or not isinstance(cognitive_context, CognitiveContext):
+            return cognitive_context, scene_record
+
+        try:
+            effective = await self._effective_context(
+                event.speaker_person_id, cognitive_context.agent_context
+            )
+            if effective is None:
+                return cognitive_context, scene_record
+            style = compile_dialogue_style(
+                effective,
+                memories=provider_memories,
+                current_text=event.text,
+            )
+            examples: list[dict] = []
+            if self.style_repo is not None and effective.agent_id:
+                examples = await self.style_repo.list_for_prompt(
+                    agent_id=effective.agent_id,
+                    person_id=event.speaker_person_id,
+                )
+            scene_view = getattr(cognitive_context, "scene_state", None)
+            personality = (
+                self.personality_compiler.compile(
+                    effective,
+                    style=style,
+                    scene=scene_view,
+                    style_examples=examples,
+                    current_text=event.text,
+                )
+                if self.personality_compiler is not None
+                else None
+            )
+            guidance = (
+                self.personality_compiler.pragmatic_guidance(
+                    scene=scene_view,
+                    action_history=cognitive_context.action_history,
+                    current_addressee_hint=event.addressee_hint.value,
+                    quiet_mode=cognitive_context.quiet_mode,
+                )
+                if self.personality_compiler is not None
+                else []
+            )
+            cognitive_context = cognitive_context.model_copy(
+                update={
+                    "dialogue_style": style.as_dict(),
+                    "personality": personality,
+                    "style_examples": examples,
+                    "pragmatic_guidance": guidance,
+                }
+            )
+            steps.append("[PERSONALITY] Style compiled")
+        except Exception as exc:
+            self.logger.error(
+                "personality_compile_failed event_id=%s error=%s",
+                event.event_id,
+                exc,
+            )
+        return cognitive_context, scene_record
+
+    async def _effective_context(self, person_id: str, agent_context):
+        data = agent_context if isinstance(agent_context, dict) else None
+        if data is not None:
+            try:
+                return EffectiveAgentContext(
+                    agent_id=str(data.get("agent_id") or ""),
+                    display_name=str(data.get("display_name") or "Companion"),
+                    pronouns=data.get("pronouns"),
+                    description=data.get("description"),
+                    person_id=data.get("person_id") or person_id,
+                    familiarity=str(data.get("familiarity") or "STRANGER"),
+                    traits={
+                        str(k): int(v)
+                        for k, v in (data.get("traits") or {}).items()
+                    },
+                    overrides={
+                        str(k): int(v)
+                        for k, v in (data.get("overrides") or {}).items()
+                    },
+                    response_conservatism=str(
+                        data.get("response_conservatism") or "balanced"
+                    ),
+                    interruption_threshold=str(
+                        data.get("interruption_threshold") or "medium"
+                    ),
+                    curiosity_level=str(data.get("curiosity_level") or "low"),
+                    revision=int(data.get("revision") or 1),
+                )
+            except (TypeError, ValueError):
+                pass
+        if self.agent_service is not None:
+            return await self.agent_service.effective(person_id)
+        return None
+
+    @staticmethod
+    def _stored_trace(action):
+        raw = getattr(action, "nonresponse_trace", None)
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return NonresponseTrace.model_validate(raw)
+        except (ValueError, TypeError):
+            return None
+
+    async def _commit_turn(
+        self,
+        *,
+        event,
+        action,
+        existing_action: bool,
+        trace,
+        scene_enabled: bool,
+        previous_scene,
+        analysis,
+        cognitive_context,
+    ) -> None:
+        """Atomic finalization of action + scene + conversation + event.
+
+        The whole unit commits or rolls back together. A scene revision
+        conflict rolls back any newly written action too, then reloads the
+        newer scene and retries the *same* already-generated action (no model
+        call). After a bounded retry the conflict is surfaced and the event is
+        left FAILED for a later retry; newer scene state is never overwritten.
+        """
+        manager = self.scene_manager
+        if not scene_enabled or manager is None:
+            async with self.repos.db.transaction(immediate=True):
+                if not existing_action:
+                    await self.repos.analysis.save_action(action)
+                await self.conversations.record_last_action(
+                    event.conversation_id, action.action_type.value
+                )
+                await self.repos.utterance.update_status(
+                    event.event_id, ProcessingStatus.COMPLETED
+                )
+            return
+
+        scene_repo = manager.scene_repo
+        previous = previous_scene
+
+        # Crash/legacy recovery: an action exists but the scene receipt does
+        # not. If the snapshot already includes this event, record the missing
+        # receipt without touching the scene; otherwise rebuild the transition
+        # from the persisted analysis proposal.
+        if existing_action:
+            receipt = await scene_repo.get_receipt(event.event_id)
+            if receipt is not None:
+                async with self.repos.db.transaction(immediate=True):
+                    await self.conversations.record_last_action(
+                        event.conversation_id, action.action_type.value
+                    )
+                    await self.repos.utterance.update_status(
+                        event.event_id, ProcessingStatus.COMPLETED
+                    )
+                return
+            try:
+                fresh = await manager.load(
+                    event.conversation_id, event.speaker_person_id
+                )
+            except Exception:
+                fresh = None
+            previous = fresh
+            if (
+                fresh is not None
+                and fresh.last_committed_event_id == event.event_id
+            ):
+                async with self.repos.db.transaction(immediate=True):
+                    await scene_repo.save_receipt_only(
+                        source_event_id=event.event_id,
+                        conversation_id=event.conversation_id,
+                        person_id=event.speaker_person_id,
+                        result_revision=fresh.revision,
+                        transition={
+                            "reason": "snapshot_already_advanced",
+                            "action": action.action_type.value,
+                        },
+                    )
+                    await self.conversations.record_last_action(
+                        event.conversation_id, action.action_type.value
+                    )
+                    await self.repos.utterance.update_status(
+                        event.event_id, ProcessingStatus.COMPLETED
+                    )
+                return
+
+        for attempt in range(3):
+            candidate = manager.preview(
+                previous,
+                getattr(analysis, "scene_proposal", None),
+                event,
+                context=cognitive_context,
+                action_history=getattr(cognitive_context, "action_history", None),
+                pending_followup=bool(
+                    trace is not None and getattr(trace, "pending_followup", False)
+                ),
+            )
+            candidate = manager.finalize(
+                candidate,
+                event=event,
+                action=action.action_type,
+                response_text=action.response_text,
+                trace=trace,
+            )
+            expected_revision = previous.revision if previous is not None else 0
+            try:
+                async with self.repos.db.transaction(immediate=True):
+                    if not existing_action:
+                        await self.repos.analysis.save_action(action)
+                    else:
+                        # Another worker may have completed the receipt while
+                        # we were preparing; re-check under the write lock.
+                        current_receipt = await scene_repo.get_receipt(
+                            event.event_id
+                        )
+                        if current_receipt is not None:
+                            candidate = None
+                    if candidate is not None:
+                        await scene_repo.apply_transition(
+                            source_event_id=event.event_id,
+                            conversation_id=event.conversation_id,
+                            person_id=event.speaker_person_id,
+                            expected_revision=expected_revision,
+                            state=candidate,
+                            transition={
+                                "action": action.action_type.value,
+                                "topic": candidate.topic,
+                                "discourse_phase": candidate.discourse_phase,
+                                "tone": candidate.tone,
+                                "revision": candidate.revision,
+                            },
+                        )
+                    await self.conversations.record_last_action(
+                        event.conversation_id, action.action_type.value
+                    )
+                    await self.repos.utterance.update_status(
+                        event.event_id, ProcessingStatus.COMPLETED
+                    )
+                return
+            except SceneRevisionConflict as exc:
+                if attempt >= 2:
+                    raise
+                self.logger.warning(
+                    "scene_revision_conflict event_id=%s attempt=%d error=%s",
+                    event.event_id,
+                    attempt + 1,
+                    exc,
+                )
+                previous = await manager.load(
+                    event.conversation_id, event.speaker_person_id
+                )
+                if (
+                    existing_action
+                    and previous is not None
+                    and previous.last_committed_event_id == event.event_id
+                ):
+                    async with self.repos.db.transaction(immediate=True):
+                        await scene_repo.save_receipt_only(
+                            source_event_id=event.event_id,
+                            conversation_id=event.conversation_id,
+                            person_id=event.speaker_person_id,
+                            result_revision=previous.revision,
+                            transition={
+                                "reason": "conflict_recovered_snapshot",
+                                "action": action.action_type.value,
+                            },
+                        )
+                        await self.conversations.record_last_action(
+                            event.conversation_id, action.action_type.value
+                        )
+                        await self.repos.utterance.update_status(
+                            event.event_id, ProcessingStatus.COMPLETED
+                        )
+                    return
 
     async def _persist_input(self, event: UtteranceEvent) -> None:
         to_save = event.model_copy(update={"processing_status": ProcessingStatus.PROCESSING})
