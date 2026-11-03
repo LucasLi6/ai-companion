@@ -73,16 +73,20 @@ class Consent(DomainModel):
     """Explicit, per-person privacy grants.
 
     ``allow_processing`` gates whether any input may enter the cognitive flow;
-    ``allow_persistence`` gates durable storage of utterances; and
-    ``allow_memory_learning`` gates whether memory candidates may be created.
-    These are independent — processing is not persistence, and persistence is
-    not learning. V0.0 never defaults these to ``True``.
+    ``allow_persistence`` gates durable storage of utterances;
+    ``allow_memory_learning`` gates whether memory candidates may be created;
+    and ``allow_external_ai`` gates whether a person's private context may be
+    sent to an *external* AI model. These are independent — processing is not
+    persistence, persistence is not learning, and local learning is **not**
+    permission to upload private data to a remote model. V0.0 never defaults
+    these to ``True``.
     """
 
     person_id: str = Field(min_length=1, max_length=128)
     allow_processing: bool
     allow_persistence: bool
     allow_memory_learning: bool
+    allow_external_ai: bool = False
     updated_at: datetime
 
 

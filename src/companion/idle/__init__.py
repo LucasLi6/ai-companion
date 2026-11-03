@@ -22,24 +22,40 @@ IDLE_AGENT = AccessContext("idle", is_admin=False, role="idle")
 from companion.providers.deepseek import DeepSeekProvider  # noqa: E402
 from companion.providers.websearch import MockWebSearchProvider  # noqa: E402
 
+from .context import IdleMemoryContextBuilder  # noqa: E402
 from .curiosity import CuriosityEngine  # noqa: E402
 from .reflection import ReflectionEngine  # noqa: E402
 from .research import ResearchEngine  # noqa: E402
 from .scheduler import IdleScheduler  # noqa: E402
 
 
-def build_idle_scheduler(runtime, *, deepseek=None, web_search=None) -> IdleScheduler:
+def build_idle_scheduler(
+    runtime, *, deepseek=None, web_search=None, settings=None
+) -> IdleScheduler:
     """Wire the idle pipeline over a running :class:`~companion.runtime.Runtime`.
 
     ``deepseek`` and ``web_search`` default to mock providers; callers may pass
     real ones (e.g. a settings-gated web search) without touching the engines.
+    Every engine reads externally-authorised context through one shared
+    :class:`IdleMemoryContextBuilder`, and research is gated by the
+    ``research.enabled`` / ``web_search.enabled`` settings.
     """
     deepseek = deepseek or DeepSeekProvider()
     web_search = web_search or MockWebSearchProvider()
-    reflection = ReflectionEngine(runtime.memory_service, deepseek)
-    curiosity = CuriosityEngine(runtime.memory_service, deepseek, runtime.repos.research)
+    settings = settings or runtime.repos.settings
+    builder = IdleMemoryContextBuilder(
+        runtime.memory_service, runtime.registry, audit=runtime.repos.audit
+    )
+    reflection = ReflectionEngine(runtime.memory_service, deepseek, builder)
+    curiosity = CuriosityEngine(
+        runtime.memory_service, deepseek, runtime.repos.research, builder
+    )
     research = ResearchEngine(
-        runtime.memory_service, runtime.repos.research, web_search, deepseek
+        runtime.memory_service,
+        runtime.repos.research,
+        web_search,
+        deepseek,
+        settings=settings,
     )
     return IdleScheduler(runtime.repos.settings, reflection, curiosity, research)
 
@@ -50,6 +66,7 @@ __all__ = [
     "ReflectionEngine",
     "CuriosityEngine",
     "ResearchEngine",
+    "IdleMemoryContextBuilder",
     "SYSTEM_ADMIN",
     "IDLE_AGENT",
 ]

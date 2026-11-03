@@ -102,6 +102,7 @@ async def test_curiosity_engine_queues_questions(rt):
 
 
 async def test_research_engine_completes_and_consolidates(rt):
+    await rt.repos.settings.set("research.enabled", "true")
     task_id = await rt.repos.research.create("OTA 为什么不稳定？", source_kind="manual")
     scheduler = build_idle_scheduler(rt)
     results = await scheduler.research.run_all(limit=1)
@@ -121,23 +122,36 @@ async def test_research_engine_completes_and_consolidates(rt):
     assert len(view["sources"]) == 3
     assert view["item"]["model_inferred"] is True
     assert view["item"]["human_confirmed"] is False
+    # Mock research must never publish trusted knowledge.
+    assert view["item"]["status"] == "CANDIDATE"
+    assert view["item"]["source_supported"] is False
 
 
-async def test_research_engine_failure_marks_failed(rt):
+async def test_research_engine_failure_requeues_then_fails(rt):
     task_id = await rt.repos.research.create("会失败的问题", source_kind="manual")
 
     class FailingSearch:
+        name = "failing"
+
         async def search(self, query, limit=5):
             raise RuntimeError("boom")
 
     engine = ResearchEngine(
         rt.memory_service, rt.repos.research, FailingSearch(), DeepSeekProvider()
     )
-    result = await engine.run_one()
+    # A retryable failure requeues while attempts < max_attempts, then fails.
+    first = await engine.run_one()
+    assert first["status"] == "PENDING"
+    assert first["attempts"] == 1
 
-    assert result["task_id"] == task_id
-    assert result["status"] == "FAILED"
-    assert "boom" in (result["error"] or "")
+    second = await engine.run_one()
+    assert second["status"] == "PENDING"
+    assert second["attempts"] == 2
+
+    third = await engine.run_one()
+    assert third["task_id"] == task_id
+    assert third["status"] == "FAILED"
+    assert "boom" in (third["error"] or "")
 
 
 async def test_idle_scheduler_respects_disabled(rt):
@@ -152,6 +166,7 @@ async def test_idle_scheduler_respects_disabled(rt):
 async def test_idle_scheduler_full_cycle(rt):
     await _seed_active_memory(rt, kind=MemoryKind.PROJECT_STATE)
     await rt.repos.settings.set("idle.enabled", "true")
+    await rt.repos.settings.set("research.enabled", "true")
     scheduler = build_idle_scheduler(rt)
     result = await scheduler.run_cycle()
 

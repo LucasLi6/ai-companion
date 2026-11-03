@@ -32,6 +32,7 @@ class PersonRegistry:
         allow_processing: bool = False,
         allow_persistence: bool = False,
         allow_memory_learning: bool = False,
+        allow_external_ai: bool = False,
         person_id: str | None = None,
     ) -> Person:
         """Register a person and their explicit consent in one atomic step."""
@@ -49,6 +50,7 @@ class PersonRegistry:
             allow_processing=allow_processing,
             allow_persistence=allow_persistence,
             allow_memory_learning=allow_memory_learning,
+            allow_external_ai=allow_external_ai,
             updated_at=now,
         )
         await self.repo.register(person, consent)
@@ -58,7 +60,10 @@ class PersonRegistry:
                 action="register",
                 entity_type="person",
                 entity_id=pid,
-                detail=f"role={person.role.value} learning={int(allow_memory_learning)}",
+                detail=(
+                    f"role={person.role.value} learning={int(allow_memory_learning)}"
+                    f" external_ai={int(allow_external_ai)}"
+                ),
             )
         return person
 
@@ -80,6 +85,7 @@ class PersonRegistry:
                     f"processing={int(consent.allow_processing)}"
                     f" persistence={int(consent.allow_persistence)}"
                     f" learning={int(consent.allow_memory_learning)}"
+                    f" external_ai={int(consent.allow_external_ai)}"
                 ),
             )
 
@@ -126,3 +132,20 @@ class PersonRegistry:
             return False
         consent = await self.repo.get_consent(person_id)
         return consent is not None and consent.allow_memory_learning
+
+    async def is_external_ai_authorized(self, person_id: str | None) -> bool:
+        """Return True only for an ACTIVE person who currently allows sending
+        their private context to an external AI model.
+
+        This is a *separate*, stricter grant than ``allow_memory_learning``:
+        storing a memory locally is not permission to upload it to a remote
+        model. Used by the idle context builder before any memory is handed to
+        a (mock or future real) external provider.
+        """
+        if person_id is None:
+            return False
+        person = await self.repo.get(person_id)
+        if person is None or person.registration_status != RegistrationStatus.ACTIVE:
+            return False
+        consent = await self.repo.get_consent(person_id)
+        return consent is not None and consent.allow_external_ai

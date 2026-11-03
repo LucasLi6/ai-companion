@@ -65,13 +65,19 @@ class MemoryItem(DomainModel):
 
 
 class MemorySource(DomainModel):
-    """A citable origin for memory content (utterance, web page, manual, …)."""
+    """A citable origin for memory content (utterance, web page, manual, …).
+
+    ``provider`` records *which* concrete provider produced the source (e.g.
+    ``mock-web-search`` vs ``http-web-search``), so mock-generated sources stay
+    distinguishable from real evidence even though both are ``source_type="web"``.
+    """
 
     source_id: str = Field(min_length=1, max_length=128)
     source_type: str = Field(min_length=1, max_length=32)
     source_ref: Optional[str] = Field(default=None, max_length=2048)
     title: Optional[str] = Field(default=None, max_length=2048)
     url: Optional[str] = Field(default=None, max_length=2048)
+    provider: Optional[str] = Field(default=None, max_length=64)
     retrieved_at: Optional[datetime] = None
     published_at: Optional[datetime] = None
 

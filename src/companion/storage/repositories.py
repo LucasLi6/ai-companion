@@ -71,12 +71,14 @@ class PersonRepository:
             if consent is not None:
                 await self.db.conn.execute(
                     "INSERT INTO consents(person_id, allow_processing, allow_persistence,"
-                    " allow_memory_learning, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    " allow_memory_learning, allow_external_ai, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         consent.person_id,
                         int(consent.allow_processing),
                         int(consent.allow_persistence),
                         int(consent.allow_memory_learning),
+                        int(consent.allow_external_ai),
                         _iso(consent.updated_at),
                     ),
                 )
@@ -121,17 +123,20 @@ class PersonRepository:
     async def set_consent(self, consent: Consent) -> None:
         await self.db.execute(
             "INSERT INTO consents(person_id, allow_processing, allow_persistence,"
-            " allow_memory_learning, updated_at) VALUES (?, ?, ?, ?, ?)"
+            " allow_memory_learning, allow_external_ai, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(person_id) DO UPDATE SET"
             " allow_processing=excluded.allow_processing,"
             " allow_persistence=excluded.allow_persistence,"
             " allow_memory_learning=excluded.allow_memory_learning,"
+            " allow_external_ai=excluded.allow_external_ai,"
             " updated_at=excluded.updated_at",
             (
                 consent.person_id,
                 int(consent.allow_processing),
                 int(consent.allow_persistence),
                 int(consent.allow_memory_learning),
+                int(consent.allow_external_ai),
                 _iso(consent.updated_at),
             ),
         )
@@ -150,7 +155,8 @@ class PersonRepository:
     async def get_consent(self, person_id: str) -> Consent | None:
         cur = await self.db.execute(
             "SELECT person_id, allow_processing, allow_persistence,"
-            " allow_memory_learning, updated_at FROM consents WHERE person_id = ?",
+            " allow_memory_learning, allow_external_ai, updated_at FROM consents"
+            " WHERE person_id = ?",
             (person_id,),
         )
         row = await cur.fetchone()
@@ -161,6 +167,7 @@ class PersonRepository:
             allow_processing=bool(row["allow_processing"]),
             allow_persistence=bool(row["allow_persistence"]),
             allow_memory_learning=bool(row["allow_memory_learning"]),
+            allow_external_ai=bool(row["allow_external_ai"]),
             updated_at=_dt(row["updated_at"]),
         )
 
@@ -289,28 +296,36 @@ class UtteranceRepository:
         exclude_event_id: str | None,
         limit: int = 20,
     ) -> list[UtteranceEvent]:
-        """Return recent utterances for a conversation, oldest first.
+        """Return the *most recent* ``limit`` utterances, oldest first.
 
-        ``exclude_event_id`` is dropped from the result: the current event is
-        already persisted before context is built, so it must not also appear
-        as "history" when a future cognitive engine assembles a chat context.
+        The inner query selects the newest ``limit`` rows (``occurred_at DESC``),
+        then the outer query flips them back to ascending order so a chat-history
+        consumer reads them chronologically. ``exclude_event_id`` — the event
+        already persisted for the current input — is always dropped, and only the
+        given ``conversation_id`` is considered, never another conversation.
+
+        Ordering semantics for ties and late events: the sort key is the pair
+        ``(occurred_at, event_id)``. ``occurred_at`` is the event's *claimed*
+        time, so an event that arrives late but carries an older timestamp still
+        sorts where its timestamp says it belongs; ``event_id`` is a
+        deterministic tie-break for events that share a timestamp, so the same
+        data always returns in the same order.
         """
-        if exclude_event_id is None:
-            cur = await self.db.execute(
-                "SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
-                " text, source, addressee_hint, occurred_at, processing_status"
-                " FROM utterances WHERE conversation_id = ?"
-                " ORDER BY occurred_at ASC, event_id ASC LIMIT ?",
-                (conversation_id, limit),
-            )
-        else:
-            cur = await self.db.execute(
-                "SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
-                " text, source, addressee_hint, occurred_at, processing_status"
-                " FROM utterances WHERE conversation_id = ? AND event_id != ?"
-                " ORDER BY occurred_at ASC, event_id ASC LIMIT ?",
-                (conversation_id, exclude_event_id, limit),
-            )
+        where = "conversation_id = ?"
+        params: list = [conversation_id]
+        if exclude_event_id is not None:
+            where += " AND event_id != ?"
+            params.append(exclude_event_id)
+        sql = (
+            "SELECT * FROM ("
+            "  SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
+            "         text, source, addressee_hint, occurred_at, processing_status"
+            f"  FROM utterances WHERE {where}"
+            "  ORDER BY occurred_at DESC, event_id DESC LIMIT ?"
+            ") ORDER BY occurred_at ASC, event_id ASC"
+        )
+        params.append(limit)
+        cur = await self.db.execute(sql, tuple(params))
         rows = await cur.fetchall()
         return [
             UtteranceEvent(
@@ -930,7 +945,21 @@ class AuditRepository:
 
 
 class ResearchRepository:
-    """Durable store for idle research tasks (populated by the Phase D engine)."""
+    """Durable store for idle research tasks (populated by the Phase D engine).
+
+    Tasks flow ``PENDING -> RUNNING -> COMPLETED`` or ``PENDING -> RUNNING ->
+    FAILED``. Claiming is atomic and lease-gated (mirroring ``JobRepository``)
+    so any number of workers may compete safely; a crashed worker's expired
+    lease is reclaimed by :meth:`recover_running`. ``memory_id`` is the
+    idempotency key of the consolidated memory: a retry that finds it already
+    set re-uses the existing memory instead of creating a duplicate.
+    """
+
+    _COLUMNS = (
+        "task_id, question, status, priority, source_kind, source_ref, result,"
+        " error, created_at, started_at, completed_at, owner_id, lease_expires_at,"
+        " attempts, max_attempts, memory_id"
+    )
 
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -942,32 +971,29 @@ class ResearchRepository:
         source_kind: str = "curiosity",
         source_ref: str | None = None,
         priority: int = 0,
+        max_attempts: int = 3,
     ) -> str:
         from companion.domain.models import new_id
 
         task_id = new_id("research")
         await self.db.execute(
             "INSERT INTO research_tasks(task_id, question, status, priority,"
-            " source_kind, source_ref, created_at) VALUES (?, ?, 'PENDING', ?, ?, ?, ?)",
-            (task_id, question, priority, source_kind, source_ref, _iso(utcnow())),
+            " source_kind, source_ref, max_attempts, created_at)"
+            " VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?)",
+            (task_id, question, priority, source_kind, source_ref, max_attempts, _iso(utcnow())),
         )
         return task_id
 
     async def get(self, task_id: str) -> dict | None:
         cur = await self.db.execute(
-            "SELECT task_id, question, status, priority, source_kind, source_ref,"
-            " result, error, created_at, started_at, completed_at FROM research_tasks"
-            " WHERE task_id = ?",
+            f"SELECT {self._COLUMNS} FROM research_tasks WHERE task_id = ?",
             (task_id,),
         )
         row = await cur.fetchone()
         return dict(row) if row is not None else None
 
     async def list(self, status: str | None = None, limit: int = 100) -> list[dict]:
-        sql = (
-            "SELECT task_id, question, status, priority, source_kind, source_ref,"
-            " result, error, created_at, started_at, completed_at FROM research_tasks"
-        )
+        sql = f"SELECT {self._COLUMNS} FROM research_tasks"
         params: tuple = ()
         if status is not None:
             sql += " WHERE status = ?"
@@ -977,6 +1003,79 @@ class ResearchRepository:
         cur = await self.db.execute(sql, params)
         return [dict(r) for r in await cur.fetchall()]
 
+    async def claim(
+        self, task_id: str, owner_id: str = "idle", lease_seconds: int = 300
+    ) -> bool:
+        """Atomically claim a ``PENDING`` task, returning ``True`` on success.
+
+        The ``WHERE status = 'PENDING' AND attempts < max_attempts`` guard plus
+        SQLite's write lock mean at most one of any number of concurrent
+        workers observes ``rowcount == 1``. The claim also records a time-limited
+        lease so a crashed worker's in-flight task can be reclaimed.
+        """
+        from companion.domain.models import utcnow
+
+        now = utcnow()
+        lease = now + timedelta(seconds=lease_seconds) if lease_seconds else None
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET status = 'RUNNING', attempts = attempts + 1,"
+            " owner_id = ?, lease_expires_at = ?, started_at = COALESCE(started_at, ?),"
+            " error = NULL WHERE task_id = ? AND status = 'PENDING'"
+            " AND attempts < max_attempts",
+            (
+                owner_id,
+                _iso(lease) if lease is not None else None,
+                _iso(now),
+                task_id,
+            ),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
+
+    async def recover_running(self, now: datetime | None = None) -> int:
+        """Reset *expired* ``RUNNING`` tasks back to ``PENDING``.
+
+        A live worker holding an unexpired lease is left untouched. Idempotent
+        consolidation (via ``memory_id``) guarantees this never duplicates a
+        memory side effect.
+        """
+        from companion.domain.models import utcnow
+
+        if now is None:
+            now = utcnow()
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET status = 'PENDING', owner_id = NULL,"
+            " lease_expires_at = NULL, started_at = NULL"
+            " WHERE status = 'RUNNING'"
+            " AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
+            (_iso(now),),
+        )
+        return cur.rowcount if hasattr(cur, "rowcount") else 0
+
+    async def fail(self, task_id: str, error: str) -> None:
+        await self.db.execute(
+            "UPDATE research_tasks SET status = 'FAILED', error = ?, completed_at = ?,"
+            " owner_id = NULL, lease_expires_at = NULL WHERE task_id = ?",
+            (error, _iso(utcnow()), task_id),
+        )
+
+    async def requeue(self, task_id: str, error: str) -> None:
+        """Requeue a task for automatic retry, keeping its attempt count."""
+        await self.db.execute(
+            "UPDATE research_tasks SET status = 'PENDING', error = ?, started_at = NULL,"
+            " owner_id = NULL, lease_expires_at = NULL WHERE task_id = ?",
+            (error, task_id),
+        )
+
+    async def retry(self, task_id: str) -> bool:
+        """Reset a *failed* task for a clean manual retry."""
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET status = 'PENDING', error = NULL,"
+            " started_at = NULL, completed_at = NULL, attempts = 0, owner_id = NULL,"
+            " lease_expires_at = NULL WHERE task_id = ? AND status = 'FAILED'",
+            (task_id,),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+
     async def set_status(self, task_id: str, status: str, error: str | None = None) -> None:
         await self.db.execute(
             "UPDATE research_tasks SET status = ?, error = ?, started_at ="
@@ -984,9 +1083,9 @@ class ResearchRepository:
             (status, error, _iso(utcnow()), task_id),
         )
 
-    async def complete(self, task_id: str, result: str) -> None:
+    async def complete(self, task_id: str, result: str, memory_id: str | None = None) -> None:
         await self.db.execute(
             "UPDATE research_tasks SET status = 'COMPLETED', result = ?,"
-            " completed_at = ? WHERE task_id = ?",
-            (result, _iso(utcnow()), task_id),
+            " memory_id = COALESCE(?, memory_id), completed_at = ? WHERE task_id = ?",
+            (result, memory_id, _iso(utcnow()), task_id),
         )

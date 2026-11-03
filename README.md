@@ -66,11 +66,11 @@ cd ai-companion
 
 # with uv
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -e ".[dev]"
+uv pip install --python .venv/bin/python -e ".[dev,ui,web]"
 
 # or with pip
 python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ".[dev,ui,web]"
 ```
 
 ## Quick start
@@ -132,7 +132,7 @@ python -m companion repl --person person_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 [SPEAKER] person_2cb3661ab2184cf08889e6644449c337
 [CONTEXT] Conversation loaded
 [MEMORY] Retrieved 0 items
-[COGNITION] Mock analysis completed
+[COGNITION] Analysis completed by mock
 [DECISION] RESPOND
 [RESPONSE] 模拟回复：我收到你的话了。
 [MEMORY_JOB] Queued
@@ -150,7 +150,7 @@ For a `--to human` utterance the same trace shows `[DECISION] IGNORE` and no
 .venv/bin/python -m pytest -q
 ```
 
-The suite (74 tests) covers: multi-person independence and duplicate names;
+The suite (153 tests) covers: multi-person independence and duplicate names;
 a decision for every allowed utterance; `IGNORE` still recording everything;
 idempotent re-submission and conflict rejection; database-restart persistence;
 background-job recovery (including a crashed `RUNNING` job); provider-exception

@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -304,6 +304,63 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at);
         CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);
         CREATE INDEX IF NOT EXISTS idx_research_tasks_status ON research_tasks(status);
+        """,
+    ),
+    # Version 5 (stabilisation): privacy and research-reliability columns.
+    # - consents.allow_external_ai is an *independent* grant for sending a
+    #   person's private context to an external AI API. It defaults to 0 and is
+    #   deliberately distinct from allow_memory_learning: learning stores data
+    #   locally, external AI uploads it to a remote model.
+    # - research_tasks gains the same lease/ownership columns as processing_jobs
+    #   so the research engine can atomically claim, recover and idempotently
+    #   complete a task, plus a ``memory_id`` idempotency key for its
+    #   consolidated memory.
+    (
+        5,
+        """
+        ALTER TABLE consents ADD COLUMN allow_external_ai INTEGER NOT NULL DEFAULT 0;
+
+        ALTER TABLE research_tasks ADD COLUMN owner_id TEXT;
+        ALTER TABLE research_tasks ADD COLUMN lease_expires_at TEXT;
+        ALTER TABLE research_tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE research_tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3;
+        ALTER TABLE research_tasks ADD COLUMN memory_id TEXT;
+        """,
+    ),
+    # Version 6 (stabilisation): demote mock research knowledge that a previous
+    # build wrote as ACTIVE WORLD_KNOWLEDGE with source_supported=1. Mock data
+    # is identified precisely — kind=WORLD_KNOWLEDGE, not human-confirmed,
+    # model-inferred, and carrying a mock web source (example.com URL or an
+    # ``extra`` field tagged with a mock provider). Human-confirmed or manual
+    # memories never match, and nothing is deleted: ACTIVE -> CANDIDATE and
+    # source_supported -> 0. Idempotent by construction (only ACTIVE rows are
+    # touched, and the version gate means it runs at most once).
+    (
+        6,
+        """
+        INSERT INTO audit_log(audit_id, actor, action, entity_type, entity_id, detail, created_at)
+        SELECT 'mig_mock_' || memory_id, 'migration', 'demote_mock_knowledge',
+               'memory', memory_id,
+               'mock research demoted ACTIVE -> CANDIDATE (source_supported cleared)',
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        FROM memory_items
+        WHERE kind = 'WORLD_KNOWLEDGE' AND status = 'ACTIVE'
+          AND human_confirmed = 0 AND model_inferred = 1
+          AND memory_id IN (
+              SELECT e.memory_id FROM memory_evidence e
+              JOIN memory_sources s ON s.source_id = e.source_id
+              WHERE s.url LIKE 'https://example.com/%' OR s.extra LIKE '%mock%'
+          );
+
+        UPDATE memory_items
+        SET status = 'CANDIDATE', source_supported = 0
+        WHERE kind = 'WORLD_KNOWLEDGE' AND status = 'ACTIVE'
+          AND human_confirmed = 0 AND model_inferred = 1
+          AND memory_id IN (
+              SELECT e.memory_id FROM memory_evidence e
+              JOIN memory_sources s ON s.source_id = e.source_id
+              WHERE s.url LIKE 'https://example.com/%' OR s.extra LIKE '%mock%'
+          );
         """,
     ),
 ]

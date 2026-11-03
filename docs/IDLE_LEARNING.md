@@ -23,8 +23,11 @@ The whole pipeline is behind the `idle.enabled` app setting (default `false`).
 
 - `idle.enabled=false` → `run_cycle()` returns `{"skipped": True, ...}` and does
   no work.
+- **Research** has its own gate, `research.enabled` (also default `false`):
+  `research run` and `run_all` do nothing until it is enabled.
 - The **web search** has its own gate, `web_search.enabled` (also default
-  `false`). When disabled, the factory returns the offline mock provider.
+  `false`). When disabled, the factory returns the offline mock provider, and a
+  real provider refuses to make a network call without authorisation.
 
 ```bash
 python -m companion --db ./data.db idle run          # no-op unless enabled
@@ -52,9 +55,10 @@ so they can propose and queue but never self-confirm:
 
 - Reflections enter as `CANDIDATE` with `human_confirmed=False`,
   `model_inferred=True`.
-- Research consolidations enter as `WORLD_KNOWLEDGE` with `source_supported=True`,
-  `model_inferred=True`, `human_confirmed=False`, and their web sources attached
-  as `SINGLE_SOURCE` evidence.
+- Research consolidations enter as `CANDIDATE` `WORLD_KNOWLEDGE` with
+  `source_supported=False`, `model_inferred=True`, `human_confirmed=False`,
+  and their web sources attached with `UNVERIFIED` evidence and the search
+  provider's name. Mock research never becomes trusted knowledge.
 - Both land in the store only for a human to `confirm`, `retract` or `delete`
   through the CLI or UI.
 

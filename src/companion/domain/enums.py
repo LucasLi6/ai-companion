@@ -70,6 +70,14 @@ class MemoryOperation(str, Enum):
 
 
 class MemoryCandidateStatus(str, Enum):
+    """Lifecycle of a raw memory *candidate* inside a consolidation job.
+
+    This is a separate axis from :class:`MemoryStatus`. ``CONSOLIDATED`` means
+    "the candidate passed validation in the job", *not* that a trusted,
+    ``ACTIVE`` memory now exists — V0.0 does not promote candidates into the
+    unified memory store at all.
+    """
+
     PENDING = "PENDING"
     CONSOLIDATED = "CONSOLIDATED"
     SKIPPED = "SKIPPED"
@@ -105,9 +113,11 @@ class MemoryKind(str, Enum):
 
 
 class MemoryStatus(str, Enum):
-    """Lifecycle/trust state of a memory item.
+    """Lifecycle/trust state of a unified memory item.
 
-    ``ACTIVE`` means "currently used", *not* "absolutely correct".
+    ``ACTIVE`` means "currently used", *not* "absolutely correct". This is a
+    separate axis from :class:`MemoryCandidateStatus` (the job-pipeline state):
+    a ``CONSOLIDATED`` candidate is not an ``ACTIVE`` memory.
     """
 
     CANDIDATE = "CANDIDATE"

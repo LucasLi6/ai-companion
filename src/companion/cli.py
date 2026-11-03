@@ -585,7 +585,11 @@ def cmd_ui(args) -> int:
     from companion.ui.app import serve
 
     args.db.parent.mkdir(parents=True, exist_ok=True)
-    serve(args.db, host=args.host, port=args.port)
+    try:
+        serve(args.db, host=args.host, port=args.port)
+    except RuntimeError as exc:
+        print(f"error: {exc}")
+        return 1
     return 0
 
 
@@ -650,6 +654,9 @@ async def cmd_research_run(args) -> int:
     db = await _connect(args.db)
     try:
         rt = build_runtime(db)
+        if not await rt.repos.settings.get_bool("research.enabled", False):
+            print("research is disabled (set research.enabled=true to enable)")
+            return 0
         scheduler = await _build_idle_scheduler(rt)
         tasks = await scheduler.research.run_all(limit=args.limit)
         for t in tasks:

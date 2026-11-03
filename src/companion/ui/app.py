@@ -377,6 +377,7 @@ async def person_manager() -> None:
                         "processing": bool(c.allow_processing) if c else False,
                         "persistence": bool(c.allow_persistence) if c else False,
                         "learning": bool(c.allow_memory_learning) if c else False,
+                        "external_ai": bool(c.allow_external_ai) if c else False,
                     }
                 )
             return out
@@ -390,6 +391,7 @@ async def person_manager() -> None:
             {"name": "processing", "label": "Processing", "field": "processing", "align": "left"},
             {"name": "persistence", "label": "Persistence", "field": "persistence", "align": "left"},
             {"name": "learning", "label": "Learning", "field": "learning", "align": "left"},
+            {"name": "external_ai", "label": "External AI", "field": "external_ai", "align": "left"},
         ],
         rows=[],
     )
@@ -406,6 +408,7 @@ async def person_manager() -> None:
         add_processing = ui.switch("Allow processing", value=True)
         add_persistence = ui.switch("Allow persistence", value=True)
         add_learning = ui.switch("Allow memory learning", value=True)
+        add_external_ai = ui.switch("Allow external AI", value=False)
 
         async def do_add() -> None:
             async with open_runtime() as rt:
@@ -415,6 +418,7 @@ async def person_manager() -> None:
                     allow_processing=add_processing.value,
                     allow_persistence=add_persistence.value,
                     allow_memory_learning=add_learning.value,
+                    allow_external_ai=add_external_ai.value,
                 )
             add_dialog.close()
             ui.notify(f"Registered {add_name.value}", type="positive")
@@ -432,6 +436,7 @@ async def person_manager() -> None:
     c_processing = ui.switch("Allow processing")
     c_persistence = ui.switch("Allow persistence")
     c_learning = ui.switch("Allow memory learning")
+    c_external_ai = ui.switch("Allow external AI")
 
     async def populate_select() -> None:
         people = await load_people()
@@ -459,6 +464,7 @@ async def person_manager() -> None:
                     allow_processing=c_processing.value,
                     allow_persistence=c_persistence.value,
                     allow_memory_learning=c_learning.value,
+                    allow_external_ai=c_external_ai.value,
                     updated_at=utcnow(),
                 )
             )
@@ -645,8 +651,22 @@ def create_app(db_path: Path):
     return app
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
 def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8080) -> None:
-    """Build the app and run the NiceGUI server (blocking)."""
+    """Build the app and run the NiceGUI server (blocking).
+
+    Binding is loopback-only by default and refused on any non-loopback host,
+    because the management UI has no authentication layer yet: exposing it on
+    a network interface would publish every person's private memories. A real
+    auth layer (not implemented in V0.0) is the precondition for lifting this.
+    """
     create_app(db_path)
+    if host not in _LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"refusing to bind to non-loopback host {host!r}: the management UI "
+            "has no authentication and must stay loopback-only"
+        )
     print(f"AI Companion UI running at http://{host}:{port}")
     ui.run(host=host, port=port, title="AI Companion", reload=False, show=False)

@@ -25,13 +25,14 @@ async def rt(db):
 
 @pytest_asyncio.fixture
 def register(rt):
-    async def _register(name, role="friend", *, processing=True, persistence=True, learning=True):
+    async def _register(name, role="friend", *, processing=True, persistence=True, learning=True, external_ai=False):
         return await rt.registry.register(
             name,
             role,
             allow_processing=processing,
             allow_persistence=persistence,
             allow_memory_learning=learning,
+            allow_external_ai=external_ai,
         )
 
     return _register

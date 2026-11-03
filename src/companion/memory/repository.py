@@ -89,7 +89,7 @@ class MemoryRepository:
             for source in sources:
                 await self.db.conn.execute(
                     "INSERT OR IGNORE INTO memory_sources(source_id, source_type, source_ref,"
-                    " title, url, retrieved_at, published_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " title, url, retrieved_at, published_at, extra) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         source.source_id,
                         source.source_type,
@@ -98,6 +98,7 @@ class MemoryRepository:
                         source.url,
                         _iso(source.retrieved_at),
                         _iso(source.published_at),
+                        json.dumps({"provider": source.provider}) if source.provider else "{}",
                     ),
                 )
             for ev in evidence:
@@ -191,11 +192,25 @@ class MemoryRepository:
         )
 
     async def add_link(self, memory_id: str, linked_memory_id: str, link_type: str) -> None:
-        await self.db.conn.execute(
+        await self.db.execute(
             "INSERT OR IGNORE INTO memory_links(memory_id, linked_memory_id, link_type)"
             " VALUES (?, ?, ?)",
             (memory_id, linked_memory_id, link_type),
         )
+
+    async def find_derived(self, source_id: str) -> list[str]:
+        """Return the ids of memories derived from ``source_id``.
+
+        ``memory_links`` stores ``(memory_id, linked_memory_id, link_type)``,
+        so a reflection derived from a source has a ``derived_from`` row where
+        ``linked_memory_id`` is the source.
+        """
+        cur = await self.db.execute(
+            "SELECT memory_id FROM memory_links"
+            " WHERE linked_memory_id = ? AND link_type = 'derived_from'",
+            (source_id,),
+        )
+        return [r["memory_id"] for r in await cur.fetchall()]
 
     # -- read --------------------------------------------------------------
 
@@ -220,12 +235,21 @@ class MemoryRepository:
     async def get_sources(self, memory_id: str) -> list[dict]:
         cur = await self.db.execute(
             "SELECT s.source_id, s.source_type, s.source_ref, s.title, s.url,"
-            " s.retrieved_at, s.published_at, e.verification_level, e.evidence_span"
+            " s.retrieved_at, s.published_at, s.extra, e.verification_level, e.evidence_span"
             " FROM memory_evidence e JOIN memory_sources s ON s.source_id = e.source_id"
             " WHERE e.memory_id = ?",
             (memory_id,),
         )
-        return [dict(r) for r in await cur.fetchall()]
+        out = []
+        for r in await cur.fetchall():
+            row = dict(r)
+            extra = row.pop("extra", "{}") or "{}"
+            try:
+                row["provider"] = json.loads(extra).get("provider")
+            except (json.JSONDecodeError, AttributeError):
+                row["provider"] = None
+            out.append(row)
+        return out
 
     async def get_links(self, memory_id: str) -> list[dict]:
         cur = await self.db.execute(

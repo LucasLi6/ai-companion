@@ -178,7 +178,7 @@ class Orchestrator:
                     analysis.reason_code.value,
                     analysis.provider,
                 )
-                steps.append("[COGNITION] Mock analysis completed")
+                steps.append(f"[COGNITION] Analysis completed by {analysis.provider}")
                 if persist:
                     analysis_id = new_id("ana")
                     candidates = analysis.memory_candidates if learn else []

@@ -99,6 +99,7 @@ class MemoryService:
         model_inferred: bool = False,
         valid_from: datetime | None = None,
         valid_until: datetime | None = None,
+        memory_id: str | None = None,
     ) -> MemoryItem:
         subjects = subjects or []
         sources = sources or []
@@ -115,7 +116,7 @@ class MemoryService:
 
         now = utcnow()
         item = MemoryItem(
-            memory_id=new_id("mem"),
+            memory_id=memory_id or new_id("mem"),
             kind=kind,
             content=content,
             status=status,
@@ -346,6 +347,7 @@ class MemoryService:
             raise MemoryNotFoundError(memory_id)
         if not self._can_modify(item, access):
             raise MemoryPermissionDeniedError(memory_id)
+        await self._invalidate_derived(memory_id, access)
         new_item = item.model_copy(
             update={
                 "status": MemoryStatus.RETRACTED,
@@ -374,12 +376,17 @@ class MemoryService:
         return new_item
 
     async def delete(self, memory_id: str, *, access: AccessContext) -> None:
-        """Permanently remove an item, its private content and index entries."""
+        """Permanently remove an item, its private content and index entries.
+
+        Memories derived from this item are invalidated (retracted) first, so
+        no reflection is left silently pointing at a deleted source.
+        """
         if not access.is_admin:
             raise MemoryPermissionDeniedError("delete requires admin")
         item = await self.repo.get(memory_id)
         if item is None:
             raise MemoryNotFoundError(memory_id)
+        await self._invalidate_derived(memory_id, access)
         await self.repo.delete(memory_id)
         self.logger.info("memory_deleted memory_id=%s by=%s", memory_id, access.actor_id)
         await self._audit(access, "delete", memory_id)
@@ -394,15 +401,42 @@ class MemoryService:
         conflicts_with: str | None = None,
         kind: MemoryKind | str = MemoryKind.REFLECTION,
         source_ids: list[str] | None = None,
+        source_access: AccessContext | None = None,
         reason: str | None = None,
     ) -> MemoryItem:
         """Record an AI-proposed change without overwriting anything.
+
+        ``source_ids`` are validated (they must exist and be visible under
+        ``source_access``, which defaults to ``access``) and recorded as
+        ``derived_from`` links, so a proposal always names the memories it was
+        derived from — never fabricated sources. ``source_access`` lets a
+        trusted internal reader that acts as a non-admin *writer* cite memories
+        it legitimately read.
 
         If ``conflicts_with`` names a human-confirmed item, the proposal is
         stored as a ``NEEDS_REVIEW`` record linked to it — never applied to the
         original. The original remains untouched until a human approves it.
         """
         kind = MemoryKind(kind)
+        # An AI proposal may never auto-classify itself as a fact about a
+        # person; only a human can create a PERSONAL_FACT.
+        if kind == MemoryKind.PERSONAL_FACT and not access.is_admin:
+            self.logger.warning(
+                "propose_personalfact_denied actor=%s downgraded_to=REFLECTION",
+                access.actor_id,
+            )
+            kind = MemoryKind.REFLECTION
+
+        validator = source_access or access
+        derived_from: list[str] = []
+        for sid in source_ids or []:
+            src = await self.repo.get(sid)
+            if src is None:
+                raise MemoryNotFoundError(sid)
+            if not await self._visible(src, validator):
+                raise MemoryPermissionDeniedError(sid)
+            derived_from.append(sid)
+
         if conflicts_with is not None:
             original = await self.repo.get(conflicts_with)
             if original is None:
@@ -419,6 +453,8 @@ class MemoryService:
                 await self.repo.add_link(
                     proposal.memory_id, conflicts_with, "conflicts_with"
                 )
+                for sid in derived_from:
+                    await self.repo.add_link(proposal.memory_id, sid, "derived_from")
                 self.logger.info(
                     "memory_conflict_proposed memory_id=%s conflicts_with=%s by=%s",
                     proposal.memory_id,
@@ -426,7 +462,10 @@ class MemoryService:
                     access.actor_id,
                 )
                 await self._audit(
-                    access, "propose_conflict", proposal.memory_id, f"conflicts_with={conflicts_with}"
+                    access,
+                    "propose_conflict",
+                    proposal.memory_id,
+                    f"conflicts_with={conflicts_with} sources={len(derived_from)}",
                 )
                 return proposal
 
@@ -439,7 +478,14 @@ class MemoryService:
             model_inferred=True,
             created_by=access.actor_id,
         )
-        await self._audit(access, "propose", proposal.memory_id, f"kind={kind.value}")
+        for sid in derived_from:
+            await self.repo.add_link(proposal.memory_id, sid, "derived_from")
+        await self._audit(
+            access,
+            "propose",
+            proposal.memory_id,
+            f"kind={kind.value} sources={len(derived_from)}",
+        )
         return proposal
 
     async def history(
@@ -465,6 +511,46 @@ class MemoryService:
         )
 
     # -- helpers -----------------------------------------------------------
+
+    async def _invalidate_derived(self, source_id: str, access: AccessContext) -> None:
+        """Retract every memory derived from ``source_id``.
+
+        Called when a source is deleted or retracted, so a reflection never
+        stays live while its evidence has gone. Invalidation keeps the derived
+        record (for audit) but excludes it from default search.
+        """
+        derived = await self.repo.find_derived(source_id)
+        for mid in derived:
+            item = await self.repo.get(mid)
+            if item is None or item.status == MemoryStatus.RETRACTED:
+                continue
+            new_item = item.model_copy(
+                update={
+                    "status": MemoryStatus.RETRACTED,
+                    "updated_at": utcnow(),
+                    "version": item.version + 1,
+                }
+            )
+            async with self.repo.db.transaction():
+                await self.repo.replace_item(new_item, item.version)
+                await self.repo.insert_revision(
+                    MemoryRevision(
+                        revision_id=new_id("rev"),
+                        memory_id=mid,
+                        version=new_item.version,
+                        kind=new_item.kind,
+                        content=new_item.content,
+                        status=new_item.status,
+                        changed_by=access.actor_id,
+                        changed_at=new_item.updated_at,
+                        reason="derived_source_invalidated",
+                    ),
+                    self._snapshot(new_item),
+                )
+            self.logger.info(
+                "memory_derived_invalidated memory_id=%s source=%s", mid, source_id
+            )
+            await self._audit(access, "retract", mid, f"derived_source={source_id}")
 
     async def _require_subjects_authorized(self, person_ids: list[str]) -> None:
         if self.authorize_subject is None:
