@@ -36,12 +36,14 @@ from companion.domain.models import (
     Consent,
     ConversationContext,
     MemoryCandidate,
+    NonresponseMotive,
     Person,
     ProcessingJob,
     UtteranceEvent,
     utcnow,
 )
 
+from companion.cognition.nonresponse import NonresponseTrace
 from companion.learning.state import LearningRepository
 from companion.research.state import ResearchStateRepository
 from companion.goals.state import GoalRepository
@@ -423,12 +425,19 @@ class AnalysisRepository:
             if analysis.affective_signal is not None
             else None
         )
+        motive_json = (
+            json.dumps(
+                analysis.nonresponse_motive.model_dump(), ensure_ascii=False
+            )
+            if analysis.nonresponse_motive is not None
+            else None
+        )
         await self.db.execute(
             "INSERT INTO cognitive_analyses(analysis_id, event_id, meaning, action,"
             " reason_code, provider, referenced_memory_ids, response_style, created_at,"
             " intent, addressed_to, silence_requested, reply_necessity, conversation_state,"
-            " affective_signal_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " affective_signal_json, nonresponse_motive_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 analysis_id,
                 analysis.event_id,
@@ -445,6 +454,7 @@ class AnalysisRepository:
                 analysis.reply_necessity.value,
                 analysis.conversation_state,
                 signal_json,
+                motive_json,
             ),
         )
 
@@ -453,7 +463,7 @@ class AnalysisRepository:
             "SELECT analysis_id, event_id, meaning, action, reason_code, provider,"
             " referenced_memory_ids, response_style, intent, addressed_to,"
             " silence_requested, reply_necessity, conversation_state,"
-            " affective_signal_json"
+            " affective_signal_json, nonresponse_motive_json"
             " FROM cognitive_analyses WHERE event_id = ?",
             (event_id,),
         )
@@ -468,6 +478,14 @@ class AnalysisRepository:
                 )
             except (ValueError, TypeError, json.JSONDecodeError):
                 signal = None
+        motive = None
+        if row["nonresponse_motive_json"]:
+            try:
+                motive = NonresponseMotive.model_validate(
+                    json.loads(row["nonresponse_motive_json"])
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                motive = None
         return CognitiveResult(
             event_id=row["event_id"],
             meaning=row["meaning"],
@@ -482,6 +500,7 @@ class AnalysisRepository:
             reply_necessity=ReplyNecessity(row["reply_necessity"] or "OPTIONAL"),
             conversation_state=row["conversation_state"] or "unknown",
             affective_signal=signal,
+            nonresponse_motive=motive,
         )
 
     async def get_analysis_id(self, event_id: str) -> Optional[str]:
@@ -640,11 +659,16 @@ class AnalysisRepository:
         return [dict(r) for r in await cur.fetchall()]
 
     async def save_action(self, action: AgentAction) -> None:
+        trace_json = (
+            json.dumps(action.nonresponse_trace, ensure_ascii=False)
+            if action.nonresponse_trace is not None
+            else None
+        )
         await self.db.execute(
             "INSERT INTO agent_actions(action_id, event_id, action_type, response_text,"
             " reason_code, status, created_at, model_suggested_action,"
-            " policy_final_action, override_reason)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " policy_final_action, override_reason, nonresponse_trace_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 action.action_id,
                 action.event_id,
@@ -660,6 +684,7 @@ class AnalysisRepository:
                 if action.policy_final_action is not None
                 else None,
                 action.override_reason,
+                trace_json,
             ),
         )
 
@@ -667,7 +692,8 @@ class AnalysisRepository:
         cur = await self.db.execute(
             "SELECT action_id, event_id, action_type, response_text, reason_code,"
             " status, created_at, model_suggested_action, policy_final_action,"
-            " override_reason FROM agent_actions WHERE event_id = ?",
+            " override_reason, nonresponse_trace_json"
+            " FROM agent_actions WHERE event_id = ?",
             (event_id,),
         )
         row = await cur.fetchone()
@@ -690,13 +716,23 @@ class AnalysisRepository:
         cur = await self.db.execute(
             "SELECT action_id, event_id, action_type, response_text, reason_code,"
             " status, created_at, model_suggested_action, policy_final_action,"
-            f" override_reason FROM agent_actions WHERE event_id IN ({placeholders})",
+            " override_reason, nonresponse_trace_json"
+            f" FROM agent_actions WHERE event_id IN ({placeholders})",
             tuple(event_ids),
         )
         rows = await cur.fetchall()
         return {r["event_id"]: self._to_action(r) for r in rows}
 
     def _to_action(self, row) -> AgentAction:
+        trace = None
+        raw_trace = row["nonresponse_trace_json"]
+        if raw_trace:
+            try:
+                trace = NonresponseTrace.model_validate(
+                    json.loads(raw_trace)
+                ).model_dump()
+            except (ValueError, TypeError, json.JSONDecodeError):
+                trace = None
         return AgentAction(
             action_id=row["action_id"],
             event_id=row["event_id"],
@@ -716,6 +752,7 @@ class AnalysisRepository:
                 else None
             ),
             override_reason=row["override_reason"],
+            nonresponse_trace=trace,
         )
 
 

@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1100,6 +1100,22 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_emotion_rules_agent_name
             ON emotion_appraisal_rules(agent_id, name);
+        """,
+    ),
+    # Version 13 (V0.3.2): explainable nonresponse.
+    #
+    # - ``cognitive_analyses.nonresponse_motive_json`` stores the model's
+    #   locally validated silence hint (NULL when absent/invalid/RESPOND).
+    # - ``agent_actions.nonresponse_trace_json`` stores the *final* reason
+    #   derived after local policy, including when policy overrode the model.
+    # Both are nullable so schema-12 rows remain readable without back-filling
+    # a motive or evidence that was never observed.
+    (
+        13,
+        """
+        ALTER TABLE cognitive_analyses ADD COLUMN nonresponse_motive_json TEXT;
+
+        ALTER TABLE agent_actions ADD COLUMN nonresponse_trace_json TEXT;
         """,
     ),
 ]

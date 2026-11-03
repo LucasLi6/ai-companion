@@ -44,6 +44,7 @@ from companion.domain.models import (
     UtteranceEvent,
     new_id,
     validate_affective_signal,
+    validate_nonresponse_motive,
 )
 from companion.memory.store import validate_referenced_memory_ids
 from companion.prompts.cognitive import build_cognitive_messages, build_repair_messages
@@ -84,9 +85,10 @@ class _RawAnalysis(BaseModel):
     referenced_memory_ids: list[str] = Field(default_factory=list)
     memory_candidates: list[_RawCandidate] = Field(default_factory=list)
     response_style: str = Field(default="deepseek_plain", max_length=128)
-    # Kept as an untyped object on purpose: an invalid signal must degrade to
-    # None locally, not fail the whole analysis schema.
+    # Kept as untyped objects on purpose: invalid optional hints must degrade
+    # locally, not fail the whole analysis schema.
     affective_signal: Optional[object] = None
+    nonresponse_motive: Optional[object] = None
 
 
 def _parse_json_object(content: str) -> dict:
@@ -244,6 +246,21 @@ class DeepSeekCognitiveProvider:
                 "deepseek_affective_signal_rejected event_id=%s", event.event_id
             )
 
+        motive = validate_nonresponse_motive(
+            raw.nonresponse_motive, event.text
+        )
+        if raw.nonresponse_motive is not None and (
+            motive is None or motive.motive == "UNKNOWN"
+        ):
+            self.logger.info(
+                "deepseek_nonresponse_motive_rejected event_id=%s",
+                event.event_id,
+            )
+        # A response is not a nonresponse; never persist a motive for it even
+        # if the model returned one.
+        if action == CognitiveAction.RESPOND:
+            motive = None
+
         return CognitiveResult(
             event_id=event.event_id,
             meaning=meaning,
@@ -260,6 +277,7 @@ class DeepSeekCognitiveProvider:
             conversation_state=(raw.conversation_state or "unknown").strip()[:128]
             or "unknown",
             affective_signal=signal,
+            nonresponse_motive=motive,
         )
 
     @staticmethod

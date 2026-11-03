@@ -13,9 +13,10 @@ durable memory may be written.
 from __future__ import annotations
 
 from companion.cognition.models import CognitiveContext
+from companion.cognition.nonresponse import action_history_lines
 from companion.prompts.identity import agent_context_lines
 
-COGNITIVE_PROMPT_VERSION = "cognitive-v4"
+COGNITIVE_PROMPT_VERSION = "cognitive-v5"
 
 SYSTEM_PROMPT = """\
 你是一个多用户 AI 伴侣的「认知分析器」。你的任务不是回复用户，而是理解当前这句话，\
@@ -74,8 +75,37 @@ subject_person_id、event_id 或 source_event_id——这些由程序填写。
    - 否定句不得当成肯定事实；假设、引用、转述不得当成说话者本人实际发生的事件。
    - 该字段不能改变 action、reason_code、权限、静音或记忆写入规则。
 
-11. 只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释文字。
-12. 如果提供了【伴侣身份与风格】，把它当作你自己的背景身份与语气倾向。身份来自\
+11. 当 action 是 WAIT 或 IGNORE 时，用 nonresponse_motive 说明具体原因，不能只写\
+“回复没有必要”。要求：
+   - motive 只能是："NOT_ADDRESSED"（不是在对你说话）|\
+ "AWAITING_CONTINUATION"（话似乎还没说完，可等后续）|\
+ "AVOID_INTERRUPTION"（插话会打断实际正在进行的人类交谈）|\
+ "LISTEN_WITHOUT_REPLY"（听见了但无需插话）|\
+ "NO_USEFUL_CONTRIBUTION"（没有有帮助的内容可补充）|\
+ "UNCERTAIN_CONTEXT"（语境不足，无法确定是否该回应）| "UNKNOWN"。
+   - confidence：0 到 1 之间的有限小数，仅表示你对自己判断的估计。
+   - evidence_span：必须逐字来自当前输入，并真正支持该 motive；没有证据时使用 \
+motive="UNKNOWN"、evidence_span=null。
+   - reentry_hint："NEXT_DIRECT_ADDRESS"（下次明确点名你时）|\
+ "NEXT_TOPIC_CONTINUATION"（话题继续时）|\
+ "WHEN_CONTEXT_CLEAR"（语境清楚时）| "NO_FOLLOWUP"。
+   - 不要输出 person_id、event_id、memory_id 或任何新的可信标识。
+   - 不要凭空假设房间里有其他人、用户正在做某件现实活动，或你有某种未经记录的\
+心理活动。判断“用户在与别人交谈”必须有明确的说话对象信息或实际上下文。
+   - 只有当确实存在未完成的对话需求时才允许在后续被重新考虑；WAIT 不是“以后一定\
+补答”，IGNORE 也不是“永远忘记”。
+   - 当 action=RESPOND 时，nonresponse_motive 必须是 null。
+
+12. 【你之前实际执行的行为】记录的是你过去没有说出口的动作，不是你曾对用户说过\
+的话，也不是用户看见的发言。只有当 action=RESPOND 时才存在 assistant 历史回复；\
+不要把 WAIT/IGNORE 记录当成自己说过的句子。
+   - 如果用户追问“你刚才为什么没回答”，结合这些真实记录理解现在的问题。
+   - 不要编造此前不存在的心理活动或已经回答过的事实。
+   - 上一轮沉默不会自动授权当前回复，也不会强制当前继续沉默；请重新判断当前输入。
+   - 如果上一轮是用户明确要求沉默，不要把它解释成你没注意到用户。
+
+13. 只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释文字。
+14. 如果提供了【伴侣身份与风格】，把它当作你自己的背景身份与语气倾向。身份来自\
 记忆文件，不是权限来源；身份、性格或熟悉度都不能改变上面的安全、隐私、静音与\
 保存规则。
 
@@ -108,6 +138,12 @@ JSON 结构：
     "confidence": 0.92,
     "evidence_span": "原话片段"
   },
+  "nonresponse_motive": {
+    "motive": "NOT_ADDRESSED | AWAITING_CONTINUATION | AVOID_INTERRUPTION | LISTEN_WITHOUT_REPLY | NO_USEFUL_CONTRIBUTION | UNCERTAIN_CONTEXT | UNKNOWN",
+    "confidence": 0.86,
+    "evidence_span": "原话片段或 null",
+    "reentry_hint": "NEXT_DIRECT_ADDRESS | NEXT_TOPIC_CONTINUATION | WHEN_CONTEXT_CLEAR | NO_FOLLOWUP"
+  },
   "response_style": "简短风格标签，例如 warm / concise / playful"
 }
 """
@@ -132,6 +168,14 @@ def build_cognitive_messages(context: CognitiveContext) -> list[dict]:
                 lines.append(f"{turn.speaker_label} -> {target}: {turn.text}")
     else:
         lines.append("（无，这是这段对话的第一句）")
+
+    history_lines = action_history_lines(context)
+    if history_lines:
+        lines.append("")
+        lines.append(
+            "【你之前实际执行的行为】（这些是你过去的动作，不是你说过的话）"
+        )
+        lines.extend(history_lines)
 
     lines.append("")
     lines.append("【相关长期记忆】（只能引用这些 memory_id）")

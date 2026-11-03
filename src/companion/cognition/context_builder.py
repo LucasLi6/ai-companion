@@ -21,6 +21,7 @@ import logging
 from typing import Optional
 
 from companion.core.policy import load_policy_config
+from companion.domain.enums import CognitiveAction
 from companion.domain.models import UtteranceEvent
 from companion.people.registry import PersonRegistry
 from companion.storage.repositories import Repositories
@@ -31,6 +32,7 @@ from .models import (
     CognitiveContext,
     CognitiveTurn,
 )
+from .nonresponse import build_action_history_record
 
 DEFAULT_HISTORY_LIMIT = 20
 DEFAULT_MAX_TURNS = 40
@@ -86,6 +88,7 @@ class ContextBuilder:
         labels = await self._resolve_labels(history, event)
         turns = self._interleave(history, actions, labels)
         turns = self._truncate(turns)
+        action_history = self._action_history(history, actions, turns)
 
         current_label = labels.get(
             event.speaker_person_id, event.speaker_label or "unknown"
@@ -106,6 +109,7 @@ class ContextBuilder:
             current_addressee_hint=event.addressee_hint.value,
             quiet_mode=False,
             turns=turns,
+            action_history=action_history,
             memories=memories,
             agent_context=agent_context,
         )
@@ -151,7 +155,13 @@ class ContextBuilder:
                 )
             )
             action = actions_by_event.get(u.event_id)
-            if action is not None and action.response_text:
+            # Only a real, visible RESPOND is assistant dialogue. A WAIT/IGNORE
+            # must never be rendered as if the companion said "I stayed quiet".
+            if (
+                action is not None
+                and action.action_type == CognitiveAction.RESPOND
+                and action.response_text
+            ):
                 turns.append(
                     CognitiveTurn(
                         event_id=u.event_id,
@@ -163,6 +173,31 @@ class ContextBuilder:
                     )
                 )
         return turns
+
+    def _action_history(
+        self, utterances, actions_by_event: dict, turns: list[CognitiveTurn]
+    ):
+        """Build recent WAIT/IGNORE records from the same filtered history.
+
+        The source utterance must still be present after privacy filtering and
+        turn truncation, so an action can never arrive in the model context
+        without the human turn it belongs to. At most eight records are kept,
+        bounding the prompt even across a long run of silence.
+        """
+        kept_event_ids = {
+            turn.event_id for turn in turns if turn.role == ROLE_HUMAN
+        }
+        records = []
+        for utterance in utterances:
+            if utterance.event_id not in kept_event_ids:
+                continue
+            action = actions_by_event.get(utterance.event_id)
+            if action is None:
+                continue
+            record = build_action_history_record(action)
+            if record is not None:
+                records.append(record)
+        return records[-8:]
 
     def _truncate(self, turns: list[CognitiveTurn]) -> list[CognitiveTurn]:
         turns = list(turns)

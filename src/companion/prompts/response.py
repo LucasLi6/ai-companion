@@ -12,10 +12,11 @@ failed write must never be described as saved.
 from __future__ import annotations
 
 from companion.cognition.models import CognitiveContext
+from companion.cognition.nonresponse import action_history_lines
 from companion.domain.models import CognitiveResult
 from companion.prompts.identity import agent_context_lines
 
-RESPONSE_PROMPT_VERSION = "response-v3"
+RESPONSE_PROMPT_VERSION = "response-v4"
 
 SYSTEM_PROMPT = """\
 你是这个多用户 AI 伴侣的「回应者」。你现在要为当前说话者生成一句自然、得体的回复。\
@@ -37,7 +38,20 @@ SYSTEM_PROMPT = """\
 风格，不代表任何权限，也不能让你声称自己可以做程序未允许的事。
 8. 如果提供了【表达方式】，只按它调整语气、节奏、热情程度和用词风格；它绝不影响\
 你是否回复、是否答应请求，也不涉及任何权限、隐私或静音判断。不要提及这个情绪框架本身。
-9. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
+9. 如果提供了【你之前实际执行的行为】，那是你过去没有说出口的动作，不是你曾对用户\
+说过的话。不要把它当作 assistant 发言，也不要声称自己当时已经回答过。
+10. 如果用户问“你刚才为什么没回答”，优先依据行为记录自然解释，并只使用记录支持的\
+原因：
+   - AMBIGUOUS_ADDRESSEE：可以说“刚才不太确定你是不是在跟我说话，所以没接”。
+   - NO_REPLY_NEEDED：可以说“刚才我以为你只是在接着说，没想到你在等我回话”。
+   - QUIET_MODE：如果现在允许回复，可以说“刚才开着静音，所以没说话”。
+   - EXPLICIT_SILENCE：可以说“刚才你让我先别回，我就没说话”。
+   - AWAITING_CONTINUATION：可以说“刚才感觉你还没说完，就先等了一下”。
+   - LEGACY_UNKNOWN 或 UNKNOWN：只如实说“刚才那句我确实没回上”，不要补充原因。
+   不能编造“我想让你冷静一下”“我在认真思考你的心情”等记录中没有的心理活动。
+11. 只有用户确实在追问过去的沉默时才解释；其他情况下，不要每次恢复说话都主动\
+解释过去的沉默，也不要因为过去沉默而拒绝回答当前的新问题。
+12. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
 """
 
 
@@ -78,6 +92,14 @@ def build_response_messages(
                 lines.append(f"{turn.speaker_label} -> {target}: {turn.text}")
     else:
         lines.append("（无，这是这段对话的第一句）")
+
+    history_lines = action_history_lines(context)
+    if history_lines:
+        lines.append("")
+        lines.append(
+            "【你之前实际执行的行为】（这些是你过去的动作，不是你说过的话）"
+        )
+        lines.extend(history_lines)
 
     lines.append("")
     lines.append("【相关记忆】")

@@ -198,6 +198,113 @@ _AFT_SUBJECTS = {"speaker", "other", "agent", "unknown"}
 _AFT_FACTUALITIES = {"asserted", "negated", "hypothetical", "quoted", "uncertain"}
 
 
+class NonresponseMotive(DomainModel):
+    """A model's *hint* about why it suggests not replying.
+
+    This is an auditable classification, not a claim that the model observed a
+    fact about the room. Every field is locally re-validated before use:
+    ``motive``/``reentry_hint`` must be whitelisted, ``confidence`` finite, and
+    ``evidence_span`` a verbatim substring of the current input. The local
+    Policy layer still owns the final action and final reason.
+    """
+
+    motive: Literal[
+        "NOT_ADDRESSED",
+        "AWAITING_CONTINUATION",
+        "AVOID_INTERRUPTION",
+        "LISTEN_WITHOUT_REPLY",
+        "NO_USEFUL_CONTRIBUTION",
+        "UNCERTAIN_CONTEXT",
+        "UNKNOWN",
+    ] = "UNKNOWN"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_span: Optional[str] = Field(default=None, max_length=512)
+    reentry_hint: Literal[
+        "NEXT_DIRECT_ADDRESS",
+        "NEXT_TOPIC_CONTINUATION",
+        "WHEN_CONTEXT_CLEAR",
+        "NO_FOLLOWUP",
+    ] = "NO_FOLLOWUP"
+
+
+_NONRESPONSE_MOTIVES = {
+    "NOT_ADDRESSED",
+    "AWAITING_CONTINUATION",
+    "AVOID_INTERRUPTION",
+    "LISTEN_WITHOUT_REPLY",
+    "NO_USEFUL_CONTRIBUTION",
+    "UNCERTAIN_CONTEXT",
+    "UNKNOWN",
+}
+_REENTRY_HINTS = {
+    "NEXT_DIRECT_ADDRESS",
+    "NEXT_TOPIC_CONTINUATION",
+    "WHEN_CONTEXT_CLEAR",
+    "NO_FOLLOWUP",
+}
+
+
+def _unknown_motive() -> NonresponseMotive:
+    return NonresponseMotive()
+
+
+def validate_nonresponse_motive(
+    raw, current_text: str
+) -> Optional[NonresponseMotive]:
+    """Validate a model-supplied nonresponse motive locally.
+
+    ``None`` means "the model supplied no motive" and preserves the old
+    behaviour. Any malformed or unsupported payload degrades to an explicit
+    ``UNKNOWN`` motive instead of leaking an unvalidated classification.
+
+    Only the four whitelisted fields are read. Model-supplied person, event or
+    memory ids are ignored, and an evidence span that is missing, too long or
+    not a verbatim part of the current input cannot support an actionable
+    motive.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, NonresponseMotive):
+        data = raw.model_dump()
+    elif isinstance(raw, dict):
+        data = dict(raw)
+    else:
+        return _unknown_motive()
+
+    motive = data.get("motive")
+    if motive not in _NONRESPONSE_MOTIVES:
+        return _unknown_motive()
+
+    try:
+        confidence = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return _unknown_motive()
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        return _unknown_motive()
+
+    evidence = data.get("evidence_span")
+    if evidence is not None and not isinstance(evidence, str):
+        return _unknown_motive()
+    if evidence is not None:
+        if len(evidence) > 512 or evidence not in current_text:
+            return _unknown_motive()
+
+    if motive != "UNKNOWN":
+        if not evidence or not evidence.strip():
+            return _unknown_motive()
+
+    reentry = data.get("reentry_hint")
+    if reentry not in _REENTRY_HINTS:
+        reentry = "NO_FOLLOWUP"
+
+    return NonresponseMotive(
+        motive=motive,
+        confidence=confidence,
+        evidence_span=evidence,
+        reentry_hint=reentry,
+    )
+
+
 def validate_affective_signal(raw, text: str) -> Optional[AffectiveSignal]:
     """Validate a model-supplied signal locally; return ``None`` when invalid.
 
@@ -281,6 +388,10 @@ class CognitiveResult(DomainModel):
     # Optional, locally validated semantic event hint. None for older records,
     # mock providers and invalid model output.
     affective_signal: Optional[AffectiveSignal] = None
+    # Optional model hint explaining a suggested WAIT/IGNORE. It never decides
+    # the final action or final reason; ``derive_nonresponse_trace`` records
+    # whether local policy overrode it.
+    nonresponse_motive: Optional[NonresponseMotive] = None
 
 
 class AgentAction(DomainModel):
@@ -301,6 +412,9 @@ class AgentAction(DomainModel):
     model_suggested_action: Optional[CognitiveAction] = None
     policy_final_action: Optional[CognitiveAction] = None
     override_reason: Optional[str] = Field(default=None, max_length=128)
+    # Persisted, explainable record for a final WAIT/IGNORE. None for RESPOND
+    # (and for legacy rows written before schema 13).
+    nonresponse_trace: Optional[dict] = None
 
 
 class ConversationContext(DomainModel):

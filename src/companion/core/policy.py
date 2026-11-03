@@ -172,6 +172,32 @@ class Policy:
 
         # 5. Trusted control state: quiet mode handled above.
 
+        # 5b. Narrow correction for a direct, trusted, required question that
+        # the model wrongly deferred for an ambiguous reason. Every hard local
+        # gate above has already passed (permission, explicit silence, quiet
+        # mode, human addressee), and only the model's *ambiguous* reasons are
+        # eligible. This can never let the model's own ``addressed_to`` field
+        # or a human-to-human utterance bypass local policy.
+        if (
+            model_action != CognitiveAction.RESPOND
+            and hint == "agent"
+            and analysis.reply_necessity == ReplyNecessity.REQUIRED
+            and not explicit_silence
+            and not context.quiet_mode
+            and analysis.reason_code
+            in (
+                ReasonCode.AMBIGUOUS_ADDRESSEE,
+                ReasonCode.UNKNOWN_ADDRESSEE,
+                ReasonCode.UNKNOWN,
+            )
+        ):
+            return decision(
+                CognitiveAction.RESPOND,
+                ReasonCode.DIRECT_AGENT_ADDRESS,
+                "direct_question_correction",
+                "model_wait_on_direct_question",
+            )
+
         # 6. Model suggestion, then 7. conservative checks on it.
         if model_action != CognitiveAction.RESPOND:
             return decision(model_action, analysis.reason_code, "model_suggestion")

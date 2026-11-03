@@ -30,6 +30,7 @@ import time
 from typing import Optional
 
 from companion.cognition.models import CognitiveContext
+from companion.cognition.nonresponse import derive_nonresponse_trace
 from companion.cognition.silence import (
     detect_explicit_remember,
     detect_explicit_silence,
@@ -321,6 +322,18 @@ class Orchestrator:
                 response_text = existing_action.response_text
                 steps.append("[ACTION] Reused existing action")
             else:
+                # Derive the final, explainable silence reason only when this
+                # event has no persisted action. A retry reuses the existing
+                # action (and therefore the original trace) above; it must not
+                # invent a new reason for a past WAIT/IGNORE.
+                trace = derive_nonresponse_trace(
+                    event=event,
+                    analysis=analysis,
+                    policy_decision=decision,
+                    conversation_context=cognitive_context
+                    if isinstance(cognitive_context, CognitiveContext)
+                    else context,
+                )
                 if final_action == CognitiveAction.RESPOND:
                     response_context = cognitive_context
                     if isinstance(response_context, CognitiveContext):
@@ -344,6 +357,9 @@ class Orchestrator:
                             model_suggested_action=decision.model_action,
                             policy_final_action=decision.action,
                             override_reason=decision.override_reason,
+                            nonresponse_trace=(
+                                trace.model_dump() if trace is not None else None
+                            ),
                         )
                     )
 
