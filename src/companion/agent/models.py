@@ -22,6 +22,7 @@ class EffectiveAgentContext:
     familiarity: str
     traits: Mapping[str, int] = field(default_factory=dict)
     overrides: Mapping[str, int] = field(default_factory=dict)
+    persona_core: Mapping[str, Any] = field(default_factory=dict)
     response_conservatism: str = "balanced"
     interruption_threshold: str = "medium"
     curiosity_level: str = "low"
@@ -37,6 +38,7 @@ class EffectiveAgentContext:
             "familiarity": self.familiarity,
             "traits": dict(self.traits),
             "overrides": dict(self.overrides),
+            "persona_core": dict(self.persona_core),
             "response_conservatism": self.response_conservatism,
             "interruption_threshold": self.interruption_threshold,
             "curiosity_level": self.curiosity_level,

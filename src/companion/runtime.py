@@ -26,6 +26,7 @@ from companion.core.conversation import ConversationManager
 from companion.core.orchestrator import Orchestrator
 from companion.core.policy import Policy
 from companion.domain.enums import JobType
+from companion.emotion.parameters import load_emotion_config
 from companion.emotion.repository import EmotionRepository
 from companion.emotion.service import EmotionService
 from companion.jobs.embedding_handler import build_embedding_handler
@@ -164,7 +165,10 @@ def build_runtime(
     # no network, no real TTS. It rides on the same SQLite file and is always
     # built so emotion works identically in mock and real-provider modes.
     emotion_service = EmotionService(
-        EmotionRepository(db), audit=repos.audit, logger=logger
+        EmotionRepository(db),
+        audit=repos.audit,
+        logger=logger,
+        config=load_emotion_config(),
     )
 
     # V0.4 scene/personality is enabled by default for the real DeepSeek path,

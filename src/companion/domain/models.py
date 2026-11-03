@@ -179,9 +179,23 @@ class AffectiveSignal(DomainModel):
         "gratitude",
         "urgency",
         "question",
+        "direct_insult",
+        "criticism",
+        "playful_teasing",
+        "apology",
+        "reconciliation",
+        "direct_praise",
+        "self_distress",
+        "support_request",
         "none",
     ] = "none"
+    # ``subject`` is the V0.3 field kept for stored compatibility; ``target``
+    # is the V0.4.1 direction of the event relative to this conversation.
     subject: Literal["speaker", "other", "agent", "unknown"] = "unknown"
+    target: Literal["AGENT", "SPEAKER", "OTHER", "UNKNOWN"] = "UNKNOWN"
+    social_intent: Literal[
+        "HOSTILE", "PLAYFUL", "SINCERE", "NEUTRAL", "UNCERTAIN"
+    ] = "UNCERTAIN"
     factuality: Literal[
         "asserted",
         "negated",
@@ -193,8 +207,25 @@ class AffectiveSignal(DomainModel):
     evidence_span: Optional[str] = Field(default=None, max_length=512)
 
 
-_AFT_EVENT_TYPES = {"achievement", "setback", "gratitude", "urgency", "question", "none"}
+_AFT_EVENT_TYPES = {
+    "achievement",
+    "setback",
+    "gratitude",
+    "urgency",
+    "question",
+    "direct_insult",
+    "criticism",
+    "playful_teasing",
+    "apology",
+    "reconciliation",
+    "direct_praise",
+    "self_distress",
+    "support_request",
+    "none",
+}
 _AFT_SUBJECTS = {"speaker", "other", "agent", "unknown"}
+_AFT_TARGETS = {"AGENT", "SPEAKER", "OTHER", "UNKNOWN"}
+_AFT_SOCIAL_INTENTS = {"HOSTILE", "PLAYFUL", "SINCERE", "NEUTRAL", "UNCERTAIN"}
 _AFT_FACTUALITIES = {"asserted", "negated", "hypothetical", "quoted", "uncertain"}
 
 
@@ -559,6 +590,17 @@ def validate_affective_signal(raw, text: str) -> Optional[AffectiveSignal]:
     if factuality not in _AFT_FACTUALITIES:
         return None
 
+    target = _normalise_enum(
+        data.get("target", _target_from_subject(subject)), _AFT_TARGETS
+    )
+    if target is None:
+        return None
+    social_intent = _normalise_enum(
+        data.get("social_intent", "UNCERTAIN"), _AFT_SOCIAL_INTENTS
+    )
+    if social_intent is None:
+        return None
+
     try:
         confidence = float(data.get("confidence", 0.0))
     except (TypeError, ValueError):
@@ -573,6 +615,8 @@ def validate_affective_signal(raw, text: str) -> Optional[AffectiveSignal]:
         return AffectiveSignal(
             event_type="none",
             subject=subject,
+            target=target,
+            social_intent=social_intent,
             factuality=factuality,
             confidence=confidence,
             evidence_span=None,
@@ -584,10 +628,54 @@ def validate_affective_signal(raw, text: str) -> Optional[AffectiveSignal]:
     return AffectiveSignal(
         event_type=event_type,
         subject=subject,
+        target=target,
+        social_intent=social_intent,
         factuality=factuality,
         confidence=confidence,
         evidence_span=evidence,
     )
+
+
+def _normalise_enum(value, allowed: set[str]) -> Optional[str]:
+    """Case-insensitive enum normalisation for model output.
+
+    Missing values stay missing; the caller supplies the legacy default.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    return text if text in allowed else None
+
+
+def _target_from_subject(subject: str) -> str:
+    return {
+        "agent": "AGENT",
+        "speaker": "SPEAKER",
+        "other": "OTHER",
+    }.get(subject, "UNKNOWN")
+
+
+class DialogueImpulse(DomainModel):
+    """A model's compact answer to "what is this turn doing, and where next?"
+
+    It is guidance for the response call, not an action decision: the Policy
+    layer still decides whether to reply, and the response model may adapt the
+    direction to the persona and the moment. Fields are short natural-language
+    observations, never fixed reply templates.
+    """
+
+    interpretation: str = Field(default="", max_length=512)
+    response_direction: str = Field(default="", max_length=512)
+    stance: str = Field(default="", max_length=256)
+    unresolved_uncertainty: str = Field(default="", max_length=512)
+
+    def as_prompt_dict(self) -> dict:
+        return {
+            "interpretation": self.interpretation,
+            "response_direction": self.response_direction,
+            "stance": self.stance,
+            "unresolved_uncertainty": self.unresolved_uncertainty,
+        }
 
 
 class CognitiveResult(DomainModel):
@@ -624,6 +712,10 @@ class CognitiveResult(DomainModel):
     # conversational scene; SceneManager decides what, if anything, is merged
     # into the persisted state. None for older records and mock providers.
     scene_proposal: Optional[SceneProposal] = None
+    # Optional interpretation of the turn and a suggested conversational
+    # direction. Guidance for the response prompt; never a fixed reply and
+    # never an action decision. None for older records and mock providers.
+    dialogue_impulse: Optional[DialogueImpulse] = None
 
 
 class AgentAction(DomainModel):

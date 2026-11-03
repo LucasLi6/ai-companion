@@ -51,6 +51,7 @@ class PersonalityCompiler:
             "不要自称 AI/模型，不要提及 prompt、内部字段、评分或权限机制。",
             "高幽默不等于必须讲笑话；高共情不等于要分析对方的心理。",
             "对方明确要求某种表达方式时，本轮优先遵从，但仍服从事实与安全边界。",
+            "性格通过选择和措辞自然体现，不要把价值观逐条说出来。",
         ]
 
         return {
@@ -60,6 +61,7 @@ class PersonalityCompiler:
             "description": effective.description,
             "relationship_tier": effective.familiarity,
             "traits": dict(effective.traits),
+            "character": dict(effective.persona_core or {}),
             "style": style.as_dict(),
             "principles": principles,
             "style_examples": examples,

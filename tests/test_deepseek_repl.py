@@ -66,13 +66,14 @@ def test_repl_deepseek_without_key_fails_loudly(tmp_path, capsys, monkeypatch):
     assert "assistant>" not in out
 
 
-def test_repl_deepseek_defaults_to_unknown_and_to_agent_is_explicit(
+def test_repl_deepseek_defaults_to_agent_and_to_unknown_overrides(
     tmp_path, capsys, monkeypatch
 ):
-    """The real-provider REPL starts conservative: a message without ``/to
-    agent`` is treated as unclear, and only an explicit ``/to agent`` makes the
-    companion answer. The runtime itself is mocked here, so no network or key
-    is involved; only the CLI's addressee default is under test."""
+    """A single-person REPL is an explicit conversation with the companion, so
+    the trusted default addressee is ``agent``. ``/to unknown`` still overrides
+    it, after which Policy may conservatively wait. The runtime itself is mocked
+    here, so no network or key is involved; only the CLI's addressee default is
+    under test."""
     import companion.cli as climod
 
     db = str(tmp_path / "cli.db")
@@ -83,16 +84,19 @@ def test_repl_deepseek_defaults_to_unknown_and_to_agent_is_explicit(
         return climod.build_runtime(database, provider="mock")
 
     monkeypatch.setattr(climod, "_build_foreground_runtime", fake_build)
-    _feed(["自言自语", "/to agent", "你好", "/quit"], monkeypatch)
+    _feed(["自言自语", "/to unknown", "你好", "/quit"], monkeypatch)
     code = main([
         "--db", db, "repl", "--person", person_id, "--provider", "deepseek",
     ])
 
     assert code == 0
     out = capsys.readouterr().out
-    assert "addressee: unknown (use /to agent to address me explicitly)" in out
-    assert "[WAIT (unknown_addressee)]" in out
+    assert (
+        "addressee: agent (single-person session; use /to human|unknown to override)"
+        in out
+    )
     assert "assistant> 模拟回复：我收到你的话了。" in out
+    assert "[WAIT (unknown_addressee)]" in out
 
 
 def test_say_deepseek_without_key_fails_loudly(tmp_path, capsys, monkeypatch):

@@ -25,6 +25,7 @@ from companion.agent.constants import (
     validate_trait,
 )
 from companion.agent.models import EffectiveAgentContext
+from companion.agent.persona_core import PersonaCore, PersonaCoreRepository
 from companion.agent.repository import AgentRepository
 from companion.core.policy import PolicyConfig
 
@@ -47,6 +48,7 @@ class AgentService:
         self.audit = audit
         self.logger = logger or logging.getLogger("companion.agent")
         self.repo = AgentRepository(repos.db)
+        self.persona_core_repo = PersonaCoreRepository(repos.db)
 
     async def ensure_defaults(self) -> None:
         await self.repo.ensure_defaults()
@@ -261,8 +263,14 @@ class AgentService:
                 traits[name] = max(TRAIT_MIN, min(TRAIT_MAX, int(value)))
 
         manifest = await self.repo.get_manifest() or {}
+        agent_id = manifest.get("agent_id", "")
+        core = (
+            await self.persona_core_repo.get_or_default(agent_id)
+            if agent_id
+            else None
+        )
         return EffectiveAgentContext(
-            agent_id=manifest.get("agent_id", ""),
+            agent_id=agent_id,
             display_name=identity.get("display_name") or "Companion",
             pronouns=identity.get("pronouns"),
             description=identity.get("description"),
@@ -270,11 +278,90 @@ class AgentService:
             familiarity=tier,
             traits=traits,
             overrides=dict(profile.get("style_overrides", {})),
+            persona_core=core.as_prompt_dict() if core else {},
             response_conservatism=policy.response_conservatism,
             interruption_threshold=policy.interruption_threshold,
             curiosity_level=policy.curiosity_level,
             revision=int(persona.get("revision") or 1),
         )
+
+    # -- persona core ------------------------------------------------------
+
+    async def show_persona_core(self) -> PersonaCore:
+        manifest = await self.repo.get_manifest() or {}
+        return await self.persona_core_repo.get_or_default(
+            manifest.get("agent_id", "")
+        )
+
+    async def set_persona_core(
+        self,
+        updates: Mapping[str, object],
+        *,
+        actor: str = "admin",
+        reason: str | None = None,
+    ) -> PersonaCore:
+        """Admin-only update of the stable character layer (audited)."""
+        manifest = await self.repo.get_manifest() or {}
+        agent_id = manifest.get("agent_id", "")
+        current = await self.persona_core_repo.get_or_default(agent_id)
+        allowed = {
+            "core_values",
+            "temperament",
+            "preferences",
+            "quirks",
+            "contradictions",
+            "conversational_boundaries",
+            "voice_identity",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise PersonalityValidationError(
+                f"unknown persona core fields: {', '.join(sorted(unknown))}"
+            )
+        candidate = PersonaCore(
+            agent_id=agent_id,
+            core_values=updates.get("core_values", current.core_values),
+            temperament=updates.get("temperament", current.temperament),
+            preferences=updates.get("preferences", current.preferences),
+            quirks=updates.get("quirks", current.quirks),
+            contradictions=updates.get(
+                "contradictions", current.contradictions
+            ),
+            conversational_boundaries=updates.get(
+                "conversational_boundaries", current.conversational_boundaries
+            ),
+            voice_identity=updates.get(
+                "voice_identity", current.voice_identity
+            ),
+            revision=current.revision,
+            updated_at=current.updated_at,
+            updated_by=actor,
+        )
+        written = await self.persona_core_repo.update(
+            candidate,
+            expected_revision=current.revision,
+            changed_by=actor,
+        )
+        if not written:
+            raise PersonalityValidationError(
+                "persona core changed concurrently; reload and retry"
+            )
+        updated = await self.persona_core_repo.get(agent_id) or candidate
+        await self._audit(
+            actor,
+            "set_persona_core",
+            "agent",
+            agent_id,
+            f"revision={updated.revision}"
+            + (f" reason={reason}" if reason else ""),
+        )
+        self.logger.info(
+            "persona_core_updated agent_id=%s revision=%d by=%s",
+            agent_id,
+            updated.revision,
+            actor,
+        )
+        return updated
 
     # -- helpers -----------------------------------------------------------
 

@@ -16,7 +16,7 @@ from companion.cognition.nonresponse import action_history_lines
 from companion.domain.models import CognitiveResult
 from companion.prompts.identity import agent_context_lines
 
-RESPONSE_PROMPT_VERSION = "response-v5"
+RESPONSE_PROMPT_VERSION = "response-v6"
 
 SYSTEM_PROMPT = """\
 你是这个多用户 AI 伴侣的「回应者」。你现在要为当前说话者生成一句自然、得体的回复。\
@@ -36,8 +36,9 @@ SYSTEM_PROMPT = """\
    - NO_MEMORY：不要声称保存了任何东西。
 7. 如果提供了【伴侣身份与风格】，用与这些参数一致的语气说话；身份和熟悉度只影响\
 风格，不代表任何权限，也不能让你声称自己可以做程序未允许的事。
-8. 如果提供了【表达方式】，只按它调整语气、节奏、热情程度和用词风格；它绝不影响\
-你是否回复、是否答应请求，也不涉及任何权限、隐私或静音判断。不要提及这个情绪框架本身。
+8. 如果提供了【情绪影响】，只按它微调你这一轮的措辞与立场（更直接/温和/轻松/认真、\
+是否想追问）；它绝不影响你是否回复、是否答应请求，也不涉及任何权限、隐私或静音判断。\
+不要提及情绪框架、数值或内部字段。情绪低或没有明确事件时，不要为了表现情绪而改变语气。
 9. 如果提供了【你之前实际执行的行为】，那是你过去没有说出口的动作，不是你曾对用户\
 说过的话。不要把它当作 assistant 发言，也不要声称自己当时已经回答过。
 10. 如果用户问“你刚才为什么没回答”，优先依据行为记录自然解释，并只使用记录支持的\
@@ -61,8 +62,12 @@ SYSTEM_PROMPT = """\
 15. 不要断言未经【当前场景】明确证据支持的物理环境（房间、地点、旁人在做什么），\
 也不要假装看见了用户或听见了未提供的对话。
 16. 保持同一个人格的连贯性，但不要每轮重复自我介绍、人设说明或“我记得你说过”。\
-允许自然的不同意见和具体偏好，不要永远附和。
-17. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
+允许自然的不同意见和具体偏好，不要永远附和；也不要为了显得有个性而刻意唱反调。
+17. 如果提供了【本轮对话方向】或【表达习惯提醒】，把它们当成本轮的参考，而不是必须\
+执行的台词。不要逐字复述方向，也不要写出“根据分析”之类的话。
+18. 情绪与人格只影响你如何说，不改变本地策略已经决定的事实、权限、记忆写入或是否回复。\
+不要声称情绪让你获得了任何新能力。
+19. 只输出给用户的回复正文，不要 JSON，不要 Markdown 代码块，不要任何前后缀说明。
 """
 
 
@@ -99,6 +104,39 @@ def build_response_messages(
         lines.append(f"关系层级: {personality.get('relationship_tier', 'STRANGER')}")
         for principle in personality.get("principles", [])[:10]:
             lines.append(f"- {principle}")
+        character = personality.get("character") or {}
+        if character:
+            lines.append("【角色核心】（稳定身份；自然体现，不要逐条说出）")
+            for value in character.get("core_values", [])[:8]:
+                lines.append(f"- 看重: {value}")
+            temperament = character.get("temperament") or {}
+            if temperament:
+                lines.append(
+                    "- 性情: "
+                    + "；".join(f"{key}={value}" for key, value in temperament.items())
+                )
+            preferences = character.get("preferences") or {}
+            if preferences:
+                lines.append(
+                    "- 偏好: "
+                    + "；".join(f"{key}={value}" for key, value in preferences.items())
+                )
+            for quirk in character.get("quirks", [])[:5]:
+                lines.append(f"- 小习惯: {quirk}")
+            for contradiction in character.get("contradictions", [])[:4]:
+                lines.append(f"- 允许的矛盾: {contradiction}")
+            for boundary in character.get("conversational_boundaries", [])[:6]:
+                lines.append(f"- 边界: {boundary}")
+            voice = character.get("voice_identity") or {}
+            if voice:
+                lines.append(
+                    "- 说话身份: "
+                    + "；".join(f"{key}={value}" for key, value in voice.items())
+                )
+            lines.append(
+                "这些是角色承诺，不是可逐条复述的设定；用选择和措辞体现，"
+                "也不要用它编造个人经历。"
+            )
         lines.append("")
 
     if context.scene_state:
@@ -138,6 +176,38 @@ def build_response_messages(
     if context.pragmatic_guidance:
         lines.append("【对话衔接提醒】")
         for item in context.pragmatic_guidance[:8]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if context.emotion_expression:
+        expression = context.emotion_expression
+        lines.append("【情绪影响】（只微调立场与措辞，不改变是否回复或任何权限）")
+        lines.append(
+            f"当前情绪: {expression.get('source_emotion', 'NEUTRAL')} "
+            f"(强度 {expression.get('intensity', 0)})"
+        )
+        adjustments = {
+            "directness_adjustment": "直接",
+            "warmth_adjustment": "温和",
+            "playfulness_adjustment": "轻松",
+            "questioning_adjustment": "追问",
+            "seriousness_adjustment": "认真",
+        }
+        for key, label in adjustments.items():
+            value = float(expression.get(key) or 0.0)
+            if abs(value) >= 0.05:
+                lines.append(f"- {label}: {value:+.2f}")
+        explanation = expression.get("explanation")
+        if explanation:
+            lines.append(f"- 说明: {explanation}")
+        lines.append(
+            "强度低或没有说明时，保持本来语气；不要为了让情绪可见而表演。"
+        )
+        lines.append("")
+
+    if context.dialogue_pattern_guidance:
+        lines.append("【表达习惯提醒】（只在本轮自然适用时参考，不是固定规则）")
+        for item in context.dialogue_pattern_guidance[:6]:
             lines.append(f"- {item}")
         lines.append("")
 
@@ -185,6 +255,18 @@ def build_response_messages(
     lines.append("【认知分析】")
     lines.append(f"理解: {analysis.meaning}")
     lines.append(f"想要的回应风格: {analysis.response_style}")
+    impulse = analysis.dialogue_impulse
+    if impulse is not None:
+        lines.append("【本轮对话方向】（参考，不是台词）")
+        if impulse.interpretation:
+            lines.append(f"交流性质: {impulse.interpretation}")
+        if impulse.response_direction:
+            lines.append(f"可考虑的方向: {impulse.response_direction}")
+        if impulse.stance:
+            lines.append(f"合适立场: {impulse.stance}")
+        if impulse.unresolved_uncertainty:
+            lines.append(f"仍不确定: {impulse.unresolved_uncertainty}")
+        lines.append("按当前语境自然取舍；不确定时宁可直说，不要编造。")
 
     actionable = [
         o
@@ -196,18 +278,6 @@ def build_response_messages(
         lines.append("【本轮记忆写入结果】（只按这些事实说明）")
         for outcome in actionable:
             lines.append(_outcome_line(outcome))
-
-    if context.speech_plan:
-        lines.append("")
-        lines.append("【表达方式】（只影响语气，不影响是否回复或回复内容）")
-        emotion = context.speech_plan.get("emotion") or "NEUTRAL"
-        instruction = context.speech_plan.get("delivery_instruction") or ""
-        rate = context.speech_plan.get("speaking_rate")
-        lines.append(f"情绪表达: {emotion}")
-        if instruction:
-            lines.append(f"表达指引: {instruction}")
-        if rate:
-            lines.append(f"语速参考: {rate}")
 
     lines.append("")
     lines.append("请直接输出回复正文。")

@@ -238,13 +238,23 @@ class EmotionRepository:
         intensity: float,
         appraisal_reason: str | None,
         created_at: datetime | None = None,
+        event_type: str | None = None,
+        target: str | None = None,
+        social_intent: str | None = None,
+        validation: str | None = None,
+        acute_before: float | None = None,
+        acute_after: float | None = None,
+        mood_after: float | None = None,
+        tension_after: float | None = None,
     ) -> str:
         event_id = new_id("emoev")
         await self.db.execute(
             "INSERT OR IGNORE INTO emotion_events(emotion_event_id, agent_id,"
             " conversation_id, person_id, source_event_id, appraisal_rule_id,"
             " memory_id, emotion, valence, arousal, intensity, appraisal_reason,"
-            " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " created_at, event_type, target, social_intent, validation,"
+            " acute_before, acute_after, mood_after, tension_after)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_id,
                 agent_id,
@@ -259,6 +269,14 @@ class EmotionRepository:
                 intensity,
                 appraisal_reason,
                 _iso(created_at or utcnow()),
+                event_type,
+                target,
+                social_intent,
+                validation,
+                acute_before,
+                acute_after,
+                mood_after,
+                tension_after,
             ),
         )
         return event_id
@@ -298,7 +316,11 @@ class EmotionRepository:
     async def get_snapshot(self, agent_id: str, person_id: str) -> dict | None:
         cur = await self.db.execute(
             "SELECT agent_id, person_id, valence, arousal, intensity, emotion,"
-            " half_life_seconds, updated_at FROM emotion_state_snapshots"
+            " half_life_seconds, updated_at, activations_json, mood_valence,"
+            " mood_arousal, mood_intensity, mood_emotion,"
+            " mood_half_life_seconds, mood_updated_at, relationship_tension,"
+            " tension_half_life_seconds, tension_updated_at, last_event_type,"
+            " last_event_at FROM emotion_state_snapshots"
             " WHERE agent_id = ? AND person_id = ?",
             (agent_id, person_id),
         )
@@ -316,17 +338,45 @@ class EmotionRepository:
         emotion: str,
         half_life_seconds: float,
         updated_at: datetime | None = None,
+        activations: dict | None = None,
+        mood_valence: float = 0.0,
+        mood_arousal: float = 0.0,
+        mood_intensity: float = 0.0,
+        mood_emotion: str = "NEUTRAL",
+        mood_half_life_seconds: float = 1800.0,
+        mood_updated_at: datetime | None = None,
+        relationship_tension: float = 0.0,
+        tension_half_life_seconds: float = 2700.0,
+        tension_updated_at: datetime | None = None,
+        last_event_type: str | None = None,
+        last_event_at: datetime | None = None,
     ) -> None:
         now = _iso(updated_at or utcnow())
         await self.db.execute(
             "INSERT INTO emotion_state_snapshots(agent_id, person_id, valence,"
-            " arousal, intensity, emotion, half_life_seconds, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " arousal, intensity, emotion, half_life_seconds, updated_at,"
+            " activations_json, mood_valence, mood_arousal, mood_intensity,"
+            " mood_emotion, mood_half_life_seconds, mood_updated_at,"
+            " relationship_tension, tension_half_life_seconds, tension_updated_at,"
+            " last_event_type, last_event_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(agent_id, person_id) DO UPDATE SET"
             " valence = excluded.valence, arousal = excluded.arousal,"
             " intensity = excluded.intensity, emotion = excluded.emotion,"
             " half_life_seconds = excluded.half_life_seconds,"
-            " updated_at = excluded.updated_at",
+            " updated_at = excluded.updated_at,"
+            " activations_json = excluded.activations_json,"
+            " mood_valence = excluded.mood_valence,"
+            " mood_arousal = excluded.mood_arousal,"
+            " mood_intensity = excluded.mood_intensity,"
+            " mood_emotion = excluded.mood_emotion,"
+            " mood_half_life_seconds = excluded.mood_half_life_seconds,"
+            " mood_updated_at = excluded.mood_updated_at,"
+            " relationship_tension = excluded.relationship_tension,"
+            " tension_half_life_seconds = excluded.tension_half_life_seconds,"
+            " tension_updated_at = excluded.tension_updated_at,"
+            " last_event_type = excluded.last_event_type,"
+            " last_event_at = excluded.last_event_at",
             (
                 agent_id,
                 person_id,
@@ -336,6 +386,18 @@ class EmotionRepository:
                 emotion,
                 half_life_seconds,
                 now,
+                json.dumps(activations or {}, ensure_ascii=False, sort_keys=True),
+                mood_valence,
+                mood_arousal,
+                mood_intensity,
+                mood_emotion,
+                mood_half_life_seconds,
+                _iso(mood_updated_at),
+                relationship_tension,
+                tension_half_life_seconds,
+                _iso(tension_updated_at),
+                last_event_type,
+                _iso(last_event_at),
             ),
         )
 
@@ -350,8 +412,8 @@ class EmotionRepository:
 
     async def get_receipt(self, source_event_id: str) -> dict | None:
         cur = await self.db.execute(
-            "SELECT source_event_id, agent_id, person_id, outcome, processed_at"
-            " FROM emotion_turn_receipts WHERE source_event_id = ?",
+            "SELECT source_event_id, agent_id, person_id, outcome, processed_at,"
+            " reason, detail FROM emotion_turn_receipts WHERE source_event_id = ?",
             (source_event_id,),
         )
         row = await cur.fetchone()
@@ -365,16 +427,21 @@ class EmotionRepository:
         person_id: str,
         outcome: str,
         processed_at: datetime | None = None,
+        reason: str | None = None,
+        detail: str | None = None,
     ) -> None:
         await self.db.execute(
             "INSERT OR IGNORE INTO emotion_turn_receipts(source_event_id, agent_id,"
-            " person_id, outcome, processed_at) VALUES (?, ?, ?, ?, ?)",
+            " person_id, outcome, processed_at, reason, detail)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 source_event_id,
                 agent_id,
                 person_id,
                 outcome,
                 _iso(processed_at or utcnow()),
+                reason,
+                detail,
             ),
         )
 

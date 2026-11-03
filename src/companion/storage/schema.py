@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1178,6 +1178,80 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE INDEX IF NOT EXISTS idx_style_examples_scope
             ON dialogue_style_examples(agent_id, person_id, status);
+        """,
+    ),
+    # Version 15 (V0.4.1): character identity, affective dynamics repair and
+    # explainable appraisal.
+    #
+    # - ``agent_persona_core`` is the admin-maintained stable identity layer
+    #   (values, temperament, preferences, quirks, contradictions, boundaries,
+    #   voice identity). It is never written by a model.
+    # - Emotion snapshots gain the three independently decaying layers plus the
+    #   per-category activations needed to derive a consistent label. New
+    #   columns have neutral defaults, so old snapshots read as legacy acute
+    #   affect without inventing a mood or tension value.
+    # - Emotion events gain the validated event/target/intent and before/after
+    #   diagnostics. Old rows keep NULL, which means "not recorded", never
+    #   "hostile".
+    # - Receipts gain ``reason``/``detail`` so NO_CHANGE is explainable.
+    # - ``cognitive_analyses.dialogue_impulse_json`` preserves the model's
+    #   optional turn interpretation for the single response call.
+    (
+        15,
+        """
+        CREATE TABLE IF NOT EXISTS agent_persona_core (
+            agent_id             TEXT PRIMARY KEY
+                                 REFERENCES cmf_manifest(agent_id) ON DELETE CASCADE,
+            core_values_json     TEXT NOT NULL DEFAULT '[]',
+            temperament_json     TEXT NOT NULL DEFAULT '{}',
+            preferences_json     TEXT NOT NULL DEFAULT '{}',
+            quirks_json          TEXT NOT NULL DEFAULT '[]',
+            contradictions_json  TEXT NOT NULL DEFAULT '[]',
+            conversational_boundaries_json TEXT NOT NULL DEFAULT '[]',
+            voice_identity_json  TEXT NOT NULL DEFAULT '{}',
+            revision             INTEGER NOT NULL DEFAULT 1,
+            updated_at           TEXT NOT NULL,
+            updated_by           TEXT NOT NULL DEFAULT 'admin'
+        );
+
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN activations_json TEXT NOT NULL DEFAULT '{}';
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN mood_valence REAL NOT NULL DEFAULT 0;
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN mood_arousal REAL NOT NULL DEFAULT 0;
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN mood_intensity REAL NOT NULL DEFAULT 0;
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN mood_emotion TEXT NOT NULL DEFAULT 'NEUTRAL';
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN mood_half_life_seconds REAL NOT NULL DEFAULT 1800;
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN mood_updated_at TEXT;
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN relationship_tension REAL NOT NULL DEFAULT 0;
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN tension_half_life_seconds REAL NOT NULL DEFAULT 2700;
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN tension_updated_at TEXT;
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN last_event_type TEXT;
+        ALTER TABLE emotion_state_snapshots
+            ADD COLUMN last_event_at TEXT;
+
+        ALTER TABLE emotion_events ADD COLUMN event_type TEXT;
+        ALTER TABLE emotion_events ADD COLUMN target TEXT;
+        ALTER TABLE emotion_events ADD COLUMN social_intent TEXT;
+        ALTER TABLE emotion_events ADD COLUMN validation TEXT;
+        ALTER TABLE emotion_events ADD COLUMN acute_before REAL;
+        ALTER TABLE emotion_events ADD COLUMN acute_after REAL;
+        ALTER TABLE emotion_events ADD COLUMN mood_after REAL;
+        ALTER TABLE emotion_events ADD COLUMN tension_after REAL;
+
+        ALTER TABLE emotion_turn_receipts ADD COLUMN reason TEXT;
+        ALTER TABLE emotion_turn_receipts ADD COLUMN detail TEXT;
+
+        ALTER TABLE cognitive_analyses ADD COLUMN dialogue_impulse_json TEXT;
         """,
     ),
 ]

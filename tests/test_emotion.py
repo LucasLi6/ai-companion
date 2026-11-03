@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from companion.emotion.appraisal import DEFAULT_RULES
 from companion.emotion.dynamics import decay, decay_factor, label_for
 from companion.emotion.models import EmotionState
 from companion.emotion.speech import SpeechPlanner
@@ -28,7 +29,7 @@ async def test_ensure_defaults_seeds_profile_and_rules(rt):
     profile = await rt.emotion_service.ensure_defaults(agent_id)
     assert profile.agent_id == agent_id
     rules = await rt.emotion_service.list_rules(agent_id)
-    assert len(rules) == 5
+    assert len(rules) == len(DEFAULT_RULES)
     assert all(r.source == "system" for r in rules)
 
 
@@ -37,7 +38,7 @@ async def test_ensure_defaults_idempotent(rt):
     await rt.emotion_service.ensure_defaults(agent_id)
     await rt.emotion_service.ensure_defaults(agent_id)
     rules = await rt.emotion_service.list_rules(agent_id)
-    assert len(rules) == 5
+    assert len(rules) == len(DEFAULT_RULES)
 
 
 # -- appraisal ---------------------------------------------------------------

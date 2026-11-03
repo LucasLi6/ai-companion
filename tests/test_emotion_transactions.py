@@ -149,8 +149,10 @@ async def test_concurrent_ensure_defaults_seeds_once(rt):
         *[rt.emotion_service.ensure_defaults(agent_id) for _ in range(5)]
     )
     rules = await rt.emotion_service.repo.list_rules(agent_id)
-    assert len(rules) == 5
-    assert len({r.name for r in rules}) == 5
+    from companion.emotion.appraisal import DEFAULT_RULES
+
+    assert len(rules) == len(DEFAULT_RULES)
+    assert len({r.name for r in rules}) == len(DEFAULT_RULES)
 
 
 async def test_profile_update_uses_optimistic_revision(rt):

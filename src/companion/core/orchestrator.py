@@ -29,6 +29,7 @@ import logging
 import time
 from typing import Optional
 
+from companion.agent.dialogue_pattern_monitor import DialoguePatternMonitor
 from companion.agent.dialogue_style import compile_dialogue_style
 from companion.agent.models import EffectiveAgentContext
 from companion.cognition.models import CognitiveContext
@@ -53,6 +54,7 @@ from companion.domain.models import (
     new_id,
     utcnow,
 )
+from companion.emotion.expression_policy import compile_expression_influence
 from companion.memory.candidates import prepare_candidates
 from companion.people.registry import PersonRegistry
 from companion.storage.repositories import Repositories
@@ -104,6 +106,7 @@ class Orchestrator:
         self.scene_manager = scene_manager
         self.personality_compiler = personality_compiler
         self.style_repo = style_repo
+        self.dialogue_patterns = DialoguePatternMonitor()
         # When set (real-DeepSeek mode), the orchestrator builds a privacy-
         # filtered CognitiveContext and hands the *same* context to both the
         # cognitive and response providers. In mock mode it stays None and the
@@ -389,6 +392,15 @@ class Orchestrator:
                         response_context = response_context.model_copy(
                             update={"memory_write_outcomes": memory_outcomes}
                         )
+                    response_context = self._scene_preview_for_response(
+                        event=event,
+                        analysis=analysis,
+                        previous_scene=scene_record,
+                        scene_enabled=scene_enabled,
+                        context=response_context,
+                        trace=trace,
+                        steps=steps,
+                    )
                     response_text = await self.response.generate(
                         event, analysis, response_context
                     )
@@ -469,6 +481,55 @@ class Orchestrator:
 
     # -- helpers -----------------------------------------------------------
 
+    def _scene_preview_for_response(
+        self,
+        *,
+        event,
+        analysis,
+        previous_scene,
+        scene_enabled: bool,
+        context,
+        trace=None,
+        steps=None,
+    ):
+        """Attach this turn's *candidate* scene to the response context.
+
+        The scene is not persisted here: ``_commit_turn`` owns the CAS write.
+        The response only needs the validated candidate so a topic shift or a
+        new environment detail from the current turn is reflected in the reply
+        instead of always seeing the previous snapshot. Failure is non-fatal.
+        """
+        if (
+            not scene_enabled
+            or self.scene_manager is None
+            or not isinstance(context, CognitiveContext)
+            or analysis.scene_proposal is None
+        ):
+            return context
+        try:
+            candidate = self.scene_manager.preview(
+                previous_scene,
+                analysis.scene_proposal,
+                event,
+                context=context,
+                action_history=context.action_history,
+                pending_followup=bool(
+                    getattr(trace, "pending_followup", False)
+                ),
+            )
+            if steps is not None:
+                steps.append("[SCENE] Candidate scene for response")
+            return context.model_copy(
+                update={"scene_state": candidate.prompt_dict()}
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "scene_preview_failed event_id=%s error=%s",
+                event.event_id,
+                exc,
+            )
+            return context
+
     async def _prepare_context(self, event, context, memories, steps):
         """Return (provider_context, provider_memories) for this utterance.
 
@@ -536,9 +597,35 @@ class Orchestrator:
                 conversation_id=event.conversation_id,
                 source_event_id=event.event_id,
                 persist=persist,
+                addressee_hint=event.addressee_hint.value,
             )
             speech_plan = await self.emotion_service.plan_speech(
                 agent_id, state=state, text=""
+            )
+            expression = compile_expression_influence(
+                state,
+                config=getattr(self.emotion_service, "config", None),
+            )
+            agent_name = None
+            if isinstance(cognitive_context, CognitiveContext):
+                agent_name = (cognitive_context.agent_context or {}).get(
+                    "display_name"
+                )
+                assistant_replies = [
+                    turn.text
+                    for turn in cognitive_context.turns
+                    if turn.role == "assistant"
+                ]
+            else:
+                assistant_replies = []
+            pattern_report = self.dialogue_patterns.analyze(
+                assistant_replies,
+                agent_name=agent_name,
+                user_name=(
+                    cognitive_context.current_speaker_label
+                    if isinstance(cognitive_context, CognitiveContext)
+                    else None
+                ),
             )
 
             if isinstance(cognitive_context, CognitiveContext):
@@ -546,14 +633,20 @@ class Orchestrator:
                     update={
                         "emotion_state": state.as_dict(),
                         "speech_plan": speech_plan.as_dict(),
+                        "emotion_expression": expression.as_dict(),
+                        "dialogue_pattern_guidance": pattern_report.guidance,
                     }
                 )
             self.logger.info(
-                "emotion_applied event_id=%s emotion=%s intensity=%.2f valence=%.2f",
+                "emotion_applied event_id=%s emotion=%s intensity=%.2f"
+                " valence=%.2f mood=%s tension=%.2f expression=%s",
                 event.event_id,
                 state.emotion,
                 state.intensity,
                 state.valence,
+                state.mood_emotion,
+                state.relationship_tension,
+                expression.explanation,
             )
             steps.append(
                 f"[EMOTION] {state.emotion} (intensity={state.intensity:.2f})"

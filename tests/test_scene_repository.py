@@ -1,4 +1,4 @@
-"""V0.4 — durable scene snapshots, receipts, CAS and migration 14.
+"""V0.4 — durable scene snapshots, receipts, CAS and migrations 14–15.
 
 All tests use the real SQLite database (WAL, foreign keys) in a temp directory.
 They pin the two safety properties: a stale writer can never overwrite a newer
@@ -58,9 +58,9 @@ def _state(person_id, event_id, *, revision, topic="旅行", source_ids=None):
     )
 
 
-async def test_schema_14_has_scene_tables_and_analysis_column(db):
+async def test_schema_15_has_scene_tables_and_analysis_column(db):
     cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 14
+    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 15
 
     cur = await db.execute("PRAGMA table_info(cognitive_analyses)")
     assert "scene_proposal_json" in {r["name"] for r in await cur.fetchall()}
@@ -247,7 +247,7 @@ async def test_delete_scope_is_scoped(db, rt):
     assert await repo.get_receipt(b_event.event_id) is not None
 
 
-async def test_migration_13_to_14_preserves_existing_data(tmp_path):
+async def test_migration_13_to_15_preserves_existing_data(tmp_path):
     """A real version-13 database upgrades in place, adding only V0.4 objects."""
     path = tmp_path / "v13.db"
     ts = "2025-01-01T00:00:00+00:00"
@@ -290,7 +290,7 @@ async def test_migration_13_to_14_preserves_existing_data(tmp_path):
     await db2.initialize()
     try:
         cur = await db2.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == 14
+        assert (await cur.fetchone())["v"] == 15
         cur = await db2.execute("SELECT event_id, meaning FROM cognitive_analyses")
         row = await cur.fetchone()
         assert (row["event_id"], row["meaning"]) == ("evt1", "old analysis")

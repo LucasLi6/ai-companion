@@ -317,8 +317,10 @@ def test_apply_emotional_stimulus_formula_and_no_input_mutation():
         updated_at=now, half_life_seconds=3600.0,
     )
     state = apply_emotional_stimulus(current, _rule(), profile, {}, now)
-    assert state.valence == pytest.approx(0.6)
-    assert state.arousal == pytest.approx(0.3)
+    # Saturated accumulation: 0 + (1-0)*0.5, then the category target
+    # (JOY = +0.65 valence / 0.45 arousal) scales the activation.
+    assert state.valence == pytest.approx(0.325)
+    assert state.arousal == pytest.approx(0.225)
     assert state.intensity == pytest.approx(0.5)
     assert state.emotion == "JOY"
     assert state.updated_at == now
@@ -336,11 +338,14 @@ def test_apply_stimulus_retains_stronger_current_intensity():
     state = apply_emotional_stimulus(
         current, _rule(intensity=0.3), None, None, now
     )
-    assert state.intensity == pytest.approx(0.56)  # max(0.8*0.70, 0.3)
+    # The 0.8 EXCITEMENT activation remains dominant; the weaker JOY event is
+    # added alongside it rather than replacing it.
+    assert state.intensity == pytest.approx(0.8)
     assert state.emotion == "EXCITEMENT"
+    assert state.activations["JOY"] == pytest.approx(0.3)
 
 
-def test_apply_stimulus_clamps_valence_and_arousal():
+def test_apply_stimulus_caps_acute_intensity_and_bounds_summary():
     now = datetime.now(timezone.utc)
     current = EmotionState(
         valence=0.95, arousal=0.95, intensity=0.0, emotion="JOY",
@@ -353,8 +358,13 @@ def test_apply_stimulus_clamps_valence_and_arousal():
         current, _rule(valence=0.4, arousal=0.2, intensity=1.0), profile,
         {"empathy": 0}, now,
     )
-    assert state.valence == 1.0
-    assert state.arousal == 1.0
+    # Gain 2 × intensity 1.0 would be 2.0; the acute cap is 0.85, and the
+    # summary is derived from the category target rather than unbounded sums.
+    assert state.intensity == pytest.approx(0.85)
+    assert state.valence == pytest.approx(0.65 * 0.85)
+    assert state.arousal == pytest.approx(0.45 * 0.85)
+    assert -1.0 <= state.valence <= 1.0
+    assert 0.0 <= state.arousal <= 1.0
 
 
 def test_speech_rate_scales_with_intensity():

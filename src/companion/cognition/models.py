@@ -76,6 +76,14 @@ class CognitiveContext(BaseModel):
     # profile) shaping *how* a reply is spoken. It never changes *whether* a
     # reply is sent, and it never authorises anything.
     speech_plan: Optional[dict] = Field(default=None)
+    # Text-side, bounded stance influence derived from the same emotion state.
+    # Unlike ``speech_plan`` it may shape wording; it never changes whether to
+    # reply, what is true, or any permission.
+    emotion_expression: Optional[dict] = Field(default=None)
+    # Prompt-only feedback from the dialogue pattern monitor (repeated openings,
+    # trailing questions, name overuse, formula repeats). It is guidance, not a
+    # rewrite request and not an extra model call.
+    dialogue_pattern_guidance: list[str] = Field(default_factory=list)
     # Trusted current scene produced locally by SceneManager. It is a
     # short-horizon description of this conversation with this person, never a
     # long-term fact and never a claim about physical reality without evidence.

@@ -40,6 +40,7 @@ from companion.domain.enums import (
 )
 from companion.domain.models import (
     CognitiveResult,
+    DialogueImpulse,
     MemoryCandidate,
     UtteranceEvent,
     new_id,
@@ -91,6 +92,7 @@ class _RawAnalysis(BaseModel):
     affective_signal: Optional[object] = None
     nonresponse_motive: Optional[object] = None
     scene_proposal: Optional[object] = None
+    dialogue_impulse: Optional[object] = None
 
 
 def _parse_json_object(content: str) -> dict:
@@ -278,6 +280,7 @@ class DeepSeekCognitiveProvider:
             current_text=event.text,
             authorized_texts=authorized_texts,
         )
+        dialogue_impulse = self._dialogue_impulse(raw.dialogue_impulse)
 
         return CognitiveResult(
             event_id=event.event_id,
@@ -297,7 +300,40 @@ class DeepSeekCognitiveProvider:
             affective_signal=signal,
             nonresponse_motive=motive,
             scene_proposal=scene_proposal,
+            dialogue_impulse=dialogue_impulse,
         )
+
+    @staticmethod
+    def _dialogue_impulse(raw) -> Optional[DialogueImpulse]:
+        """Parse an optional guidance hint; malformed input degrades to None.
+
+        The impulse never decides an action. It only gives the single response
+        call a sense of what this turn is doing and where it might go, so the
+        reply does not have to re-derive it from raw history.
+        """
+        if raw is None:
+            return None
+        if isinstance(raw, DialogueImpulse):
+            return raw
+        if not isinstance(raw, dict):
+            return None
+        data = {
+            key: str(value or "").strip()
+            for key, value in raw.items()
+            if key
+            in {
+                "interpretation",
+                "response_direction",
+                "stance",
+                "unresolved_uncertainty",
+            }
+        }
+        if not any(data.values()):
+            return None
+        try:
+            return DialogueImpulse(**data)
+        except Exception:
+            return None
 
     @staticmethod
     def _operation(value: str) -> MemoryOperation:

@@ -16,7 +16,7 @@ from companion.cognition.models import CognitiveContext
 from companion.cognition.nonresponse import action_history_lines
 from companion.prompts.identity import agent_context_lines
 
-COGNITIVE_PROMPT_VERSION = "cognitive-v6"
+COGNITIVE_PROMPT_VERSION = "cognitive-v7"
 
 SYSTEM_PROMPT = """\
 你是一个多用户 AI 伴侣的「认知分析器」。你的任务不是回复用户，而是理解当前这句话，\
@@ -63,17 +63,40 @@ subject_person_id、event_id 或 source_event_id——这些由程序填写。
 - kind："PERSONAL_FACT" | "EPISODE" | "RELATIONSHIP" | "PROJECT_STATE" | "HYPOTHESIS"。
 - evidence_span：从当前输入中原样复制的、支持该陈述的最短片段；不要改写。
 
-10. affective_signal 表示当前这句话中「明确表达的事件性质」，不是对用户心理状态的诊断。\
-只能基于当前输入和已授权的上下文；不要额外输出解释字段。要求：
+10. affective_signal 表示当前这句话中「明确表达的事件性质」，不是对用户心理状态的诊断，\
+也不是对说话者人品的判断。只能基于当前输入和已授权的上下文；不要额外输出解释字段。要求：
    - event_type 只能是："achievement"（明确取得成果）| "setback"（明确受挫/失败）|\
- "gratitude"（明确感谢）| "urgency"（明确紧急）| "question"（明确提问）| "none"（其他/不确定）。
+ "gratitude"（明确感谢）| "urgency"（明确紧急）| "question"（明确提问）|\
+ "direct_insult"（明确针对你的侮辱/辱骂）| "criticism"（针对你或你的回答的具体批评）|\
+ "playful_teasing"（明显玩闹的调侃）| "apology"（向你道歉）|\
+ "reconciliation"（主动修复关系/和解）| "direct_praise"（直接肯定/称赞你）|\
+ "self_distress"（说话者表达自己的难受/压力）|\
+ "support_request"（明确请求支持/帮助）| "none"（其他/不确定）。
+   - target 只能是："AGENT"（这句话针对你）| "SPEAKER"（关于说话者自己）|\
+ "OTHER"（针对第三方）| "UNKNOWN"。
    - subject 只能是："speaker"（说话者本人）| "other"（别人）| "agent"（你）| "unknown"。
+   - social_intent 只能是："HOSTILE"（明确敌意）| "PLAYFUL"（玩闹）|\
+ "SINCERE"（真诚）| "NEUTRAL"（中性）| "UNCERTAIN"（无法判断）。
    - factuality 只能是："asserted"（肯定陈述）| "negated"（否定）|\
  "hypothetical"（假设/愿望）| "quoted"（引用/转述）| "uncertain"（不确定）。
    - confidence：0 到 1 之间的有限小数。
    - evidence_span：必须逐字来自当前输入；无法逐字引用时返回 event_type="none"。
    - 否定句不得当成肯定事实；假设、引用、转述不得当成说话者本人实际发生的事件。
+   - 脏话本身不等于敌意：可能是口头禅、感叹、引用或玩闹。只有明确的攻击对象和\
+明确敌意才可用 direct_insult；无法判断时用 playful_teasing（若明显玩闹）或 none。
+   - 单次玩笑不得标为 direct_insult 或 repeated_hostility。反复敌意需要多轮证据，\
+本字段只描述当前这句话；重复判断由本地规则完成。
+   - 引用别人的话、假设句、转述、影视台词里的侮辱不得标为针对你的 direct_insult。
    - 该字段不能改变 action、reason_code、权限、静音或记忆写入规则。
+
+10b. dialogue_impulse 是你对「这句话在做什么、接下来怎样接」的简短判断，供最终回复\
+参考，不是固定回复模板，也不决定 action。要求：
+   - interpretation：这句话在交流上是什么（例如“在吐槽今天的工作”“在测试我会不会附和”）。
+   - response_direction：一个自然的方向（例如“先接住情绪，再问一个具体问题”），\
+不要写成完整回复。
+   - stance：你这一轮合适的立场/态度（例如“坦白不同意但保持轻松”）。
+   - unresolved_uncertainty：仍不确定、需要对方澄清的点；没有就写空字符串。
+   - 不要编造事实、心理诊断或对方未说过的信息。
 
 11. 当 action 是 WAIT 或 IGNORE 时，用 nonresponse_motive 说明具体原因，不能只写\
 “回复没有必要”。要求：
@@ -152,11 +175,19 @@ JSON 结构：
     }
   ],
   "affective_signal": {
-    "event_type": "achievement | setback | gratitude | urgency | question | none",
+    "event_type": "achievement | setback | gratitude | urgency | question | direct_insult | criticism | playful_teasing | apology | reconciliation | direct_praise | self_distress | support_request | none",
+    "target": "AGENT | SPEAKER | OTHER | UNKNOWN",
     "subject": "speaker | other | agent | unknown",
+    "social_intent": "HOSTILE | PLAYFUL | SINCERE | NEUTRAL | UNCERTAIN",
     "factuality": "asserted | negated | hypothetical | quoted | uncertain",
     "confidence": 0.92,
     "evidence_span": "原话片段"
+  },
+  "dialogue_impulse": {
+    "interpretation": "这句话在交流上是什么",
+    "response_direction": "一个自然的方向，不是完整回复",
+    "stance": "本轮合适的立场/态度",
+    "unresolved_uncertainty": "仍需澄清的点，或空字符串"
   },
   "nonresponse_motive": {
     "motive": "NOT_ADDRESSED | AWAITING_CONTINUATION | AVOID_INTERRUPTION | LISTEN_WITHOUT_REPLY | NO_USEFUL_CONTRIBUTION | UNCERTAIN_CONTEXT | UNKNOWN",

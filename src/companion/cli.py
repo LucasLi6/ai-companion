@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 
@@ -462,6 +463,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_ae = p_agent_sub.add_parser("effective", parents=[_common_parser()], help="Show the effective context for one person")
     p_ae.add_argument("--person", required=True)
     p_ae.set_defaults(func=cmd_agent_effective)
+    p_pc = p_agent_sub.add_parser(
+        "persona-core", parents=[_common_parser()],
+        help="Show or set the admin-maintained character core",
+    )
+    p_pc_sub = p_pc.add_subparsers(dest="persona_core_command")
+    p_pcs = p_pc_sub.add_parser("show", parents=[_common_parser()], help="Show the character core")
+    p_pcs.set_defaults(func=cmd_agent_persona_core_show)
+    p_pcset = p_pc_sub.add_parser("set", parents=[_common_parser()], help="Set character core fields from JSON")
+    p_pcset.add_argument("--json", required=True, dest="core_json",
+                         help="JSON object with core_values/temperament/preferences/quirks/contradictions/boundaries")
+    p_pcset.add_argument("--reason", default=None)
+    p_pcset.set_defaults(func=cmd_agent_persona_core_set)
     p_style = p_agent_sub.add_parser(
         "style-example", parents=[_common_parser()],
         help="Manage trusted style references (never fixed replies)",
@@ -1334,15 +1347,18 @@ async def cmd_repl(args) -> int:
         if person is None:
             print(err)
             return 1
-        # Real DeepSeek starts conservative: an utterance without an explicit
-        # /to agent is treated as unclear, so the model cannot talk over a
-        # conversation it may not be part of. Mock keeps its old default.
-        addressee = "unknown" if provider == "deepseek" else "agent"
+        # A single-person REPL is an explicit conversation with the companion:
+        # the trusted default addressee is therefore "agent". Multi-person or
+        # background ingestion must not use this default; callers set
+        # "unknown"/"human" explicitly. ``/to human`` and ``/to unknown`` still
+        # override this for the rest of the session, and local Policy remains
+        # the final authority.
+        addressee = "agent"
         print("AI Companion REPL. Type /help for commands.")
         print(f"speaking as {person.person_id} ({person.display_name})")
         print(f"provider: {rt.provider}")
         if provider == "deepseek":
-            print(f"addressee: {addressee} (use /to agent to address me explicitly)")
+            print("addressee: agent (single-person session; use /to human|unknown to override)")
         if provider == "deepseek":
             authorized = await rt.registry.is_external_ai_authorized(person.person_id)
             if not authorized:
@@ -1643,6 +1659,62 @@ async def cmd_agent_effective(args) -> int:
             print(f"effective.{name}: {value}")
     except RelationshipValidationError as exc:
         print(f"invalid person: {exc}")
+        return 1
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_agent_persona_core_show(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db, with_worker=False)
+        core = await rt.agent_service.show_persona_core()
+        data = core.as_prompt_dict()
+        print(f"agent_id: {core.agent_id}")
+        print(f"revision: {core.revision}")
+        print(f"updated_by: {core.updated_by}")
+        print(f"updated_at: {core.updated_at}")
+        for field in (
+            "core_values",
+            "quirks",
+            "contradictions",
+            "conversational_boundaries",
+        ):
+            print(f"{field}: {json.dumps(data[field], ensure_ascii=False)}")
+        for field in ("temperament", "preferences", "voice_identity"):
+            print(f"{field}: {json.dumps(data[field], ensure_ascii=False, sort_keys=True)}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_agent_persona_core_set(args) -> int:
+    db = await _connect(args.db)
+    try:
+        try:
+            updates = json.loads(args.core_json)
+        except json.JSONDecodeError as exc:
+            print(f"invalid JSON: {exc}")
+            return 1
+        if not isinstance(updates, dict):
+            print("invalid JSON: expected an object of persona core fields")
+            return 1
+        # Friendly alias; persisted field names remain explicit.
+        if "boundaries" in updates and "conversational_boundaries" not in updates:
+            updates["conversational_boundaries"] = updates.pop("boundaries")
+        rt = build_runtime(db, with_worker=False)
+        core = await rt.agent_service.set_persona_core(
+            updates, actor="admin", reason=args.reason
+        )
+        print(f"persona core updated (revision {core.revision})")
+        for field in ("core_values", "temperament", "preferences", "quirks",
+                      "contradictions", "conversational_boundaries", "voice_identity"):
+            value = getattr(core, field)
+            rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            print(f"{field}: {rendered}")
+    except PersonalityValidationError as exc:
+        print(f"invalid persona core: {exc}")
         return 1
     finally:
         await db.close()
@@ -2036,6 +2108,13 @@ async def cmd_emotion_show(args) -> int:
         print(f"responsiveness: {profile.responsiveness}")
         print(f"revision: {profile.revision}")
         print(f"expression_style: {profile.expression_style}")
+        cfg = rt.emotion_service.config
+        print("== dynamics ==")
+        print(f"acute_half_life_seconds: {cfg.acute_half_life_seconds}")
+        print(f"mood_half_life_seconds: {cfg.mood_half_life_seconds}")
+        print(f"tension_half_life_seconds: {cfg.tension_half_life_seconds}")
+        print(f"acute_intensity_cap: {cfg.acute_intensity_cap}")
+        print(f"text_expression_min_intensity: {cfg.text_expression_min_intensity}")
     finally:
         await db.close()
     return 0
@@ -2057,7 +2136,13 @@ async def cmd_emotion_inspect(args) -> int:
             print(
                 f"  {s['person_id']}  {s['emotion']}  v={s['valence']}"
                 f" a={s['arousal']} i={s['intensity']}  at={s['updated_at']}"
+                f"  | mood={s.get('mood_emotion', 'NEUTRAL')}"
+                f" mi={s.get('mood_intensity', 0)}"
+                f"  | tension={s.get('relationship_tension', 0)}"
             )
+            activations = s.get("activations_json")
+            if activations and activations != "{}":
+                print(f"      activations={activations}")
         events = await rt.emotion_service.list_events(agent_id, limit=args.limit)
         if args.person:
             events = [e for e in events if e.get("person_id") == args.person]
@@ -2065,8 +2150,14 @@ async def cmd_emotion_inspect(args) -> int:
         for e in events:
             print(
                 f"  {e['emotion_event_id']}  {e['emotion']}"
+                f"  event={e.get('event_type') or '-'}"
+                f" target={e.get('target') or '-'}"
+                f" intent={e.get('social_intent') or '-'}"
+                f" validation={e.get('validation') or '-'}"
                 f"  rule={e['appraisal_rule_id'] or '-'}"
                 f"  reason={e['appraisal_reason'] or '-'}"
+                f"  acute={e.get('acute_before')}->{e.get('acute_after')}"
+                f"  mood={e.get('mood_after')} tension={e.get('tension_after')}"
             )
         feedback = await rt.emotion_service.list_feedback(agent_id)
         print(f"== feedback: {len(feedback)} ==")
@@ -2151,7 +2242,13 @@ async def cmd_emotion_simulate(args) -> int:
             return 0
         stored_at = datetime.fromisoformat(snap["updated_at"])
         fake_now = stored_at + timedelta(seconds=args.elapsed_seconds)
-        svc = EmotionService(repo, audit=None, logger=None, clock=lambda: fake_now)
+        svc = EmotionService(
+            repo,
+            audit=None,
+            logger=None,
+            clock=lambda: fake_now,
+            config=rt.emotion_service.config,
+        )
         state = await svc.get_state(agent_id, args.person)
         print(f"person: {args.person}")
         print(f"stored_at: {snap['updated_at']}")
@@ -2160,6 +2257,14 @@ async def cmd_emotion_simulate(args) -> int:
         print(f"valence: {state.valence:.4f}")
         print(f"arousal: {state.arousal:.4f}")
         print(f"intensity: {state.intensity:.4f}")
+        print(f"activations: {state.activations}")
+        print(f"mood: {state.mood_emotion} i={state.mood_intensity:.4f}"
+              f" v={state.mood_valence:.4f} a={state.mood_arousal:.4f}")
+        print(f"relationship_tension: {state.relationship_tension:.4f}")
+        from companion.emotion.expression_policy import compile_expression_influence
+
+        expression = compile_expression_influence(state, config=svc.config)
+        print(f"expression: {expression.as_dict()}")
     finally:
         await db.close()
     return 0

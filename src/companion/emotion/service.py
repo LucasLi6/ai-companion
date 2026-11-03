@@ -20,6 +20,7 @@ event or a rule.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -33,6 +34,10 @@ from companion.emotion.models import (
     EmotionState,
     SpeechStylePlan,
     VoiceProfile,
+)
+from companion.emotion.parameters import (
+    DEFAULT_CONFIG,
+    EmotionDynamicsConfig,
 )
 from companion.emotion.repository import EmotionRepository
 from companion.emotion.speech import SpeechPlanner
@@ -53,13 +58,15 @@ class EmotionService:
         audit: Optional[AuditRepository] = None,
         logger: Optional[logging.Logger] = None,
         clock=None,
+        config: EmotionDynamicsConfig | None = None,
     ) -> None:
         self.repo = repo
         self.audit = audit
         self.logger = logger or logging.getLogger("companion.emotion")
         # ``clock`` is injectable for deterministic decay tests; default is UTC.
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        self.appraisal = AppraisalEngine(logger=logger)
+        self.config = config or DEFAULT_CONFIG
+        self.appraisal = AppraisalEngine(logger=logger, config=self.config)
         self.speech = SpeechPlanner(logger=logger)
 
     # -- profile ------------------------------------------------------------
@@ -78,8 +85,8 @@ class EmotionService:
             agent_id=agent_id,
             baseline_valence=0.0,
             baseline_arousal=0.0,
-            default_half_life_seconds=3600,
-            responsiveness=0.5,
+            default_half_life_seconds=int(self.config.acute_half_life_seconds),
+            responsiveness=self.config.responsiveness,
             expression_style={},
             revision=1,
             created_at=now,
@@ -271,28 +278,19 @@ class EmotionService:
         baseline_arousal = profile.baseline_arousal if profile else 0.0
 
         snap = await self.repo.get_snapshot(agent_id, person_id)
-        state = EmotionState(
-            valence=baseline_valence,
-            arousal=baseline_arousal,
-            intensity=0.0,
-            emotion="NEUTRAL",
-            updated_at=self.clock(),
-            half_life_seconds=profile.default_half_life_seconds if profile else 3600.0,
+        state = self._state_from_snapshot(
+            snap,
+            profile,
+            now=self.clock(),
+            baseline_valence=baseline_valence,
+            baseline_arousal=baseline_arousal,
         )
-        if snap is not None:
-            state = EmotionState(
-                valence=snap["valence"],
-                arousal=snap["arousal"],
-                intensity=snap["intensity"],
-                emotion=snap["emotion"],
-                updated_at=datetime.fromisoformat(snap["updated_at"]),
-                half_life_seconds=snap["half_life_seconds"],
-            )
         state = decay(
             state,
             now=self.clock(),
             baseline_valence=baseline_valence,
             baseline_arousal=baseline_arousal,
+            config=self.config,
         )
         if persist_checkpoint:
             await self._checkpoint(agent_id, person_id, state)
@@ -310,6 +308,7 @@ class EmotionService:
         conversation_id: str | None = None,
         source_event_id: str | None = None,
         persist: bool = True,
+        addressee_hint: str | None = None,
     ) -> EmotionState:
         """Appraise and apply one turn atomically, idempotently, at one instant.
 
@@ -344,6 +343,8 @@ class EmotionService:
                 profile=profile,
                 traits=traits,
                 now=now,
+                config=self.config,
+                addressee_hint=addressee_hint,
             )
             return self._state_from_result(result, profile, now)
 
@@ -382,6 +383,8 @@ class EmotionService:
                 profile=profile,
                 traits=traits,
                 now=now,
+                config=self.config,
+                addressee_hint=addressee_hint,
             )
 
             if result.trigger_rule_id is None:
@@ -392,7 +395,12 @@ class EmotionService:
                         person_id=person_id,
                         outcome="NO_CHANGE",
                         processed_at=now,
+                        reason=result.reason,
+                        detail=result.diagnostic,
                     )
+                self._log_evaluation(
+                    result, agent_id=agent_id, person_id=person_id
+                )
                 return current
 
             state = self._state_from_result(result, profile, now)
@@ -409,6 +417,14 @@ class EmotionService:
                 intensity=state.intensity,
                 appraisal_reason=result.reason,
                 created_at=now,
+                event_type=result.event_type,
+                target=result.target,
+                social_intent=result.social_intent,
+                validation=result.validation,
+                acute_before=result.acute_before,
+                acute_after=result.acute_after,
+                mood_after=result.mood_after,
+                tension_after=result.tension_after,
             )
             await self._checkpoint(
                 agent_id, person_id, state, updated_at=now
@@ -420,7 +436,12 @@ class EmotionService:
                     person_id=person_id,
                     outcome="APPLIED",
                     processed_at=now,
+                    reason=result.reason,
+                    detail=result.event_type,
                 )
+            self._log_evaluation(
+                result, agent_id=agent_id, person_id=person_id
+            )
             return state
 
     async def apply_result(
@@ -505,32 +526,97 @@ class EmotionService:
     ) -> EmotionState:
         baseline_valence = profile.baseline_valence if profile else 0.0
         baseline_arousal = profile.baseline_arousal if profile else 0.0
-        if snapshot is None:
-            state = EmotionState(
-                valence=baseline_valence,
-                arousal=baseline_arousal,
-                intensity=0.0,
-                emotion="NEUTRAL",
-                updated_at=now,
-                half_life_seconds=(
-                    profile.default_half_life_seconds if profile else 3600.0
-                ),
-            )
-        else:
-            state = EmotionState(
-                valence=snapshot["valence"],
-                arousal=snapshot["arousal"],
-                intensity=snapshot["intensity"],
-                emotion=snapshot["emotion"],
-                updated_at=datetime.fromisoformat(snapshot["updated_at"]),
-                half_life_seconds=snapshot["half_life_seconds"],
-            )
+        state = self._state_from_snapshot(
+            snapshot,
+            profile,
+            now=now,
+            baseline_valence=baseline_valence,
+            baseline_arousal=baseline_arousal,
+        )
         return decay(
             state,
             now=now,
             baseline_valence=baseline_valence,
             baseline_arousal=baseline_arousal,
+            config=self.config,
         )
+
+    def _state_from_snapshot(
+        self,
+        snapshot: dict | None,
+        profile: EmotionProfile | None,
+        *,
+        now: datetime,
+        baseline_valence: float,
+        baseline_arousal: float,
+    ) -> EmotionState:
+        """Load a snapshot, preserving legacy rows without inventing layers.
+
+        A pre-schema-15 row has no activation map, mood or tension columns set;
+        it is read as acute-only affect, and the legacy acute fields remain the
+        source of truth. Nothing is back-filled or fabricated.
+        """
+        default_half_life = (
+            float(profile.default_half_life_seconds)
+            if profile
+            else float(self.config.acute_half_life_seconds)
+        )
+        if snapshot is None:
+            return EmotionState(
+                valence=baseline_valence,
+                arousal=baseline_arousal,
+                intensity=0.0,
+                emotion="NEUTRAL",
+                updated_at=now,
+                half_life_seconds=default_half_life,
+                mood_half_life_seconds=self.config.mood_half_life_seconds,
+                tension_half_life_seconds=self.config.tension_half_life_seconds,
+            )
+        activations = {}
+        raw = snapshot.get("activations_json")
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    activations = {
+                        str(key): float(value) for key, value in parsed.items()
+                    }
+            except (json.JSONDecodeError, TypeError, ValueError):
+                activations = {}
+        return EmotionState(
+            valence=snapshot["valence"],
+            arousal=snapshot["arousal"],
+            intensity=snapshot["intensity"],
+            emotion=snapshot["emotion"],
+            updated_at=datetime.fromisoformat(snapshot["updated_at"]),
+            half_life_seconds=snapshot["half_life_seconds"],
+            activations=activations,
+            mood_valence=float(snapshot.get("mood_valence") or 0.0),
+            mood_arousal=float(snapshot.get("mood_arousal") or 0.0),
+            mood_intensity=float(snapshot.get("mood_intensity") or 0.0),
+            mood_emotion=snapshot.get("mood_emotion") or "NEUTRAL",
+            mood_updated_at=self._optional_dt(snapshot.get("mood_updated_at")),
+            mood_half_life_seconds=float(
+                snapshot.get("mood_half_life_seconds")
+                or self.config.mood_half_life_seconds
+            ),
+            relationship_tension=float(
+                snapshot.get("relationship_tension") or 0.0
+            ),
+            tension_updated_at=self._optional_dt(
+                snapshot.get("tension_updated_at")
+            ),
+            tension_half_life_seconds=float(
+                snapshot.get("tension_half_life_seconds")
+                or self.config.tension_half_life_seconds
+            ),
+            last_event_type=snapshot.get("last_event_type"),
+            last_event_at=self._optional_dt(snapshot.get("last_event_at")),
+        )
+
+    @staticmethod
+    def _optional_dt(value: str | None) -> datetime | None:
+        return datetime.fromisoformat(value) if value else None
 
     @staticmethod
     def _state_from_result(
@@ -538,6 +624,8 @@ class EmotionService:
         profile: EmotionProfile | None,
         now: datetime,
     ) -> EmotionState:
+        if result.state is not None:
+            return result.state
         return EmotionState(
             valence=result.valence,
             arousal=result.arousal,
@@ -545,7 +633,7 @@ class EmotionService:
             emotion=result.emotion,
             updated_at=now,
             half_life_seconds=(
-                float(profile.default_half_life_seconds) if profile else 3600.0
+                float(profile.default_half_life_seconds) if profile else 300.0
             ),
         )
 
@@ -557,6 +645,7 @@ class EmotionService:
         *,
         updated_at: datetime | None = None,
     ) -> None:
+        moment = updated_at or state.updated_at or self.clock()
         await self.repo.upsert_snapshot(
             agent_id=agent_id,
             person_id=person_id,
@@ -565,7 +654,44 @@ class EmotionService:
             intensity=state.intensity,
             emotion=state.emotion,
             half_life_seconds=state.half_life_seconds,
-            updated_at=updated_at,
+            updated_at=moment,
+            activations=state.activations,
+            mood_valence=state.mood_valence,
+            mood_arousal=state.mood_arousal,
+            mood_intensity=state.mood_intensity,
+            mood_emotion=state.mood_emotion,
+            mood_half_life_seconds=state.mood_half_life_seconds,
+            mood_updated_at=state.mood_updated_at or moment,
+            relationship_tension=state.relationship_tension,
+            tension_half_life_seconds=state.tension_half_life_seconds,
+            tension_updated_at=state.tension_updated_at or moment,
+            last_event_type=state.last_event_type,
+            last_event_at=state.last_event_at,
+        )
+
+    def _log_evaluation(
+        self,
+        result: AppraisalResult,
+        *,
+        agent_id: str,
+        person_id: str,
+    ) -> None:
+        """One structured, PII-free diagnostic line per evaluated turn."""
+        self.logger.info(
+            "emotion_evaluated agent_id=%s person_id=%s event_type=%s"
+            " target=%s validation=%s rule=%s outcome=%s"
+            " acute_before=%.4f acute_after=%.4f mood=%.4f tension=%.4f",
+            agent_id,
+            person_id,
+            result.event_type or "none",
+            result.target or "UNKNOWN",
+            result.validation,
+            result.reason or "none",
+            result.diagnostic,
+            result.acute_before,
+            result.acute_after,
+            result.mood_after,
+            result.tension_after,
         )
 
     # -- speech plan --------------------------------------------------------

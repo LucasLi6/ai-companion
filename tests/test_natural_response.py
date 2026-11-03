@@ -98,8 +98,8 @@ def _context(**overrides):
 
 
 def test_prompt_versions_are_bumped():
-    assert COGNITIVE_PROMPT_VERSION == "cognitive-v6"
-    assert RESPONSE_PROMPT_VERSION == "response-v5"
+    assert COGNITIVE_PROMPT_VERSION == "cognitive-v7"
+    assert RESPONSE_PROMPT_VERSION == "response-v6"
 
 
 def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():
