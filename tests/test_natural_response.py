@@ -79,13 +79,6 @@ def _context(**overrides):
             "relationship_tier": "CLOSE",
             "principles": ["保持同一个人格：语气、价值观和边界跨轮次稳定，不随机换人设。"],
         },
-        "style_examples": [
-            {
-                "scenario": "技术讨论",
-                "user_text": "这个 bug 怎么查？",
-                "ideal_response": "先看复现路径，再看最近改了什么。",
-            }
-        ],
     }
     payload.update(overrides)
     return CognitiveContext(**payload)
@@ -97,7 +90,7 @@ def _system(ctx=None):
 
 def test_prompt_versions_are_bumped():
     assert COGNITIVE_PROMPT_VERSION == "cognitive-v9"
-    assert RESPONSE_PROMPT_VERSION == "response-v11"
+    assert RESPONSE_PROMPT_VERSION == "response-v12"
 
 
 def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():
@@ -290,7 +283,7 @@ def test_response_prompt_drops_style_vectors_and_cognitive_json():
     assert "此刻情绪偏向好奇" in system
 
 
-def test_response_prompt_renders_stances_and_style_examples_as_guidance():
+def test_response_prompt_renders_stances_not_style_examples():
     ctx = _context(
         character_snapshot={
             "display_name": "Ava",
@@ -309,8 +302,9 @@ def test_response_prompt_renders_stances_and_style_examples_as_guidance():
     assert "核心价值: 诚实；具体" in system
     assert "我更喜欢老摇滚。" in system
     assert "保持连贯" in system
-    assert "风格参考（不是真实历史，也不是固定回复；只学语气，不照抄）" in system
-    assert "先看复现路径" in system
+    # V0.5 removed the per-turn style-reference block from generation.
+    assert "风格参考" not in system
+    assert "交流表达参考" not in system
 
 
 def test_response_prompt_forbids_fixed_replies_and_category_templates():

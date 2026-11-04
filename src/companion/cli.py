@@ -2263,10 +2263,10 @@ async def cmd_emotion_simulate(args) -> int:
         print(f"mood: {state.mood_emotion} i={state.mood_intensity:.4f}"
               f" v={state.mood_valence:.4f} a={state.mood_arousal:.4f}")
         print(f"relationship_tension: {state.relationship_tension:.4f}")
-        from companion.emotion.expression_policy import compile_expression_influence
+        from companion.emotion.expression_policy import compile_affect_context
 
-        expression = compile_expression_influence(state, config=svc.config)
-        print(f"expression: {expression.as_dict()}")
+        affect_context = compile_affect_context(state, config=svc.config)
+        print(f"affect_context: {affect_context or '(none)'}")
     finally:
         await db.close()
     return 0

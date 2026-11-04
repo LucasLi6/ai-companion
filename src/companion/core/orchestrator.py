@@ -36,11 +36,9 @@ from companion.agent.character import (
     load_emotional_dispositions,
     validate_stored_snapshot,
 )
-from companion.agent.dialogue_pattern_monitor import DialoguePatternMonitor
 from companion.agent.dialogue_style import compile_dialogue_style
 from companion.agent.models import EffectiveAgentContext
 from companion.agent.persona_core import sanitise_prompt_core
-from companion.agent.reply_mode import resolve_reply_mode
 from companion.cognition.models import CognitiveContext
 from companion.cognition.nonresponse import NonresponseTrace, derive_nonresponse_trace
 from companion.cognition.scene_repository import SceneRevisionConflict
@@ -63,10 +61,7 @@ from companion.domain.models import (
     new_id,
     utcnow,
 )
-from companion.emotion.expression_policy import (
-    compile_affect_context,
-    compile_expression_influence,
-)
+from companion.emotion.expression_policy import compile_affect_context
 from companion.emotion.transition import build_conversational_affect
 from companion.memory.candidates import prepare_candidates
 from companion.people.registry import PersonRegistry
@@ -128,8 +123,10 @@ class Orchestrator:
         # (old mock wiring) the pipeline is byte-for-byte the V0.3.2 flow.
         self.scene_manager = scene_manager
         self.personality_compiler = personality_compiler
+        # Retained for the admin data interface (style references are managed
+        # through ``rt.style_repo``); the default generation chain no longer
+        # retrieves or injects them per turn.
         self.style_repo = style_repo
-        self.dialogue_patterns = DialoguePatternMonitor()
         # When set (real-DeepSeek mode), the orchestrator builds a privacy-
         # filtered CognitiveContext and hands the *same* context to both the
         # cognitive and response providers. In mock mode it stays None and the
@@ -492,34 +489,6 @@ class Orchestrator:
                             trace=trace,
                             steps=steps,
                         )
-                        if isinstance(response_context, CognitiveContext):
-                            # V0.5: choose the generation strategy only after
-                            # cognitive analysis and policy have finished, and
-                            # select style references with the current turn's
-                            # pragmatic reading. Nothing here can change the
-                            # action, permissions or facts.
-                            mode = resolve_reply_mode(
-                                text=event.text,
-                                analysis=analysis,
-                                context=response_context,
-                            )
-                            examples = await self._select_style_examples(
-                                event=event,
-                                analysis=analysis,
-                                context=response_context,
-                                mode=mode,
-                            )
-                            response_context = response_context.model_copy(
-                                update={
-                                    "reply_mode": mode.value,
-                                    "style_examples": examples,
-                                }
-                            )
-                            steps.append(f"[REPLY_MODE] {mode.value}")
-                            if examples:
-                                steps.append(
-                                    f"[STYLE] Selected {len(examples)} reference(s)"
-                                )
                         response_text = await self.response.generate(
                             event, analysis, response_context
                         )
@@ -690,19 +659,25 @@ class Orchestrator:
         steps,
         persist,
     ):
-        """Compute the companion's own affect and attach it to the context.
+        """Appraise this turn's emotion and attach a short state context.
 
-        Called only after a *persisted* analysis exists. ``provider_memories``
-        is the privacy-filtered list that already reached the model, never the
-        raw retrieval set. ``process_turn`` appraises, applies and records the
-        turn in one transaction, so a retry reuses the analysis and the receipt
+        The collapsed V0.5 flow is exactly: emotional event → state update →
+        a short, human-readable affect context when (and only when) the state
+        is meaningful. ``process_turn`` appraises, applies and records the turn
+        in one transaction, so a retry reuses the analysis and the receipt
         rather than double-applying the shift.
 
+        What is *not* computed here any more: a per-turn speech plan (the
+        independent TTS capability still exists on the service), a numeric
+        directness/warmth stance, or dialogue-pattern feedback. Those duplicated
+        the response prompt's own guidance and added serial work per turn.
+        Weak or irrelevant affect yields an empty ``affect_context`` instead of
+        a filled-in placeholder.
+
         Emotion is presentation-only and must never fail the turn, so any error
-        is logged and swallowed — a reply still happens, just without an
-        emotional delivery plan. ``persist`` gates only the event/snapshot
-        writes (honouring the consent persistence flag); the in-memory state and
-        speech plan are computed regardless.
+        is logged and swallowed — a reply still happens, just without a state
+        line. ``persist`` gates only the event/snapshot writes (honouring the
+        consent persistence flag).
         """
         if self.emotion_service is None:
             return cognitive_context
@@ -760,63 +735,31 @@ class Orchestrator:
                 conversational_affect=conversational_affect,
                 dispositions=dispositions,
             )
-            speech_plan = await self.emotion_service.plan_speech(
-                agent_id, state=state, text=""
-            )
             emotion_config = getattr(self.emotion_service, "config", None)
-            expression = compile_expression_influence(
-                state,
-                config=emotion_config,
-                interaction_frame=current_frame,
-            )
             affect_context = compile_affect_context(
                 state,
                 interaction_frame=current_frame,
                 frame_changed=frame_changed,
                 config=emotion_config,
             )
-            agent_name = None
-            if isinstance(cognitive_context, CognitiveContext):
-                agent_name = (cognitive_context.agent_context or {}).get(
-                    "display_name"
-                )
-                assistant_replies = [
-                    turn.text
-                    for turn in cognitive_context.turns
-                    if turn.role == "assistant"
-                ]
-            else:
-                assistant_replies = []
-            pattern_report = self.dialogue_patterns.analyze(
-                assistant_replies,
-                agent_name=agent_name,
-                user_name=(
-                    cognitive_context.current_speaker_label
-                    if isinstance(cognitive_context, CognitiveContext)
-                    else None
-                ),
-            )
 
             if isinstance(cognitive_context, CognitiveContext):
                 cognitive_context = cognitive_context.model_copy(
                     update={
                         "emotion_state": state.as_dict(),
-                        "speech_plan": speech_plan.as_dict(),
-                        "emotion_expression": expression.as_dict(),
                         "affect_context": affect_context,
-                        "dialogue_pattern_guidance": pattern_report.guidance,
                     }
                 )
             self.logger.info(
                 "emotion_applied event_id=%s emotion=%s intensity=%.2f"
-                " valence=%.2f mood=%s tension=%.2f expression=%s",
+                " valence=%.2f mood=%s tension=%.2f affect_context=%s",
                 event.event_id,
                 state.emotion,
                 state.intensity,
                 state.valence,
                 state.mood_emotion,
                 state.relationship_tension,
-                expression.explanation,
+                bool(affect_context),
             )
             steps.append(
                 f"[EMOTION] {state.emotion} (intensity={state.intensity:.2f})"
@@ -1046,45 +989,6 @@ class Orchestrator:
                 exc,
             )
             return cognitive_context
-
-    async def _select_style_examples(
-        self, *, event, analysis, context, mode
-    ) -> list[dict]:
-        """Pick at most three references for this turn, after cognition.
-
-        Selection is non-fatal: a missing repository, an empty table or a
-        retrieval error must never lose the reply. Only trusted admin examples
-        visible to this person are candidates.
-        """
-        if self.style_repo is None or not isinstance(context, CognitiveContext):
-            return []
-        snapshot = context.character_snapshot or {}
-        agent = context.agent_context or {}
-        agent_id = ""
-        if isinstance(snapshot, dict):
-            agent_id = str(snapshot.get("agent_id") or "")
-        if not agent_id and isinstance(agent, dict):
-            agent_id = str(agent.get("agent_id") or "")
-        if not agent_id:
-            return []
-        try:
-            return await self.style_repo.list_relevant_for_prompt(
-                agent_id=agent_id,
-                person_id=event.speaker_person_id,
-                current_text=event.text,
-                recent_turns=context.turns,
-                mode=mode,
-                pragmatic=getattr(analysis, "pragmatic", None),
-                scene_state=context.scene_state,
-                limit=3,
-            )
-        except Exception as exc:
-            self.logger.warning(
-                "style_example_selection_failed event_id=%s error=%s",
-                event.event_id,
-                exc,
-            )
-            return []
 
     async def _prepare_dialogue(
         self,

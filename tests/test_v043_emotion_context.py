@@ -11,10 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from companion.emotion.dynamics import apply_emotional_stimulus
-from companion.emotion.expression_policy import (
-    compile_affect_context,
-    compile_expression_influence,
-)
+from companion.emotion.expression_policy import compile_affect_context
 from companion.emotion.models import AppraisalRule, EmotionState
 from companion.emotion.parameters import DEFAULT_CONFIG, EmotionDynamicsConfig
 from companion.emotion.transition import (
@@ -89,19 +86,16 @@ def test_composite_gate_lets_mood_or_tension_through_a_quiet_acute_layer():
         mood_emotion="SADNESS",
         mood_intensity=0.5,
     )
-    influence = compile_expression_influence(
-        quiet_acute_low_mood, config=DEFAULT_CONFIG
-    )
-    # The old single 0.20 acute threshold returned zeros here.
-    assert influence.is_active()
-    assert influence.source_emotion == "NEUTRAL"
+    # The old single 0.20 acute threshold returned an empty description here;
+    # the composite gate lets the meaningful mood colour through.
+    text = compile_affect_context(quiet_acute_low_mood, config=DEFAULT_CONFIG)
+    assert "底色偏向低落" in text
 
     tension_only = _state(
         intensity=0.05, relationship_tension=0.6, activations={}
     )
-    assert compile_expression_influence(
-        tension_only, config=DEFAULT_CONFIG
-    ).is_active()
+    text = compile_affect_context(tension_only, config=DEFAULT_CONFIG)
+    assert "明显未散开的紧张" in text
 
 
 def test_off_mode_still_applies_a_conversation_frame_change():

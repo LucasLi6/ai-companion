@@ -1,8 +1,10 @@
-"""V0.5 — response prompt strategy and autonomous stopping.
+"""V0.5 — the response prompt is one unified speaking-style contract.
 
-The response call owns its length. There is no ``stop`` sentinel, no paragraph
-split, no regex deletion and no post-generation polish call: DeepSeek finishes
-at the natural end of the reply. These tests pin that contract directly.
+The response call owns its length: there is no ``stop`` sentinel, no paragraph
+split, no regex deletion and no post-generation polish call. V0.5 removed the
+SOCIAL/TASK mode switch and the per-turn style-reference block, so the system
+message now carries exactly one 【说话方式】 contract regardless of topic. These
+tests pin that contract directly.
 """
 
 from __future__ import annotations
@@ -13,8 +15,6 @@ from companion.domain.models import CognitiveResult
 from companion.prompts.response import (
     BASE_RESPONSE_PROMPT,
     RESPONSE_PROMPT_VERSION,
-    SOCIAL_GENERATION_GUIDANCE,
-    TASK_GENERATION_GUIDANCE,
     build_response_messages,
 )
 from companion.providers.deepseek_response import DeepSeekResponseProvider
@@ -93,20 +93,18 @@ def _system(messages):
 async def test_two_paragraph_reply_is_returned_unchanged():
     client = RecordingClient("这是第一段。\n\n这是第二段。")
     provider = DeepSeekResponseProvider(client)
-    context = _context()
 
-    text = await provider.generate(_event(), _analysis(), context)
+    text = await provider.generate(_event(), _analysis(), _context())
 
     assert text == "这是第一段。\n\n这是第二段。"
 
 
-async def test_multiline_task_reply_is_returned_unchanged():
+async def test_multiline_reply_is_returned_unchanged():
     answer = "第一步：检查接线。\n\n第二步：查看串口配置。\n\n第三步：确认中断。\n"
     client = RecordingClient(answer)
     provider = DeepSeekResponseProvider(client)
-    context = _context().model_copy(update={"reply_mode": "TASK"})
 
-    text = await provider.generate(_event(), _analysis(), context)
+    text = await provider.generate(_event(), _analysis(), _context())
 
     assert text == answer.strip()
 
@@ -135,8 +133,8 @@ async def test_exactly_one_model_call_per_generation():
 # -- prompt structure --------------------------------------------------------
 
 
-def test_prompt_version_is_v11():
-    assert RESPONSE_PROMPT_VERSION == "response-v11"
+def test_prompt_version_is_v12():
+    assert RESPONSE_PROMPT_VERSION == "response-v12"
 
 
 def test_base_prompt_has_generation_goal_and_stopping_rule():
@@ -146,32 +144,26 @@ def test_base_prompt_has_generation_goal_and_stopping_rule():
     assert "只输出回复正文" in BASE_RESPONSE_PROMPT
 
 
-def test_social_is_the_default_generation_mode():
+def test_speaking_style_is_one_unified_block_not_mode_switched():
     system = _system(build_response_messages(_context(), _analysis()))
 
-    assert SOCIAL_GENERATION_GUIDANCE in system
-    assert "【当前交流模式：SOCIAL】" in system
-    assert "约1–3句话" in system
-    assert "完成一次自然回应后直接结束" in system
-    assert TASK_GENERATION_GUIDANCE not in system
+    assert "【说话方式】" in system
+    assert "像日常聊天一样说话" in system
+    assert "默认简短" in system
+    # No per-turn SOCIAL/TASK strategy is injected any more.
+    assert "【当前交流模式：SOCIAL】" not in system
+    assert "【当前交流模式：TASK】" not in system
+    assert "当前交流模式" not in system
 
 
-def test_task_mode_switches_guidance_and_allows_detail():
-    context = _context().model_copy(update={"reply_mode": "TASK"})
-    system = _system(build_response_messages(context, _analysis()))
-
-    assert TASK_GENERATION_GUIDANCE in system
-    assert "【当前交流模式：TASK】" in system
-    assert "允许多段回答、代码、步骤" in system
-    assert SOCIAL_GENERATION_GUIDANCE not in system
+def test_shortness_is_guidance_not_a_hard_cap():
+    assert "这只是表达倾向，不是硬性限制" in BASE_RESPONSE_PROMPT
+    # Task detail lives in the same block rather than a second guidance string.
+    assert "允许多段回答" in BASE_RESPONSE_PROMPT
+    assert "详细解释" in BASE_RESPONSE_PROMPT
 
 
-def test_social_guidance_is_not_a_hard_sentence_cap():
-    assert "不是硬性限制" in SOCIAL_GENERATION_GUIDANCE
-    assert "需要说得更多时可以继续" in SOCIAL_GENERATION_GUIDANCE
-
-
-def test_style_examples_are_fictional_references_not_history():
+def test_style_examples_are_not_injected():
     examples = [
         {
             "scenario": "日常闲聊",
@@ -183,47 +175,11 @@ def test_style_examples_are_fictional_references_not_history():
     messages = build_response_messages(context, _analysis())
     system = _system(messages)
 
-    assert "以下是管理员审核的虚构对话" in system
-    assert "它们不是你与当前用户实际发生过的历史" in system
-    assert "如果与正式 Persona Core 冲突" in system
-    assert "场景：日常闲聊" in system
-    assert "用户：我今天差点迟到。" in system
-    assert "差点？那就是没迟到。先算你赢。" in system
-
-    # A reference may never become an assistant turn or real user history.
-    assistant_contents = [
-        message["content"]
-        for message in messages
-        if message["role"] == "assistant"
-    ]
-    assert all("差点？那就是没迟到" not in content for content in assistant_contents)
-    user_contents = [
-        message["content"] for message in messages if message["role"] == "user"
-    ]
-    assert all("我今天差点迟到" not in content for content in user_contents)
-
-
-def test_at_most_three_style_examples_reach_the_prompt():
-    examples = [
-        {
-            "scenario": f"场景{i}",
-            "user_text": f"用户{i}",
-            "ideal_response": f"回应{i}",
-        }
-        for i in range(6)
-    ]
-    system = _system(
-        build_response_messages(_context(style_examples=examples), _analysis())
-    )
-
-    assert "场景0" in system
-    assert "场景2" in system
-    assert "场景3" not in system
-
-
-def test_no_style_section_when_no_examples_are_selected():
-    system = _system(build_response_messages(_context(), _analysis()))
     assert "交流表达参考" not in system
+    assert "以下是管理员审核的虚构对话" not in system
+    assert "差点？那就是没迟到" not in system
+    # The old reference can never appear as history either.
+    assert all("差点？那就是没迟到" not in m["content"] for m in messages)
 
 
 def _event():

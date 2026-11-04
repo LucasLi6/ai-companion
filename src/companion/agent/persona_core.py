@@ -34,6 +34,9 @@ from companion.storage.database import Database
 
 MAX_LIST_ITEMS = 10
 MAX_ITEM_LENGTH = 240
+# Hard cap for the admin-authored full character description. Importers must
+# validate against this before writing; nothing may silently truncate.
+MAX_DESCRIPTION = 4000
 
 DEFAULT_TEMPERAMENT: dict[str, str] = {
     "directness": "moderate",
@@ -83,7 +86,7 @@ class PersonaCore(BaseModel):
     # Admin-authored long-form description. This is the import target for a
     # future reviewed full-character importer; it is trusted config, not model
     # output and not a claim of real-world history.
-    character_description: str = Field(default="", max_length=4000)
+    character_description: str = Field(default="", max_length=MAX_DESCRIPTION)
     revision: int = 1
     updated_at: datetime | None = None
     updated_by: str = "admin"
@@ -102,8 +105,10 @@ class PersonaCore(BaseModel):
     @classmethod
     def _validate_description(cls, value: str) -> str:
         text = str(value or "").replace("\x00", " ").strip()
-        if len(text) > 4000:
-            raise ValueError("character_description must be at most 4000 chars")
+        if len(text) > MAX_DESCRIPTION:
+            raise ValueError(
+                f"character_description must be at most {MAX_DESCRIPTION} chars"
+            )
         return text
 
     @field_validator("temperament", "preferences", "voice_identity")

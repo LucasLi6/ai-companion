@@ -1,20 +1,19 @@
-"""V0.5 — SOCIAL/TASK routing and style selection through the real pipeline.
+"""V0.5 — the real pipeline makes exactly two calls and injects no extra routing.
 
 These tests drive the actual Orchestrator over the real database and the real
 privacy-filtered ContextBuilder, with fake providers (no network). They pin:
 
-- the mode is chosen after cognition and before the response;
-- the selected references reach only the response context;
-- the cognitive call still happens exactly once and never sees the examples;
-- a two-paragraph reply survives the whole pipeline unchanged.
+- the default generation chain no longer classifies SOCIAL/TASK or retrieves
+  style references per turn;
+- the cognitive call happens exactly once and never sees generation guidance;
+- a multi-paragraph reply survives the whole pipeline unchanged;
+- the real DeepSeek response request carries the one unified 【说话方式】 block.
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
-from companion.agent.style_seed import seed_style_examples
 from companion.domain.enums import CognitiveAction, EventSource, ReasonCode
 from companion.domain.models import (
     CognitiveResult,
@@ -23,9 +22,6 @@ from companion.domain.models import (
 )
 from companion.providers.deepseek_client import ChatResponse
 from companion.runtime import build_runtime
-
-ASSET = Path(__file__).resolve().parents[1] / "assets" / "ava_style_examples_v1.jsonl"
-TASK_CATEGORIES = {"task", "engineering"}
 
 
 class FakeCognitive:
@@ -119,10 +115,6 @@ async def _runtime(db, *, pragmatic, response_text="好的。"):
         allow_mixed_providers=True,
     )
     await rt.agent_service.ensure_defaults()
-    manifest = await rt.agent_service.repo.get_manifest()
-    await seed_style_examples(
-        db, agent_id=manifest["agent_id"], path=ASSET
-    )
     person = await rt.registry.register(
         "Alice",
         "owner",
@@ -145,7 +137,7 @@ def _event_for(person_id, text):
     )
 
 
-async def test_social_turn_is_routed_and_gets_social_references(db):
+async def test_social_turn_has_no_mode_routing_or_style_retrieval(db):
     pragmatic = PragmaticAnalysis(
         primary_act="SELF_DISCLOSURE",
         interaction_frame="SUPPORT",
@@ -162,24 +154,16 @@ async def test_social_turn_is_routed_and_gets_social_references(db):
     )
 
     assert report.status == "COMPLETED"
-    assert response.contexts[-1].reply_mode == "SOCIAL"
-    selected = response.contexts[-1].style_examples
-    assert selected
-    assert {row["category"] for row in selected} <= {
-        "daily",
-        "playful",
-        "relationship",
-        "emotion",
-        "debate",
-        "identity",
-        "preferences",
-        "continuity",
-        "social",
-        "other",
-    }
+    assert cognitive.calls == 1
+    assert response.calls == 1
+    # The removed fields are gone from the model entirely.
+    assert not hasattr(response.contexts[-1], "reply_mode")
+    assert not hasattr(response.contexts[-1], "style_examples")
+    assert not any("REPLY_MODE" in step for step in report.steps)
+    assert not any("STYLE" in step for step in report.steps)
 
 
-async def test_task_turn_is_routed_and_gets_task_references(db):
+async def test_task_turn_uses_the_same_single_generation_path(db):
     pragmatic = PragmaticAnalysis(
         primary_act="REQUEST",
         interaction_frame="TASK",
@@ -196,13 +180,12 @@ async def test_task_turn_is_routed_and_gets_task_references(db):
     )
 
     assert report.status == "COMPLETED"
-    assert response.contexts[-1].reply_mode == "TASK"
-    selected = response.contexts[-1].style_examples
-    assert selected
-    assert {row["category"] for row in selected} <= TASK_CATEGORIES
+    assert cognitive.calls == 1
+    assert response.calls == 1
+    assert not hasattr(response.contexts[-1], "reply_mode")
 
 
-async def test_cognitive_call_never_receives_reply_mode_or_examples(db):
+async def test_cognitive_call_never_receives_generation_guidance(db):
     pragmatic = PragmaticAnalysis(
         primary_act="SELF_DISCLOSURE",
         interaction_frame="SUPPORT",
@@ -215,11 +198,8 @@ async def test_cognitive_call_never_receives_reply_mode_or_examples(db):
     )
 
     cognitive_context = cognitive.contexts[0]
-    assert cognitive_context.style_examples == []
-    assert cognitive_context.reply_mode is None
-    # The response context is a different, enriched copy.
-    assert response.contexts[0].style_examples
-    assert response.contexts[0].reply_mode == "SOCIAL"
+    assert not hasattr(cognitive_context, "style_examples")
+    assert not hasattr(cognitive_context, "reply_mode")
 
 
 async def test_two_calls_per_turn_and_no_post_generation_truncation(db):
@@ -242,7 +222,8 @@ async def test_two_calls_per_turn_and_no_post_generation_truncation(db):
     assert report.response_text == reply
 
 
-async def test_style_selection_failure_does_not_lose_the_reply(db):
+async def test_style_store_failure_cannot_affect_the_reply(db):
+    # The default chain never touches the style store; a broken one is inert.
     pragmatic = PragmaticAnalysis(
         primary_act="SELF_DISCLOSURE",
         interaction_frame="SUPPORT",
@@ -259,19 +240,13 @@ async def test_style_selection_failure_does_not_lose_the_reply(db):
 
     assert report.status == "COMPLETED"
     assert report.response_text == "嗯，我在。"
-    assert response.contexts[-1].style_examples == []
-    assert response.contexts[-1].reply_mode == "SOCIAL"
 
 
-async def test_real_deepseek_providers_receive_the_selected_mode(db):
+async def test_real_deepseek_providers_receive_the_unified_speaking_block(db):
     reply = "这是第一段。\n\n这是第二段。"
     client = FakeDeepSeekClient(reply)
     rt = build_runtime(db, provider="deepseek", deepseek_client=client)
     await rt.agent_service.ensure_defaults()
-    manifest = await rt.agent_service.repo.get_manifest()
-    await seed_style_examples(
-        db, agent_id=manifest["agent_id"], path=ASSET
-    )
     person = await rt.registry.register(
         "Alice",
         "owner",
@@ -293,10 +268,10 @@ async def test_real_deepseek_providers_receive_the_selected_mode(db):
         "response",
     ]
     system = client.calls[1]["messages"][0]["content"]
-    assert "【当前交流模式：TASK】" in system
-    assert "【当前交流模式：SOCIAL】" not in system
-    assert "PID" in system
+    assert "【说话方式】" in system
+    assert "当前交流模式" not in system
+    assert "交流表达参考" not in system
     # The cognitive request never carries response-only material.
     cognitive_system = client.calls[0]["messages"][0]["content"]
+    assert "【说话方式】" not in cognitive_system
     assert "当前交流模式" not in cognitive_system
-    assert "交流表达参考" not in cognitive_system

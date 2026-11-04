@@ -141,7 +141,10 @@ def test_memory_is_used_only_when_relevant_and_outcomes_are_truthful():
     assert "无需保存" not in system
 
 
-def test_style_examples_are_reference_not_history_and_not_a_script():
+def test_style_examples_are_not_injected_by_default():
+    # V0.5 removed the per-turn style-reference retrieval and render block.
+    # Even a legacy caller passing the old field must reach the model as plain
+    # conversation only, never as a reference/script section.
     context = _context(
         style_examples=[
             {
@@ -163,10 +166,9 @@ def test_style_examples_are_reference_not_history_and_not_a_script():
     messages = build_response_messages(context, _analysis())
     system = messages[0]["content"]
 
-    assert "风格参考（不是真实历史，也不是固定回复；只学语气，不照抄）" in system
-    assert "那就先别硬撑。" in system
-    # Examples live in the system reference block, not in the transcript.
-    assert all("那就先别硬撑。" not in m["content"] for m in messages[1:])
+    assert "风格参考" not in system
+    assert "那就先别硬撑。" not in system
+    assert all("那就先别硬撑。" not in m["content"] for m in messages)
 
 
 def test_system_prompt_keeps_local_authority_and_no_template_categories():

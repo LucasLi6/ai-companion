@@ -714,7 +714,9 @@ async def test_provider_drops_scene_claim_without_verbatim_evidence(db):
     assert snapshot.state.environment["location"] == "UNKNOWN"
 
 
-async def test_style_example_is_prompt_guidance_not_dialogue_history(db):
+async def test_style_example_is_not_injected_per_turn(db):
+    # V0.5 removed per-turn style-example retrieval from the default chain: an
+    # admin reference is stored data, not something every response sees.
     rt, client = _runtime(
         db,
         [
@@ -740,10 +742,8 @@ async def test_style_example_is_prompt_guidance_not_dialogue_history(db):
 
     response_prompt = client.requests("response")[0]["messages"][0]["content"]
     analysis_prompt = client.requests("analysis")[0]["messages"][1]["content"]
-    assert "风格参考" in response_prompt
-    assert "先确认回调有没有到网关，再看签名。" in response_prompt
-    assert "不是真实历史，也不是固定回复" in response_prompt
-    # The analysis prompt never receives the style reference as history.
+    assert "风格参考" not in response_prompt
+    assert "先确认回调有没有到网关，再看签名。" not in response_prompt
     assert "先确认回调有没有到网关，再看签名。" not in analysis_prompt
     turns = await rt.repos.utterance.recent_context("c1", None, 20)
     assert all("先确认回调有没有到网关" not in t.text for t in turns)

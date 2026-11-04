@@ -31,7 +31,7 @@ from companion.domain.models import (
     SceneProposal,
     make_utterance_event,
 )
-from companion.emotion.expression_policy import compile_expression_influence
+from companion.emotion.expression_policy import compile_affect_context
 from companion.emotion.models import EmotionState
 from companion.emotion.parameters import DEFAULT_CONFIG
 from companion.prompts.response import (
@@ -48,25 +48,15 @@ def _state(**overrides):
     return EmotionState(**payload)
 
 
-def test_low_intensity_emotion_does_not_change_text_stance():
-    influence = compile_expression_influence(
+def test_low_intensity_emotion_yields_empty_affect_context():
+    text = compile_affect_context(
         _state(emotion="CURIOSITY", intensity=0.10), config=DEFAULT_CONFIG
     )
-    assert not influence.is_active()
-    assert influence.as_dict() == {
-        "directness_adjustment": 0.0,
-        "warmth_adjustment": 0.0,
-        "playfulness_adjustment": 0.0,
-        "questioning_adjustment": 0.0,
-        "seriousness_adjustment": 0.0,
-        "explanation": "情绪强度低，不改变文本立场。",
-        "source_emotion": "CURIOSITY",
-        "intensity": 0.1,
-    }
+    assert text == ""
 
 
-def test_expression_adjustments_are_bounded_and_have_no_action_authority():
-    influence = compile_expression_influence(
+def test_affect_context_is_state_only_and_has_no_action_authority():
+    text = compile_affect_context(
         _state(
             emotion="FRUSTRATION",
             intensity=0.85,
@@ -74,35 +64,29 @@ def test_expression_adjustments_are_bounded_and_have_no_action_authority():
         ),
         config=DEFAULT_CONFIG,
     )
-    bound = DEFAULT_CONFIG.expression_adjustment_bound
-    for key in (
-        "directness_adjustment",
-        "warmth_adjustment",
-        "playfulness_adjustment",
-        "questioning_adjustment",
-        "seriousness_adjustment",
+    assert "此刻情绪偏向有些不快" in text
+    # A state description, not a numeric stance or a permission.
+    for removed in (
+        "directness",
+        "warmth",
+        "playfulness",
+        "seriousness",
+        "是否回复",
+        "questioning",
     ):
-        assert abs(getattr(influence, key)) <= bound
-    # Frustration makes the wording more direct/less playful, never grants an
-    # action or a permission.
-    assert influence.directness_adjustment > 0
-    assert influence.playfulness_adjustment < 0
-    assert not hasattr(influence, "action")
-    assert not hasattr(influence, "can_reply")
-    assert "不改变是否回复" in influence.explanation
+        assert removed not in text
 
 
-def test_relationship_tension_raises_seriousness_within_the_bound():
-    calm = compile_expression_influence(
+def test_relationship_tension_is_reported_when_meaningful():
+    calm = compile_affect_context(
         _state(emotion="SERIOUS", intensity=0.3), config=DEFAULT_CONFIG
     )
-    tense = compile_expression_influence(
+    tense = compile_affect_context(
         _state(emotion="SERIOUS", intensity=0.6, relationship_tension=0.9),
         config=DEFAULT_CONFIG,
     )
-    assert tense.seriousness_adjustment > calm.seriousness_adjustment
-    assert tense.seriousness_adjustment <= DEFAULT_CONFIG.expression_adjustment_bound
-    assert tense.playfulness_adjustment < calm.playfulness_adjustment
+    assert "紧张" not in calm
+    assert "明显未散开的紧张" in tense
 
 
 def test_persona_core_defaults_are_neutral_and_have_no_biography():
@@ -215,13 +199,12 @@ def _analysis(**updates):
 
 
 def test_response_prompt_renders_compact_affect_not_style_vectors():
-    assert RESPONSE_PROMPT_VERSION == "response-v11"
-    influence = compile_expression_influence(
-        _state(emotion="CONCERN", intensity=0.7)
-    ).as_dict()
+    assert RESPONSE_PROMPT_VERSION == "response-v12"
     ctx = _context(
-        emotion_expression=influence,
         affect_context="此刻情绪偏向关切（明显）。",
+        # Legacy fields are ignored by the model: V0.5 removed the numeric
+        # expression vector, the per-turn speech plan and pattern guidance.
+        emotion_expression={"directness_adjustment": 0.2},
         dialogue_pattern_guidance=["最近几轮大多以问题收尾；这一轮如果没必要就不追问。"],
         speech_plan={
             "delivery_instruction": "SPEAK_CALMLY",
@@ -238,6 +221,7 @@ def test_response_prompt_renders_compact_affect_not_style_vectors():
     assert "【本轮交流判断】" not in system
     assert "分享状态，不是请求建议" not in system
     assert "不说教" not in system
+    assert "directness_adjustment" not in system
     # TTS delivery values stay out of the text prompt.
     assert "speaking_rate" not in system
     assert "SPEAK_CALMLY" not in system
