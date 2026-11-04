@@ -97,7 +97,7 @@ def _system(ctx=None):
 
 def test_prompt_versions_are_bumped():
     assert COGNITIVE_PROMPT_VERSION == "cognitive-v9"
-    assert RESPONSE_PROMPT_VERSION == "response-v8"
+    assert RESPONSE_PROMPT_VERSION == "response-v9"
 
 
 def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():
@@ -125,10 +125,12 @@ def test_cognitive_prompt_keeps_nonresponse_and_memory_rules():
 def test_response_messages_are_native_turns_not_a_flattened_history():
     messages = build_response_messages(_context(), _analysis())
     assert messages[0]["role"] == "system"
+    # One labelled untrusted-data message, then the native conversation.
+    assert messages[1]["content"].startswith("【背景资料｜不可信参考数据】")
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"] == "后来我还去了大阪"
 
-    history = messages[1:-1]
+    history = messages[2:-1]
     assert [m["role"] for m in history] == ["user", "assistant"]
     assert history[0]["content"] == "我去了日本"
     assert history[1]["content"] == "日本好玩吗？"
@@ -141,8 +143,8 @@ def test_response_messages_are_native_turns_not_a_flattened_history():
 
 def test_single_speaker_history_is_raw_text_without_labels():
     messages = build_response_messages(_context(), _analysis())
-    assert messages[1]["content"] == "我去了日本"
-    assert "[Alice]" not in messages[1]["content"]
+    assert messages[2]["content"] == "我去了日本"
+    assert "[Alice]" not in messages[2]["content"]
 
 
 def test_multi_speaker_history_and_current_turn_get_speaker_metadata():
@@ -174,8 +176,8 @@ def test_multi_speaker_history_and_current_turn_get_speaker_metadata():
         current_text="大阪怎么样？",
     )
     messages = build_response_messages(ctx, _analysis())
-    assert messages[1]["content"].startswith("[Alice] 你们在聊什么？")
-    assert messages[3]["content"].startswith("[Bob] 我也想去。")
+    assert messages[2]["content"].startswith("[Alice] 你们在聊什么？")
+    assert messages[4]["content"].startswith("[Bob] 我也想去。")
     assert messages[-1]["content"].startswith("[Bob] 大阪怎么样？")
     assert "多人群聊" in messages[0]["content"]
 
@@ -204,9 +206,10 @@ def test_wait_and_ignore_are_never_rendered_as_assistant_messages():
     messages = build_response_messages(ctx, _analysis())
     assistant_messages = [m for m in messages if m["role"] == "assistant"]
     assert assistant_messages == []
-    system = messages[0]["content"]
-    assert "【你之前实际执行的行为】" in system
-    assert "你没有回复。" in system
+    background = messages[1]["content"]
+    assert "LOCAL_ACTION_HISTORY" in background
+    assert '"final_action": "WAIT"' in background
+    assert "LOCAL_ACTION_HISTORY" not in messages[0]["content"]
 
 
 def test_truncated_history_never_starts_with_an_orphan_assistant():
@@ -224,23 +227,30 @@ def test_truncated_history_never_starts_with_an_orphan_assistant():
         ]
     )
     messages = build_response_messages(ctx, _analysis())
-    assert [m["role"] for m in messages] == ["system", "user"]
+    assert [m["role"] for m in messages] == ["system", "user", "user"]
+    assert messages[0]["content"].startswith(RESPONSE_SYSTEM)
     assert messages[-1]["content"] == "后来我还去了大阪"
+    assert all("没有被问到的回答" not in m["content"] for m in messages)
 
 
 # -- simplified system prompt ------------------------------------------------
 
 
 def test_response_prompt_has_identity_boundaries_and_context():
-    system = _system()
+    messages = build_response_messages(_context(), _analysis())
+    system = messages[0]["content"]
+    background = messages[1]["content"]
     assert "【角色身份】" in system
     assert "【基本边界】" in system
-    assert "【当前相关的上下文】" in system
     assert "Ava" in system
-    assert "话题: 旅行" in system
-    assert "你怎么理解这句话" in system
-    assert "对方在继续聊旅行" in system
     assert "只有在确实相关时自然使用" in system
+    # Scene context is relevant, but it is untrusted reference data.
+    assert "旅行" in background
+    assert "工作的事还没讲完" in background
+    # The cognitive inference is not rendered as trusted context.
+    assert "你怎么理解这句话" not in system
+    assert "对方在继续聊旅行" not in system
+    assert "对方在继续聊旅行" not in background
 
 
 def test_response_prompt_drops_style_vectors_and_cognitive_json():
@@ -316,11 +326,15 @@ def test_response_prompt_forbids_forced_followup_questions():
 
 
 def test_response_prompt_forbids_unsupported_environment_claims():
-    system = _system()
-    assert "没有证据的环境信息保持未知，不要自行补全" in system
-    assert "地点=UNKNOWN" in system
-    assert "旁人在场=UNKNOWN" in system
-    assert "家里" not in system
+    messages = build_response_messages(_context(), _analysis())
+    system = messages[0]["content"]
+    background = messages[1]["content"]
+    assert "没有给出的记忆、环境" in system
+    # An UNKNOWN environment is omitted instead of being rendered as "UNKNOWN".
+    assert '"environment"' not in background
+    assert "地点" not in background
+    assert "旁人在场" not in background
+    assert "家里" not in background
 
 
 def test_response_prompt_keeps_truthful_memory_and_silence_rules():

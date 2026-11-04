@@ -448,7 +448,13 @@ class AnalysisRepository:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    async def save_analysis(self, analysis: CognitiveResult, analysis_id: str) -> None:
+    async def save_analysis(
+        self,
+        analysis: CognitiveResult,
+        analysis_id: str,
+        *,
+        persona: dict | None = None,
+    ) -> None:
         signal_json = (
             json.dumps(analysis.affective_signal.model_dump(), ensure_ascii=False)
             if analysis.affective_signal is not None
@@ -479,13 +485,30 @@ class AnalysisRepository:
             if analysis.pragmatic is not None
             else None
         )
+        persona_agent_id = None
+        persona_revision = None
+        persona_snapshot_json = None
+        if isinstance(persona, dict):
+            agent_id = persona.get("agent_id")
+            if agent_id:
+                persona_agent_id = str(agent_id)[:128]
+            try:
+                revision = int(persona.get("revision"))
+            except (TypeError, ValueError):
+                revision = None
+            if revision is not None:
+                persona_revision = revision
+            snapshot = persona.get("snapshot")
+            if isinstance(snapshot, dict):
+                persona_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
         await self.db.execute(
             "INSERT INTO cognitive_analyses(analysis_id, event_id, meaning, action,"
             " reason_code, provider, referenced_memory_ids, response_style, created_at,"
             " intent, addressed_to, silence_requested, reply_necessity, conversation_state,"
             " affective_signal_json, nonresponse_motive_json, scene_proposal_json,"
-            " dialogue_impulse_json, pragmatic_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " dialogue_impulse_json, pragmatic_json, persona_agent_id, persona_revision,"
+            " persona_snapshot_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 analysis_id,
                 analysis.event_id,
@@ -506,6 +529,9 @@ class AnalysisRepository:
                 scene_json,
                 impulse_json,
                 pragmatic_json,
+                persona_agent_id,
+                persona_revision,
+                persona_snapshot_json,
             ),
         )
 
@@ -591,6 +617,35 @@ class AnalysisRepository:
         )
         row = await cur.fetchone()
         return row["analysis_id"] if row is not None else None
+
+    async def get_analysis_persona(self, event_id: str) -> dict | None:
+        """The trusted character revision an analysis was produced with.
+
+        Returns ``None`` when no analysis exists. A row that predates schema 17
+        has NULL metadata; callers must treat that as "unknown", not as a
+        matching revision.
+        """
+        cur = await self.db.execute(
+            "SELECT persona_agent_id, persona_revision, persona_snapshot_json"
+            " FROM cognitive_analyses WHERE event_id = ?",
+            (event_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        snapshot = None
+        if row["persona_snapshot_json"]:
+            try:
+                parsed = json.loads(row["persona_snapshot_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                snapshot = parsed
+        return {
+            "agent_id": row["persona_agent_id"],
+            "revision": row["persona_revision"],
+            "snapshot": snapshot,
+        }
 
     async def save_candidate(self, candidate: MemoryCandidate) -> None:
         # INSERT OR IGNORE + idx_candidates_event_content (schema v7) makes a
@@ -1126,6 +1181,7 @@ class Repositories:
         candidates: list[MemoryCandidate],
         job_key: str | None,
         job_payload: dict,
+        persona: dict | None = None,
     ) -> str | None:
         """Atomically persist an analysis, its memory candidates and the job.
 
@@ -1136,7 +1192,9 @@ class Repositories:
         from companion.domain.enums import JobType
 
         async with self.db.transaction():
-            await self.analysis.save_analysis(analysis, analysis_id)
+            await self.analysis.save_analysis(
+                analysis, analysis_id, persona=persona
+            )
             for cand in candidates:
                 await self.analysis.save_candidate(cand)
             if job_key is None:

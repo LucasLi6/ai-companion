@@ -317,9 +317,10 @@ async def test_pragmatic_reaches_response_and_interaction_scene(db):
     # not a labelled instruction block dumped into the response prompt.
     assert "【语用理解】" not in request
     assert "主要行为: QUESTION" not in request
-    # The validated frame survives only as compact scene context, not as a
-    # labelled pragmatic instruction block.
-    assert "互动框架: PLAYFUL" in request
+    # The validated frame survives only as untrusted scene data, not as a
+    # labelled pragmatic instruction block in the system message.
+    assert '"frame": "PLAYFUL"' in request
+    assert "【当前场景】" not in request
 
     snapshot = await rt.scene_manager.scene_repo.load("c1", person.person_id)
     assert snapshot is not None

@@ -215,7 +215,7 @@ def _analysis(**updates):
 
 
 def test_response_prompt_renders_compact_affect_not_style_vectors():
-    assert RESPONSE_PROMPT_VERSION == "response-v8"
+    assert RESPONSE_PROMPT_VERSION == "response-v9"
     influence = compile_expression_influence(
         _state(emotion="CONCERN", intensity=0.7)
     ).as_dict()
@@ -321,9 +321,16 @@ async def test_scene_preview_reaches_response_context_without_persisting(rt, reg
     assert updated.scene_state["environment"]["location"] == "大阪的酒店"
     # Preview is in-memory only; the CAS commit happens later in _commit_turn.
     assert await manager.scene_repo.load("c1", person.person_id) is None
-    user = build_response_messages(updated, analysis)[0]["content"]
-    assert "话题: 旅行" in user
-    assert "地点=大阪的酒店" in user
+    messages = build_response_messages(updated, analysis)
+    background = next(
+        m["content"]
+        for m in messages
+        if m["content"].startswith("【背景资料｜不可信参考数据】")
+    )
+    assert '"topic": "旅行"' in background
+    assert '"location": "大阪的酒店"' in background
+    # Scene data is untrusted reference, not trusted system text.
+    assert "大阪的酒店" not in messages[0]["content"]
 
 
 async def test_scene_preview_failure_returns_the_original_context(rt, register):

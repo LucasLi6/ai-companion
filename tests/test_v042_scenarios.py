@@ -508,7 +508,11 @@ async def test_full_chain_request_capture_order_and_versions(db):
     assert response_user == text
     response_system = response_call["messages"][0]["content"]
     assert "【角色身份】" in response_system
-    assert "【当前场景】" in response_system
+    # Scene context is untrusted background data, not trusted system text.
+    background = response_call["messages"][1]
+    assert background["role"] == "user"
+    assert background["content"].startswith("【背景资料｜不可信参考数据】")
+    assert "【当前场景】" not in response_system
     assert "【语用理解】" not in response_system
     assert "【认知分析】" not in response_system
     assert "想要的回应风格" not in response_system

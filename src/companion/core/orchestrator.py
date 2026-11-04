@@ -73,6 +73,15 @@ from .policy import Policy, PolicyDecision
 from .safety import assess_safety, detect_language, safety_response
 
 
+class PersonaRevisionConflict(Exception):
+    """A retried analysis cannot be paired with the persona it was made under.
+
+    Raised instead of silently generating a reply with a newer character
+    revision than the persisted analysis. The caller reports an explicit
+    conflict; the user can submit the utterance under a new event id.
+    """
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -315,6 +324,7 @@ class Orchestrator:
                         candidates=candidates,
                         job_key=job_key,
                         job_payload={"event_id": event.event_id},
+                        persona=self._persona_record(cognitive_context),
                     )
             else:
                 self.logger.info(
@@ -327,6 +337,33 @@ class Orchestrator:
                     job = await self.repos.job.get_by_key(f"memory:{event.event_id}")
                     if job is not None:
                         job_id = job.job_id
+
+            # 5b. A retried analysis must be answered by the same trusted
+            # character revision that produced it. If the persona changed
+            # between the failed response and this retry, restore the recorded
+            # snapshot; if that is impossible, fail explicitly rather than
+            # silently mixing two versions.
+            try:
+                cognitive_context = await self._restore_analysis_persona(
+                    event, cognitive_context
+                )
+            except PersonaRevisionConflict as exc:
+                if persist:
+                    await self.repos.utterance.update_status(
+                        event.event_id, ProcessingStatus.FAILED
+                    )
+                self.logger.warning(
+                    "persona_revision_conflict event_id=%s error=%s",
+                    event.event_id,
+                    exc,
+                )
+                steps.append(f"[CONFLICT] {exc}")
+                return ProcessingReport(
+                    event_id=event.event_id,
+                    status=ReportStatus.CONFLICT.value,
+                    error=str(exc),
+                    steps=steps,
+                )
 
             # 6. Local policy decides the final action from the (reused or
             # fresh) analysis before any further side effects. Hard local rules
@@ -796,6 +833,95 @@ class Orchestrator:
             return None
         manifest = await self.agent_service.repo.get_manifest()
         return manifest.get("agent_id") if manifest else None
+
+    @staticmethod
+    def _persona_record(context) -> Optional[dict]:
+        """The trusted persona revision to persist next to an analysis."""
+        if not isinstance(context, CognitiveContext):
+            return None
+        snapshot = context.character_snapshot
+        if not isinstance(snapshot, dict):
+            return None
+        agent_id = snapshot.get("agent_id")
+        try:
+            revision = int(snapshot.get("revision"))
+        except (TypeError, ValueError):
+            revision = None
+        if not agent_id or revision is None:
+            return None
+        return {
+            "agent_id": str(agent_id),
+            "revision": revision,
+            "snapshot": snapshot,
+        }
+
+    async def _restore_analysis_persona(self, event, cognitive_context):
+        """Keep a retried analysis and its reply on one persona revision.
+
+        - same agent/revision: nothing to do;
+        - different revision with a stored snapshot: restore exactly that
+          snapshot for this turn's response;
+        - different/unknown revision without a usable snapshot: raise an
+          explicit conflict. A legacy row (schema 16) has NULL metadata and is
+          therefore "unknown", never assumed to match.
+        """
+        if not isinstance(cognitive_context, CognitiveContext):
+            return cognitive_context
+        current = cognitive_context.character_snapshot
+        if not isinstance(current, dict):
+            # Mock/lightweight mode has no persona content in the providers, so
+            # there is no character version that could be mixed.
+            return cognitive_context
+
+        stored = await self.repos.analysis.get_analysis_persona(event.event_id)
+        if stored is None:
+            return cognitive_context
+
+        stored_agent = stored.get("agent_id")
+        try:
+            stored_revision = int(stored.get("revision"))
+        except (TypeError, ValueError):
+            stored_revision = None
+
+        if not stored_agent or stored_revision is None:
+            raise PersonaRevisionConflict(
+                "the persisted analysis has no persona revision"
+                " (legacy row); submit the utterance with a new event_id"
+            )
+
+        current_agent = str(current.get("agent_id") or "")
+        try:
+            current_revision = int(current.get("revision"))
+        except (TypeError, ValueError):
+            current_revision = None
+
+        if (
+            str(stored_agent) == current_agent
+            and current_revision is not None
+            and stored_revision == current_revision
+        ):
+            return cognitive_context
+
+        snapshot = stored.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise PersonaRevisionConflict(
+                "persona changed after this analysis was saved"
+                f" (analysis {stored_agent}@{stored_revision},"
+                f" current {current_agent}@{current_revision}) and the original"
+                " snapshot is unavailable; submit the utterance with a new"
+                " event_id"
+            )
+
+        self.logger.info(
+            "persona_snapshot_restored event_id=%s analysis_revision=%s"
+            " current_revision=%s",
+            event.event_id,
+            stored_revision,
+            current_revision,
+        )
+        return cognitive_context.model_copy(
+            update={"character_snapshot": snapshot}
+        )
 
     async def _scene_enabled(self) -> bool:
         if self.scene_manager is None:

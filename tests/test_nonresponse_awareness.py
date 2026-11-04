@@ -286,17 +286,26 @@ def test_prompts_render_action_history_as_action_not_speech():
     assert "assistant:" not in cognitive_prompt
     assert "我选择了沉默" not in cognitive_prompt
 
-    response_prompt = build_response_messages(
-        ctx, _analysis(event, action=CognitiveAction.RESPOND, necessity=ReplyNecessity.REQUIRED)
-    )[0]["content"]
-    assert "【你之前实际执行的行为】" in response_prompt
-    assert "AMBIGUOUS_ADDRESSEE" in response_prompt
-    assert "不是你说过的话" in response_prompt
-    # The silent turn never becomes an assistant utterance.
     response_messages = build_response_messages(
         ctx, _analysis(event, action=CognitiveAction.RESPOND, necessity=ReplyNecessity.REQUIRED)
     )
-    assert [m["role"] for m in response_messages] == ["system", "user", "user"]
+    response_background = next(
+        m["content"]
+        for m in response_messages
+        if m["content"].startswith("【背景资料｜不可信参考数据】")
+    )
+    assert "LOCAL_ACTION_HISTORY" in response_background
+    assert "AMBIGUOUS_ADDRESSEE" in response_background
+    assert "不是你说过的话" in response_messages[0]["content"]
+    assert "LOCAL_ACTION_HISTORY" not in response_messages[0]["content"]
+    # The silent turn never becomes an assistant utterance; the background
+    # message is data, then the human history and current turn.
+    assert [m["role"] for m in response_messages] == [
+        "system",
+        "user",
+        "user",
+        "user",
+    ]
 
 
 # -- end-to-end DeepSeek (fake client) --------------------------------------
@@ -395,11 +404,22 @@ async def test_two_turn_awareness_end_to_end_and_restart(db):
 
     response_messages = client.calls[2]["messages"]
     response_prompt = response_messages[0]["content"]
-    assert "【你之前实际执行的行为】" in response_prompt
-    assert "AMBIGUOUS_ADDRESSEE" in response_prompt
-    # The WAIT is never sent as an assistant message; only the human turn and
-    # the current turn are present.
-    assert [m["role"] for m in response_messages] == ["system", "user", "user"]
+    response_background = next(
+        m["content"]
+        for m in response_messages
+        if m["content"].startswith("【背景资料｜不可信参考数据】")
+    )
+    assert "LOCAL_ACTION_HISTORY" in response_background
+    assert "AMBIGUOUS_ADDRESSEE" in response_background
+    assert "LOCAL_ACTION_HISTORY" not in response_prompt
+    # The WAIT is never sent as an assistant message; the background data
+    # message is followed by the human turn and the current turn.
+    assert [m["role"] for m in response_messages] == [
+        "system",
+        "user",
+        "user",
+        "user",
+    ]
 
     first_action = await rt.repos.analysis.get_action(first.event_id)
     second_action = await rt.repos.analysis.get_action(second.event_id)

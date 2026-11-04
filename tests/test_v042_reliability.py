@@ -36,11 +36,17 @@ from companion.storage.schema import SCHEMA_VERSION
 
 
 async def test_schema_16_carries_pragmatic_and_stance_storage(db):
-    assert SCHEMA_VERSION == 16
+    assert SCHEMA_VERSION == 17
 
     cur = await db.execute("PRAGMA table_info(cognitive_analyses)")
     columns = {row["name"] for row in await cur.fetchall()}
-    assert {"pragmatic_json", "dialogue_impulse_json"} <= columns
+    assert {
+        "pragmatic_json",
+        "dialogue_impulse_json",
+        "persona_agent_id",
+        "persona_revision",
+        "persona_snapshot_json",
+    } <= columns
 
     cur = await db.execute("PRAGMA table_info(agent_persona_core)")
     persona_columns = {row["name"] for row in await cur.fetchall()}

@@ -205,23 +205,31 @@ def transition_affect(
     frame = str(affect.interaction_frame or "UNKNOWN").upper()
 
     frame_confidence = float(getattr(affect, "confidence", 0.0))
-    frame_spec = (
-        _FRAME_STIMULI.get(frame)
-        if affect.frame_changed
-        and cfg.frame_transition_enabled
-        and frame_confidence >= cfg.frame_transition_min_confidence
-        else None
-    )
-    same_frame_spec = (
-        _same_frame_stimulus(affect, cfg)
-        if frame_spec is None and rule is None
-        else None
-    )
-
-    prepared = current
+    # V0.4.3.1: the master switch gates *every* conversation-driven mechanism,
+    # including frame changes, same-frame developments and the suppression of
+    # old activations. They must not be computed (and therefore must not apply)
+    # while conversation transitions are disabled. An independently validated
+    # appraisal rule remains allowed; it is a different mechanism.
     conversation_enabled = bool(
         getattr(cfg, "conversation_transition_enabled", True)
     )
+    frame_spec = None
+    same_frame_spec = None
+    if conversation_enabled:
+        frame_spec = (
+            _FRAME_STIMULI.get(frame)
+            if affect.frame_changed
+            and cfg.frame_transition_enabled
+            and frame_confidence >= cfg.frame_transition_min_confidence
+            else None
+        )
+        same_frame_spec = (
+            _same_frame_stimulus(affect, cfg)
+            if frame_spec is None and rule is None
+            else None
+        )
+
+    prepared = current
     active_spec = frame_spec or same_frame_spec
     if (
         conversation_enabled
@@ -279,7 +287,9 @@ def transition_affect(
             scene_relevance=relevance,
         )
         # A repair frame lowers tension even when an apology rule also fired.
-        if affect.frame_changed and frame == "REPAIR":
+        # The frame itself is a conversation-driven signal, so it stays inside
+        # the master switch too.
+        if conversation_enabled and affect.frame_changed and frame == "REPAIR":
             state = _adjust_tension(state, -cfg.tension_decrease * 0.5, moment)
         return AffectTransition(state=state, cause=cause, changed=True)
 

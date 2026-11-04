@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1305,6 +1305,23 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE emotion_events ADD COLUMN frame_from TEXT;
         ALTER TABLE emotion_events ADD COLUMN frame_to TEXT;
         ALTER TABLE emotion_events ADD COLUMN scene_relevance REAL;
+        """,
+    ),
+    # Version 17 (V0.4.3.1): pin the trusted character revision an analysis was
+    # produced with.
+    #
+    # A response can be retried after a provider failure. Without this record a
+    # retry could reuse an analysis from persona revision N while generating the
+    # reply with revision N+1, silently mixing two character versions. The
+    # snapshot itself is stored so a retry can reproduce exactly the character
+    # view the analysis saw. Legacy rows keep NULL, which means "unknown"; such
+    # a retry is refused explicitly rather than mixed silently.
+    (
+        17,
+        """
+        ALTER TABLE cognitive_analyses ADD COLUMN persona_agent_id TEXT;
+        ALTER TABLE cognitive_analyses ADD COLUMN persona_revision INTEGER;
+        ALTER TABLE cognitive_analyses ADD COLUMN persona_snapshot_json TEXT;
         """,
     ),
 ]

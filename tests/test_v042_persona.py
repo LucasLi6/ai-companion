@@ -114,8 +114,10 @@ async def test_persona_core_leads_the_response_request(db):
     assert "偏爱安静的现场演出" in request
     assert "她说话不急，喜欢先听完再给判断。" in request
     assert "【基本边界】" in request
-    # Identity comes before the current context; boundaries stay authoritative.
-    assert request.index("【角色身份】") < request.index("【当前相关的上下文】")
+    # Identity precedes any untrusted background data; boundaries stay
+    # authoritative in the system message.
+    if "【背景资料" in request:
+        assert request.index("【角色身份】") < request.index("【背景资料")
 
 
 async def test_full_description_import_is_admin_revisioned(db):

@@ -229,9 +229,13 @@ def compile_affect_context(
 ) -> str:
     """A compact, human-readable state description for the response prompt.
 
-    Deliberately not a list of numeric adjustments: the character system should
-    sound like a person in a mood, not execute a style vector. Nothing here
-    changes whether to reply, what is true, or any permission.
+    V0.4.3.1 returns an empty string when nothing about the current affect is
+    worth mentioning. It never emits a forced "emotion is calm" line just to
+    fill the prompt, and it never repeats a disclaimer about simulated emotion
+    (that generic rule lives in the trusted system prompt). Only a significant
+    current emotion, a meaningful mood, a lingering relationship tension or a
+    known interaction frame produces text. Nothing here changes whether to
+    reply, what is true, or any permission.
     """
     cfg = config or DEFAULT_CONFIG
     minimum = cfg.text_expression_min_intensity
@@ -245,8 +249,6 @@ def compile_affect_context(
     elif mood_active:
         label = _EMOTION_LABEL.get(state.mood_emotion, state.mood_emotion)
         parts.append(f"此刻情绪平平，底色偏向{label}")
-    else:
-        parts.append("此刻情绪比较平稳")
 
     if mood_active and acute_active:
         label = _EMOTION_LABEL.get(state.mood_emotion, state.mood_emotion)
@@ -266,11 +268,7 @@ def compile_affect_context(
         prefix = "本轮气氛刚刚转为" if frame_changed else "本轮对话气氛是"
         parts.append(f"{prefix}{_FRAME_LABEL[frame]}")
 
-    if len(parts) == 1 and parts[0] == "此刻情绪比较平稳" and frame not in _FRAME_LABEL:
+    if not parts:
         return ""
 
-    return (
-        "；".join(parts)
-        + "。这是角色当下的内在状态，只用来把握语气和分寸；"
-        "自然带出来即可，不必逐条说明，也不要把它描述成真实的身体感受。"
-    )
+    return "；".join(parts) + "。"

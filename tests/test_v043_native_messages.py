@@ -85,7 +85,7 @@ def test_native_roles_and_current_user_message():
     assert messages[3]["content"] == "最近有点累"
     assert messages[4]["content"] == "那就慢一点。"
     assert messages[-1]["content"] == "现在呢"
-    assert RESPONSE_PROMPT_VERSION == "response-v8"
+    assert RESPONSE_PROMPT_VERSION == "response-v9"
 
 
 def test_no_flattened_dialogue_or_cognitive_json_in_the_request():
@@ -120,9 +120,13 @@ def test_wait_and_ignore_never_become_assistant_messages():
     assert all("我选择沉默" not in m["content"] for m in messages)
     # The human utterance is history; the non-response is only an action.
     assert any(m["content"] == "你睡了吗？" for m in messages if m["role"] == "user")
-    system = messages[0]["content"]
-    assert "你没有回复。" in system
-    assert "当时最终决定：WAIT" in system
+    # Action history is untrusted background data, never trusted system text.
+    background = messages[1]["content"]
+    assert background.startswith("【背景资料｜不可信参考数据】")
+    assert "LOCAL_ACTION_HISTORY" in background
+    assert '"final_action": "WAIT"' in background
+    assert '"user_utterance": "你睡了吗？"' in background
+    assert "LOCAL_ACTION_HISTORY" not in messages[0]["content"]
 
 
 def test_single_person_history_is_raw_and_group_history_has_labels():
@@ -142,10 +146,20 @@ def test_single_person_history_is_raw_and_group_history_has_labels():
         ],
     )
     messages = build_response_messages(group, _analysis())
-    # Consecutive user turns are merged for chat-API alternation.
-    assert messages[1]["content"] == "[Ada] 我先说\n\n[Ben] 我也在"
-    assert messages[2]["role"] == "assistant"
-    assert messages[3]["content"] == "[Ada] 嗯"
+    # Consecutive user messages are preserved: each event keeps its own
+    # boundary and speaker label instead of being flattened into one turn.
+    assert [m["role"] for m in messages] == [
+        "system",
+        "user",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    assert messages[1]["content"] == "[Ada] 我先说"
+    assert messages[2]["content"] == "[Ben] 我也在"
+    assert messages[3]["role"] == "assistant"
+    assert messages[4]["content"] == "[Ada] 嗯"
     assert messages[-1]["content"] == "[Cara] 现在呢\n（对你说）"
 
 

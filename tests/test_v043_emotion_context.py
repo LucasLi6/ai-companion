@@ -57,10 +57,12 @@ def test_compact_affect_is_a_state_description_without_numbers():
     assert "心情底色偏向低落" in text
     assert "还残留一点紧张" in text
     assert "本轮对话气氛是" in text
-    assert "这是角色当下的内在状态" in text
+    # The description is state-only; the generic "don't perform" rule lives
+    # in the trusted system prompt and is not repeated every turn.
+    assert "这是角色当下的内在状态" not in text
+    assert "真实的身体感受" not in text
     assert "0." not in text
     assert "directness" not in text
-    assert "真实的身体感受" in text
 
 
 def test_affect_context_empty_when_neutral_and_no_frame():
