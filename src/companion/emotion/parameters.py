@@ -17,7 +17,7 @@ constructing a different :class:`EmotionDynamicsConfig` explicitly.
 from __future__ import annotations
 
 import os
-from typing import Mapping, Optional
+from typing import Literal, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -68,6 +68,24 @@ class EmotionDynamicsConfig(BaseModel):
     # cannot silently become a personality rewrite.
     expression_adjustment_bound: float = Field(default=0.30, gt=0, le=1.0)
 
+    # -- V0.4.2 conversation-driven affect -------------------------------
+    # Time decay is auxiliary: OFF ignores elapsed time entirely; AUXILIARY
+    # keeps the existing decay math *and* enables scene-relevance suppression
+    # and ranking override; LEGACY is the V0.4.1 behaviour (decay only).
+    time_decay_mode: Literal["OFF", "AUXILIARY", "LEGACY"] = "AUXILIARY"
+    # Old, scene-irrelevant activations are scaled by
+    # 1 - (1 - relevance) * suppression before a new event is composed.
+    scene_relevance_suppression: float = Field(default=0.65, ge=0.0, le=1.0)
+    # An additional suppression when the interaction frame itself changed.
+    frame_change_suppression: float = Field(default=0.25, ge=0.0, le=1.0)
+    # A new event at least this strong may take over the expressed emotion.
+    ranking_override_min_impact: float = Field(default=0.35, ge=0.0, le=1.0)
+    ranking_override_strength: float = Field(default=0.55, ge=0.0, le=1.0)
+    # Frame-change-only transitions (no discrete appraisal event).
+    frame_transition_enabled: bool = True
+    frame_transition_scale: float = Field(default=1.0, ge=0.0, le=2.0)
+    frame_transition_min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+
     emotion_half_lives: dict[str, float] = Field(
         default_factory=lambda: dict(DEFAULT_EMOTION_HALF_LIVES)
     )
@@ -90,6 +108,20 @@ class EmotionDynamicsConfig(BaseModel):
                 str(emotion).upper(), self.acute_half_life_seconds
             )
         )
+
+
+def _env_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = env.get(key)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_mode(
+    env: Mapping[str, str], key: str, default: str
+) -> Literal["OFF", "AUXILIARY", "LEGACY"]:
+    raw = str(env.get(key) or "").strip().upper()
+    return raw if raw in ("OFF", "AUXILIARY", "LEGACY") else default
 
 
 def _env_float(env: Mapping[str, str], key: str, default: float) -> float:
@@ -145,6 +177,30 @@ def load_emotion_config(
         ),
         expression_adjustment_bound=_env_float(
             values, "EMOTION_EXPRESSION_ADJUSTMENT_BOUND", 0.30
+        ),
+        time_decay_mode=_env_mode(
+            values, "EMOTION_TIME_DECAY_MODE", "AUXILIARY"
+        ),
+        scene_relevance_suppression=_env_float(
+            values, "EMOTION_SCENE_RELEVANCE_SUPPRESSION", 0.65
+        ),
+        frame_change_suppression=_env_float(
+            values, "EMOTION_FRAME_CHANGE_SUPPRESSION", 0.25
+        ),
+        ranking_override_min_impact=_env_float(
+            values, "EMOTION_RANKING_OVERRIDE_MIN_IMPACT", 0.35
+        ),
+        ranking_override_strength=_env_float(
+            values, "EMOTION_RANKING_OVERRIDE_STRENGTH", 0.55
+        ),
+        frame_transition_enabled=_env_bool(
+            values, "EMOTION_FRAME_TRANSITION_ENABLED", True
+        ),
+        frame_transition_scale=_env_float(
+            values, "EMOTION_FRAME_TRANSITION_SCALE", 1.0
+        ),
+        frame_transition_min_confidence=_env_float(
+            values, "EMOTION_FRAME_TRANSITION_MIN_CONFIDENCE", 0.55
         ),
     )
 

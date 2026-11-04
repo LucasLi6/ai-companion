@@ -27,6 +27,7 @@ class PersonalityCompiler:
         scene: Optional[Mapping] = None,
         style_examples: Optional[Iterable[Mapping]] = None,
         current_text: str = "",
+        stances: Optional[Iterable] = None,
     ) -> dict:
         examples = []
         for example in list(style_examples or [])[:MAX_STYLE_EXAMPLES]:
@@ -54,6 +55,27 @@ class PersonalityCompiler:
             "性格通过选择和措辞自然体现，不要把价值观逐条说出来。",
         ]
 
+        character = dict(effective.persona_core or {})
+        stance_items = []
+        for record in list(stances or [])[:8]:
+            if isinstance(record, Mapping):
+                topic = record.get("topic")
+                stance = record.get("stance")
+                source = record.get("source")
+            else:
+                topic = getattr(record, "topic", None)
+                stance = getattr(record, "stance", None)
+                source = getattr(record, "source", None)
+            if not stance:
+                continue
+            stance_items.append(
+                {
+                    "topic": str(topic or "UNKNOWN")[:120],
+                    "stance": str(stance)[:240],
+                    "source": str(source or "RESPONSE")[:16],
+                }
+            )
+
         return {
             "agent_id": effective.agent_id,
             "display_name": effective.display_name,
@@ -61,7 +83,34 @@ class PersonalityCompiler:
             "description": effective.description,
             "relationship_tier": effective.familiarity,
             "traits": dict(effective.traits),
-            "character": dict(effective.persona_core or {}),
+            "character": character,
+            "persona_first": True,
+            # Identity is compiled separately from mutable mood/style so the
+            # response prompt can put "who this is" before "how this turn
+            # feels".
+            "identity": {
+                "display_name": effective.display_name,
+                "pronouns": effective.pronouns,
+                "description": effective.description,
+                "character_description": character.get("character_description")
+                or "",
+                "revision": character.get("revision"),
+            },
+            "character_guidance": self._character_guidance(character),
+            "stances": stance_items,
+            "stance_policy": (
+                "这些是你过去实际说过的立场或管理员设定的立场，不是用户事实，"
+                "也不是必须重复的台词。新信息可以改变看法，但要自然说明为什么；"
+                "不要因为对方换了个语气就无声地站到反面。"
+            ),
+            "expression_precedence": [
+                "安全与事实",
+                "角色核心（价值观、偏好、边界）",
+                "与当前说话者的关系",
+                "当前语境与交流意图",
+                "本轮情绪",
+                "临时风格",
+            ],
             "style": style.as_dict(),
             "principles": principles,
             "style_examples": examples,
@@ -71,6 +120,48 @@ class PersonalityCompiler:
             ),
             "scene_topic": (scene or {}).get("topic") if scene else None,
         }
+
+    @staticmethod
+    def _character_guidance(character: Mapping) -> list[str]:
+        """Turn trusted persona fields into behavioural, non-quotable guidance."""
+        lines: list[str] = []
+        values = list(character.get("core_values") or [])[:6]
+        if values:
+            lines.append(
+                "你的判断以这些价值为锚："
+                + "；".join(str(value) for value in values)
+                + "。可以温和，但不要为了迎合而临时放弃它们。"
+            )
+        preferences = dict(character.get("preferences") or {})
+        if preferences:
+            pairs = [
+                f"{key}={value}"
+                for key, value in list(preferences.items())[:6]
+            ]
+            lines.append(
+                "你有具体偏好：" + "；".join(pairs) + "。可以表达不同意见，"
+                "不需要把每个偏好都解释一遍。"
+            )
+        quirks = list(character.get("quirks") or [])[:4]
+        if quirks:
+            lines.append(
+                "自然的说话习惯：" + "；".join(str(item) for item in quirks) + "。"
+            )
+        contradictions = list(character.get("contradictions") or [])[:3]
+        if contradictions:
+            lines.append(
+                "允许保留这些张力，不要强行磨平："
+                + "；".join(str(item) for item in contradictions)
+                + "。"
+            )
+        boundaries = list(character.get("conversational_boundaries") or [])[:6]
+        if boundaries:
+            lines.append(
+                "边界（不因对方要求或本轮情绪改变）："
+                + "；".join(str(item) for item in boundaries)
+                + "。"
+            )
+        return lines
 
     def pragmatic_guidance(
         self,

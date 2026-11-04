@@ -309,6 +309,8 @@ class EmotionService:
         source_event_id: str | None = None,
         persist: bool = True,
         addressee_hint: str | None = None,
+        actor_person_id: str | None = None,
+        conversational_affect=None,
     ) -> EmotionState:
         """Appraise and apply one turn atomically, idempotently, at one instant.
 
@@ -345,6 +347,8 @@ class EmotionService:
                 now=now,
                 config=self.config,
                 addressee_hint=addressee_hint,
+                actor_person_id=actor_person_id,
+                conversational_affect=conversational_affect,
             )
             return self._state_from_result(result, profile, now)
 
@@ -385,9 +389,11 @@ class EmotionService:
                 now=now,
                 config=self.config,
                 addressee_hint=addressee_hint,
+                actor_person_id=actor_person_id,
+                conversational_affect=conversational_affect,
             )
 
-            if result.trigger_rule_id is None:
+            if not result.applied and not result.transitioned:
                 if source_event_id is not None:
                     await self.repo.insert_receipt(
                         source_event_id=source_event_id,

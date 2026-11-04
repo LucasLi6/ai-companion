@@ -30,6 +30,7 @@ from companion.cognition.scene_models import (
     MAX_EVIDENCE_ITEMS,
     MAX_OPEN_LOOPS,
     MAX_SOURCE_EVENTS,
+    INTERACTION_FRAMES,
     MAX_TOPIC_STACK,
     OPEN_LOOP_TTL_TURNS,
     UNKNOWN,
@@ -45,6 +46,15 @@ from companion.domain.models import (
     utcnow,
     validate_scene_proposal,
 )
+
+PRAGMATIC_MIN_CONFIDENCE = 0.55
+_FRAME_FROM_PHASE = {
+    "OPENING": "OPENING",
+    "EXPLORING": "ONGOING",
+    "DEEPENING": "ONGOING",
+    "WRAPPING_UP": "WRAPPING_UP",
+    "CLOSED": "CLOSED",
+}
 
 
 class SceneManager:
@@ -129,6 +139,7 @@ class SceneManager:
         context=None,
         action_history: Optional[Iterable] = None,
         pending_followup: bool = False,
+        pragmatic=None,
     ) -> SceneState:
         """Build the candidate next scene without persisting it.
 
@@ -172,6 +183,7 @@ class SceneManager:
 
         if clean is None:
             state.environment = env
+            self._apply_pragmatic(state, pragmatic)
             self._age_open_loops(state)
             return state
 
@@ -209,6 +221,7 @@ class SceneManager:
         if clean.open_loop is not None and pending_followup:
             self._add_loop(state, clean, event)
 
+        self._apply_pragmatic(state, pragmatic)
         self._age_open_loops(state)
         return state
 
@@ -247,6 +260,66 @@ class SceneManager:
         return state
 
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _apply_pragmatic(state: SceneState, pragmatic) -> None:
+        """Merge a validated pragmatic hint into the interaction frame.
+
+        A low-confidence or missing hint changes nothing. The frame is a
+        short-horizon summary, so only frame/phase/act/setup/expectation move;
+        topic, environment and open loops remain owned by the scene proposal.
+        """
+        if pragmatic is None:
+            return
+        try:
+            confidence = float(getattr(pragmatic, "confidence", 0.0))
+        except (TypeError, ValueError):
+            return
+        if confidence < PRAGMATIC_MIN_CONFIDENCE:
+            return
+
+        previous = state.interaction
+        frame = str(getattr(pragmatic, "interaction_frame", "UNKNOWN")).upper()
+        if frame not in INTERACTION_FRAMES or frame == "UNKNOWN":
+            frame = previous.frame
+        phase = _FRAME_FROM_PHASE.get(
+            str(state.discourse_phase or "UNCERTAIN").upper(), previous.phase
+        )
+        act = str(getattr(pragmatic, "primary_act", "OTHER") or "OTHER").upper()
+        role = str(getattr(pragmatic, "setup_payoff_role", "NONE") or "NONE").upper()
+        expectation = str(
+            getattr(pragmatic, "implied_interpretation", "") or ""
+        ).strip()[:200]
+
+        open_setup = previous.open_setup
+        if role == "SETUP":
+            literal = str(getattr(pragmatic, "literal_interpretation", "") or "")
+            implied = str(getattr(pragmatic, "implied_interpretation", "") or "")
+            setup_text = (implied or literal).strip()[:200]
+            if setup_text:
+                open_setup = setup_text
+        elif role == "PAYOFF":
+            open_setup = None
+
+        changed = (
+            frame != previous.frame
+            or phase != previous.phase
+            or act != previous.last_social_act
+            or expectation != previous.expectation
+            or open_setup != previous.open_setup
+        )
+        if not changed:
+            return
+        state.interaction = previous.model_copy(
+            update={
+                "frame": frame,
+                "phase": phase,
+                "open_setup": open_setup,
+                "last_social_act": act,
+                "expectation": expectation,
+                "revision": previous.revision + 1,
+            }
+        )
 
     @staticmethod
     def _append_source(ids: list[str], event_id: str) -> list[str]:

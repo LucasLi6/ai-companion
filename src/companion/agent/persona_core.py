@@ -80,6 +80,10 @@ class PersonaCore(BaseModel):
         default_factory=lambda: list(DEFAULT_BOUNDARIES)
     )
     voice_identity: dict[str, str] = Field(default_factory=dict)
+    # Admin-authored long-form description. This is the import target for a
+    # future reviewed full-character importer; it is trusted config, not model
+    # output and not a claim of real-world history.
+    character_description: str = Field(default="", max_length=4000)
     revision: int = 1
     updated_at: datetime | None = None
     updated_by: str = "admin"
@@ -93,6 +97,14 @@ class PersonaCore(BaseModel):
     @classmethod
     def _validate_boundaries(cls, value: list[str]) -> list[str]:
         return _clean_items(value, "conversational_boundaries")
+
+    @field_validator("character_description")
+    @classmethod
+    def _validate_description(cls, value: str) -> str:
+        text = str(value or "").replace("\x00", " ").strip()
+        if len(text) > 4000:
+            raise ValueError("character_description must be at most 4000 chars")
+        return text
 
     @field_validator("temperament", "preferences", "voice_identity")
     @classmethod
@@ -120,8 +132,49 @@ class PersonaCore(BaseModel):
             "contradictions": list(self.contradictions),
             "conversational_boundaries": list(self.conversational_boundaries),
             "voice_identity": dict(self.voice_identity),
+            "character_description": self.character_description,
             "revision": self.revision,
         }
+
+
+_PROMPT_CORE_FIELDS = (
+    "core_values",
+    "temperament",
+    "preferences",
+    "quirks",
+    "contradictions",
+    "conversational_boundaries",
+    "voice_identity",
+    "character_description",
+)
+
+
+def sanitise_prompt_core(raw, agent_id: str) -> dict:
+    """Return a prompt-safe persona core from a possibly stale mapping.
+
+    Used only when the trusted :class:`PersonaCoreService` is unavailable. The
+    whitelist and Pydantic validators mean a forged or model-authored mapping
+    cannot smuggle extra fields, oversized values or an unknown shape into the
+    response prompt.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    payload = {
+        field: raw[field] for field in _PROMPT_CORE_FIELDS if field in raw
+    }
+    try:
+        revision = int(raw.get("revision") or 1)
+    except (TypeError, ValueError):
+        revision = 1
+    try:
+        core = PersonaCore(
+            agent_id=agent_id or "unknown",
+            revision=max(1, revision),
+            **payload,
+        )
+    except (ValueError, TypeError):
+        return {}
+    return core.as_prompt_dict()
 
 
 def default_persona_core(agent_id: str, now: datetime | None = None) -> PersonaCore:
@@ -169,7 +222,8 @@ class PersonaCoreRepository:
         cur = await self.db.execute(
             "SELECT agent_id, core_values_json, temperament_json,"
             " preferences_json, quirks_json, contradictions_json,"
-            " conversational_boundaries_json, voice_identity_json, revision,"
+            " conversational_boundaries_json, voice_identity_json,"
+            " character_description, revision,"
             " updated_at, updated_by FROM agent_persona_core WHERE agent_id = ?",
             (agent_id,),
         )
@@ -187,6 +241,7 @@ class PersonaCoreRepository:
                 row["conversational_boundaries_json"]
             ),
             voice_identity=_json_dict(row["voice_identity_json"]),
+            character_description=row["character_description"] or "",
             revision=int(row["revision"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             updated_by=row["updated_by"],
@@ -207,8 +262,9 @@ class PersonaCoreRepository:
             "INSERT OR IGNORE INTO agent_persona_core(agent_id, core_values_json,"
             " temperament_json, preferences_json, quirks_json,"
             " contradictions_json, conversational_boundaries_json,"
-            " voice_identity_json, revision, updated_at, updated_by)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " voice_identity_json, character_description, revision, updated_at,"
+            " updated_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 core.agent_id,
                 json.dumps(core.core_values, ensure_ascii=False),
@@ -218,6 +274,7 @@ class PersonaCoreRepository:
                 json.dumps(core.contradictions, ensure_ascii=False),
                 json.dumps(core.conversational_boundaries, ensure_ascii=False),
                 json.dumps(core.voice_identity, ensure_ascii=False, sort_keys=True),
+                core.character_description,
                 core.revision,
                 now.isoformat(),
                 core.updated_by,
@@ -238,7 +295,8 @@ class PersonaCoreRepository:
             "UPDATE agent_persona_core SET core_values_json = ?,"
             " temperament_json = ?, preferences_json = ?, quirks_json = ?,"
             " contradictions_json = ?, conversational_boundaries_json = ?,"
-            " voice_identity_json = ?, revision = revision + 1, updated_at = ?,"
+            " voice_identity_json = ?, character_description = ?,"
+            " revision = revision + 1, updated_at = ?,"
             " updated_by = ? WHERE agent_id = ? AND revision = ?",
             (
                 json.dumps(core.core_values, ensure_ascii=False),
@@ -248,6 +306,7 @@ class PersonaCoreRepository:
                 json.dumps(core.contradictions, ensure_ascii=False),
                 json.dumps(core.conversational_boundaries, ensure_ascii=False),
                 json.dumps(core.voice_identity, ensure_ascii=False, sort_keys=True),
+                core.character_description,
                 moment.isoformat(),
                 changed_by,
                 core.agent_id,
@@ -285,6 +344,7 @@ class PersonaCoreService:
         contradictions: Optional[list[str]] = None,
         conversational_boundaries: Optional[list[str]] = None,
         voice_identity: Optional[dict[str, str]] = None,
+        character_description: Optional[str] = None,
         changed_by: str = "admin",
     ) -> PersonaCore:
         current = await self.repo.get_or_default(agent_id)
@@ -309,6 +369,9 @@ class PersonaCoreService:
             voice_identity=current.voice_identity
             if voice_identity is None
             else voice_identity,
+            character_description=current.character_description
+            if character_description is None
+            else character_description,
             revision=current.revision,
             updated_at=current.updated_at,
             updated_by=changed_by,

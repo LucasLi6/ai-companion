@@ -35,6 +35,18 @@ ENVIRONMENT_TTL_TURNS = 6
 
 UNKNOWN = "UNKNOWN"
 
+INTERACTION_FRAMES = {
+    "CASUAL",
+    "PLAYFUL",
+    "SERIOUS",
+    "CONFLICT",
+    "REPAIR",
+    "SUPPORT",
+    "TASK",
+    "UNKNOWN",
+}
+INTERACTION_PHASES = {"OPENING", "ONGOING", "WRAPPING_UP", "CLOSED", "UNKNOWN"}
+
 
 class SceneEvidence(BaseModel):
     """A trusted pointer to the utterance that supports a scene field."""
@@ -74,6 +86,34 @@ def default_environment() -> dict:
     }
 
 
+class InteractionFrameState(BaseModel):
+    """The current *interaction* frame, as distinct from the topic scene.
+
+    A topic ("travel") can stay the same while the frame changes ("playful"
+    teasing becomes a real conflict). The frame is derived from trusted,
+    locally validated pragmatic hints; it is bounded and persisted inside the
+    scene snapshot. It informs emotion transitions and response wording, never
+    permissions or actions.
+    """
+
+    frame: str = Field(default="UNKNOWN", max_length=32)
+    phase: str = Field(default="UNKNOWN", max_length=32)
+    open_setup: Optional[str] = Field(default=None, max_length=200)
+    last_social_act: str = Field(default="UNKNOWN", max_length=32)
+    expectation: str = Field(default="", max_length=200)
+    revision: int = Field(default=0, ge=0)
+
+    def prompt_dict(self) -> dict:
+        return {
+            "frame": self.frame,
+            "phase": self.phase,
+            "open_setup": self.open_setup,
+            "last_social_act": self.last_social_act,
+            "expectation": self.expectation,
+            "revision": self.revision,
+        }
+
+
 class SceneState(DomainModel):
     """The committed scene for one ``(conversation_id, person_id)`` scope."""
 
@@ -86,6 +126,7 @@ class SceneState(DomainModel):
     mode: str = Field(default="UNKNOWN", max_length=32)
     discourse_phase: str = Field(default="UNCERTAIN", max_length=32)
     tone: str = Field(default="UNCERTAIN", max_length=32)
+    interaction: InteractionFrameState = Field(default_factory=InteractionFrameState)
     open_loops: list[OpenLoop] = Field(default_factory=list)
     # Environment values are only ever populated from an explicit, evidenced
     # statement. ``status`` is UNKNOWN unless that evidence existed.
@@ -110,6 +151,7 @@ class SceneState(DomainModel):
             "mode": self.mode,
             "discourse_phase": self.discourse_phase,
             "tone": self.tone,
+            "interaction": self.interaction.prompt_dict(),
             "open_loops": [
                 {"topic": loop.topic, "summary": loop.summary}
                 for loop in self.open_loops[:MAX_OPEN_LOOPS]

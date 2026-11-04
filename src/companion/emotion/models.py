@@ -174,6 +174,15 @@ class AppraisalResult:
     acute_after: float = 0.0
     mood_after: float = 0.0
     tension_after: float = 0.0
+    # V0.4.2: what moved the affect and how relevant the previous scene was.
+    # ``transition_cause`` is EVENT, FRAME_CHANGE, REPAIR or None. A frame-only
+    # transition has no trigger_rule_id but still produced a new state.
+    transition_cause: Optional[str] = None
+    transition_reason: Optional[str] = None
+    transition_detail: Optional[dict] = None
+    frame_from: Optional[str] = None
+    frame_to: Optional[str] = None
+    scene_relevance: float = 0.0
     # The complete resulting state (all three layers + activations) when the
     # appraisal produced one. ``None`` for callers constructing a legacy
     # AppraisalResult by hand.
@@ -182,6 +191,10 @@ class AppraisalResult:
     @property
     def applied(self) -> bool:
         return self.trigger_rule_id is not None
+
+    @property
+    def transitioned(self) -> bool:
+        return self.state is not None and self.transition_cause is not None
 
 
 @dataclass(frozen=True)

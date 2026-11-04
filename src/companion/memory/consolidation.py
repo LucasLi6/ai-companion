@@ -46,6 +46,7 @@ from companion.memory.models import AccessContext, MemoryItem
 from companion.memory.repository import MemoryRepository
 from companion.memory.service import MemoryService
 from companion.memory.topics import canonicalize_topic
+from companion.memory.transience import is_temporary_emotion_statement
 from companion.storage.repositories import Repositories
 
 _CONFLICT_STATUSES = [
@@ -216,6 +217,21 @@ class MemoryWriter:
                 kind=kind,
                 status=MemoryStatus.CANDIDATE,
                 detail="hypothetical",
+            )
+        # A passing emotional state is context for this conversation, not a
+        # durable fact about the person. Store it in the emotion/scene layers,
+        # not in long-term memory.
+        if (
+            candidate.subject_person_id in (None, speaker_id)
+            and assertion in _SELF_ASSERTIONS
+            and is_temporary_emotion_statement(content)
+        ):
+            return _Plan(
+                outcome=MemoryWriteOutcome.NO_MEMORY,
+                content=content,
+                kind=kind,
+                status=MemoryStatus.CANDIDATE,
+                detail="temporary_emotion_not_durable",
             )
 
         hinted = candidate.subject_person_id

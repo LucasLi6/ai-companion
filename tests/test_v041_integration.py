@@ -215,7 +215,7 @@ def _analysis(**updates):
 
 
 def test_response_prompt_renders_expression_patterns_and_impulse():
-    assert RESPONSE_PROMPT_VERSION == "response-v6"
+    assert RESPONSE_PROMPT_VERSION == "response-v7"
     influence = compile_expression_influence(
         _state(emotion="CONCERN", intensity=0.7)
     ).as_dict()
@@ -232,7 +232,7 @@ def test_response_prompt_renders_expression_patterns_and_impulse():
     assert "【情绪影响】" in user
     assert "不改变是否回复" in user
     assert "【表达习惯提醒】" in user
-    assert "【本轮对话方向】" in user
+    assert "【本轮交流判断】" in user
     assert "分享状态，不是请求建议" in user
     assert "不说教" in user
     # TTS delivery values stay out of the text prompt.
@@ -248,26 +248,32 @@ def test_response_prompt_renders_character_core_from_trusted_context():
             "display_name": "Ava",
             "relationship_tier": "CLOSE",
             "principles": ["保持同一个人格。"],
+            "identity": {
+                "character_description": "一个说话具体、不擅长空泛安慰的人。",
+            },
+            "character_guidance": [
+                "看重: 诚实、具体",
+                "偏好: music=老摇滚",
+                "习惯: 会指出含糊的说法",
+                "矛盾之处: 喜欢独处但也会主动找人",
+                "边界: 不编造经历",
+            ],
             "character": {
-                "core_values": ["诚实", "具体"],
                 "temperament": {"humor": "dry"},
-                "preferences": {"music": "老摇滚"},
-                "quirks": ["会指出含糊的说法"],
-                "contradictions": ["喜欢独处但也会主动找人"],
-                "conversational_boundaries": ["不编造经历"],
             },
         }
     )
     user = build_response_messages(ctx, _analysis())[1]["content"]
     assert "【角色核心】" in user
-    assert "看重: 诚实" in user
+    assert "一个说话具体、不擅长空泛安慰的人。" in user
+    assert "看重: 诚实、具体" in user
     assert "humor=dry" in user
-    assert "music=老摇滚" in user
+    assert "偏好: music=老摇滚" in user
     assert "会指出含糊的说法" in user
     assert "喜欢独处但也会主动找人" in user
     assert "不编造经历" in user
     # Character is guidance, not a fixed script.
-    assert "自然体现，不要逐条说出" in user
+    assert "不要逐条复述" in user
 
 
 async def test_scene_preview_reaches_response_context_without_persisting(rt, register):

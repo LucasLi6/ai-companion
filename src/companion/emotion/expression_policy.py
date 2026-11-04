@@ -34,7 +34,10 @@ _STANCE: dict[str, tuple[float, float, float, float, float]] = {
     "EXCITEMENT": (0.2, 0.6, 0.7, 0.2, -0.3),
     "RELIEF": (0.0, 0.5, 0.2, -0.1, -0.2),
     "CURIOSITY": (0.1, 0.1, 0.1, 0.7, 0.0),
-    "CONCERN": (-0.1, 0.7, -0.5, 0.2, 0.5),
+    # Concern is attention, not a script for comfort. V0.4.2 removes the
+    # automatic warmth/question bump: it slightly lowers playfulness and raises
+    # seriousness, but it must not make every reply softer or end in a question.
+    "CONCERN": (-0.05, 0.15, -0.35, -0.10, 0.35),
     "SADNESS": (-0.2, 0.5, -0.6, -0.2, 0.3),
     "FRUSTRATION": (0.6, -0.6, -0.7, -0.2, 0.5),
     "SERIOUS": (0.3, 0.0, -0.4, 0.0, 0.8),

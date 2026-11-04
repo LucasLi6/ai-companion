@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1252,6 +1252,59 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE emotion_turn_receipts ADD COLUMN detail TEXT;
 
         ALTER TABLE cognitive_analyses ADD COLUMN dialogue_impulse_json TEXT;
+        """,
+    ),
+    # Version 16 (V0.4.2): conversation-driven affect, character identity and
+    # stance continuity.
+    #
+    # - ``agent_persona_core.character_description`` stores a trusted,
+    #   admin-authored long-form character description. It is prompt context,
+    #   never a model-authored biography and never a source of real-world facts.
+    # - ``agent_stances`` records stances the companion actually expressed in an
+    #   emitted response (or an admin explicitly configured). It deliberately
+    #   has no model-private-thought source: continuity may only cite what was
+    #   said or configured.
+    # - ``cognitive_analyses.pragmatic_json`` preserves the locally validated
+    #   pragmatic reading for retries, so an analysis is not recomputed and the
+    #   response sees the same frame it was analysed with.
+    # - Emotion events gain the transition cause/frame fields for audit. Old
+    #   rows keep NULL, which means "not recorded".
+    (
+        16,
+        """
+        ALTER TABLE agent_persona_core
+            ADD COLUMN character_description TEXT NOT NULL DEFAULT '';
+
+        CREATE TABLE IF NOT EXISTS agent_stances (
+            stance_id        TEXT PRIMARY KEY,
+            agent_id         TEXT NOT NULL
+                             REFERENCES cmf_manifest(agent_id) ON DELETE CASCADE,
+            person_id        TEXT REFERENCES persons(person_id) ON DELETE CASCADE,
+            conversation_id  TEXT,
+            topic            TEXT NOT NULL DEFAULT 'UNKNOWN',
+            stance           TEXT NOT NULL,
+            source           TEXT NOT NULL
+                             CHECK (source IN ('ADMIN', 'RESPONSE')),
+            source_event_id  TEXT,
+            status           TEXT NOT NULL DEFAULT 'ACTIVE'
+                             CHECK (status IN ('ACTIVE', 'RETIRED')),
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_stances_source
+            ON agent_stances(source_event_id, stance)
+            WHERE source_event_id IS NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_agent_stances_scope
+            ON agent_stances(agent_id, person_id, status, created_at);
+
+        ALTER TABLE cognitive_analyses ADD COLUMN pragmatic_json TEXT;
+
+        ALTER TABLE emotion_events ADD COLUMN transition_cause TEXT;
+        ALTER TABLE emotion_events ADD COLUMN frame_from TEXT;
+        ALTER TABLE emotion_events ADD COLUMN frame_to TEXT;
+        ALTER TABLE emotion_events ADD COLUMN scene_relevance REAL;
         """,
     ),
 ]

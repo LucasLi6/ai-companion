@@ -98,8 +98,8 @@ def _context(**overrides):
 
 
 def test_prompt_versions_are_bumped():
-    assert COGNITIVE_PROMPT_VERSION == "cognitive-v7"
-    assert RESPONSE_PROMPT_VERSION == "response-v6"
+    assert COGNITIVE_PROMPT_VERSION == "cognitive-v8"
+    assert RESPONSE_PROMPT_VERSION == "response-v7"
 
 
 def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():
@@ -133,38 +133,60 @@ def test_response_prompt_renders_scene_and_style_as_guidance():
     assert "本轮明确要求: current_request_short" in user
 
 
+def test_response_prompt_puts_persona_before_scene_and_emotion():
+    ctx = _context(
+        emotion_expression={
+            "source_emotion": "CURIOSITY",
+            "intensity": 0.4,
+            "questioning_adjustment": 0.2,
+        }
+    )
+    user = build_response_messages(ctx, _analysis())[1]["content"]
+    assert (
+        user.index("【角色核心】")
+        < user.index("【当前场景】")
+        < user.index("【情绪影响】")
+    )
+
+
+def test_response_prompt_does_not_forward_cozy_style_or_direction():
+    user = build_response_messages(_context(), _analysis())[1]["content"]
+    # ``response_style`` is a legacy label; it must not become a cozy script.
+    assert "想要的回应风格" not in user
+    assert "可考虑的方向" not in user
+
+
 def test_response_prompt_forbids_fixed_replies_and_category_templates():
-    assert "没有固定的回复模板" in RESPONSE_SYSTEM
-    assert "不要按 ANSWER/SUPPORT/PLAYFUL 等分类套话" in RESPONSE_SYSTEM
-    assert "不要逐字照抄风格参考" in RESPONSE_SYSTEM
-    assert "也不要把它们当作真实对话历史" in RESPONSE_SYSTEM
+    assert "没有固定回复" in RESPONSE_SYSTEM
+    assert "不要按ANSWER/SUPPORT/PLAYFUL 等分类套模板" in RESPONSE_SYSTEM
     user = build_response_messages(_context(), _analysis())[1]["content"]
     assert "不是真实历史，不是固定回复" in user
 
 
 def test_response_prompt_forbids_forced_followup_questions():
-    assert "不要每轮都以问题结尾" in RESPONSE_SYSTEM
-    assert "不要为了延长对话而追问" in RESPONSE_SYSTEM
+    assert "不要每轮以问题结尾" in RESPONSE_SYSTEM
+    assert "安慰、追问、总结都不是默认动作" in RESPONSE_SYSTEM
     user = build_response_messages(_context(), _analysis())[1]["content"]
     assert "不要每轮都用反问或追问推进对话" in user
 
 
 def test_response_prompt_forbids_unsupported_environment_claims():
-    assert "不要断言未经【当前场景】明确证据支持的物理环境" in RESPONSE_SYSTEM
+    assert "没有证据的物理环境" in RESPONSE_SYSTEM
+    assert "不要补全" in RESPONSE_SYSTEM
     user = build_response_messages(_context(), _analysis())[1]["content"]
     assert "没有证据的环境信息保持未知，不要自行补全" in user
 
 
 def test_response_prompt_keeps_personality_stable_without_self_intro():
-    assert "保持同一个人格的连贯性" in RESPONSE_SYSTEM
-    assert "不要每轮重复自我介绍" in RESPONSE_SYSTEM
-    assert "允许自然的不同意见和具体偏好" in RESPONSE_SYSTEM
+    assert "保持同一个人" in RESPONSE_SYSTEM
+    assert "不要每轮自我介绍" in RESPONSE_SYSTEM
+    assert "可以有不同意见、具体偏好" in RESPONSE_SYSTEM
 
 
 def test_response_prompt_keeps_truthful_memory_and_silence_rules():
-    assert "PENDING_REVIEW：必须说明还需要确认" in RESPONSE_SYSTEM
-    assert "不能编造“我想让你冷静一下”" in RESPONSE_SYSTEM
-    assert "只有用户确实在追问过去的沉默时才解释" in RESPONSE_SYSTEM
+    assert "PENDING_REVIEW 必须说还需要确认" in RESPONSE_SYSTEM
+    assert "不要编造心理活动" in RESPONSE_SYSTEM
+    assert "只有对方明确追问过去的沉默时" in RESPONSE_SYSTEM
 
 
 def test_response_prompt_has_no_hard_coded_persona_lines():
@@ -175,9 +197,9 @@ def test_response_prompt_has_no_hard_coded_persona_lines():
 
 
 def test_response_prompt_is_plain_text_only():
-    assert "只输出给用户的回复正文" in RESPONSE_SYSTEM
+    assert "只输出回复正文" in RESPONSE_SYSTEM
     assert "不要 JSON" in RESPONSE_SYSTEM
-    assert "不要 Markdown 代码块" in RESPONSE_SYSTEM
+    assert "不要 Markdown" in RESPONSE_SYSTEM
 
 
 def test_scene_unknown_is_rendered_as_unknown_not_invented():

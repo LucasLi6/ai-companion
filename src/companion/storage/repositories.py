@@ -35,8 +35,10 @@ from companion.domain.models import (
     CognitiveResult,
     Consent,
     ConversationContext,
+    DialogueImpulse,
     MemoryCandidate,
     NonresponseMotive,
+    PragmaticAnalysis,
     Person,
     ProcessingJob,
     UtteranceEvent,
@@ -467,12 +469,23 @@ class AnalysisRepository:
             if analysis.scene_proposal is not None
             else None
         )
+        impulse_json = (
+            json.dumps(analysis.dialogue_impulse.model_dump(), ensure_ascii=False)
+            if analysis.dialogue_impulse is not None
+            else None
+        )
+        pragmatic_json = (
+            json.dumps(analysis.pragmatic.model_dump(), ensure_ascii=False)
+            if analysis.pragmatic is not None
+            else None
+        )
         await self.db.execute(
             "INSERT INTO cognitive_analyses(analysis_id, event_id, meaning, action,"
             " reason_code, provider, referenced_memory_ids, response_style, created_at,"
             " intent, addressed_to, silence_requested, reply_necessity, conversation_state,"
-            " affective_signal_json, nonresponse_motive_json, scene_proposal_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " affective_signal_json, nonresponse_motive_json, scene_proposal_json,"
+            " dialogue_impulse_json, pragmatic_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 analysis_id,
                 analysis.event_id,
@@ -491,6 +504,8 @@ class AnalysisRepository:
                 signal_json,
                 motive_json,
                 scene_json,
+                impulse_json,
+                pragmatic_json,
             ),
         )
 
@@ -499,7 +514,8 @@ class AnalysisRepository:
             "SELECT analysis_id, event_id, meaning, action, reason_code, provider,"
             " referenced_memory_ids, response_style, intent, addressed_to,"
             " silence_requested, reply_necessity, conversation_state,"
-            " affective_signal_json, nonresponse_motive_json, scene_proposal_json"
+            " affective_signal_json, nonresponse_motive_json, scene_proposal_json,"
+            " dialogue_impulse_json, pragmatic_json"
             " FROM cognitive_analyses WHERE event_id = ?",
             (event_id,),
         )
@@ -532,6 +548,22 @@ class AnalysisRepository:
                 )
             except (ValueError, TypeError, json.JSONDecodeError):
                 scene_proposal = None
+        impulse = None
+        if row["dialogue_impulse_json"]:
+            try:
+                impulse = DialogueImpulse.model_validate(
+                    json.loads(row["dialogue_impulse_json"])
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                impulse = None
+        pragmatic = None
+        if row["pragmatic_json"]:
+            try:
+                pragmatic = PragmaticAnalysis.model_validate(
+                    json.loads(row["pragmatic_json"])
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pragmatic = None
         return CognitiveResult(
             event_id=row["event_id"],
             meaning=row["meaning"],
@@ -548,6 +580,8 @@ class AnalysisRepository:
             affective_signal=signal,
             nonresponse_motive=motive,
             scene_proposal=scene_proposal,
+            dialogue_impulse=impulse,
+            pragmatic=pragmatic,
         )
 
     async def get_analysis_id(self, event_id: str) -> Optional[str]:

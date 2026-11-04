@@ -37,6 +37,11 @@ from companion.emotion.dynamics import (
     label_for,
     reaction_gain,
 )
+from companion.emotion.interaction import (
+    INVALID_EVIDENCE as INTERACTION_INVALID_EVIDENCE,
+    LOW_CONFIDENCE as INTERACTION_LOW_CONFIDENCE,
+    validate_interaction,
+)
 from companion.emotion.models import (
     AppraisalResult,
     AppraisalRule,
@@ -46,6 +51,10 @@ from companion.emotion.models import (
 from companion.emotion.parameters import (
     DEFAULT_CONFIG,
     EmotionDynamicsConfig,
+)
+from companion.emotion.transition import (
+    ConversationalAffect,
+    transition_affect,
 )
 
 # A signal below this confidence is ignored (conservative initial threshold,
@@ -60,6 +69,7 @@ INVALID_EVIDENCE = "INVALID_EVIDENCE"
 UNSUPPORTED_EVENT = "UNSUPPORTED_EVENT"
 RULE_DISABLED = "RULE_DISABLED"
 NO_RULE_MATCHED = "NO_RULE_MATCHED"
+FRAME_TRANSITION = "FRAME_TRANSITION"
 APPLIED = "APPLIED"
 
 OUTCOMES = (
@@ -69,6 +79,7 @@ OUTCOMES = (
     UNSUPPORTED_EVENT,
     RULE_DISABLED,
     NO_RULE_MATCHED,
+    FRAME_TRANSITION,
     APPLIED,
 )
 
@@ -91,40 +102,8 @@ EVENT_TO_RULE = {
     "support_request": "support_request_concern",
 }
 
-# Which target each event must have to act on *this* conversation. ``UNKNOWN``
-# is accepted only for the V0.3 events, where older signals had no target
-# field; it is never enough for an interpersonal event.
-_TARGET_RULES: dict[str, set[str]] = {
-    "achievement": {"SPEAKER", "UNKNOWN"},
-    "setback": {"SPEAKER", "UNKNOWN"},
-    "gratitude": {"AGENT", "UNKNOWN"},
-    "urgency": {"SPEAKER", "UNKNOWN"},
-    "question": {"AGENT", "SPEAKER", "OTHER", "UNKNOWN"},
-    "direct_insult": {"AGENT"},
-    "repeated_hostility": {"AGENT"},
-    "criticism": {"AGENT"},
-    "playful_teasing": {"AGENT"},
-    "apology": {"AGENT"},
-    "reconciliation": {"AGENT"},
-    "direct_praise": {"AGENT"},
-    "self_distress": {"SPEAKER"},
-    "support_request": {"AGENT", "UNKNOWN"},
-}
-
-# Social intent required per event. In particular, ``direct_insult`` requires
-# explicit HOSTILE intent; PLAYFUL/UNCERTAIN stays playful or unsupported and
-# never becomes hostility by keyword inference.
-_INTENT_RULES: dict[str, set[str]] = {
-    "direct_insult": {"HOSTILE"},
-    "repeated_hostility": {"HOSTILE"},
-    "criticism": {"HOSTILE", "SINCERE", "NEUTRAL", "UNCERTAIN"},
-    "playful_teasing": {"PLAYFUL"},
-    "apology": {"SINCERE"},
-    "reconciliation": {"SINCERE"},
-    "direct_praise": {"SINCERE", "PLAYFUL", "NEUTRAL"},
-    "self_distress": {"SINCERE", "NEUTRAL", "UNCERTAIN"},
-    "support_request": {"SINCERE", "NEUTRAL", "UNCERTAIN"},
-}
+# Per-event target/intent/factuality policy lives in ``interaction.py`` so the
+# cognitive layer and the emotion layer cannot drift apart.
 
 # Words whose "asserted" status is particularly easy to get wrong: seeing them
 # inside a question or a negation must not create a positive/negative event.
@@ -320,6 +299,8 @@ class AppraisalEngine:
         now: Optional[datetime] = None,
         config: EmotionDynamicsConfig | None = None,
         addressee_hint: Optional[str] = None,
+        actor_person_id: Optional[str] = None,
+        conversational_affect: Optional[ConversationalAffect] = None,
     ) -> AppraisalResult:
         """Choose the eligible rule and compute the resulting emotional state.
 
@@ -341,9 +322,29 @@ class AppraisalEngine:
 
         if signal is not None:
             diagnostic, validation = self._signal_diagnostic(
-                signal, text, base, moment, cfg, addressee_hint=addressee_hint
+                signal,
+                text,
+                base,
+                moment,
+                cfg,
+                addressee_hint=addressee_hint,
+                actor_person_id=actor_person_id,
             )
             if diagnostic is not None:
+                # A rejected event does not fire its rule, but a trusted
+                # pragmatic frame change may still move affect (e.g. a repair
+                # frame that carries no discrete appraisal event).
+                framed = self._frame_only(
+                    base,
+                    conversational_affect,
+                    signal,
+                    profile,
+                    traits,
+                    moment,
+                    cfg,
+                )
+                if framed is not None:
+                    return framed
                 return self._unchanged(
                     base,
                     self._legacy_reason(diagnostic),
@@ -363,6 +364,17 @@ class AppraisalEngine:
             if matched is None:
                 disabled = self._resolve_semantic_rule(event_type, rules)
                 if disabled is not None:
+                    framed = self._frame_only(
+                        base,
+                        conversational_affect,
+                        signal,
+                        profile,
+                        traits,
+                        moment,
+                        cfg,
+                    )
+                    if framed is not None:
+                        return framed
                     return self._unchanged(
                         base,
                         self._legacy_reason(RULE_DISABLED),
@@ -370,6 +382,17 @@ class AppraisalEngine:
                         validation="valid",
                         signal=signal,
                     )
+                framed = self._frame_only(
+                    base,
+                    conversational_affect,
+                    signal,
+                    profile,
+                    traits,
+                    moment,
+                    cfg,
+                )
+                if framed is not None:
+                    return framed
                 return self._unchanged(
                     base,
                     self._legacy_reason(NO_RULE_MATCHED),
@@ -386,12 +409,24 @@ class AppraisalEngine:
                 memories=memories,
                 signal=signal,
                 cfg=cfg,
+                affect=conversational_affect,
             )
 
         matched = next(
             (r for r in active if self._matches(r, text, memories)), None
         )
         if matched is None:
+            framed = self._frame_only(
+                base,
+                conversational_affect,
+                None,
+                profile,
+                traits,
+                moment,
+                cfg,
+            )
+            if framed is not None:
+                return framed
             return self._unchanged(
                 base,
                 "no_rule_matched",
@@ -405,6 +440,7 @@ class AppraisalEngine:
             moment,
             memories=memories,
             cfg=cfg,
+            affect=conversational_affect,
         )
 
     # -- signal handling ----------------------------------------------------
@@ -418,51 +454,40 @@ class AppraisalEngine:
         config: EmotionDynamicsConfig,
         *,
         addressee_hint: Optional[str] = None,
+        actor_person_id: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
-        """Return ``(outcome, validation)``; ``outcome=None`` means actionable."""
+        """Return ``(outcome, validation)``; ``outcome=None`` means actionable.
+
+        Validation is per event type, not a global "must be speaker/asserted"
+        gate. The speaker identity is the trusted runtime value; the model's
+        ``subject`` field is retained for audit only.
+        """
         event_type = getattr(signal, "event_type", "none")
         if event_type == "none":
             return NO_EVENT, "none"
         if event_type not in EVENT_TO_RULE:
             return UNSUPPORTED_EVENT, "unsupported_event"
-        try:
-            confidence = float(getattr(signal, "confidence", 0.0))
-        except (TypeError, ValueError):
-            return LOW_CONFIDENCE, "invalid_confidence"
-        if not (confidence >= SIGNAL_MIN_CONFIDENCE):
-            return LOW_CONFIDENCE, "low_confidence"
-        if getattr(signal, "factuality", "uncertain") != "asserted":
-            return UNSUPPORTED_EVENT, "not_asserted"
-        if getattr(signal, "subject", "unknown") != "speaker":
-            return UNSUPPORTED_EVENT, "unsupported_subject"
 
-        target = str(getattr(signal, "target", "UNKNOWN") or "UNKNOWN").upper()
-        intent = str(
-            getattr(signal, "social_intent", "UNCERTAIN") or "UNCERTAIN"
-        ).upper()
-        if target not in _TARGET_RULES.get(event_type, set()):
-            return UNSUPPORTED_EVENT, "unsupported_target"
-        if intent not in _INTENT_RULES.get(event_type, {intent}):
-            return UNSUPPORTED_EVENT, "unsupported_social_intent"
-        # Trusted addressee routing: when the session says this turn is meant
-        # for a human/unknown listener, a model claim that it targets the agent
-        # is not enough. ``None`` keeps old callers backward compatible; the
-        # orchestrator always supplies the trusted value.
-        if (
-            target == "AGENT"
-            and addressee_hint is not None
-            and str(addressee_hint).strip().lower() != "agent"
-        ):
-            return UNSUPPORTED_EVENT, "not_addressed_to_agent"
-        if (
-            event_type == "repeated_hostility"
-            and not self._hostility_is_repeated(state, now, config)
+        check = validate_interaction(
+            signal,
+            text,
+            addressee_hint=addressee_hint,
+            actor_person_id=actor_person_id,
+            min_confidence=SIGNAL_MIN_CONFIDENCE,
+        )
+        if check.event is None:
+            if check.reason == INTERACTION_LOW_CONFIDENCE:
+                return LOW_CONFIDENCE, check.reason
+            if check.reason == INTERACTION_INVALID_EVIDENCE:
+                return INVALID_EVIDENCE, check.reason
+            return UNSUPPORTED_EVENT, check.reason
+
+        # ``repeated_hostility`` is a locally derived rule, never a model event;
+        # the repeat evidence must be present in the state before it is used.
+        if event_type == "repeated_hostility" and not self._hostility_is_repeated(
+            state, now, config
         ):
             return UNSUPPORTED_EVENT, "no_local_repeat_evidence"
-
-        evidence = getattr(signal, "evidence_span", None)
-        if not evidence or not isinstance(evidence, str) or evidence not in text:
-            return INVALID_EVIDENCE, "evidence_not_in_text"
         return None, "valid"
 
     @staticmethod
@@ -530,6 +555,7 @@ class AppraisalEngine:
         memories: list[dict],
         signal=None,
         cfg: EmotionDynamicsConfig | None = None,
+        affect: Optional[ConversationalAffect] = None,
     ) -> AppraisalResult:
         cfg = cfg or self.config
         gain, empathy = reaction_gain(profile, traits, cfg)
@@ -547,9 +573,25 @@ class AppraisalEngine:
             )
 
         moment = now or base.updated_at or datetime.now(timezone.utc)
-        state = apply_emotional_stimulus(
-            base, rule, profile, traits, moment, config=cfg
-        )
+        cause = None
+        if affect is not None:
+            # V0.4.2: compose the event on top of a scene-relevance-adjusted
+            # base and let a strong event re-rank a stale dominant emotion.
+            transition = transition_affect(
+                base,
+                affect,
+                rule=rule,
+                profile=profile,
+                traits=traits,
+                now=moment,
+                config=cfg,
+            )
+            state = transition.state
+            cause = transition.cause
+        else:
+            state = apply_emotional_stimulus(
+                base, rule, profile, traits, moment, config=cfg
+            )
         return AppraisalResult(
             emotion=state.emotion,
             valence=state.valence,
@@ -567,6 +609,67 @@ class AppraisalEngine:
             acute_after=state.intensity,
             mood_after=state.mood_intensity,
             tension_after=state.relationship_tension,
+            transition_cause=cause.code if cause is not None else "EVENT",
+            transition_reason=cause.reason if cause is not None else rule.name,
+            transition_detail=cause.as_dict() if cause is not None else None,
+            frame_from=cause.previous_frame if cause is not None else None,
+            frame_to=cause.frame if cause is not None else None,
+            scene_relevance=cause.scene_relevance if cause is not None else 0.0,
+            state=state,
+        )
+
+    def _frame_only(
+        self,
+        base: EmotionState,
+        affect: Optional[ConversationalAffect],
+        signal,
+        profile: Optional[EmotionProfile],
+        traits: Optional[Mapping[str, int]],
+        now: datetime,
+        config: EmotionDynamicsConfig,
+    ) -> Optional[AppraisalResult]:
+        """Apply a validated frame change when no event rule fired.
+
+        Returns ``None`` when there is nothing to change, so callers can keep
+        their precise NO_CHANGE diagnostic.
+        """
+        if affect is None:
+            return None
+        transition = transition_affect(
+            base,
+            affect,
+            rule=None,
+            profile=profile,
+            traits=traits,
+            now=now,
+            config=config,
+        )
+        if not transition.changed:
+            return None
+        state = transition.state
+        cause = transition.cause
+        return AppraisalResult(
+            emotion=state.emotion,
+            valence=state.valence,
+            arousal=state.arousal,
+            intensity=state.intensity,
+            trigger_rule_id=None,
+            reason=cause.reason,
+            diagnostic=FRAME_TRANSITION,
+            event_type=getattr(signal, "event_type", None),
+            target=getattr(signal, "target", None),
+            social_intent=getattr(signal, "social_intent", None),
+            validation="valid" if signal is not None else "none",
+            acute_before=base.intensity,
+            acute_after=state.intensity,
+            mood_after=state.mood_intensity,
+            tension_after=state.relationship_tension,
+            transition_cause=cause.code,
+            transition_reason=cause.reason,
+            transition_detail=cause.as_dict(),
+            frame_from=cause.previous_frame,
+            frame_to=cause.frame,
+            scene_relevance=cause.scene_relevance,
             state=state,
         )
 

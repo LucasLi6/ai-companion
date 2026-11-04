@@ -140,6 +140,11 @@ def decay(
     cfg = config or DEFAULT_CONFIG
     now = now or datetime.now(timezone.utc)
 
+    if str(getattr(cfg, "time_decay_mode", "AUXILIARY")).upper() == "OFF":
+        # Time decay is auxiliary in V0.4.2. In OFF mode elapsed time never
+        # changes affect; only conversational events do.
+        return state
+
     activations = dict(state.activations or {})
     elapsed = _elapsed_seconds(state.updated_at, now)
     if activations:

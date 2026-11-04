@@ -32,6 +32,7 @@ from typing import Optional
 from companion.agent.dialogue_pattern_monitor import DialoguePatternMonitor
 from companion.agent.dialogue_style import compile_dialogue_style
 from companion.agent.models import EffectiveAgentContext
+from companion.agent.persona_core import sanitise_prompt_core
 from companion.cognition.models import CognitiveContext
 from companion.cognition.nonresponse import NonresponseTrace, derive_nonresponse_trace
 from companion.cognition.scene_repository import SceneRevisionConflict
@@ -55,12 +56,14 @@ from companion.domain.models import (
     utcnow,
 )
 from companion.emotion.expression_policy import compile_expression_influence
+from companion.emotion.transition import build_conversational_affect
 from companion.memory.candidates import prepare_candidates
 from companion.people.registry import PersonRegistry
 from companion.storage.repositories import Repositories
 
 from .conversation import ConversationManager
-from .policy import Policy
+from .policy import Policy, PolicyDecision
+from .safety import assess_safety, detect_language, safety_response
 
 
 class Orchestrator:
@@ -186,6 +189,10 @@ class Orchestrator:
         # model.
         explicit_silence = detect_explicit_silence(event.text)
         explicit_remember = detect_explicit_remember(event.text)
+        # Local safety assessment is computed once and reused below: it both
+        # selects the independent reply path and keeps crisis content out of
+        # durable memory.
+        safety = assess_safety(event.text)
         self.logger.info(
             "context_loaded conversation_id=%s quiet_mode=%s memories=%d"
             " explicit_silence=%s explicit_remember=%s",
@@ -280,7 +287,7 @@ class Orchestrator:
                             analysis.memory_candidates,
                             explicit_remember_request=explicit_remember,
                         )
-                        if learn
+                        if learn and not safety.triggered
                         else []
                     )
                     job_key = (
@@ -350,6 +357,25 @@ class Orchestrator:
                 addressee_hint=event.addressee_hint.value,
                 explicit_silence=explicit_silence,
             )
+            # 7b. Independent safety floor. An explicit high-risk statement is
+            # answered by a fixed local reply, not by persona improvisation and
+            # not by a model deferral. Only an explicit human addressee or a
+            # denied permission can suppress it; quiet mode, a model WAIT and
+            # an explicit "don't reply" cannot.
+            if (
+                safety.triggered
+                and event.addressee_hint.value != "human"
+                and analysis.reason_code != ReasonCode.PERMISSION_DENIED
+            ):
+                decision = PolicyDecision(
+                    action=CognitiveAction.RESPOND,
+                    reason_code=ReasonCode.SAFETY_RESPONSE,
+                    model_action=decision.model_action,
+                    override_reason=f"safety_{safety.category.lower()}",
+                    rule="safety_response",
+                )
+                steps.append(f"[SAFETY] local_{safety.category.lower()}")
+
             final_action, final_reason = decision.action, decision.reason_code
             steps.append(f"[DECISION] {final_action.value}")
             if decision.overrode_model:
@@ -387,24 +413,32 @@ class Orchestrator:
                     else context,
                 )
                 if final_action == CognitiveAction.RESPOND:
-                    response_context = cognitive_context
-                    if isinstance(response_context, CognitiveContext):
-                        response_context = response_context.model_copy(
-                            update={"memory_write_outcomes": memory_outcomes}
+                    if safety.triggered:
+                        # Fixed local text: no model call, no persona/emotion
+                        # shaping, no scene preview. The reason is auditable.
+                        response_text = safety_response(
+                            safety.category, detect_language(event.text)
                         )
-                    response_context = self._scene_preview_for_response(
-                        event=event,
-                        analysis=analysis,
-                        previous_scene=scene_record,
-                        scene_enabled=scene_enabled,
-                        context=response_context,
-                        trace=trace,
-                        steps=steps,
-                    )
-                    response_text = await self.response.generate(
-                        event, analysis, response_context
-                    )
-                    steps.append(f"[RESPONSE] {response_text}")
+                        steps.append("[RESPONSE][SAFETY] local safety reply")
+                    else:
+                        response_context = cognitive_context
+                        if isinstance(response_context, CognitiveContext):
+                            response_context = response_context.model_copy(
+                                update={"memory_write_outcomes": memory_outcomes}
+                            )
+                        response_context = self._scene_preview_for_response(
+                            event=event,
+                            analysis=analysis,
+                            previous_scene=scene_record,
+                            scene_enabled=scene_enabled,
+                            context=response_context,
+                            trace=trace,
+                            steps=steps,
+                        )
+                        response_text = await self.response.generate(
+                            event, analysis, response_context
+                        )
+                        steps.append(f"[RESPONSE] {response_text}")
                 action_obj = AgentAction(
                     action_id=new_id("act"),
                     event_id=event.event_id,
@@ -438,6 +472,11 @@ class Orchestrator:
                 )
                 if scene_enabled and action_obj is not None:
                     steps.append("[SCENE] Transition committed")
+                # Stance continuity may only cite a response that was actually
+                # emitted (or admin config). A retry reuses the existing action
+                # and must not duplicate the record.
+                if existing_action is None:
+                    await self._record_stances(event, action_obj, cognitive_context)
 
             if job_id is not None:
                 steps.append("[MEMORY_JOB] Queued")
@@ -503,7 +542,10 @@ class Orchestrator:
             not scene_enabled
             or self.scene_manager is None
             or not isinstance(context, CognitiveContext)
-            or analysis.scene_proposal is None
+            or (
+                analysis.scene_proposal is None
+                and getattr(analysis, "pragmatic", None) is None
+            )
         ):
             return context
         try:
@@ -516,6 +558,7 @@ class Orchestrator:
                 pending_followup=bool(
                     getattr(trace, "pending_followup", False)
                 ),
+                pragmatic=getattr(analysis, "pragmatic", None),
             )
             if steps is not None:
                 steps.append("[SCENE] Candidate scene for response")
@@ -587,6 +630,21 @@ class Orchestrator:
                 return cognitive_context
 
             agent_context = getattr(cognitive_context, "agent_context", None)
+            # The *previous* committed frame, before this turn's pragmatic
+            # reading, lets the transition distinguish a real frame change
+            # from a frame that simply stayed the same.
+            previous_frame = "UNKNOWN"
+            scene_view = getattr(cognitive_context, "scene_state", None)
+            if isinstance(scene_view, dict):
+                interaction = scene_view.get("interaction")
+                if isinstance(interaction, dict):
+                    previous_frame = interaction.get("frame") or "UNKNOWN"
+            conversational_affect = build_conversational_affect(
+                pragmatic=getattr(analysis, "pragmatic", None),
+                signal=getattr(analysis, "affective_signal", None),
+                previous_frame=previous_frame,
+                actor_person_id=event.speaker_person_id,
+            )
             state = await self.emotion_service.process_turn(
                 agent_id,
                 person_id,
@@ -598,6 +656,8 @@ class Orchestrator:
                 source_event_id=event.event_id,
                 persist=persist,
                 addressee_hint=event.addressee_hint.value,
+                actor_person_id=event.speaker_person_id,
+                conversational_affect=conversational_affect,
             )
             speech_plan = await self.emotion_service.plan_speech(
                 agent_id, state=state, text=""
@@ -656,6 +716,39 @@ class Orchestrator:
                 "emotion_failed event_id=%s error=%s", event.event_id, exc
             )
         return cognitive_context
+
+    async def _record_stances(self, event, action_obj, cognitive_context) -> None:
+        """Persist public stances from an emitted response. Never fatal."""
+        if (
+            self.agent_service is None
+            or action_obj is None
+            or action_obj.action_type != CognitiveAction.RESPOND
+            or action_obj.reason_code == ReasonCode.SAFETY_RESPONSE
+            or not action_obj.response_text
+        ):
+            return
+        try:
+            agent_id = await self._resolve_agent_id()
+            if not agent_id:
+                return
+            topic = "UNKNOWN"
+            scene_view = getattr(cognitive_context, "scene_state", None)
+            if isinstance(scene_view, dict):
+                topic = scene_view.get("topic") or "UNKNOWN"
+            await self.agent_service.record_response_stances(
+                agent_id,
+                person_id=event.speaker_person_id,
+                conversation_id=event.conversation_id,
+                source_event_id=event.event_id,
+                response_text=action_obj.response_text,
+                topic=topic,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "stance_record_failed event_id=%s error=%s",
+                event.event_id,
+                exc,
+            )
 
     async def _resolve_agent_id(self) -> Optional[str]:
         if self.agent_service is None:
@@ -736,6 +829,19 @@ class Orchestrator:
                     person_id=event.speaker_person_id,
                 )
             scene_view = getattr(cognitive_context, "scene_state", None)
+            stances = []
+            if self.agent_service is not None and effective.agent_id:
+                try:
+                    stances = await self.agent_service.list_stances(
+                        effective.agent_id,
+                        person_id=event.speaker_person_id,
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "stance_load_failed event_id=%s error=%s",
+                        event.event_id,
+                        exc,
+                    )
             personality = (
                 self.personality_compiler.compile(
                     effective,
@@ -743,6 +849,7 @@ class Orchestrator:
                     scene=scene_view,
                     style_examples=examples,
                     current_text=event.text,
+                    stances=stances,
                 )
                 if self.personality_compiler is not None
                 else None
@@ -778,8 +885,12 @@ class Orchestrator:
         data = agent_context if isinstance(agent_context, dict) else None
         if data is not None:
             try:
+                agent_id = str(data.get("agent_id") or "")
+                persona_core = await self._trusted_persona_core(
+                    data.get("persona_core"), agent_id=agent_id
+                )
                 return EffectiveAgentContext(
-                    agent_id=str(data.get("agent_id") or ""),
+                    agent_id=agent_id,
                     display_name=str(data.get("display_name") or "Companion"),
                     pronouns=data.get("pronouns"),
                     description=data.get("description"),
@@ -793,6 +904,7 @@ class Orchestrator:
                         str(k): int(v)
                         for k, v in (data.get("overrides") or {}).items()
                     },
+                    persona_core=persona_core,
                     response_conservatism=str(
                         data.get("response_conservatism") or "balanced"
                     ),
@@ -807,6 +919,39 @@ class Orchestrator:
         if self.agent_service is not None:
             return await self.agent_service.effective(person_id)
         return None
+
+    async def _trusted_persona_core(self, candidate, *, agent_id: str) -> dict:
+        """Re-read the admin-maintained character core for this turn.
+
+        The context builder already put a copy on ``agent_context``, but a
+        transient dict is not authority: anything that reconstructs the
+        effective context (including a future caller) could drop or forge it.
+        When the trusted service is wired we always use its current revision;
+        otherwise we whitelist the local copy through the same validators.
+        """
+        if self.agent_service is not None:
+            try:
+                core = await self.agent_service.show_persona_core()
+            except Exception:  # pragma: no cover - defensive, logged below
+                self.logger.warning(
+                    "persona_core_trusted_read_failed agent_id=%s", agent_id
+                )
+                return sanitise_prompt_core(candidate, agent_id)
+            supplied = None
+            if isinstance(candidate, dict):
+                try:
+                    supplied = int(candidate.get("revision") or 0)
+                except (TypeError, ValueError):
+                    supplied = None
+            if supplied is not None and supplied != core.revision:
+                self.logger.info(
+                    "persona_core_revision_refreshed agent_id=%s supplied=%s trusted=%d",
+                    agent_id,
+                    supplied,
+                    core.revision,
+                )
+            return core.as_prompt_dict()
+        return sanitise_prompt_core(candidate, agent_id)
 
     @staticmethod
     def _stored_trace(action):
@@ -909,6 +1054,7 @@ class Orchestrator:
                 pending_followup=bool(
                     trace is not None and getattr(trace, "pending_followup", False)
                 ),
+                pragmatic=getattr(analysis, "pragmatic", None),
             )
             candidate = manager.finalize(
                 candidate,

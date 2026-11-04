@@ -60,7 +60,7 @@ def _state(person_id, event_id, *, revision, topic="旅行", source_ids=None):
 
 async def test_schema_15_has_scene_tables_and_analysis_column(db):
     cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 15
+    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 16
 
     cur = await db.execute("PRAGMA table_info(cognitive_analyses)")
     assert "scene_proposal_json" in {r["name"] for r in await cur.fetchall()}
@@ -290,7 +290,7 @@ async def test_migration_13_to_15_preserves_existing_data(tmp_path):
     await db2.initialize()
     try:
         cur = await db2.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == 15
+        assert (await cur.fetchone())["v"] == SCHEMA_VERSION
         cur = await db2.execute("SELECT event_id, meaning FROM cognitive_analyses")
         row = await cur.fetchone()
         assert (row["event_id"], row["meaning"]) == ("evt1", "old analysis")

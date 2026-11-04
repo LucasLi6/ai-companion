@@ -564,6 +564,123 @@ def validate_scene_proposal(
     )
 
 
+_PRAGMATIC_ACTS = {
+    "INFORMATION",
+    "REQUEST",
+    "QUESTION",
+    "ANSWER",
+    "INVITATION",
+    "TEASING",
+    "COMPLAINT",
+    "CRITICISM",
+    "APOLOGY",
+    "GRATITUDE",
+    "SELF_DISCLOSURE",
+    "REPAIR",
+    "GREETING",
+    "FAREWELL",
+    "BOUNDARY",
+    "SMALL_TALK",
+    "OTHER",
+}
+_PRAGMATIC_FRAMES = {
+    "CASUAL",
+    "PLAYFUL",
+    "SERIOUS",
+    "CONFLICT",
+    "REPAIR",
+    "SUPPORT",
+    "TASK",
+    "UNKNOWN",
+}
+_PRAGMATIC_ROLES = {"SETUP", "PAYOFF", "CONTINUATION", "NONE"}
+_PRAGMATIC_TRANSITIONS = {"CONTINUE", "SHIFT", "RETURN", "UNCERTAIN"}
+
+
+def validate_pragmatic_analysis(
+    raw,
+    text: str,
+    *,
+    allowed_antecedent_ids=None,
+) -> Optional[PragmaticAnalysis]:
+    """Validate a model's pragmatic hint locally.
+
+    A malformed or unsupported primary act, or evidence that is not a verbatim
+    part of the current input, makes the whole hint unusable (``None``).
+    Secondary acts, frame, role, transition and the antecedent id degrade
+    field-by-field. ``allowed_antecedent_ids`` is the trusted set of event ids
+    visible in this turn's context; an id outside it is dropped, never passed
+    on as if a real earlier turn had been found.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, PragmaticAnalysis):
+        data = raw.model_dump()
+    elif isinstance(raw, dict):
+        data = dict(raw)
+    else:
+        return None
+
+    primary = str(data.get("primary_act") or "OTHER").strip().upper()
+    if primary not in _PRAGMATIC_ACTS:
+        return None
+
+    evidence = _valid_evidence(data.get("evidence_span"), [text])
+    if evidence is None:
+        return None
+
+    try:
+        confidence = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        confidence = 0.0
+
+    secondary: list[str] = []
+    raw_secondary = data.get("secondary_acts")
+    if isinstance(raw_secondary, list):
+        for item in raw_secondary[:3]:
+            act = str(item or "").strip().upper()
+            if act in _PRAGMATIC_ACTS and act != primary and act not in secondary:
+                secondary.append(act)
+
+    frame = str(data.get("interaction_frame") or "UNKNOWN").strip().upper()
+    if frame not in _PRAGMATIC_FRAMES:
+        frame = "UNKNOWN"
+    role = str(data.get("setup_payoff_role") or "NONE").strip().upper()
+    if role not in _PRAGMATIC_ROLES:
+        role = "NONE"
+    transition = str(data.get("topic_transition") or "UNCERTAIN").strip().upper()
+    if transition not in _PRAGMATIC_TRANSITIONS:
+        transition = "UNCERTAIN"
+
+    refers = bool(data.get("refers_to_previous_turn", False))
+    antecedent = _clean_text(data.get("antecedent_event_id"), 128)
+    if not refers or antecedent is None:
+        antecedent = None
+    elif allowed_antecedent_ids is not None and antecedent not in {
+        str(item) for item in allowed_antecedent_ids
+    }:
+        antecedent = None
+
+    literal = _clean_text(data.get("literal_interpretation"), 512) or ""
+    implied = _clean_text(data.get("implied_interpretation"), 512) or ""
+
+    return PragmaticAnalysis(
+        primary_act=primary,
+        secondary_acts=secondary,
+        interaction_frame=frame,
+        refers_to_previous_turn=refers,
+        antecedent_event_id=antecedent,
+        setup_payoff_role=role,
+        literal_interpretation=literal,
+        implied_interpretation=implied,
+        topic_transition=transition,
+        confidence=confidence,
+        evidence_span=evidence,
+    )
+
+
 def validate_affective_signal(raw, text: str) -> Optional[AffectiveSignal]:
     """Validate a model-supplied signal locally; return ``None`` when invalid.
 
@@ -678,6 +795,78 @@ class DialogueImpulse(DomainModel):
         }
 
 
+class PragmaticAnalysis(DomainModel):
+    """What the speaker is *doing* with this turn, as trusted hints.
+
+    This is a pragmatic layer, not a second action decision. It records the
+    primary (and at most a few secondary) social acts, the interaction frame,
+    whether the turn refers back to a visible earlier turn, how a setup/payoff
+    joke or promise is progressing, and a short literal/implied reading.
+
+    ``antecedent_event_id`` is locally re-validated against the visible
+    conversation; a model may not invent a previous event. Every field here is
+    guidance for the response prompt and for local scene/frame transitions. It
+    can never change permissions, whether to reply, or what is true.
+    """
+
+    primary_act: Literal[
+        "INFORMATION",
+        "REQUEST",
+        "QUESTION",
+        "ANSWER",
+        "INVITATION",
+        "TEASING",
+        "COMPLAINT",
+        "CRITICISM",
+        "APOLOGY",
+        "GRATITUDE",
+        "SELF_DISCLOSURE",
+        "REPAIR",
+        "GREETING",
+        "FAREWELL",
+        "BOUNDARY",
+        "SMALL_TALK",
+        "OTHER",
+    ] = "OTHER"
+    secondary_acts: list[str] = Field(default_factory=list, max_length=3)
+    interaction_frame: Literal[
+        "CASUAL",
+        "PLAYFUL",
+        "SERIOUS",
+        "CONFLICT",
+        "REPAIR",
+        "SUPPORT",
+        "TASK",
+        "UNKNOWN",
+    ] = "UNKNOWN"
+    refers_to_previous_turn: bool = False
+    antecedent_event_id: Optional[str] = Field(default=None, max_length=128)
+    setup_payoff_role: Literal[
+        "SETUP", "PAYOFF", "CONTINUATION", "NONE"
+    ] = "NONE"
+    literal_interpretation: str = Field(default="", max_length=512)
+    implied_interpretation: str = Field(default="", max_length=512)
+    topic_transition: Literal[
+        "CONTINUE", "SHIFT", "RETURN", "UNCERTAIN"
+    ] = "UNCERTAIN"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_span: Optional[str] = Field(default=None, max_length=512)
+
+    def as_prompt_dict(self) -> dict:
+        return {
+            "primary_act": self.primary_act,
+            "secondary_acts": list(self.secondary_acts),
+            "interaction_frame": self.interaction_frame,
+            "refers_to_previous_turn": self.refers_to_previous_turn,
+            "antecedent_event_id": self.antecedent_event_id,
+            "setup_payoff_role": self.setup_payoff_role,
+            "literal_interpretation": self.literal_interpretation,
+            "implied_interpretation": self.implied_interpretation,
+            "topic_transition": self.topic_transition,
+            "confidence": self.confidence,
+        }
+
+
 class CognitiveResult(DomainModel):
     """Structured output of a cognitive provider.
 
@@ -716,6 +905,9 @@ class CognitiveResult(DomainModel):
     # direction. Guidance for the response prompt; never a fixed reply and
     # never an action decision. None for older records and mock providers.
     dialogue_impulse: Optional[DialogueImpulse] = None
+    # Optional, locally validated pragmatic reading of the turn. It feeds the
+    # interaction frame and the response prompt; it never decides an action.
+    pragmatic: Optional[PragmaticAnalysis] = None
 
 
 class AgentAction(DomainModel):

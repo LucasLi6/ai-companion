@@ -16,7 +16,7 @@ from companion.cognition.models import CognitiveContext
 from companion.cognition.nonresponse import action_history_lines
 from companion.prompts.identity import agent_context_lines
 
-COGNITIVE_PROMPT_VERSION = "cognitive-v7"
+COGNITIVE_PROMPT_VERSION = "cognitive-v8"
 
 SYSTEM_PROMPT = """\
 你是一个多用户 AI 伴侣的「认知分析器」。你的任务不是回复用户，而是理解当前这句话，\
@@ -92,11 +92,25 @@ subject_person_id、event_id 或 source_event_id——这些由程序填写。
 10b. dialogue_impulse 是你对「这句话在做什么、接下来怎样接」的简短判断，供最终回复\
 参考，不是固定回复模板，也不决定 action。要求：
    - interpretation：这句话在交流上是什么（例如“在吐槽今天的工作”“在测试我会不会附和”）。
-   - response_direction：一个自然的方向（例如“先接住情绪，再问一个具体问题”），\
-不要写成完整回复。
+   - response_direction：一个自然的交流方向（例如“直接回答，不额外安慰”或\
+“接住这个玩笑，但别追问”）。不要默认安排安慰、共情或追问，也不要写成完整回复。
    - stance：你这一轮合适的立场/态度（例如“坦白不同意但保持轻松”）。
    - unresolved_uncertainty：仍不确定、需要对方澄清的点；没有就写空字符串。
    - 不要编造事实、心理诊断或对方未说过的信息。
+
+10c. pragmatic 是你对「这句话在交流上正在做什么」的语用判断，供回复参考，不改变 action、权限或任何事实。要求：
+   - primary_act 只能是："INFORMATION" | "REQUEST" | "QUESTION" | "ANSWER" | "INVITATION" | "TEASING" | "COMPLAINT" | "CRITICISM" | "APOLOGY" | "GRATITUDE" | "SELF_DISCLOSURE" | "REPAIR" | "GREETING" | "FAREWELL" | "BOUNDARY" | "SMALL_TALK" | "OTHER"。
+   - secondary_acts：最多 3 个，同上取值；不确定就 []。
+   - interaction_frame："CASUAL" | "PLAYFUL" | "SERIOUS" | "CONFLICT" | "REPAIR" | "SUPPORT" | "TASK" | "UNKNOWN"。按当前这句话和可见上下文判断，不要因为一个词就升级为冲突。
+   - refers_to_previous_turn：只有当前这句话确实在回应/追问/接梗/引用上一轮时才为 true。
+   - antecedent_event_id：如果 refers_to_previous_turn=true，只能填【最近对话】中方括号里出现过的 event id；没有把握就填 null。绝不能编造 id。
+   - setup_payoff_role："SETUP"（在铺垫）| "PAYOFF"（接上之前的铺垫）| "CONTINUATION" | "NONE"。
+   - literal_interpretation：字面上在说什么（简短）。
+   - implied_interpretation：可能真正想表达/期待什么（简短）；没有额外含义就写空字符串。
+   - topic_transition："CONTINUE" | "SHIFT" | "RETURN" | "UNCERTAIN"。
+   - confidence：0 到 1 的有限小数。
+   - evidence_span：必须逐字来自当前输入；无法逐字引用时整个 pragmatic 填 null。
+   - 不要输出 person_id、具体情绪诊断、对说话者人品的判断，也不要把猜测写成事实。
 
 11. 当 action 是 WAIT 或 IGNORE 时，用 nonresponse_motive 说明具体原因，不能只写\
 “回复没有必要”。要求：
@@ -189,6 +203,19 @@ JSON 结构：
     "stance": "本轮合适的立场/态度",
     "unresolved_uncertainty": "仍需澄清的点，或空字符串"
   },
+  "pragmatic": {
+    "primary_act": "REQUEST | QUESTION | TEASING | SELF_DISCLOSURE | OTHER …",
+    "secondary_acts": [],
+    "interaction_frame": "CASUAL | PLAYFUL | SERIOUS | CONFLICT | REPAIR | SUPPORT | TASK | UNKNOWN",
+    "refers_to_previous_turn": false,
+    "antecedent_event_id": null,
+    "setup_payoff_role": "SETUP | PAYOFF | CONTINUATION | NONE",
+    "literal_interpretation": "字面意思",
+    "implied_interpretation": "额外含义或空字符串",
+    "topic_transition": "CONTINUE | SHIFT | RETURN | UNCERTAIN",
+    "confidence": 0.8,
+    "evidence_span": "逐字证据"
+  },
   "nonresponse_motive": {
     "motive": "NOT_ADDRESSED | AWAITING_CONTINUATION | AVOID_INTERRUPTION | LISTEN_WITHOUT_REPLY | NO_USEFUL_CONTRIBUTION | UNCERTAIN_CONTEXT | UNKNOWN",
     "confidence": 0.86,
@@ -215,7 +242,7 @@ JSON 结构：
     "confidence": 0.7,
     "evidence_span": "逐字证据或 null"
   },
-  "response_style": "简短风格标签，例如 warm / concise / playful"
+  "response_style": "简短风格标签；不是固定模板，也不得覆盖人格核心"
 }
 """
 
@@ -232,11 +259,16 @@ def build_cognitive_messages(context: CognitiveContext) -> list[dict]:
     lines.append("【最近对话】（按时间顺序；assistant 是你自己的历史回复）")
     if context.turns:
         for turn in context.turns:
+            # The internal event id is included so a pragmatic antecedent can
+            # point at a real visible turn; it is not a memory id or a person
+            # id, and the program still revalidates every reference.
             if turn.role == "assistant":
-                lines.append(f"assistant: {turn.text}")
+                lines.append(f"assistant [{turn.event_id}]: {turn.text}")
             else:
                 target = turn.addressee_hint or "unknown"
-                lines.append(f"{turn.speaker_label} -> {target}: {turn.text}")
+                lines.append(
+                    f"{turn.speaker_label} -> {target} [{turn.event_id}]: {turn.text}"
+                )
     else:
         lines.append("（无，这是这段对话的第一句）")
 
@@ -287,6 +319,15 @@ def build_cognitive_messages(context: CognitiveContext) -> list[dict]:
             f"旁人在场={env.get('other_people_present', 'UNKNOWN')} "
             f"({env.get('provenance', 'UNKNOWN')})"
         )
+        interaction = scene.get("interaction") or {}
+        frame = interaction.get("frame")
+        if frame and frame != "UNKNOWN":
+            lines.append(
+                f"互动框架: {frame} | 阶段: {interaction.get('phase', 'UNKNOWN')} | "
+                f"上一社会行为: {interaction.get('last_social_act', 'UNKNOWN')}"
+            )
+        if interaction.get("open_setup"):
+            lines.append(f"- 未收的铺垫: {interaction['open_setup']}")
         lines.append("没有证据的环境信息为 UNKNOWN；不要据此补写房间、地点或旁人。")
 
     lines.append("")

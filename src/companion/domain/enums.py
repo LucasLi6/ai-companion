@@ -66,6 +66,7 @@ class ReasonCode(str, Enum):
     CONSERVATIVE_AMBIGUITY = "conservative_ambiguity"
     QUIET_MODE = "quiet_mode"
     PERMISSION_DENIED = "permission_denied"
+    SAFETY_RESPONSE = "safety_response"
     UNKNOWN = "unknown"
 
 

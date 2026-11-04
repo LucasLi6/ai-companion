@@ -46,6 +46,7 @@ from companion.domain.models import (
     new_id,
     validate_affective_signal,
     validate_nonresponse_motive,
+    validate_pragmatic_analysis,
     validate_scene_proposal,
 )
 from companion.memory.store import validate_referenced_memory_ids
@@ -93,6 +94,7 @@ class _RawAnalysis(BaseModel):
     nonresponse_motive: Optional[object] = None
     scene_proposal: Optional[object] = None
     dialogue_impulse: Optional[object] = None
+    pragmatic: Optional[object] = None
 
 
 def _parse_json_object(content: str) -> dict:
@@ -281,6 +283,18 @@ class DeepSeekCognitiveProvider:
             authorized_texts=authorized_texts,
         )
         dialogue_impulse = self._dialogue_impulse(raw.dialogue_impulse)
+        # Antecedents must point at a turn the model could actually see. The
+        # ids are internal, but a fabricated one is still a fabricated history
+        # claim, so it is dropped rather than carried into the scene/frame.
+        pragmatic = validate_pragmatic_analysis(
+            raw.pragmatic,
+            event.text,
+            allowed_antecedent_ids={turn.event_id for turn in ctx.turns},
+        )
+        if raw.pragmatic is not None and pragmatic is None:
+            self.logger.info(
+                "deepseek_pragmatic_rejected event_id=%s", event.event_id
+            )
 
         return CognitiveResult(
             event_id=event.event_id,
@@ -301,6 +315,7 @@ class DeepSeekCognitiveProvider:
             nonresponse_motive=motive,
             scene_proposal=scene_proposal,
             dialogue_impulse=dialogue_impulse,
+            pragmatic=pragmatic,
         )
 
     @staticmethod

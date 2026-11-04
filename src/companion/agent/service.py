@@ -27,6 +27,11 @@ from companion.agent.constants import (
 from companion.agent.models import EffectiveAgentContext
 from companion.agent.persona_core import PersonaCore, PersonaCoreRepository
 from companion.agent.repository import AgentRepository
+from companion.agent.stance import (
+    AgentStance,
+    AgentStanceRepository,
+    extract_stance_candidates,
+)
 from companion.core.policy import PolicyConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -49,6 +54,7 @@ class AgentService:
         self.logger = logger or logging.getLogger("companion.agent")
         self.repo = AgentRepository(repos.db)
         self.persona_core_repo = PersonaCoreRepository(repos.db)
+        self.stance_repo = AgentStanceRepository(repos.db)
 
     async def ensure_defaults(self) -> None:
         await self.repo.ensure_defaults()
@@ -312,6 +318,7 @@ class AgentService:
             "contradictions",
             "conversational_boundaries",
             "voice_identity",
+            "character_description",
         }
         unknown = set(updates) - allowed
         if unknown:
@@ -332,6 +339,9 @@ class AgentService:
             ),
             voice_identity=updates.get(
                 "voice_identity", current.voice_identity
+            ),
+            character_description=updates.get(
+                "character_description", current.character_description
             ),
             revision=current.revision,
             updated_at=current.updated_at,
@@ -362,6 +372,116 @@ class AgentService:
             actor,
         )
         return updated
+
+    async def import_persona_description(
+        self,
+        description: str,
+        *,
+        actor: str = "admin",
+        reason: str | None = None,
+    ) -> PersonaCore:
+        """Import an admin-authored full character description.
+
+        This is the reviewed import interface: the description is stored as
+        trusted configuration and rendered as character context. It is not
+        parsed into facts, and a model never calls this. A future importer may
+        extract structured fields from the same text after human review.
+        """
+        return await self.set_persona_core(
+            {"character_description": description},
+            actor=actor,
+            reason=reason or "import_persona_description",
+        )
+
+    # -- stance continuity -------------------------------------------------
+
+    async def list_stances(
+        self,
+        agent_id: str,
+        *,
+        person_id: str | None = None,
+        limit: int = 6,
+    ) -> list[AgentStance]:
+        if not agent_id:
+            return []
+        return await self.stance_repo.list_recent(
+            agent_id, person_id=person_id, limit=limit
+        )
+
+    async def record_response_stances(
+        self,
+        agent_id: str,
+        *,
+        person_id: str | None,
+        conversation_id: str | None,
+        source_event_id: str | None,
+        response_text: str,
+        topic: str = "UNKNOWN",
+    ) -> list[str]:
+        """Persist stances the companion actually emitted. Never fails a turn."""
+        if not agent_id or not response_text:
+            return []
+        candidates = extract_stance_candidates(response_text)
+        if not candidates:
+            return []
+        for stance in candidates:
+            await self.stance_repo.insert(
+                agent_id=agent_id,
+                person_id=person_id,
+                conversation_id=conversation_id,
+                topic=topic,
+                stance=stance,
+                source="RESPONSE",
+                source_event_id=source_event_id,
+            )
+        self.logger.info(
+            "stance_recorded agent_id=%s source_event_id=%s count=%d",
+            agent_id,
+            source_event_id,
+            len(candidates),
+        )
+        return candidates
+
+    async def add_stance(
+        self,
+        stance: str,
+        *,
+        topic: str = "UNKNOWN",
+        person_id: str | None = None,
+        actor: str = "admin",
+    ) -> str | None:
+        """Admin-configured stance (audited, trusted)."""
+        manifest = await self.repo.get_manifest() or {}
+        agent_id = manifest.get("agent_id", "")
+        if not agent_id:
+            return None
+        stance_id = await self.stance_repo.insert(
+            agent_id=agent_id,
+            person_id=person_id,
+            conversation_id=None,
+            topic=topic,
+            stance=stance,
+            source="ADMIN",
+        )
+        if stance_id is not None:
+            await self._audit(
+                actor, "add_agent_stance", "agent", agent_id, topic
+            )
+        return stance_id
+
+    async def retire_stance(
+        self, stance_id: str, *, actor: str = "admin"
+    ) -> bool:
+        manifest = await self.repo.get_manifest() or {}
+        agent_id = manifest.get("agent_id", "")
+        if not agent_id:
+            return False
+        changed = await self.stance_repo.retire(agent_id, stance_id)
+        if changed:
+            await self._audit(
+                actor, "retire_agent_stance", "agent", agent_id, stance_id
+            )
+        return changed
 
     # -- helpers -----------------------------------------------------------
 
