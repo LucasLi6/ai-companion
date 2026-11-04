@@ -983,6 +983,9 @@ class ProcessingReport(DomainModel):
     job_id: Optional[str] = None
     error: Optional[str] = None
     memory_write_outcomes: list[dict] = Field(default_factory=list)
+    # Stage durations in milliseconds (no content, no identifiers). Used for
+    # latency reporting; absent stages are simply omitted.
+    timings: dict[str, float] = Field(default_factory=dict)
     steps: list[str] = Field(default_factory=list)
 
 

@@ -119,7 +119,12 @@ async def test_duplicate_model_candidates_are_persisted_once(db):
             {"content": "Alice 住在杭州"},
         ]
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -134,7 +139,12 @@ async def test_uncertain_candidate_is_stored_as_candidate_not_active(db):
     # cannot treat this as a clear self-report: it is durably staged as a
     # CANDIDATE, never presented as an ACTIVE fact.
     client = CandidateClient([{"content": "Alice 喜欢川菜"}])
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -165,7 +175,12 @@ async def test_uncertain_candidate_is_stored_as_candidate_not_active(db):
 
 async def test_consolidation_rerun_changes_nothing(db):
     client = CandidateClient([{"content": "Alice 喜欢川菜"}])
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -186,7 +201,12 @@ async def test_consolidation_rerun_changes_nothing(db):
 
 async def test_no_candidates_persisted_without_learning_consent(db):
     client = CandidateClient([{"content": "Alice 喜欢川菜"}])
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt, learning=False)
     event = _event(person.person_id)
 

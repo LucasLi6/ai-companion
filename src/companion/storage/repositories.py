@@ -49,6 +49,7 @@ from companion.cognition.nonresponse import NonresponseTrace
 from companion.learning.state import LearningRepository
 from companion.research.state import ResearchStateRepository
 from companion.goals.state import GoalRepository
+from companion.runtime_context.repository import RuntimeSnapshotRepository
 
 from .database import Database
 
@@ -335,6 +336,8 @@ class UtteranceRepository:
         conversation_id: str,
         exclude_event_id: str | None,
         limit: int = 20,
+        *,
+        before_event: "UtteranceEvent | None" = None,
     ) -> list[UtteranceEvent]:
         """Return the *most recent* ``limit`` utterances, oldest first.
 
@@ -356,6 +359,13 @@ class UtteranceRepository:
         if exclude_event_id is not None:
             where += " AND event_id != ?"
             params.append(exclude_event_id)
+        if before_event is not None:
+            # Background analysis of an already-answered turn must see only
+            # what the speaker could see at that moment: exclude this event and
+            # anything ordered after it (occurred_at, event_id tie-break).
+            where += " AND (occurred_at < ? OR (occurred_at = ? AND event_id < ?))"
+            occurred = before_event.occurred_at.isoformat()
+            params.extend([occurred, occurred, before_event.event_id])
         sql = (
             "SELECT * FROM ("
             "  SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
@@ -381,6 +391,46 @@ class UtteranceRepository:
             )
             for r in rows
         ]
+
+    async def last_before_speaker(
+        self,
+        person_id: str,
+        *,
+        before: datetime,
+        exclude_event_id: str | None = None,
+    ) -> UtteranceEvent | None:
+        """The most recent utterance by ``person_id`` strictly before ``before``.
+
+        Used for "Last Heard" continuity. The comparison is strict so the
+        current event can never be returned as its own history, and the
+        exclusion is applied again for an event that shares its timestamp.
+        """
+        where = "speaker_person_id = ? AND occurred_at < ?"
+        params: list = [person_id, _iso(before)]
+        if exclude_event_id is not None:
+            where += " AND event_id != ?"
+            params.append(exclude_event_id)
+        cur = await self.db.execute(
+            "SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
+            " text, source, addressee_hint, occurred_at, processing_status"
+            f" FROM utterances WHERE {where}"
+            " ORDER BY occurred_at DESC, event_id DESC LIMIT 1",
+            tuple(params),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return UtteranceEvent(
+            event_id=row["event_id"],
+            conversation_id=row["conversation_id"],
+            speaker_person_id=row["speaker_person_id"],
+            speaker_label=row["speaker_label"],
+            text=row["text"],
+            source=EventSource(row["source"]),
+            addressee_hint=AddresseeHint(row["addressee_hint"]),
+            occurred_at=_dt(row["occurred_at"]),
+            processing_status=ProcessingStatus(row["processing_status"]),
+        )
 
     async def list_events(
         self, person_id: str | None = None, limit: int = 100
@@ -447,6 +497,12 @@ class UtteranceRepository:
 class AnalysisRepository:
     def __init__(self, db: Database) -> None:
         self.db = db
+
+    async def delete_analysis(self, event_id: str) -> None:
+        """Remove a placeholder analysis before storing the deferred result."""
+        await self.db.execute(
+            "DELETE FROM cognitive_analyses WHERE event_id = ?", (event_id,)
+        )
 
     async def save_analysis(
         self,
@@ -793,6 +849,53 @@ class AnalysisRepository:
             (event_id,),
         )
         return [dict(r) for r in await cur.fetchall()]
+
+    async def last_action_for_speaker(
+        self,
+        person_id: str,
+        *,
+        before: datetime,
+        action_type: str | None = None,
+    ) -> tuple[AgentAction, datetime] | None:
+        """Latest completed action for anything this speaker said.
+
+        Returns ``(action, occurred_at)`` where ``occurred_at`` is the source
+        utterance's time. ``action_type="RESPOND"`` answers "when did the
+        companion last actually say something to this speaker?"; ``None``
+        includes WAIT/IGNORE, i.e. "when did we last have a turn?".
+        """
+        where = (
+            "u.speaker_person_id = ? AND u.occurred_at < ?"
+            " AND a.status IN ('COMPLETED', 'TRUNCATED')"
+        )
+        params: list = [person_id, _iso(before)]
+        if action_type is not None:
+            where += " AND a.action_type = ?"
+            params.append(action_type)
+        cur = await self.db.execute(
+            "SELECT a.action_id, a.event_id, a.action_type, a.response_text,"
+            " a.reason_code, a.status, a.created_at, a.model_suggested_action,"
+            " a.policy_final_action, a.override_reason, a.nonresponse_trace_json,"
+            " u.occurred_at"
+            " FROM agent_actions a JOIN utterances u ON u.event_id = a.event_id"
+            f" WHERE {where}"
+            " ORDER BY u.occurred_at DESC, a.rowid DESC LIMIT 1",
+            tuple(params),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return self._to_action(row), _dt(row["occurred_at"])
+
+    async def delete_action(self, event_id: str) -> None:
+        """Remove a partial (CANCELLED/FAILED) action before a retry.
+
+        A completed or truncated action is never deleted: it is the durable
+        record of what was actually emitted.
+        """
+        await self.db.execute(
+            "DELETE FROM agent_actions WHERE event_id = ?", (event_id,)
+        )
 
     async def save_action(self, action: AgentAction) -> None:
         trace_json = (
@@ -1172,6 +1275,7 @@ class Repositories:
     research_state: ResearchStateRepository
     learning: LearningRepository
     goals: GoalRepository
+    runtime_snapshot: RuntimeSnapshotRepository
 
     async def persist_cognitive_outcome(
         self,
@@ -1219,6 +1323,7 @@ def make_repositories(db: Database) -> Repositories:
         research_state=ResearchStateRepository(db),
         learning=LearningRepository(db),
         goals=GoalRepository(db),
+        runtime_snapshot=RuntimeSnapshotRepository(db),
     )
 
 

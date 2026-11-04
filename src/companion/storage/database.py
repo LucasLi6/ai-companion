@@ -117,6 +117,30 @@ class Database:
             await self._conn.close()
             self._conn = None
 
+    async def backup_to(self, path: str | Path) -> Path:
+        """Write a consistent snapshot of the live database to ``path``.
+
+        Uses SQLite's online backup API: the copy is made by the engine,
+        includes committed WAL content and does not require stopping writers.
+        It refuses to overwrite an existing file, so a backup is never silently
+        replaced. Take one before a schema migration for a rollback route.
+        """
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise FileExistsError(f"backup target already exists: {target}")
+        async with self._lock:
+            destination = await aiosqlite.connect(str(target))
+            try:
+                await self.conn.backup(destination)
+                await destination.commit()
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+            finally:
+                await destination.close()
+        return target
+
     @property
     def conn(self) -> aiosqlite.Connection:
         """The raw connection.

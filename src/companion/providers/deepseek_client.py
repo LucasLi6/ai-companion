@@ -207,6 +207,23 @@ class ChatResponse:
     total_tokens: int
 
 
+@dataclass(frozen=True)
+class StreamDelta:
+    """One incremental piece of a streaming completion.
+
+    ``reasoning_content`` is deliberately not represented: the thinking stream
+    is never displayed, logged or forwarded. Only the visible ``content`` and
+    the terminal metadata leave this module.
+    """
+
+    content: str = ""
+    finish_reason: Optional[str] = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    usage_reported: bool = False
+
+
 def _classify_exception(exc: Exception) -> tuple[str, bool]:
     """Map an SDK/transport exception to ``(error_type, retryable)``.
 
@@ -259,6 +276,52 @@ def _safe_detail(exc: Exception) -> str:
     if status is not None:
         return f"HTTP {status}"
     return type(exc).__name__
+
+
+class _Usage:
+    """Accumulate streaming usage without assuming every chunk carries it."""
+
+    __slots__ = (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "reported",
+    )
+
+    def __init__(self) -> None:
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.reported = False
+
+    def absorb(self, usage) -> None:
+        if usage is None:
+            return
+        try:
+            self.prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            self.completion_tokens = int(
+                getattr(usage, "completion_tokens", 0) or 0
+            )
+            self.total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+            self.reported = True
+        except (TypeError, ValueError):
+            return
+
+
+async def _close_stream(stream) -> None:
+    if stream is None:
+        return
+    close = getattr(stream, "aclose", None)
+    if close is None:
+        close = getattr(stream, "close", None)
+    if close is None:
+        return
+    try:
+        result = close()
+        if hasattr(result, "__await__"):
+            await result
+    except Exception:  # closing a broken stream must never mask the real error
+        return
 
 
 # -- client -----------------------------------------------------------------
@@ -372,6 +435,213 @@ class DeepSeekClient:
                 raise last_error
             attempt += 1
             await asyncio.sleep(self.config.retry_backoff_seconds * (2 ** (attempt - 1)))
+
+    async def stream_completion(
+        self,
+        messages: list[dict],
+        *,
+        request_type: str = "response",
+        event_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        json_mode: Optional[bool] = None,
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+    ):
+        """Yield visible deltas from a real streaming Chat Completions call.
+
+        This is a true stream: each delta is yielded as it arrives, not after
+        the response is complete. ``reasoning_content`` is ignored entirely.
+
+        Retries are only safe *before* the first visible delta. Once any text
+        has been shown to the caller, an error propagates so the orchestration
+        layer can persist an explicit interrupted/partial status instead of
+        silently restarting the reply. Cancellation closes the upstream stream
+        and re-raises, so the caller can record the partial output.
+        """
+        if not self.config.api_key and self._client is None:
+            raise DeepSeekConfigError(
+                "no DEEPSEEK_API_KEY configured (Real mode requires a key)"
+            )
+        if json_mode is None:
+            json_mode = request_type == "analysis"
+        if max_tokens is None:
+            max_tokens = (
+                self.config.analysis_max_tokens
+                if request_type == "analysis"
+                else self.config.response_max_tokens
+            )
+        if reasoning_effort is None:
+            reasoning_effort = (
+                self.config.analysis_reasoning_effort
+                if request_type == "analysis"
+                else self.config.response_reasoning_effort
+            )
+        request_id = request_id or new_id("dsrq")
+
+        attempt = 0
+        while True:
+            t0 = time.monotonic()
+            first_token_ms: Optional[float] = None
+            emitted = False
+            finish_reason: Optional[str] = None
+            usage = _Usage()
+            stream = None
+            try:
+                stream = await self._open_stream(
+                    messages,
+                    json_mode=json_mode,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
+                iterator = stream.__aiter__()
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            anext(iterator), timeout=self.config.timeout_seconds
+                        )
+                    except StopAsyncIteration:
+                        break
+                    usage.absorb(getattr(chunk, "usage", None))
+                    choices = getattr(chunk, "choices", None) or []
+                    choice = choices[0] if choices else None
+                    content = ""
+                    if choice is not None:
+                        delta = getattr(choice, "delta", None)
+                        # ``reasoning_content`` is intentionally never read.
+                        content = getattr(delta, "content", None) or ""
+                        reason = getattr(choice, "finish_reason", None)
+                        if reason:
+                            finish_reason = reason
+                    if content:
+                        if first_token_ms is None:
+                            first_token_ms = (time.monotonic() - t0) * 1000
+                        emitted = True
+                        yield StreamDelta(
+                            content=content, finish_reason=finish_reason
+                        )
+                    elif finish_reason is not None:
+                        yield StreamDelta(finish_reason=finish_reason)
+
+                self._audit_stream(
+                    request_id,
+                    event_id,
+                    request_type,
+                    usage,
+                    (time.monotonic() - t0) * 1000,
+                    first_token_ms,
+                    success=True,
+                    error_type=None,
+                )
+                # A final metadata delta lets the caller see usage and the
+                # finish reason even when the provider sent them separately.
+                yield StreamDelta(
+                    finish_reason=finish_reason,
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                    total_tokens=usage.total_tokens,
+                    usage_reported=usage.reported,
+                )
+                return
+            except asyncio.CancelledError:
+                await _close_stream(stream)
+                self._audit_stream(
+                    request_id,
+                    event_id,
+                    request_type,
+                    usage,
+                    (time.monotonic() - t0) * 1000,
+                    first_token_ms,
+                    success=False,
+                    error_type="cancelled",
+                )
+                raise
+            except Exception as exc:
+                await _close_stream(stream)
+                if isinstance(exc, DeepSeekError):
+                    error = exc
+                else:
+                    error_type, retryable = _classify_exception(exc)
+                    error = _wrap_error(error_type, _safe_detail(exc))
+                    error.retryable = retryable
+                self._audit_stream(
+                    request_id,
+                    event_id,
+                    request_type,
+                    usage,
+                    (time.monotonic() - t0) * 1000,
+                    first_token_ms,
+                    success=False,
+                    error_type=error.error_type,
+                )
+                # Text already shown to a person cannot be silently restarted.
+                if emitted or not error.retryable or attempt >= self.config.max_retries:
+                    raise error
+                attempt += 1
+                await asyncio.sleep(
+                    self.config.retry_backoff_seconds * (2 ** (attempt - 1))
+                )
+
+    async def _open_stream(
+        self,
+        messages: list[dict],
+        *,
+        json_mode: bool,
+        max_tokens: int,
+        reasoning_effort: Optional[str],
+    ):
+        if self._client is None:
+            raise DeepSeekConfigError("no DeepSeek client configured")
+        params: dict = {
+            "model": self.config.model,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            params["response_format"] = {"type": "json_object"}
+        if reasoning_effort is not None:
+            params["reasoning_effort"] = reasoning_effort
+        try:
+            return await self._client.chat.completions.create(**params)
+        except DeepSeekError:
+            raise
+        except Exception as exc:
+            error_type, retryable = _classify_exception(exc)
+            error = _wrap_error(error_type, _safe_detail(exc))
+            error.retryable = retryable
+            raise error from exc
+
+    def _audit_stream(
+        self,
+        request_id: str,
+        event_id: Optional[str],
+        request_type: str,
+        usage,
+        latency_ms: float,
+        first_token_ms: Optional[float],
+        *,
+        success: bool,
+        error_type: Optional[str],
+    ) -> None:
+        """Structured stream log — never content, never a reasoning stream."""
+        self.logger.info(
+            "deepseek_stream request_id=%s event_id=%s provider=deepseek model=%s"
+            " request_type=%s latency_ms=%.2f time_to_first_token_ms=%s"
+            " input_tokens=%d output_tokens=%d total_tokens=%d success=%s"
+            " error_type=%s",
+            request_id,
+            event_id,
+            self.config.model,
+            request_type,
+            latency_ms,
+            f"{first_token_ms:.2f}" if first_token_ms is not None else "none",
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+            "true" if success else "false",
+            error_type or "none",
+        )
 
     async def _request(
         self,

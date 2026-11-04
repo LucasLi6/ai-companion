@@ -113,6 +113,7 @@ async def _runtime(db, *, pragmatic, response_text="好的。"):
         cognitive=cognitive,
         response=response,
         allow_mixed_providers=True,
+        fast_path_enabled=False,
     )
     await rt.agent_service.ensure_defaults()
     person = await rt.registry.register(
@@ -245,7 +246,12 @@ async def test_style_store_failure_cannot_affect_the_reply(db):
 async def test_real_deepseek_providers_receive_the_unified_speaking_block(db):
     reply = "这是第一段。\n\n这是第二段。"
     client = FakeDeepSeekClient(reply)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     await rt.agent_service.ensure_defaults()
     person = await rt.registry.register(
         "Alice",

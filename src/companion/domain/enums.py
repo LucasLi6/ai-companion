@@ -142,6 +142,10 @@ class ReplyNecessity(str, Enum):
 class JobType(str, Enum):
     MEMORY_CONSOLIDATION = "MEMORY_CONSOLIDATION"
     EMBEDDING = "EMBEDDING"
+    # V0.6: deferred cognitive/memory extraction for a Fast Path turn. The
+    # reply does not wait for it; it is durable, idempotent per event and
+    # retryable like any other job.
+    TURN_ANALYSIS = "TURN_ANALYSIS"
 
 
 class JobStatus(str, Enum):

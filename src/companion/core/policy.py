@@ -77,6 +77,10 @@ class PolicyDecision:
     model_action: CognitiveAction
     override_reason: Optional[str] = None
     rule: str = "model_suggestion"
+    # ``"model"`` when the suggestion came from a cognitive provider, or
+    # ``"local_fast_path"`` when the turn was routed locally. The field keeps a
+    # local decision auditable without pretending a model analysed it.
+    source: str = "model"
 
     @property
     def overrode_model(self) -> bool:
@@ -125,6 +129,11 @@ class Policy:
     ) -> PolicyDecision:
         model_action = analysis.action
         hint = addressee_hint or "unknown"
+        local_source = (
+            "local_fast_path"
+            if str(getattr(analysis, "provider", "")) == "local_fast_path"
+            else "model"
+        )
 
         def decision(
             action: CognitiveAction,
@@ -138,6 +147,7 @@ class Policy:
                 model_action=model_action,
                 override_reason=override if action != model_action else None,
                 rule=rule,
+                source=local_source,
             )
 
         # 1. Permission is a hard gate.
@@ -219,7 +229,11 @@ class Policy:
                     "unaddressed_response_below_threshold",
                 )
 
-        return decision(CognitiveAction.RESPOND, analysis.reason_code, "model_suggestion")
+        return decision(
+            CognitiveAction.RESPOND,
+            analysis.reason_code,
+            "fast_path_local_policy" if local_source == "local_fast_path" else "model_suggestion",
+        )
 
     def _may_interject(self, necessity: ReplyNecessity) -> bool:
         """Whether an unaddressed RESPOND suggestion clears the local bar."""

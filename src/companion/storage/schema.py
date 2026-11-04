@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1322,6 +1322,34 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE cognitive_analyses ADD COLUMN persona_agent_id TEXT;
         ALTER TABLE cognitive_analyses ADD COLUMN persona_revision INTEGER;
         ALTER TABLE cognitive_analyses ADD COLUMN persona_snapshot_json TEXT;
+        """,
+    ),
+    # Version 18 (V0.6): per-event runtime snapshot.
+    #
+    # The snapshot pins the event's arrival time and temporal gaps so a retry
+    # reuses the original values instead of refreshing them. It stores only
+    # derived, city-level location data when GeoIP is enabled and consented —
+    # never a raw IP address. The display time zone is an IANA name; the UTC
+    # offset is a derived convenience value, not the stored authority.
+    (
+        18,
+        """
+        CREATE TABLE IF NOT EXISTS runtime_snapshots (
+            event_id           TEXT PRIMARY KEY
+                               REFERENCES utterances(event_id) ON DELETE CASCADE,
+            conversation_id    TEXT NOT NULL,
+            speaker_person_id  TEXT,
+            received_at_utc    TEXT NOT NULL,
+            occurred_at_utc    TEXT NOT NULL,
+            timezone_name      TEXT NOT NULL,
+            timezone_source    TEXT NOT NULL,
+            local_time         TEXT NOT NULL,
+            snapshot_json      TEXT NOT NULL,
+            created_at         TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_runtime_snapshots_conversation
+            ON runtime_snapshots(conversation_id, created_at);
         """,
     ),
 ]

@@ -379,7 +379,12 @@ async def test_two_turn_awareness_end_to_end_and_restart(db):
             ),
         ]
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     alice = await _register(rt, external_ai=True)
 
     first = _event(alice.person_id, "你在听吗？", at=1)

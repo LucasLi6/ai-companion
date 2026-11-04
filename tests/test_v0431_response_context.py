@@ -220,7 +220,12 @@ async def _agent_id(rt):
 
 async def test_real_response_request_never_contains_the_inference(db):
     client = _FakeClient(_payload())
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -237,7 +242,12 @@ async def test_real_response_request_never_contains_the_inference(db):
 
 async def test_analysis_action_still_drives_local_policy(db):
     client = _FakeClient(_payload(action="WAIT", reason_code="ambiguous_addressee"))
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -267,7 +277,12 @@ async def test_scene_proposal_is_still_applied_even_without_meaning(db):
             }
         )
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -286,7 +301,12 @@ async def test_scene_proposal_is_still_applied_even_without_meaning(db):
 
 async def test_neutral_turn_has_no_filler_but_keeps_state_and_tts(db):
     client = _FakeClient(_payload())
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(

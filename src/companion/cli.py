@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -62,10 +64,24 @@ from companion.providers.deepseek_client import (
 )
 from companion.recovery import RecoveryError, RecoveryManager
 from companion.runtime import build_runtime
+from companion.runtime_context.timezone import TimeZoneService, valid_zone
 from companion.storage.database import Database
 from companion.storage.repositories import make_repositories
 
 DEFAULT_CONVERSATION = "default"
+
+# Runtime-context settings. GeoIP stays off unless explicitly enabled here (or
+# at the process level) *and* a locally licensed database is present.
+RUNTIME_SETTING_TIMEZONE = "runtime.timezone"
+RUNTIME_SETTING_REENTRY_GAP = "runtime.reentry_gap_seconds"
+RUNTIME_SETTING_GEOIP_ENABLED = "privacy.geoip.enabled"
+RUNTIME_SETTING_GEOIP_TRUSTED_PROXIES = "privacy.geoip.trusted_proxies"
+RUNTIME_SETTING_KEYS = (
+    RUNTIME_SETTING_TIMEZONE,
+    RUNTIME_SETTING_REENTRY_GAP,
+    RUNTIME_SETTING_GEOIP_ENABLED,
+    RUNTIME_SETTING_GEOIP_TRUSTED_PROXIES,
+)
 
 # Memory-management commands act as the trusted local admin, not as a person.
 ADMIN = AccessContext("admin", is_admin=True, role="cli")
@@ -310,6 +326,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_policy_set.add_argument("value")
     p_policy_set.set_defaults(func=cmd_policy_set)
+
+    p_runtime = sub.add_parser(
+        "runtime",
+        parents=[_common_parser()],
+        help="Show or set runtime context settings (time zone, GeoIP)",
+    )
+    p_runtime_sub = p_runtime.add_subparsers(dest="runtime_command")
+    p_runtime_show = p_runtime_sub.add_parser(
+        "show", parents=[_common_parser()], help="Show runtime context settings"
+    )
+    p_runtime_show.set_defaults(func=cmd_runtime_show)
+    p_runtime_set = p_runtime_sub.add_parser(
+        "set", parents=[_common_parser()], help="Set one runtime context setting"
+    )
+    p_runtime_set.add_argument("key", choices=list(RUNTIME_SETTING_KEYS))
+    p_runtime_set.add_argument("value")
+    p_runtime_set.set_defaults(func=cmd_runtime_set)
 
     p_ui = sub.add_parser("ui", parents=[_common_parser()], help="Start the management web UI (NiceGUI)")
     p_ui.add_argument("--host", default="127.0.0.1")
@@ -730,6 +763,35 @@ async def cmd_inspect(args) -> int:
             print(f"override_reason: {action.override_reason or '-'}")
             print(f"response_text: {action.response_text or '(none)'}")
 
+        snapshot = await rt.repos.runtime_snapshot.get(args.event_id)
+        if snapshot:
+            print("-- runtime context --")
+            print(
+                f"local_time: {snapshot.local_time}"
+                f" ({snapshot.timezone}, source={snapshot.timezone_source})"
+            )
+            print(
+                f"last_heard_gap_seconds: {snapshot.last_heard_gap_seconds}"
+                f" last_interaction_gap_seconds: {snapshot.last_interaction_gap_seconds}"
+                f" last_meaningful_context_gap_seconds:"
+                f" {snapshot.last_meaningful_context_gap_seconds}"
+            )
+            print(f"reentry_state: {snapshot.reentry_state}")
+            print(f"ava_emotion: {snapshot.ava_emotion or '-'}")
+            if snapshot.location is not None:
+                place = ", ".join(
+                    part
+                    for part in (
+                        snapshot.location.city,
+                        snapshot.location.subdivision,
+                        snapshot.location.country,
+                    )
+                    if part
+                )
+                print(f"network_egress_location: {place or '(unknown)'}")
+            else:
+                print("network_egress_location: (none)")
+
         candidates = await rt.repos.analysis.get_candidates(args.event_id)
         writes = {
             w["candidate_id"]: w
@@ -1108,6 +1170,86 @@ async def cmd_policy_set(args) -> int:
         repos = make_repositories(db)
         await repos.settings.set(args.key, value)
         print(f"{args.key} = {value}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_runtime_show(args) -> int:
+    db = await _connect(args.db)
+    try:
+        repos = make_repositories(db)
+        settings = repos.settings
+        user_zone = await settings.get(RUNTIME_SETTING_TIMEZONE)
+        resolved = TimeZoneService().resolve(user_timezone=user_zone)
+        geo_enabled = await settings.get_bool(RUNTIME_SETTING_GEOIP_ENABLED, False)
+        proxies = await settings.get(RUNTIME_SETTING_GEOIP_TRUSTED_PROXIES)
+        raw_gap = await settings.get(RUNTIME_SETTING_REENTRY_GAP)
+
+        print(f"{RUNTIME_SETTING_TIMEZONE}: {user_zone or '(not set)'}")
+        print(f"resolved time zone: {resolved.name} (source={resolved.source})")
+        print(f"{RUNTIME_SETTING_REENTRY_GAP}: {raw_gap or '(default 21600)'}")
+        print(f"{RUNTIME_SETTING_GEOIP_ENABLED}: {str(geo_enabled).lower()}")
+        print(f"GEOIP_DB_PATH: {'configured' if os.environ.get('GEOIP_DB_PATH') else '(not set)'}")
+        print(
+            f"{RUNTIME_SETTING_GEOIP_TRUSTED_PROXIES}: {proxies or '(none)'}"
+        )
+        print(
+            "note: GeoIP is opt-in and local-only; it is only used when the"
+            " speaker permits external AI use. A location is never stored as"
+            " a raw IP."
+        )
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_runtime_set(args) -> int:
+    key, value = args.key, args.value.strip()
+    if key == RUNTIME_SETTING_TIMEZONE:
+        zone = valid_zone(value)
+        if zone is None:
+            print(
+                f"invalid IANA time zone {value!r}; example: Asia/Shanghai"
+            )
+            return 1
+        normalised = zone
+    elif key == RUNTIME_SETTING_REENTRY_GAP:
+        try:
+            seconds = int(value)
+        except ValueError:
+            print("reentry gap must be a whole number of seconds")
+            return 1
+        if seconds <= 0:
+            print("reentry gap must be positive")
+            return 1
+        normalised = str(seconds)
+    elif key == RUNTIME_SETTING_GEOIP_ENABLED:
+        lowered = value.lower()
+        if lowered not in ("true", "false", "1", "0", "yes", "no", "on", "off"):
+            print("expected true or false")
+            return 1
+        normalised = "true" if lowered in ("true", "1", "yes", "on") else "false"
+    elif key == RUNTIME_SETTING_GEOIP_TRUSTED_PROXIES:
+        items = [item.strip() for item in value.split(",") if item.strip()]
+        normalised_items: list[str] = []
+        for item in items:
+            try:
+                normalised_items.append(
+                    str(ipaddress.ip_network(item, strict=False))
+                )
+            except ValueError:
+                print(f"invalid proxy network {item!r}")
+                return 1
+        normalised = ",".join(normalised_items)
+    else:  # argparse restricts the choice; defensive only
+        print(f"unknown runtime setting {key!r}")
+        return 1
+
+    db = await _connect(args.db)
+    try:
+        await make_repositories(db).settings.set(key, normalised)
+        print(f"{key} = {normalised}")
     finally:
         await db.close()
     return 0

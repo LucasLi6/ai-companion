@@ -177,10 +177,12 @@ async def test_deepseek_responds_through_the_real_pipeline(db):
     assert report.action == CognitiveAction.RESPOND
     assert report.reason_code == ReasonCode.DIRECT_AGENT_ADDRESS
     assert report.response_text == "你好！很高兴见到你。"
-    assert [c["request_type"] for c in client.calls] == ["analysis", "response"]
+    # V0.6 Fast Path: a clearly addressed direct turn makes exactly one model
+    # call (the response). No cognitive round-trip is needed for the reply.
+    assert [c["request_type"] for c in client.calls] == ["response"]
 
     analysis = await rt.repos.analysis.get_analysis(event.event_id)
-    assert analysis is not None and analysis.provider == "deepseek"
+    assert analysis is not None and analysis.provider == "local_fast_path"
     action = await rt.repos.analysis.get_action(event.event_id)
     assert action is not None and action.response_text == "你好！很高兴见到你。"
 
@@ -213,8 +215,11 @@ async def test_deepseek_quiet_mode_suppresses_only_the_response(db):
 
     assert report.action == CognitiveAction.WAIT
     assert report.response_text is None
-    # Analysis still ran (and was persisted); only the reply was withheld.
-    assert [c["request_type"] for c in client.calls] == ["analysis"]
+    # Fast Path: quiet mode is a local rule, so nothing is sent at all. The
+    # local decision record is still persisted for audit.
+    assert [c["request_type"] for c in client.calls] == []
+    analysis = await rt.repos.analysis.get_analysis(report.event_id)
+    assert analysis is not None and analysis.provider == "local_fast_path"
 
 
 async def test_deepseek_second_turn_sees_prior_history(db):
@@ -229,8 +234,11 @@ async def test_deepseek_second_turn_sees_prior_history(db):
         _event(person.person_id, "今晚吃什么好？")
     )
 
-    # calls: 0 analysis#1, 1 response#1, 2 analysis#2
-    second_prompt = client.calls[2]["messages"][1]["content"]
+    # Fast Path: calls are 0 response#1, 1 response#2. The second response
+    # request sees the prior human turn and the assistant reply to it.
+    second_prompt = "\n".join(
+        m["content"] for m in client.calls[1]["messages"]
+    )
     assert "我在学做饭" in second_prompt
     assert "你好！很高兴见到你。" in second_prompt  # the assistant turn
 
@@ -246,7 +254,7 @@ async def test_deepseek_non_persistence_calls_ai_but_writes_nothing(db):
     assert report.status == "COMPLETED"
     assert report.action == CognitiveAction.RESPOND
     assert report.response_text == "你好！很高兴见到你。"
-    assert len(client.calls) == 2
+    assert len(client.calls) == 1  # Fast Path: response only
     # No durable record of this interaction.
     assert await rt.repos.utterance.get(event.event_id) is None
     assert await rt.repos.analysis.get_analysis(event.event_id) is None

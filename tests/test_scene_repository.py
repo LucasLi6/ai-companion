@@ -60,7 +60,7 @@ def _state(person_id, event_id, *, revision, topic="旅行", source_ids=None):
 
 async def test_schema_15_has_scene_tables_and_analysis_column(db):
     cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 17
+    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 18
 
     cur = await db.execute("PRAGMA table_info(cognitive_analyses)")
     assert "scene_proposal_json" in {r["name"] for r in await cur.fetchall()}

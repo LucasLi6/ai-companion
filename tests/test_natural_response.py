@@ -90,7 +90,7 @@ def _system(ctx=None):
 
 def test_prompt_versions_are_bumped():
     assert COGNITIVE_PROMPT_VERSION == "cognitive-v9"
-    assert RESPONSE_PROMPT_VERSION == "response-v12"
+    assert RESPONSE_PROMPT_VERSION == "response-v13"
 
 
 def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():

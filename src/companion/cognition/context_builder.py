@@ -64,7 +64,11 @@ class ContextBuilder:
         self._people: dict[str, object] = {}
 
     async def build(
-        self, event: UtteranceEvent, memories: list[dict]
+        self,
+        event: UtteranceEvent,
+        memories: list[dict],
+        *,
+        before_event: Optional[UtteranceEvent] = None,
     ) -> CognitiveContext:
         self._people = {}
 
@@ -72,6 +76,7 @@ class ContextBuilder:
             event.conversation_id,
             exclude_event_id=event.event_id,
             limit=self.history_limit,
+            before_event=before_event,
         )
         if self.privacy_gateway is not None:
             # External-AI gate: only history from authorized speakers and only
@@ -161,6 +166,7 @@ class ContextBuilder:
             if (
                 action is not None
                 and action.action_type == CognitiveAction.RESPOND
+                and action.status in ("COMPLETED", "TRUNCATED")
                 and action.response_text
             ):
                 turns.append(

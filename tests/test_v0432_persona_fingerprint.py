@@ -126,7 +126,12 @@ async def _person(rt):
 
 async def _runtime(db):
     client = _FakeClient(failures=1)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     return rt, client, person
 

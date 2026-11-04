@@ -36,6 +36,7 @@ ANALYSIS_JSON = json.dumps(
         "referenced_memory_ids": [],
         "memory_candidates": [{"content": "Alice 喜欢川菜"}],
         "response_style": "warm",
+        "reply_necessity": "REQUIRED",
     },
     ensure_ascii=False,
 )
@@ -87,10 +88,13 @@ async def _person(rt):
 
 
 def _event(person_id, text="你好"):
+    # ``unknown`` keeps these recovery tests on the Deliberation Path: they
+    # exercise the two-call analysis+response pipeline (Fast Path coverage
+    # lives in test_v06_fast_path.py).
     return make_utterance_event(
         conversation_id="c1",
         text=text,
-        addressee_hint="agent",
+        addressee_hint="unknown",
         speaker_person_id=person_id,
         source=EventSource.TEST,
     )

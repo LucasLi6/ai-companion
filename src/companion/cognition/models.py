@@ -93,3 +93,7 @@ class CognitiveContext(BaseModel):
     personality: Optional[dict] = Field(default=None)
     # Short pragmatic reminders assembled from scene/action history.
     pragmatic_guidance: list[str] = Field(default_factory=list)
+    # V0.6: per-event runtime state (local time, temporal gaps, re-entry state,
+    # optional network-egress location). Derived and persisted once per event
+    # so a retry sees the same values. Prompt data, never an instruction.
+    runtime_snapshot: Optional[dict] = Field(default=None)

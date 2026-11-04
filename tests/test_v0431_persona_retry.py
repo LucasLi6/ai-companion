@@ -94,7 +94,12 @@ async def _person(rt):
 
 async def test_same_revision_retry_reuses_analysis_and_finishes(db):
     client = _FakeClient(failures=1)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     await rt.agent_service.set_persona_core(
         {"character_description": OLD_PERSONA}, actor="admin"
@@ -116,7 +121,12 @@ async def test_same_revision_retry_reuses_analysis_and_finishes(db):
 
 async def test_retry_after_persona_change_uses_the_stored_snapshot(db):
     client = _FakeClient(failures=1)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     before = await rt.agent_service.set_persona_core(
         {"character_description": OLD_PERSONA}, actor="admin"
@@ -142,7 +152,12 @@ async def test_retry_after_persona_change_uses_the_stored_snapshot(db):
 
 async def test_changed_revision_without_a_snapshot_is_an_explicit_conflict(db):
     client = _FakeClient(failures=1)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     await rt.agent_service.set_persona_core(
         {"character_description": OLD_PERSONA}, actor="admin"
@@ -174,7 +189,12 @@ async def test_changed_revision_without_a_snapshot_is_an_explicit_conflict(db):
 
 async def test_legacy_row_without_persona_metadata_is_a_conflict(db):
     client = _FakeClient(failures=1)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     event = _event(person.person_id, "你好")
 
@@ -197,7 +217,12 @@ async def test_legacy_row_without_persona_metadata_is_a_conflict(db):
 
 async def test_completed_turn_is_a_duplicate_not_a_second_response(db):
     client = _FakeClient(failures=0)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     event = _event(person.person_id, "你好")
 
@@ -254,7 +279,7 @@ async def test_schema_16_rows_read_as_unknown_persona_not_as_matching(tmp_path):
     try:
         await db.initialize()
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 17
+        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 18
 
         repo = AnalysisRepository(db)
         stored = await repo.get_analysis_persona("evt_legacy")

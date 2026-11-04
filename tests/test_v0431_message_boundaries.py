@@ -295,7 +295,12 @@ async def test_orchestrator_keeps_two_user_turns_and_no_fake_assistant(
             _payload("RESPOND", "direct_agent_address"),
         ]
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     alice = await _person(rt)
     first = _event(alice.person_id, "嗯。", event_id="evt_first")
     second = _event(alice.person_id, "你到底在不在？", event_id="evt_second")
@@ -322,7 +327,12 @@ async def test_orchestrator_labels_two_speakers_without_merging(db):
             _payload("RESPOND", "direct_agent_address"),
         ]
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     alice = await _person(rt, "Alice")
     bob = await _person(rt, "Bob")
 

@@ -24,6 +24,7 @@ from companion.cognition.context_builder import ContextBuilder
 from companion.cognition.scene_manager import SceneManager
 from companion.cognition.privacy import ForegroundPrivacyGateway
 from companion.core.conversation import ConversationManager
+from companion.core.metrics import LatencyMetrics
 from companion.core.orchestrator import Orchestrator
 from companion.core.policy import Policy
 from companion.domain.enums import JobType
@@ -31,7 +32,7 @@ from companion.emotion.parameters import load_emotion_config
 from companion.emotion.repository import EmotionRepository
 from companion.emotion.service import EmotionService
 from companion.jobs.embedding_handler import build_embedding_handler
-from companion.jobs.handlers import memory_consolidation
+from companion.jobs.handlers import build_turn_analysis_handler, memory_consolidation
 from companion.jobs.worker import JobWorker
 from companion.memory.consolidation import MemoryWriter
 from companion.memory.embedding_repository import EmbeddingRepository
@@ -48,6 +49,9 @@ from companion.providers.deepseek_client import (
 from companion.providers.deepseek_cognitive import DeepSeekCognitiveProvider
 from companion.providers.deepseek_response import DeepSeekResponseProvider
 from companion.providers.mock import MockCognitiveProvider, MockResponseProvider
+from companion.runtime_context.geolocation import GeoLocationService
+from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
+from companion.runtime_context.timezone import TimeZoneService
 from companion.storage.database import Database
 from companion.storage.repositories import Repositories, make_repositories
 
@@ -77,6 +81,9 @@ class Runtime:
     scene_manager: Optional[SceneManager] = None
     style_repo: Optional[StyleExampleRepository] = None
     personality_compiler: Optional[PersonalityCompiler] = None
+    runtime_snapshot_builder: Optional[RuntimeSnapshotBuilder] = None
+    geo_service: Optional[GeoLocationService] = None
+    metrics: Optional[LatencyMetrics] = None
 
 
 def build_runtime(
@@ -94,6 +101,7 @@ def build_runtime(
     scene_enabled: Optional[bool] = None,
     personality_generation_enabled: Optional[bool] = None,
     cognitive_repair_enabled: Optional[bool] = None,
+    fast_path_enabled: Optional[bool] = None,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
 
@@ -236,9 +244,42 @@ def build_runtime(
     worker = None
     if with_worker:
         handlers = {"MEMORY_CONSOLIDATION": memory_consolidation}
+        if context_builder is not None:
+            handlers[JobType.TURN_ANALYSIS.value] = build_turn_analysis_handler(
+                cognitive=cognitive,
+                context_builder=context_builder,
+                memory=memory,
+            )
         if embedding_service is not None:
             handlers["EMBEDDING"] = build_embedding_handler(embedding_service)
         worker = JobWorker(repos, handlers, logger=logger)
+
+    # V0.6 runtime context. Timezone resolution is always on (it needs no
+    # consent and no network). GeoIP is strictly opt-in: it requires
+    # GEOIP_ENABLED and a locally licensed GeoLite2 City database; no
+    # credentials are read, stored or committed here.
+    geoip_enabled = os.environ.get("GEOIP_ENABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    geo_service = GeoLocationService(
+        db_path=os.environ.get("GEOIP_DB_PATH"),
+        enabled=geoip_enabled,
+        logger=logger,
+    )
+    runtime_snapshot_builder = RuntimeSnapshotBuilder(
+        repos,
+        timezone_service=TimeZoneService(),
+        geo_service=geo_service,
+        logger=logger,
+    )
+    metrics = LatencyMetrics()
+    if fast_path_enabled is None:
+        fast_path_enabled = os.environ.get(
+            "AVA_FAST_PATH_ENABLED", "true"
+        ).strip().lower() in ("1", "true", "yes", "on")
 
     orchestrator = Orchestrator(
         repos=repos,
@@ -256,6 +297,9 @@ def build_runtime(
         scene_manager=scene_manager,
         personality_compiler=personality_compiler,
         style_repo=style_repo,
+        runtime_snapshot_builder=runtime_snapshot_builder,
+        metrics=metrics,
+        fast_path_enabled=bool(fast_path_enabled),
         logger=logger,
     )
     return Runtime(
@@ -280,4 +324,7 @@ def build_runtime(
         scene_manager=scene_manager,
         style_repo=style_repo,
         personality_compiler=personality_compiler,
+        runtime_snapshot_builder=runtime_snapshot_builder,
+        geo_service=geo_service,
+        metrics=metrics,
     )

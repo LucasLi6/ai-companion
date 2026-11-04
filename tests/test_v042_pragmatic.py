@@ -297,7 +297,12 @@ def test_low_confidence_pragmatic_does_not_move_the_frame(rt):
 
 async def test_pragmatic_reaches_response_and_interaction_scene(db):
     client = _FakeClient({})
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
 
     first = _event(person.person_id, "我给你讲个冷笑话")
@@ -337,7 +342,12 @@ async def test_pragmatic_does_not_override_the_local_action(db):
             "pragmatic": _raw(primary_act="REQUEST", interaction_frame="SERIOUS"),
         }
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     report = await rt.orchestrator.process_utterance(
         _event(person.person_id, "你刚才那句是什么意思？")

@@ -170,7 +170,12 @@ async def _say(rt, person_id, text, turn, *, conversation="c1", to="agent"):
 
 def _runtime(db, script):
     client = ScriptedDeepSeekClient(script)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     return rt, client
 
 

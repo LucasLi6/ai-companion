@@ -171,7 +171,12 @@ async def _apply_persona(rt):
 
 async def _deepseek_turn(db, text="你好"):
     client = FakeDeepSeekClient("在呢。")
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     await rt.agent_service.ensure_defaults()
     await _apply_persona(rt)
     person = await rt.registry.register(

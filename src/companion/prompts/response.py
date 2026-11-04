@@ -14,6 +14,11 @@ generation strategy and rendered relevant style references. V0.5
 classifies a reply mode or retrieves style examples per turn. Spoken,
 short and natural language is now governed by one unified 【说话方式】 block,
 and the model is left to organise its own wording from its stable persona.
+V0.6 (``response-v13``) appends one compact, trusted runtime block (local time,
+temporal gaps, re-entry state, optional network-egress location) after the
+stable persona prefix, and makes the anti-template rule explicit: a reply must
+not default to a mechanical "conclusion + one explanatory paragraph" shape.
+No post-generation detector, truncation or second polishing model is used.
 
 - the ``system`` message contains only trusted application data: the fixed
   boundaries, the admin-maintained Persona Core, this turn's locally computed
@@ -45,8 +50,9 @@ from companion.prompts.addressee import (
     safe_speaker_label,
 )
 from companion.prompts.identity import compile_trait_tendencies
+from companion.runtime_context.assembler import compile_runtime_context
 
-RESPONSE_PROMPT_VERSION = "response-v12"
+RESPONSE_PROMPT_VERSION = "response-v13"
 
 # Bounded background data. These limits keep one hostile turn from flooding the
 # prompt and keep the untrusted block predictable.
@@ -93,6 +99,8 @@ BASE_RESPONSE_PROMPT = """\
 自然、明确、真实地回答，不要假装自己是人类。
 - 情绪状态只影响语气和分寸，不是要报告的内容；不要把它说成真实的身体感受，也不要\
 为了显得有情绪而表演。
+- 【当前时间与状态】里的时间是本地可信数据。时间间隔只是事实，不是固定话术；不要\
+每轮重复“好久不见”、重逢或时间提醒，也不要把它当成本轮对方说的话。
 - 没有固定回复，也不按 ANSWER/SUPPORT/PLAYFUL 之类分类套模板；不要每轮以问题结尾。
 - 用与对方相同的语言。只输出回复正文，不要 JSON，不要 Markdown 代码块，\
 不要任何前后缀说明。
@@ -101,18 +109,23 @@ BASE_RESPONSE_PROMPT = """\
 像日常聊天一样说话。自然、口语化、直接、不端着，别把普通聊天写成文章，也别像\
 客服或教科书。
 
-默认简短。简单交流通常一句话就够，需要解释时再多说一两句——这只是表达倾向，\
-不是硬性限制。没有必要的信息就不说，不为了显得完整而补充第二段。
+没有固定长度，也没有固定结构。日常对话通常不需要长篇，但一句话够不够用取决于\
+对方在说什么：接一个玩笑、回应一句分享，可能一句就够；对方在讲一件复杂的事、\
+需要你解释或一起想清楚时，该展开就展开。不要为了显得完整而补一段解释，也不要\
+为了显得简洁而省略必要信息。
+
+不要把回答套进“先给结论，再解释一段”的固定形状。先想清楚这段对话真正需要什么，\
+再决定说多少、按什么顺序说；同一个意思不必换句话重复一遍。
 
 先理解对方这句话在当前交流里起什么作用：可能是玩笑、试探、抱怨、分享、邀请、\
 表达态度、闲聊，也可能是明确的任务或知识需求。回应它真正的作用，而不是只回应\
 字面含义；对方开玩笑就自然接话，分享就不必转成建议，表达情绪就不必自动分析\
 心理。不要解释已经明显成立的玩笑。
 
-知识类问题同样默认简短：先用简单的话讲清楚最关键的结论，再解释一两个关键原因，\
-不要一上来就列出五六种可能、长篇定义、背景知识、公式和操作步骤。对方明确要求\
-详细解释、推导、代码、完整排查或分步骤教程时，再充分展开；准确和必要信息不能\
-因为追求简短而被省略。
+知识类问题按内容需要组织：先讲对方最需要的部分，再补充必要的理由、条件或步骤。\
+不要一上来就列出五六种可能、长篇定义、无关背景或操作步骤。对方明确要求详细\
+解释、推导、代码、完整排查或分步骤教程时，再充分展开；准确和必要信息不能因为\
+追求简短而被省略。
 
 对方提出明确任务或知识需求时，按你的理科、工程背景认真完成：允许多段回答、\
 代码、步骤、数学推导和详细解释，不要因为平时聊天简短就删掉必要内容；同时保持\
@@ -306,6 +319,10 @@ def _trusted_turn_lines(
             "真人说，unknown 表示指向不明确。分清是谁在说，不要把不同人的话混成"
             "一个人，也不要根据正文猜测或改写这个标签。"
         )
+
+    runtime_block = compile_runtime_context(context.runtime_snapshot)
+    if runtime_block:
+        lines.append(runtime_block)
 
     if context.affect_context:
         lines.append(f"【此刻的状态】{context.affect_context}")

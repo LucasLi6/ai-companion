@@ -364,7 +364,12 @@ async def test_cross_turn_conflict_repair_then_neutral_continuation(db):
             "行，聊别的。",
         ],
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     agent_id = await _agent_id(rt)
 
@@ -415,7 +420,12 @@ async def test_cross_turn_topic_shift_suppresses_the_old_emotion(db):
             ),
         ]
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     agent_id = await _agent_id(rt)
 
@@ -446,7 +456,12 @@ async def test_cross_turn_playful_setup_payoff_stays_playful(db):
         ],
         responses=["行，我听着。", "冷。但你赢了。"],
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
     agent_id = await _agent_id(rt)
 
@@ -471,7 +486,12 @@ async def test_cross_turn_emitted_stance_reaches_the_next_response_request(db):
             "这个乐队我听过，还行。",
         ],
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
 
     await rt.orchestrator.process_utterance(_event(person.person_id, turn1))
@@ -492,7 +512,12 @@ async def test_cross_turn_emitted_stance_reaches_the_next_response_request(db):
 async def test_full_chain_request_capture_order_and_versions(db):
     text = "这个 bug 怎么查？"
     client = _ScriptedClient([_payload(text, act="QUESTION")])
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
 
     await rt.orchestrator.process_utterance(_event(person.person_id, text))
@@ -522,7 +547,12 @@ async def test_full_chain_request_capture_order_and_versions(db):
 async def test_safety_turn_makes_no_response_request(db):
     text = "我现在不想活了"
     client = _ScriptedClient([_payload(text, act="SELF_DISCLOSURE", frame="SUPPORT")])
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        fast_path_enabled=False,
+    )
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(_event(person.person_id, text))

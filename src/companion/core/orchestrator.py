@@ -25,6 +25,7 @@ guarantee.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import Optional
@@ -48,13 +49,16 @@ from companion.cognition.silence import (
 )
 from companion.domain.enums import (
     CognitiveAction,
+    JobType,
     ProcessingStatus,
     ReasonCode,
     RegistrationStatus,
     ReportStatus,
+    ReplyNecessity,
 )
 from companion.domain.models import (
     AgentAction,
+    CognitiveResult,
     ConversationContext,
     ProcessingReport,
     UtteranceEvent,
@@ -65,10 +69,15 @@ from companion.emotion.expression_policy import compile_affect_context
 from companion.emotion.transition import build_conversational_affect
 from companion.memory.candidates import prepare_candidates
 from companion.people.registry import PersonRegistry
+from companion.runtime_context.connection import ConnectionInfo
+from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
 from companion.storage.repositories import Repositories
 
 from .conversation import ConversationManager
+from .fast_path import LOCAL_PROVIDER, decide_route
+from .metrics import LatencyMetrics
 from .policy import Policy, PolicyDecision
+from .response_events import ResponseEventSink
 from .safety import assess_safety, detect_language, safety_response
 
 
@@ -100,6 +109,9 @@ class Orchestrator:
         scene_manager=None,
         personality_compiler=None,
         style_repo=None,
+        runtime_snapshot_builder: Optional[RuntimeSnapshotBuilder] = None,
+        metrics: Optional[LatencyMetrics] = None,
+        fast_path_enabled: bool = True,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repos = repos
@@ -132,6 +144,16 @@ class Orchestrator:
         # cognitive and response providers. In mock mode it stays None and the
         # providers receive the lightweight ConversationContext as before.
         self.context_builder = context_builder
+        # V0.6: one immutable runtime snapshot per event (time, zone, gaps,
+        # optional consented location). Missing builder keeps older wirings
+        # working unchanged.
+        self.runtime_snapshot_builder = runtime_snapshot_builder
+        self.metrics = metrics or LatencyMetrics()
+        # Operational switch. On by default: a clearly addressed direct turn
+        # makes one model call. An operator (or a test targeting the richer
+        # deliberation pipeline) can turn it off; routing still never looks at
+        # message text.
+        self.fast_path_enabled = fast_path_enabled
         self.logger = logger or logging.getLogger("companion.orchestrator")
         self._conversation_locks: dict[str, asyncio.Lock] = {}
 
@@ -142,14 +164,68 @@ class Orchestrator:
             self._conversation_locks[conversation_id] = lock
         return lock
 
-    async def process_utterance(self, event: UtteranceEvent) -> ProcessingReport:
+    async def process_utterance(
+        self,
+        event: UtteranceEvent,
+        *,
+        connection: Optional[ConnectionInfo] = None,
+    ) -> ProcessingReport:
         # Per-conversation serialization: events in the same conversation run
         # one at a time, in submission order.
         async with self._lock_for(event.conversation_id):
-            return await self._process(event)
+            return await self._process(event, connection=connection)
 
-    async def _process(self, event: UtteranceEvent) -> ProcessingReport:
+    async def process_utterance_stream(
+        self,
+        event: UtteranceEvent,
+        *,
+        connection: Optional[ConnectionInfo] = None,
+    ):
+        """Process one event, yielding true incremental :class:`ResponseEvent`s.
+
+        The turn runs in a background task so deltas can be yielded while the
+        database work continues. Only a short local transaction is open at a
+        time; no DB transaction spans the model stream. If the consumer stops
+        early, the task is cancelled and any text already shown is persisted
+        with an explicit ``CANCELLED`` action status, never as a complete reply.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        sink = ResponseEventSink(
+            event.event_id, event.conversation_id, queue.put_nowait
+        )
+
+        async def run() -> ProcessingReport:
+            try:
+                async with self._lock_for(event.conversation_id):
+                    return await self._process(
+                        event, connection=connection, stream=sink
+                    )
+            finally:
+                queue.put_nowait(None)
+
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    async def _process(
+        self,
+        event: UtteranceEvent,
+        *,
+        connection: Optional[ConnectionInfo] = None,
+        stream: Optional[ResponseEventSink] = None,
+    ) -> ProcessingReport:
         t0 = time.monotonic()
+        timings: dict[str, float] = {}
         self.logger.info(
             "event_received event_id=%s conversation_id=%s speaker_person_id=%s addressee_hint=%s",
             event.event_id,
@@ -227,6 +303,39 @@ class Orchestrator:
             f"[MEMORY] Retrieved {len(memories)} items",
         ]
 
+        # 3b. One runtime snapshot per event. It is created after the event is
+        # durable (FK) and reused verbatim on a retry: received_at and every
+        # temporal gap stay fixed. Location is only resolved when GeoIP is
+        # enabled and this speaker allows external AI use.
+        runtime_snapshot = None
+        if self.runtime_snapshot_builder is not None:
+            try:
+                runtime_snapshot = await self.runtime_snapshot_builder.build(
+                    event,
+                    connection=connection,
+                    allow_external_ai=bool(consent.allow_external_ai),
+                    persist=persist,
+                )
+                steps.append(
+                    f"[RUNTIME] {runtime_snapshot.timezone}"
+                    f" ({runtime_snapshot.timezone_source}),"
+                    f" reentry={runtime_snapshot.reentry_state}"
+                )
+            except Exception as exc:  # runtime context is never fatal
+                self.logger.warning(
+                    "runtime_snapshot_failed event_id=%s error=%s",
+                    event.event_id,
+                    exc,
+                )
+        timings["context_ms"] = (time.monotonic() - t0) * 1000
+
+        # Response lifecycle state for the streaming report. Initialised before
+        # the pipeline so a failure in any earlier stage can still be reported
+        # truthfully (nothing was streamed).
+        response_id = new_id("resp")
+        response_text: Optional[str] = None
+        stream_emitted = False
+
         try:
             # 4b. Build the external-AI context (privacy-filtered history,
             # labels, memories) when the real provider is wired in. Mock mode
@@ -275,15 +384,72 @@ class Orchestrator:
                     event, cognitive_context
                 )
 
-            # 5. Cognitive analysis: reuse a durable analysis, else compute.
+            cognitive_context = self._attach_runtime_snapshot(
+                cognitive_context, runtime_snapshot
+            )
+
+            # 5. Routing: a clearly addressed, ordinary direct turn takes the
+            # Fast Path (no cognitive call). Ambiguous addressees, explicit
+            # memory requests and domains the local metadata cannot settle use
+            # the Deliberation Path. The decision never comes from message text.
+            t_analysis = time.monotonic()
             analysis = None
             analysis_id: Optional[str] = None
             if persist:
                 analysis = await self.repos.analysis.get_analysis(event.event_id)
                 analysis_id = await self.repos.analysis.get_analysis_id(event.event_id)
 
-            job_id: Optional[str] = None
+            fast_path = False
             if analysis is None:
+                route = decide_route(
+                    addressee_hint=event.addressee_hint.value,
+                    explicit_remember=explicit_remember,
+                    # Fast Path still obeys the external-AI gate: without an
+                    # explicit grant the turn goes through the standard path,
+                    # where the privacy gateway returns a local denial without
+                    # any network call.
+                    fast_path_enabled=(
+                        self.fast_path_enabled
+                        and self.context_builder is not None
+                        and bool(consent.allow_external_ai)
+                    ),
+                )
+                fast_path = route.is_fast
+                steps.append(f"[ROUTE] {route.route}:{route.reason}")
+            elif str(getattr(analysis, "provider", "")) == LOCAL_PROVIDER:
+                fast_path = True
+
+            job_id: Optional[str] = None
+            if analysis is None and fast_path:
+                # A local decision record, explicitly marked as local. It is not
+                # a model analysis and is never presented as one.
+                analysis = self._local_fast_path_analysis(event)
+                steps.append("[COGNITION] Skipped (fast path, no model analysis)")
+                self.logger.info(
+                    "fast_path_selected event_id=%s",
+                    event.event_id,
+                )
+                if persist:
+                    analysis_id = new_id("ana")
+                    job_id = await self.repos.persist_cognitive_outcome(
+                        analysis,
+                        analysis_id,
+                        candidates=[],
+                        job_key=None,
+                        job_payload={},
+                        persona=self._persona_record(cognitive_context),
+                    )
+                    # Memory learning still happens, but off the critical path:
+                    # a durable, idempotent job extracts candidates after the
+                    # reply. Nothing is acknowledged before a real write.
+                    if learn and self.jobs is not None and not safety.triggered:
+                        job_id = await self.repos.job.enqueue(
+                            JobType.TURN_ANALYSIS,
+                            f"turn_analysis:{event.event_id}",
+                            {"event_id": event.event_id},
+                        )
+                        steps.append("[MEMORY_JOB] Background analysis queued")
+            elif analysis is None:
                 analysis = await self.cognitive.analyze(
                     event, cognitive_context, provider_memories
                 )
@@ -338,6 +504,13 @@ class Orchestrator:
                     job = await self.repos.job.get_by_key(f"memory:{event.event_id}")
                     if job is not None:
                         job_id = job.job_id
+                    if str(getattr(analysis, "provider", "")) == LOCAL_PROVIDER:
+                        job_id = await self.repos.job.enqueue(
+                            JobType.TURN_ANALYSIS,
+                            f"turn_analysis:{event.event_id}",
+                            {"event_id": event.event_id},
+                        ) or job_id
+            timings["analysis_ms"] = (time.monotonic() - t_analysis) * 1000
 
             # 5b. A retried analysis must be answered by the same trusted
             # character revision that produced it. If the persona changed
@@ -434,6 +607,12 @@ class Orchestrator:
                 steps,
                 persist,
             )
+            runtime_snapshot = await self._update_runtime_emotion(
+                event, runtime_snapshot, cognitive_context
+            )
+            cognitive_context = self._attach_runtime_snapshot(
+                cognitive_context, runtime_snapshot
+            )
 
             # 9. Reuse the durable action if it already exists, else generate a
             # response and persist the action.
@@ -442,15 +621,34 @@ class Orchestrator:
                 if persist
                 else None
             )
+            if existing_action is not None and existing_action.status not in (
+                "COMPLETED",
+                "TRUNCATED",
+            ):
+                # A previous attempt was interrupted mid-stream. Its partial
+                # text is retained only long enough to be truthful; the retry
+                # must not reuse it as a finished reply.
+                if persist:
+                    await self.repos.analysis.delete_action(event.event_id)
+                existing_action = None
+                steps.append("[ACTION] Discarded interrupted partial response")
             response_text: Optional[str] = None
             trace = None
             action_obj = None
+            response_id = new_id("resp")
+            action_status = "COMPLETED"
+            stream_meta: dict = {}
+            stream_emitted = False
             if existing_action is not None:
                 final_action = existing_action.action_type
                 final_reason = existing_action.reason_code
                 response_text = existing_action.response_text
                 action_obj = existing_action
+                action_status = existing_action.status
                 trace = self._stored_trace(existing_action)
+                if stream is not None and final_action == CognitiveAction.RESPOND:
+                    stream.started(response_id)
+                    stream_emitted = True
                 steps.append("[ACTION] Reused existing action")
             else:
                 # Derive the final, explainable silence reason before any
@@ -466,6 +664,7 @@ class Orchestrator:
                     if isinstance(cognitive_context, CognitiveContext)
                     else context,
                 )
+                t_generation = time.monotonic()
                 if final_action == CognitiveAction.RESPOND:
                     if safety.triggered:
                         # Fixed local text: no model call, no persona/emotion
@@ -473,6 +672,9 @@ class Orchestrator:
                         response_text = safety_response(
                             safety.category, detect_language(event.text)
                         )
+                        if stream is not None:
+                            stream.started(response_id)
+                            stream_emitted = True
                         steps.append("[RESPONSE][SAFETY] local safety reply")
                     else:
                         response_context = cognitive_context
@@ -489,17 +691,48 @@ class Orchestrator:
                             trace=trace,
                             steps=steps,
                         )
-                        response_text = await self.response.generate(
-                            event, analysis, response_context
-                        )
+                        if stream is not None and hasattr(
+                            self.response, "generate_stream"
+                        ):
+                            (
+                                response_text,
+                                action_status,
+                                response_id,
+                                stream_meta,
+                            ) = await self._generate_streaming(
+                                event=event,
+                                analysis=analysis,
+                                response_context=response_context,
+                                stream=stream,
+                                started_at=t_generation,
+                                persist=persist,
+                                trace=trace,
+                            )
+                            stream_emitted = True
+                        else:
+                            generated = await self.response.generate(
+                                event, analysis, response_context
+                            )
+                            response_text = str(generated)
+                            # A provider may report that it stopped at the
+                            # token limit; the reply is real but incomplete, so
+                            # it must not be persisted as COMPLETED.
+                            if (
+                                getattr(generated, "finish_reason", None)
+                                == "length"
+                            ):
+                                action_status = "TRUNCATED"
                         steps.append(f"[RESPONSE] {response_text}")
+                timings["generation_ms"] = (time.monotonic() - t_generation) * 1000
+                if stream_meta.get("first_token_ms") is not None:
+                    timings["time_to_first_token_ms"] = stream_meta["first_token_ms"]
                 action_obj = AgentAction(
                     action_id=new_id("act"),
                     event_id=event.event_id,
                     action_type=final_action,
                     response_text=response_text,
                     reason_code=final_reason,
-                    status="COMPLETED",
+                    status=action_status,
                     created_at=utcnow(),
                     model_suggested_action=decision.model_action,
                     policy_final_action=decision.action,
@@ -535,12 +768,28 @@ class Orchestrator:
             if job_id is not None:
                 steps.append("[MEMORY_JOB] Queued")
             steps.append("[STATUS] Completed")
+            if (
+                stream is not None
+                and final_action == CognitiveAction.RESPOND
+            ):
+                if not stream_emitted:
+                    stream.started(response_id)
+                stream.completed(
+                    response_id,
+                    text=response_text or "",
+                    finish_reason=stream_meta.get("finish_reason"),
+                    usage=stream_meta.get("usage"),
+                    report_status=ReportStatus.COMPLETED.value,
+                    action=final_action.value,
+                )
+            timings["total_ms"] = (time.monotonic() - t0) * 1000
+            self.metrics.record_many(timings)
             self.logger.info(
                 "action_saved event_id=%s action=%s reason_code=%s duration_ms=%.2f status=COMPLETED",
                 event.event_id,
                 final_action.value,
                 final_reason.value,
-                (time.monotonic() - t0) * 1000,
+                timings["total_ms"],
             )
             return ProcessingReport(
                 event_id=event.event_id,
@@ -551,24 +800,50 @@ class Orchestrator:
                 analysis_id=analysis_id,
                 job_id=job_id,
                 memory_write_outcomes=memory_outcomes,
+                timings=timings,
                 steps=steps,
             )
-        except Exception as exc:  # provider failure — keep the event retryable.
+        except asyncio.CancelledError:
+            # Natural cancellation (consumer stopped). A partial, if any, was
+            # already persisted by ``_generate_streaming`` with CANCELLED.
             if persist:
                 await self.repos.utterance.update_status(
                     event.event_id, ProcessingStatus.FAILED
                 )
+            timings["total_ms"] = (time.monotonic() - t0) * 1000
+            self.metrics.record_many(timings)
+            self.logger.info(
+                "processing_cancelled event_id=%s duration_ms=%.2f",
+                event.event_id,
+                timings["total_ms"],
+            )
+            raise
+        except Exception as exc:  # provider failure — keep the event retryable.
+            if stream is not None and stream_emitted:
+                # The stream already began (a partial or full text may have
+                # been shown) but the turn did not commit. Report it as failed
+                # rather than leaving the consumer waiting for a completion.
+                stream.failed(
+                    response_id, error=str(exc), partial_text=response_text
+                )
+            if persist:
+                await self.repos.utterance.update_status(
+                    event.event_id, ProcessingStatus.FAILED
+                )
+            timings["total_ms"] = (time.monotonic() - t0) * 1000
+            self.metrics.record_many(timings)
             self.logger.error(
                 "processing_failed event_id=%s error=%s duration_ms=%.2f",
                 event.event_id,
                 exc,
-                (time.monotonic() - t0) * 1000,
+                timings["total_ms"],
             )
             steps.append(f"[STATUS] FAILED: {exc}")
             return ProcessingReport(
                 event_id=event.event_id,
                 status=ReportStatus.FAILED.value,
                 error=str(exc),
+                timings=timings,
                 steps=steps,
             )
 
@@ -648,6 +923,192 @@ class Orchestrator:
                 f"[PRIVACY] Filtered {len(memories) - len(provider_memories)} memories"
             )
         return cognitive_context, provider_memories
+
+    @staticmethod
+    def _attach_runtime_snapshot(context, snapshot):
+        """Attach the per-event runtime data to the provider context.
+
+        It is prompt *data* (local, trusted state), never an instruction and
+        never a place for model output. Only the rich CognitiveContext reaches
+        the real provider; the mock path keeps its lightweight context.
+        """
+        if snapshot is None or not isinstance(context, CognitiveContext):
+            return context
+        return context.model_copy(update={"runtime_snapshot": snapshot.as_dict()})
+
+    @staticmethod
+    def _local_fast_path_analysis(event) -> CognitiveResult:
+        """A local decision record for a clearly direct turn.
+
+        This is deliberately *not* presented as a model analysis: ``provider``
+        is ``local_fast_path`` and the meaning string says so. The policy still
+        applies every local rule (quiet mode, explicit silence, permissions)
+        on top of it, and background learning runs as a durable job.
+        """
+        return CognitiveResult(
+            event_id=event.event_id,
+            meaning="direct address; fast path (no model analysis)",
+            action=CognitiveAction.RESPOND,
+            reason_code=ReasonCode.DIRECT_AGENT_ADDRESS,
+            response_style="fast_path",
+            provider=LOCAL_PROVIDER,
+            intent="direct_chat",
+            addressed_to="agent",
+            reply_necessity=ReplyNecessity.REQUIRED,
+            conversation_state="direct",
+        )
+
+    async def _update_runtime_emotion(self, event, snapshot, cognitive_context):
+        """Record the companion's own state on the runtime snapshot.
+
+        The snapshot is created before emotion is appraised; the emotion value
+        is therefore attached afterwards, in memory for the prompt and (when
+        persistence is allowed) on the stored row. A retry reuses the stored
+        snapshot and this updates it again with the freshly reused state.
+        """
+        if snapshot is None:
+            return snapshot
+        state = getattr(cognitive_context, "emotion_state", None)
+        if not isinstance(state, dict):
+            return snapshot
+        emotion = state.get("emotion")
+        if not emotion:
+            return snapshot
+        updated = snapshot.model_copy(update={"ava_emotion": str(emotion)})
+        try:
+            await self.repos.runtime_snapshot.set_emotion(
+                event.event_id, updated.ava_emotion
+            )
+        except Exception as exc:  # runtime context is never fatal
+            self.logger.warning(
+                "runtime_emotion_update_failed event_id=%s error=%s",
+                event.event_id,
+                exc,
+            )
+        return updated
+
+    async def _generate_streaming(
+        self,
+        *,
+        event,
+        analysis,
+        response_context,
+        stream,
+        started_at: float,
+        persist: bool,
+        trace=None,
+    ):
+        """Stream a response, yielding deltas through ``stream``.
+
+        Returns ``(text, action_status, response_id, meta)``. A partial reply
+        is persisted with an explicit ``CANCELLED``/``FAILED`` status and is
+        never reported as complete. Only after the provider reports the full
+        completion is the status ``COMPLETED`` (or ``TRUNCATED`` when the
+        provider stopped because of the token limit).
+        """
+        response_id = new_id("resp")
+        chunks: list[str] = []
+        finish_reason: Optional[str] = None
+        usage: Optional[dict] = None
+        first_token = False
+        first_token_ms: Optional[float] = None
+        stream.started(response_id)
+        try:
+            async for delta in self.response.generate_stream(
+                event, analysis, response_context
+            ):
+                if delta.content:
+                    if not first_token:
+                        first_token = True
+                        first_token_ms = (time.monotonic() - started_at) * 1000
+                    chunks.append(delta.content)
+                    stream.delta(response_id, delta.content)
+                if delta.finish_reason:
+                    finish_reason = delta.finish_reason
+                if delta.usage_reported and delta.total_tokens is not None:
+                    usage = {
+                        "prompt_tokens": delta.prompt_tokens,
+                        "completion_tokens": delta.completion_tokens,
+                        "total_tokens": delta.total_tokens,
+                    }
+        except asyncio.CancelledError:
+            partial = "".join(chunks)
+            await self._persist_partial(
+                event=event,
+                analysis=analysis,
+                text=partial,
+                status="CANCELLED",
+                trace=trace,
+                persist=persist,
+            )
+            stream.cancelled(response_id, partial_text=partial or None)
+            raise
+        except Exception as exc:
+            partial = "".join(chunks)
+            await self._persist_partial(
+                event=event,
+                analysis=analysis,
+                text=partial,
+                status="FAILED",
+                trace=trace,
+                persist=persist,
+            )
+            stream.failed(response_id, error=str(exc), partial_text=partial or None)
+            raise
+        text = "".join(chunks).strip()
+        status = "TRUNCATED" if finish_reason == "length" else "COMPLETED"
+        return (
+            text,
+            status,
+            response_id,
+            {"finish_reason": finish_reason, "usage": usage, "first_token_ms": first_token_ms},
+        )
+
+    async def _persist_partial(
+        self,
+        *,
+        event,
+        analysis,
+        text: str,
+        status: str,
+        trace=None,
+        persist: bool,
+    ) -> None:
+        """Persist interrupted output in a short, separate transaction.
+
+        No DB transaction is held while the model streams; this only runs once
+        the stream has already ended (cancelled or failed). The event stays
+        retryable: a later retry deletes this partial action and regenerates.
+        """
+        if not persist:
+            return
+        action = AgentAction(
+            action_id=new_id("act"),
+            event_id=event.event_id,
+            action_type=CognitiveAction.RESPOND,
+            response_text=text or None,
+            reason_code=getattr(analysis, "reason_code", ReasonCode.UNKNOWN),
+            status=status,
+            created_at=utcnow(),
+            model_suggested_action=getattr(analysis, "action", None),
+            nonresponse_trace=(
+                trace.model_dump() if trace is not None else None
+            ),
+        )
+        try:
+            async with self.repos.db.transaction(immediate=True):
+                await self.repos.analysis.delete_action(event.event_id)
+                await self.repos.analysis.save_action(action)
+                await self.repos.utterance.update_status(
+                    event.event_id, ProcessingStatus.FAILED
+                )
+        except Exception as exc:  # never mask the original interruption
+            self.logger.warning(
+                "partial_persist_failed event_id=%s status=%s error=%s",
+                event.event_id,
+                status,
+                exc,
+            )
 
     async def _apply_emotion(
         self,

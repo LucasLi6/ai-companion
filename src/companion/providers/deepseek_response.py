@@ -19,6 +19,23 @@ from companion.prompts.response import build_response_messages
 PROVIDER_NAME = "deepseek"
 
 
+class ResponseText(str):
+    """Reply text that also carries the provider's terminal stop reason.
+
+    A ``str`` subclass keeps the ``ResponseProvider`` protocol unchanged (the
+    orchestrator still receives text), while letting the blocking path report
+    ``finish_reason == "length"`` as ``TRUNCATED`` instead of claiming the
+    reply is complete. Callers may simply use it as a string.
+    """
+
+    finish_reason: Optional[str] = None
+
+    def __new__(cls, value: str, finish_reason: Optional[str] = None):
+        text = super().__new__(cls, value)
+        text.finish_reason = finish_reason
+        return text
+
+
 class ResponsePermissionError(Exception):
     """Raised if a response is requested for a speaker with no external-AI grant."""
 
@@ -45,18 +62,7 @@ class DeepSeekResponseProvider:
         analysis: CognitiveResult,
         context,
     ) -> str:
-        if self.privacy_gateway is not None:
-            auth = await self.privacy_gateway.authorize_event(event.speaker_person_id)
-            if not auth.allowed:
-                self.logger.warning(
-                    "deepseek_response_denied event_id=%s reason=%s",
-                    event.event_id,
-                    auth.reason,
-                )
-                raise ResponsePermissionError(
-                    f"external AI not permitted: {auth.reason}"
-                )
-
+        await self._authorize(event)
         ctx = self._as_context(event, context, analysis)
         messages = build_response_messages(ctx, analysis)
         response = await self.client.complete(
@@ -65,7 +71,46 @@ class DeepSeekResponseProvider:
             event_id=event.event_id,
             json_mode=False,
         )
-        return response.content.strip()
+        return ResponseText(
+            response.content.strip(), getattr(response, "finish_reason", None)
+        )
+
+    async def generate_stream(
+        self,
+        event: UtteranceEvent,
+        analysis: CognitiveResult,
+        context,
+    ):
+        """Yield real deltas as the provider produces them.
+
+        Each item is a :class:`~companion.providers.deepseek_client.StreamDelta`.
+        The caller decides how to display and persist it; this method never
+        assembles the whole reply before yielding.
+        """
+        await self._authorize(event)
+        ctx = self._as_context(event, context, analysis)
+        messages = build_response_messages(ctx, analysis)
+        async for delta in self.client.stream_completion(
+            messages,
+            request_type="response",
+            event_id=event.event_id,
+            json_mode=False,
+        ):
+            yield delta
+
+    async def _authorize(self, event: UtteranceEvent) -> None:
+        if self.privacy_gateway is None:
+            return
+        auth = await self.privacy_gateway.authorize_event(event.speaker_person_id)
+        if not auth.allowed:
+            self.logger.warning(
+                "deepseek_response_denied event_id=%s reason=%s",
+                event.event_id,
+                auth.reason,
+            )
+            raise ResponsePermissionError(
+                f"external AI not permitted: {auth.reason}"
+            )
 
     @staticmethod
     def _as_context(
