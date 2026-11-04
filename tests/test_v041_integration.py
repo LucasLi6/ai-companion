@@ -215,7 +215,7 @@ def _analysis(**updates):
 
 
 def test_response_prompt_renders_compact_affect_not_style_vectors():
-    assert RESPONSE_PROMPT_VERSION == "response-v9"
+    assert RESPONSE_PROMPT_VERSION == "response-v11"
     influence = compile_expression_influence(
         _state(emotion="CONCERN", intensity=0.7)
     ).as_dict()

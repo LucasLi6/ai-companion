@@ -30,13 +30,17 @@ import time
 from typing import Optional
 
 from companion.agent.character import (
+    CharacterSnapshotValidationError,
     build_character_snapshot,
+    character_snapshot_fingerprint,
     load_emotional_dispositions,
+    validate_stored_snapshot,
 )
 from companion.agent.dialogue_pattern_monitor import DialoguePatternMonitor
 from companion.agent.dialogue_style import compile_dialogue_style
 from companion.agent.models import EffectiveAgentContext
 from companion.agent.persona_core import sanitise_prompt_core
+from companion.agent.reply_mode import resolve_reply_mode
 from companion.cognition.models import CognitiveContext
 from companion.cognition.nonresponse import NonresponseTrace, derive_nonresponse_trace
 from companion.cognition.scene_repository import SceneRevisionConflict
@@ -488,6 +492,34 @@ class Orchestrator:
                             trace=trace,
                             steps=steps,
                         )
+                        if isinstance(response_context, CognitiveContext):
+                            # V0.5: choose the generation strategy only after
+                            # cognitive analysis and policy have finished, and
+                            # select style references with the current turn's
+                            # pragmatic reading. Nothing here can change the
+                            # action, permissions or facts.
+                            mode = resolve_reply_mode(
+                                text=event.text,
+                                analysis=analysis,
+                                context=response_context,
+                            )
+                            examples = await self._select_style_examples(
+                                event=event,
+                                analysis=analysis,
+                                context=response_context,
+                                mode=mode,
+                            )
+                            response_context = response_context.model_copy(
+                                update={
+                                    "reply_mode": mode.value,
+                                    "style_examples": examples,
+                                }
+                            )
+                            steps.append(f"[REPLY_MODE] {mode.value}")
+                            if examples:
+                                steps.append(
+                                    f"[STYLE] Selected {len(examples)} reference(s)"
+                                )
                         response_text = await self.response.generate(
                             event, analysis, response_context
                         )
@@ -856,14 +888,21 @@ class Orchestrator:
         }
 
     async def _restore_analysis_persona(self, event, cognitive_context):
-        """Keep a retried analysis and its reply on one persona revision.
+        """Keep a retried analysis and its reply on one character snapshot.
 
-        - same agent/revision: nothing to do;
-        - different revision with a stored snapshot: restore exactly that
-          snapshot for this turn's response;
-        - different/unknown revision without a usable snapshot: raise an
-          explicit conflict. A legacy row (schema 16) has NULL metadata and is
-          therefore "unknown", never assumed to match.
+        The Persona Core revision alone is not enough: traits, description,
+        relationship tier, stances and emotional dispositions can change while
+        the revision stays the same. Consistency is therefore decided by the
+        SHA-256 fingerprint of the complete snapshot:
+
+        - same fingerprint: the current snapshot is exactly the one the
+          analysis saw;
+        - different fingerprint with a valid stored snapshot: restore that
+          snapshot for this response only (it is never written back over the
+          current Persona Core);
+        - missing/corrupt/inconsistent metadata or snapshot: an explicit
+          conflict. A legacy row (schema 16) has NULL metadata and is
+          "unknown", never assumed to match.
         """
         if not isinstance(cognitive_context, CognitiveContext):
             return cognitive_context
@@ -877,50 +916,61 @@ class Orchestrator:
         if stored is None:
             return cognitive_context
 
-        stored_agent = stored.get("agent_id")
         try:
-            stored_revision = int(stored.get("revision"))
-        except (TypeError, ValueError):
-            stored_revision = None
-
-        if not stored_agent or stored_revision is None:
+            saved = validate_stored_snapshot(stored)
+            current_agent = str(current.get("agent_id") or "").strip()
+            if not current_agent:
+                raise CharacterSnapshotValidationError(
+                    "the current character snapshot has no agent_id"
+                )
+            if saved["agent_id"] != current_agent:
+                raise CharacterSnapshotValidationError(
+                    "agent identity mismatch: the analysis was produced by"
+                    f" {saved['agent_id']}, current is {current_agent}"
+                )
+            saved_fingerprint = character_snapshot_fingerprint(saved)
+            current_fingerprint = character_snapshot_fingerprint(current)
+        except CharacterSnapshotValidationError as exc:
             raise PersonaRevisionConflict(
-                "the persisted analysis has no persona revision"
-                " (legacy row); submit the utterance with a new event_id"
-            )
+                f"{exc}; submit the utterance with a new event_id"
+            ) from exc
 
-        current_agent = str(current.get("agent_id") or "")
-        try:
-            current_revision = int(current.get("revision"))
-        except (TypeError, ValueError):
-            current_revision = None
-
-        if (
-            str(stored_agent) == current_agent
-            and current_revision is not None
-            and stored_revision == current_revision
-        ):
+        if saved_fingerprint == current_fingerprint:
             return cognitive_context
 
-        snapshot = stored.get("snapshot")
-        if not isinstance(snapshot, dict):
+        # Restoring a snapshot can re-expose stances or other user-derived
+        # material recorded under an authorization that has since been
+        # withdrawn. The current grant, not the old snapshot, decides.
+        if not await self._external_ai_authorized(event.speaker_person_id):
             raise PersonaRevisionConflict(
-                "persona changed after this analysis was saved"
-                f" (analysis {stored_agent}@{stored_revision},"
-                f" current {current_agent}@{current_revision}) and the original"
-                " snapshot is unavailable; submit the utterance with a new"
-                " event_id"
+                "external AI authorization was withdrawn after this analysis"
+                " was saved; its character snapshot cannot be resent"
+                " (submit the utterance with a new event_id)"
             )
 
         self.logger.info(
-            "persona_snapshot_restored event_id=%s analysis_revision=%s"
-            " current_revision=%s",
+            "persona_snapshot_restored event_id=%s analysis_fingerprint=%s"
+            " current_fingerprint=%s",
             event.event_id,
-            stored_revision,
-            current_revision,
+            saved_fingerprint[:12],
+            current_fingerprint[:12],
         )
         return cognitive_context.model_copy(
-            update={"character_snapshot": snapshot}
+            update={"character_snapshot": saved}
+        )
+
+    async def _external_ai_authorized(self, person_id) -> bool:
+        """The same trusted consent check the privacy gateway applies."""
+        if person_id is None:
+            return False
+        person = await self.registry.get(person_id)
+        if person is None or person.registration_status != RegistrationStatus.ACTIVE:
+            return False
+        consent = await self.registry.get_consent(person_id)
+        return bool(
+            consent is not None
+            and consent.allow_processing
+            and consent.allow_external_ai
         )
 
     async def _scene_enabled(self) -> bool:
@@ -996,6 +1046,45 @@ class Orchestrator:
                 exc,
             )
             return cognitive_context
+
+    async def _select_style_examples(
+        self, *, event, analysis, context, mode
+    ) -> list[dict]:
+        """Pick at most three references for this turn, after cognition.
+
+        Selection is non-fatal: a missing repository, an empty table or a
+        retrieval error must never lose the reply. Only trusted admin examples
+        visible to this person are candidates.
+        """
+        if self.style_repo is None or not isinstance(context, CognitiveContext):
+            return []
+        snapshot = context.character_snapshot or {}
+        agent = context.agent_context or {}
+        agent_id = ""
+        if isinstance(snapshot, dict):
+            agent_id = str(snapshot.get("agent_id") or "")
+        if not agent_id and isinstance(agent, dict):
+            agent_id = str(agent.get("agent_id") or "")
+        if not agent_id:
+            return []
+        try:
+            return await self.style_repo.list_relevant_for_prompt(
+                agent_id=agent_id,
+                person_id=event.speaker_person_id,
+                current_text=event.text,
+                recent_turns=context.turns,
+                mode=mode,
+                pragmatic=getattr(analysis, "pragmatic", None),
+                scene_state=context.scene_state,
+                limit=3,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "style_example_selection_failed event_id=%s error=%s",
+                event.event_id,
+                exc,
+            )
+            return []
 
     async def _prepare_dialogue(
         self,
@@ -1090,18 +1179,11 @@ class Orchestrator:
                 memories=provider_memories,
                 current_text=event.text,
             )
-            examples: list[dict] = []
-            if self.style_repo is not None and effective.agent_id:
-                examples = await self.style_repo.list_for_prompt(
-                    agent_id=effective.agent_id,
-                    person_id=event.speaker_person_id,
-                )
             personality = (
                 self.personality_compiler.compile(
                     effective,
                     style=style,
                     scene=scene_view,
-                    style_examples=examples,
                     current_text=event.text,
                     stances=stances,
                 )
@@ -1122,7 +1204,6 @@ class Orchestrator:
                 update={
                     "dialogue_style": style.as_dict(),
                     "personality": personality,
-                    "style_examples": examples,
                     "pragmatic_guidance": guidance,
                 }
             )

@@ -97,7 +97,7 @@ def _system(ctx=None):
 
 def test_prompt_versions_are_bumped():
     assert COGNITIVE_PROMPT_VERSION == "cognitive-v9"
-    assert RESPONSE_PROMPT_VERSION == "response-v9"
+    assert RESPONSE_PROMPT_VERSION == "response-v11"
 
 
 def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():
@@ -176,9 +176,9 @@ def test_multi_speaker_history_and_current_turn_get_speaker_metadata():
         current_text="大阪怎么样？",
     )
     messages = build_response_messages(ctx, _analysis())
-    assert messages[2]["content"].startswith("[Alice] 你们在聊什么？")
-    assert messages[4]["content"].startswith("[Bob] 我也想去。")
-    assert messages[-1]["content"].startswith("[Bob] 大阪怎么样？")
+    assert messages[2]["content"].startswith("[Alice → unknown] 你们在聊什么？")
+    assert messages[4]["content"].startswith("[Bob → unknown] 我也想去。")
+    assert messages[-1]["content"].startswith("[Bob → unknown] 大阪怎么样？")
     assert "多人群聊" in messages[0]["content"]
 
 

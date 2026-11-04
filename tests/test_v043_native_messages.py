@@ -85,7 +85,7 @@ def test_native_roles_and_current_user_message():
     assert messages[3]["content"] == "最近有点累"
     assert messages[4]["content"] == "那就慢一点。"
     assert messages[-1]["content"] == "现在呢"
-    assert RESPONSE_PROMPT_VERSION == "response-v9"
+    assert RESPONSE_PROMPT_VERSION == "response-v11"
 
 
 def test_no_flattened_dialogue_or_cognitive_json_in_the_request():
@@ -156,11 +156,11 @@ def test_single_person_history_is_raw_and_group_history_has_labels():
         "user",
         "user",
     ]
-    assert messages[1]["content"] == "[Ada] 我先说"
-    assert messages[2]["content"] == "[Ben] 我也在"
+    assert messages[1]["content"] == "[Ada → unknown] 我先说"
+    assert messages[2]["content"] == "[Ben → unknown] 我也在"
     assert messages[3]["role"] == "assistant"
-    assert messages[4]["content"] == "[Ada] 嗯"
-    assert messages[-1]["content"] == "[Cara] 现在呢\n（对你说）"
+    assert messages[4]["content"] == "[Ada → unknown] 嗯"
+    assert messages[-1]["content"] == "[Cara → Companion] 现在呢"
 
 
 def test_orphan_or_empty_assistant_turns_are_not_sent():

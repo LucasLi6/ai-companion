@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from companion.cognition.models import CognitiveContext
 from companion.cognition.nonresponse import action_history_lines
+from companion.prompts.addressee import normalize_addressee_hint
 from companion.prompts.identity import (
     agent_context_lines,
     compile_cognitive_character_context,
@@ -295,7 +296,7 @@ def build_cognitive_messages(context: CognitiveContext) -> list[dict]:
             if turn.role == "assistant":
                 lines.append(f"assistant [{turn.event_id}]: {turn.text}")
             else:
-                target = turn.addressee_hint or "unknown"
+                target = normalize_addressee_hint(turn.addressee_hint)
                 lines.append(
                     f"{turn.speaker_label} -> {target} [{turn.event_id}]: {turn.text}"
                 )
@@ -363,7 +364,7 @@ def build_cognitive_messages(context: CognitiveContext) -> list[dict]:
     lines.append("")
     lines.append("【当前输入】")
     lines.append(f"说话人: {context.current_speaker_label}")
-    lines.append(f"指向: {context.current_addressee_hint}")
+    lines.append(f"指向: {normalize_addressee_hint(context.current_addressee_hint)}")
     lines.append(f"内容: {context.current_text}")
     lines.append("")
     lines.append("请分析，并只输出 JSON。")

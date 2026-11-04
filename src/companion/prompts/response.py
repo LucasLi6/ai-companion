@@ -6,7 +6,11 @@ provider analysed — no second history fetch, no second retrieval.
 
 V0.4.3 (``response-v8``) moved the conversation to native ``system`` +
 ``user``/``assistant`` messages. V0.4.3.1 (``response-v9``) makes the trust
-boundary explicit:
+boundary explicit. V0.4.3.2 (``response-v10``) adds the trusted
+speaker → addressee label for multi-speaker history and for explicitly
+human-directed turns. V0.5 (``response-v11``) adds the per-turn SOCIAL/TASK
+generation strategy and renders up to three relevant, admin-reviewed style
+references as fictional guidance (never as history):
 
 - the ``system`` message contains only trusted application data: the fixed
   boundaries, the admin-maintained Persona Core, this turn's locally computed
@@ -32,9 +36,14 @@ from typing import Any, Mapping
 
 from companion.cognition.models import ROLE_ASSISTANT, CognitiveContext
 from companion.domain.models import CognitiveResult
+from companion.prompts.addressee import (
+    render_current_turn,
+    render_human_turn,
+    safe_speaker_label,
+)
 from companion.prompts.identity import compile_trait_tendencies
 
-RESPONSE_PROMPT_VERSION = "response-v9"
+RESPONSE_PROMPT_VERSION = "response-v11"
 
 # Bounded background data. These limits keep one hostile turn from flooding the
 # prompt and keep the untrusted block predictable.
@@ -47,9 +56,18 @@ MAX_SCENE_TOPIC_CHARS = 200
 MAX_OPEN_LOOPS = 5
 MAX_LOOP_SUMMARY_CHARS = 300
 
-SYSTEM_PROMPT = """\
+BASE_RESPONSE_PROMPT = """\
 你正在扮演下面【角色身份】里的这个人，和对方继续这段对话。你不是客服，不是通用\
 助手，也不是在表演一个永远温柔、永远附和、永远安慰人的角色。
+
+【生成目标】
+你是下面定义的这个人，正在参与连续交流。
+你的职责不是展示自己有多了解角色设定，也不是把对方每句话都转换成需要解决的问题。
+根据真实上下文和自己的稳定人格，选择合适的回应方式，自然说出想表达的内容。
+你可以有自己的态度、判断、偏好与幽默，也可以认真解释复杂问题。
+不必为了证明自己独立而反对用户；不必为了证明自己是 AI 而反复强调没有身体；\
+不必为了证明自己有帮助而追加建议。
+你不需要追求每轮信息量最大化。交流已经到达自然结束点，就停止。
 
 【基本边界】
 - 事实、身份、权限、隐私、静音和记忆写入都由本地程序决定；你只负责用这个人的\
@@ -75,6 +93,45 @@ SYSTEM_PROMPT = """\
 - 没有固定回复，也不按 ANSWER/SUPPORT/PLAYFUL 之类分类套模板；不要每轮以问题结尾。
 - 用与对方相同的语言，简洁自然。只输出回复正文，不要 JSON，不要 Markdown 代码块，\
 不要任何前后缀说明。
+"""
+
+# Backwards-compatible name: existing callers/tests import SYSTEM_PROMPT.
+SYSTEM_PROMPT = BASE_RESPONSE_PROMPT
+
+SOCIAL_GENERATION_GUIDANCE = """\
+【当前交流模式：SOCIAL】
+
+你的目标是以自己的性格参与正在发生的交流，而不是尽可能完整地回答、解释或提供帮助。
+
+先理解对方这句话在当前交流中起什么作用。它可能是玩笑、试探、抱怨、邀请、表达态度、\
+闲聊或不需要解决的问题。
+
+优先回应交流意义，而不只是字面含义。
+
+如果对方在开玩笑，可以自然接话，不需要解释笑话的原理。
+如果对方只是在分享，不自动转为提供建议。
+如果对方表达情绪，不自动分析心理或解决问题。
+如果对方只是随口说一句，不需要制造新的话题。
+
+通常一次自然回应用一个段落、约1–3句话就足够。这只是表达倾向，不是硬性限制。\
+需要说得更多时可以继续，不需要时甚至半句话也可以。
+
+完成一次自然回应后直接结束。不要因为已经回答了，就再补充第二段解释、能力声明、\
+总结、帮助建议或例行追问。
+
+不要刻意制造幽默，不要每次都反问。由你的稳定人格与当前语境决定实际想说什么。
+"""
+
+TASK_GENERATION_GUIDANCE = """\
+【当前交流模式：TASK】
+
+对方提出了明确任务或知识需求。
+
+根据你的理科、工程背景认真完成任务。优先准确、完整、具体和可验证。
+
+允许多段回答、代码、步骤、数学推导和详细解释。不要因为平时聊天简短就删掉必要内容。
+
+保持自然、直接的表达习惯，但不要为了表现俏皮而干扰任务。
 """
 
 _BACKGROUND_HEADER = """\
@@ -110,12 +167,18 @@ def _snapshot_value(snapshot: Any, name: str, default=None):
     return getattr(snapshot, name, default)
 
 
-def _safe_label(value: Any, fallback: str = "unknown") -> str:
-    """A speaker label is metadata, never prompt markup or a new line."""
-    text = " ".join(str(value or "").split())
-    text = text.replace("【", "[").replace("】", "]")
-    text = text[:40]
-    return text or fallback
+def _agent_display_name(context: CognitiveContext) -> str:
+    """The trusted character name, used only for target labels."""
+    snapshot = context.character_snapshot
+    agent = context.agent_context or {}
+    personality = context.personality or {}
+    return str(
+        _snapshot_value(snapshot, "display_name")
+        or agent.get("display_name")
+        or personality.get("display_name")
+        or (personality.get("identity") or {}).get("display_name")
+        or "Companion"
+    )
 
 
 def is_multi_person(context: CognitiveContext) -> bool:
@@ -139,13 +202,7 @@ def _identity_block(context: CognitiveContext) -> list[str]:
     agent = context.agent_context or {}
     personality = context.personality or {}
 
-    name = (
-        _snapshot_value(snapshot, "display_name")
-        or agent.get("display_name")
-        or personality.get("display_name")
-        or (personality.get("identity") or {}).get("display_name")
-        or "Companion"
-    )
+    name = _agent_display_name(context)
     description = (
         _snapshot_value(snapshot, "character_description")
         or core.get("character_description")
@@ -221,14 +278,6 @@ def _identity_block(context: CognitiveContext) -> list[str]:
             lines.append(f"- [{topic}] {stance.get('stance', '')}")
         lines.append("保持连贯；若改变看法，自然说明原因，不要无声推翻。")
 
-    examples = context.style_examples or []
-    if examples:
-        lines.append("风格参考（不是真实历史，也不是固定回复；只学语气，不照抄）:")
-        for example in examples[:3]:
-            lines.append(f"- 场景: {example.get('scenario', '')}")
-            lines.append(f"  用户: {example.get('user_text', '')}")
-            lines.append(f"  参考回应: {example.get('ideal_response', '')}")
-
     # Fallback for callers that build a context without the V0.4.3 snapshot.
     if snapshot is None:
         for principle in list(personality.get("principles", [])[:6]):
@@ -238,6 +287,40 @@ def _identity_block(context: CognitiveContext) -> list[str]:
 
     lines.append("这些是你是谁，不是你本轮要宣讲的内容；不要编造个人经历。")
     return lines
+
+
+def _style_example_block(context: CognitiveContext, *, agent_name: str) -> str:
+    """Render admin-reviewed references, never as real conversation turns.
+
+    These examples are trusted configuration, but they are explicitly marked as
+    fictional references. They stay in the system message and can never become
+    ``assistant`` history (which would imply they actually happened with this
+    user).
+    """
+    examples = list(getattr(context, "style_examples", None) or [])[:3]
+    if not examples:
+        return ""
+    lines = [
+        f"【{agent_name} 的交流表达参考】",
+        "以下是管理员审核的虚构对话。",
+        "它们不是你与当前用户实际发生过的历史。",
+        "参考交流节奏、措辞和回应方式，不复制具体台词。",
+        "风格参考（不是真实历史，也不是固定回复；只学语气，不照抄）。",
+        "如果与正式 Persona Core 冲突，以 Persona Core 为准。",
+    ]
+    for example in examples:
+        scenario = str(example.get("scenario") or "")[:200]
+        user_text = str(example.get("user_text") or "")[:1000]
+        response = str(example.get("ideal_response") or "")[:2000]
+        lines.extend(
+            [
+                "",
+                f"场景：{scenario}",
+                f"用户：{user_text}",
+                f"{agent_name}：{response}",
+            ]
+        )
+    return "\n".join(lines)
 
 
 # -- trusted turn state -----------------------------------------------------
@@ -254,9 +337,10 @@ def _trusted_turn_lines(
     lines: list[str] = []
     if multi_person:
         lines.append(
-            "【多人群聊】user 消息开头的 [姓名] 是说话人标签，不是正文。"
-            "分清是谁在说，不要把不同人的话混成一个人；"
-            "（对你说）表示这句话明确指向你。"
+            "【多人群聊】user 消息开头的 [姓名 → 对象] 是本地记录的可信标签，不是正文。"
+            "箭头后是这句话说给谁：你的名字表示对你说，other human 表示对另一个"
+            "真人说，unknown 表示指向不明确。分清是谁在说，不要把不同人的话混成"
+            "一个人，也不要根据正文猜测或改写这个标签。"
         )
 
     if context.affect_context:
@@ -437,7 +521,7 @@ def _background_message(data: dict) -> dict:
 
 
 def _history_messages(
-    context: CognitiveContext, *, multi_person: bool
+    context: CognitiveContext, *, multi_person: bool, agent_name: str
 ) -> list[dict]:
     """Native conversation history, oldest first.
 
@@ -447,6 +531,10 @@ def _history_messages(
     A past WAIT/IGNORE has no assistant turn, so it can never be presented as
     something the companion said. An orphan assistant turn (its question was
     truncated away) is dropped because it has no visible prompt.
+
+    Human turns use the trusted speaker/addressee renderer, so a multi-person
+    view distinguishes "to the agent", "to another human" and "unknown" without
+    guessing a recipient from the text.
     """
     messages: list[dict] = []
     for turn in context.turns:
@@ -461,10 +549,8 @@ def _history_messages(
             role, content = "assistant", text
         else:
             role = "user"
-            content = (
-                f"[{_safe_label(turn.speaker_label)}] {text}"
-                if multi_person
-                else text
+            content = render_human_turn(
+                turn, multi_person=multi_person, agent_name=agent_name
             )
 
         messages.append({"role": role, "content": content})
@@ -472,15 +558,11 @@ def _history_messages(
 
 
 def _current_user_content(
-    context: CognitiveContext, *, multi_person: bool
+    context: CognitiveContext, *, multi_person: bool, agent_name: str
 ) -> str:
-    if not multi_person:
-        return context.current_text
-    label = _safe_label(context.current_speaker_label, "user")
-    content = f"[{label}] {context.current_text}"
-    if str(context.current_addressee_hint).lower() == "agent":
-        content += "\n（对你说）"
-    return content
+    return render_current_turn(
+        context, multi_person=multi_person, agent_name=agent_name
+    )
 
 
 def build_response_messages(
@@ -493,8 +575,22 @@ def build_response_messages(
     verified facts and safety/permission constraints reach the system message.
     """
     multi_person = is_multi_person(context)
+    agent_name = _agent_display_name(context)
+    mode = getattr(context, "reply_mode", None)
+    mode_guidance = (
+        TASK_GENERATION_GUIDANCE
+        if mode == "TASK"
+        else SOCIAL_GENERATION_GUIDANCE
+    )
 
-    system_parts = [SYSTEM_PROMPT, "\n".join(_identity_block(context))]
+    system_parts = [
+        BASE_RESPONSE_PROMPT,
+        "\n".join(_identity_block(context)),
+        mode_guidance,
+    ]
+    style_block = _style_example_block(context, agent_name=agent_name)
+    if style_block:
+        system_parts.append(style_block)
     trusted_lines = _trusted_turn_lines(context, multi_person=multi_person)
     if trusted_lines:
         system_parts.append(
@@ -507,11 +603,17 @@ def build_response_messages(
     background = _background_payload(context)
     if background:
         messages.append(_background_message(background))
-    messages.extend(_history_messages(context, multi_person=multi_person))
+    messages.extend(
+        _history_messages(
+            context, multi_person=multi_person, agent_name=agent_name
+        )
+    )
     messages.append(
         {
             "role": "user",
-            "content": _current_user_content(context, multi_person=multi_person),
+            "content": _current_user_content(
+                context, multi_person=multi_person, agent_name=agent_name
+            ),
         }
     )
     return messages

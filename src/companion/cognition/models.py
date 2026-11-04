@@ -106,5 +106,9 @@ class CognitiveContext(BaseModel):
     # Trusted, admin-authored style references (max 3). These are style
     # standards, not real conversation history and never fixed replies.
     style_examples: list[dict] = Field(default_factory=list)
+    # V0.5: this turn's response-generation strategy. It is selected locally
+    # after cognitive analysis (SOCIAL/TASK) and only changes how the response
+    # is generated; it never changes whether to reply, permissions or facts.
+    reply_mode: Optional[Literal["SOCIAL", "TASK"]] = Field(default=None)
     # Short pragmatic reminders assembled from scene/action history.
     pragmatic_guidance: list[str] = Field(default_factory=list)

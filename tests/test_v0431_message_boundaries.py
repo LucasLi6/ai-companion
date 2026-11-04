@@ -148,9 +148,9 @@ def test_two_speakers_keep_their_labels_and_separate_events():
         "user",
         "user",
     ]
-    assert messages[1]["content"] == "[Alice] 我先说"
-    assert messages[2]["content"] == "[Bob] 我也说"
-    assert messages[3]["content"] == "[Alice] 所以呢？\n（对你说）"
+    assert messages[1]["content"] == "[Alice → unknown] 我先说"
+    assert messages[2]["content"] == "[Bob → unknown] 我也说"
+    assert messages[3]["content"] == "[Alice → Companion] 所以呢？"
     assert "多人群聊" in messages[0]["content"]
 
 
@@ -172,10 +172,10 @@ def test_speaker_change_across_an_assistant_turn_keeps_order_and_labels():
         "user",
         "user",
     ]
-    assert messages[1]["content"] == "[Alice] 你们在聊什么？"
+    assert messages[1]["content"] == "[Alice → unknown] 你们在聊什么？"
     assert messages[2]["content"] == "在聊旅行。"
-    assert messages[3]["content"] == "[Bob] 我也想加入。"
-    assert messages[4]["content"] == "[Alice] 所以呢？\n（对你说）"
+    assert messages[3]["content"] == "[Bob → unknown] 我也想加入。"
+    assert messages[4]["content"] == "[Alice → Companion] 所以呢？"
 
 
 @pytest.mark.parametrize("action", ["WAIT", "IGNORE"])
@@ -334,7 +334,9 @@ async def test_orchestrator_labels_two_speakers_without_merging(db):
     )
 
     messages = client.response_messages()
-    assert messages[-2] == {"role": "user", "content": "[Alice] 有人吗？"}
-    assert messages[-1] == {"role": "user", "content": "[Bob] 你好。\n（对你说）"}
+    assert messages[-2] == {"role": "user", "content": "[Alice → unknown] 有人吗？"}
+    assert messages[-1]["role"] == "user"
+    assert messages[-1]["content"].startswith("[Bob → ")
+    assert messages[-1]["content"].endswith("] 你好。")
     assert all(message["role"] != "assistant" for message in messages)
     assert "多人群聊" in messages[0]["content"]
