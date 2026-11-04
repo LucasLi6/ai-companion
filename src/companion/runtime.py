@@ -13,6 +13,7 @@ fallback to mock).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -92,6 +93,7 @@ def build_runtime(
     embedding_provider=None,
     scene_enabled: Optional[bool] = None,
     personality_generation_enabled: Optional[bool] = None,
+    cognitive_repair_enabled: Optional[bool] = None,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
 
@@ -214,8 +216,15 @@ def build_runtime(
             agent_service=agent_service,
             logger=logger,
         )
+        if cognitive_repair_enabled is None:
+            cognitive_repair_enabled = os.environ.get(
+                "DEEPSEEK_COGNITIVE_REPAIR_ENABLED", ""
+            ).strip().lower() in ("1", "true", "yes", "on")
         cognitive = cognitive or DeepSeekCognitiveProvider(
-            deepseek_client, privacy_gateway=gateway, logger=logger
+            deepseek_client,
+            privacy_gateway=gateway,
+            logger=logger,
+            repair_enabled=bool(cognitive_repair_enabled),
         )
         response = response or DeepSeekResponseProvider(
             deepseek_client, privacy_gateway=gateway, logger=logger

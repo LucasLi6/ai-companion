@@ -301,6 +301,7 @@ class AppraisalEngine:
         addressee_hint: Optional[str] = None,
         actor_person_id: Optional[str] = None,
         conversational_affect: Optional[ConversationalAffect] = None,
+        dispositions: Optional[Mapping[str, float]] = None,
     ) -> AppraisalResult:
         """Choose the eligible rule and compute the resulting emotional state.
 
@@ -342,6 +343,7 @@ class AppraisalEngine:
                     traits,
                     moment,
                     cfg,
+                    dispositions=dispositions,
                 )
                 if framed is not None:
                     return framed
@@ -372,6 +374,7 @@ class AppraisalEngine:
                         traits,
                         moment,
                         cfg,
+                        dispositions=dispositions,
                     )
                     if framed is not None:
                         return framed
@@ -390,6 +393,7 @@ class AppraisalEngine:
                     traits,
                     moment,
                     cfg,
+                    dispositions=dispositions,
                 )
                 if framed is not None:
                     return framed
@@ -410,6 +414,7 @@ class AppraisalEngine:
                 signal=signal,
                 cfg=cfg,
                 affect=conversational_affect,
+                dispositions=dispositions,
             )
 
         matched = next(
@@ -424,6 +429,7 @@ class AppraisalEngine:
                 traits,
                 moment,
                 cfg,
+                dispositions=dispositions,
             )
             if framed is not None:
                 return framed
@@ -441,6 +447,7 @@ class AppraisalEngine:
             memories=memories,
             cfg=cfg,
             affect=conversational_affect,
+            dispositions=dispositions,
         )
 
     # -- signal handling ----------------------------------------------------
@@ -556,9 +563,10 @@ class AppraisalEngine:
         signal=None,
         cfg: EmotionDynamicsConfig | None = None,
         affect: Optional[ConversationalAffect] = None,
+        dispositions: Optional[Mapping[str, float]] = None,
     ) -> AppraisalResult:
         cfg = cfg or self.config
-        gain, empathy = reaction_gain(profile, traits, cfg)
+        gain, empathy = reaction_gain(profile, traits, cfg, dispositions)
         empathy_factor = (
             0.8 + 0.4 * empathy if rule.emotion in ("CONCERN", "SADNESS") else 1.0
         )
@@ -585,12 +593,19 @@ class AppraisalEngine:
                 traits=traits,
                 now=moment,
                 config=cfg,
+                dispositions=dispositions,
             )
             state = transition.state
             cause = transition.cause
         else:
             state = apply_emotional_stimulus(
-                base, rule, profile, traits, moment, config=cfg
+                base,
+                rule,
+                profile,
+                traits,
+                moment,
+                config=cfg,
+                dispositions=dispositions,
             )
         return AppraisalResult(
             emotion=state.emotion,
@@ -627,8 +642,9 @@ class AppraisalEngine:
         traits: Optional[Mapping[str, int]],
         now: datetime,
         config: EmotionDynamicsConfig,
+        dispositions: Optional[Mapping[str, float]] = None,
     ) -> Optional[AppraisalResult]:
-        """Apply a validated frame change when no event rule fired.
+        """Apply a validated frame change or same-frame development.
 
         Returns ``None`` when there is nothing to change, so callers can keep
         their precise NO_CHANGE diagnostic.
@@ -643,6 +659,7 @@ class AppraisalEngine:
             traits=traits,
             now=now,
             config=config,
+            dispositions=dispositions,
         )
         if not transition.changed:
             return None

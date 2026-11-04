@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Mapping, Optional
 
 from companion.domain.models import new_id
 from companion.storage.database import Database
@@ -76,6 +76,95 @@ _TRIVIAL_AGREEMENT = re.compile(
     r"^(我觉得|我认为)(这|那)?(件|个)?(事|事情)?(还|也)?(可以|行|没问题|挺好|不错)"
     r"[。！!]?$"
 )
+# A passing mood is not a stable position. V0.4.3 keeps the stance extractor
+# deliberately conservative so "我觉得今天真烦" never becomes character.
+_TRANSIENT = re.compile(
+    r"(现在|目前|今天|今晚|刚才|刚刚|最近|这两天|这几天|这会儿|这一刻)"
+    r"[^。！？!?]{0,16}"
+    r"(烦|累|难过|伤心|生气|焦虑|紧张|压力|心情|崩|沮丧|郁闷)"
+)
+_HYPOTHETICAL_OR_QUOTED = re.compile(
+    r"(如果|假如|要是|若是|万一|假设|哪天|"
+    r"你说|他说|她说|别人说|听说|据说|有人说|台词|歌词|引用|转述|"
+    r"\bif\b|\bwould\b|\bsuppose\b|\bquote\b)",
+    re.IGNORECASE,
+)
+
+_CJK_RUN = re.compile(r"[一-鿿]{2,}")
+_LATIN_WORD = re.compile(r"[A-Za-z]{3,}")
+
+
+def _terms(text: str) -> set[str]:
+    """Small, deterministic relevance vocabulary (CJK bigrams + latin words)."""
+    value = str(text or "")
+    terms: set[str] = set()
+    for run in _CJK_RUN.findall(value):
+        for index in range(len(run) - 1):
+            terms.add(run[index : index + 2])
+    terms.update(word.lower() for word in _LATIN_WORD.findall(value))
+    return terms
+
+
+def filter_relevant_stances(
+    stances,
+    *,
+    topic: str | None = None,
+    query_text: str = "",
+    limit: int = DEFAULT_PROMPT_STANCES,
+) -> list:
+    """Keep only stances that plausibly bear on the current topic.
+
+    A stable opinion about music must not follow the companion into a
+    discussion about a debugger. Relevance is a local, conservative token
+    overlap between the stance (topic + text) and the current topic/utterance.
+    An unmatched *response-derived* stance is dropped rather than injected as
+    generic character dressing; the persona can still form a fresh view from
+    its own values. Admin-configured stances are curated character, so they
+    stay available (within the bounded limit) even without a token overlap.
+    """
+    candidates = list(stances or [])
+    if not candidates:
+        return []
+
+    def field(record, name):
+        return (
+            record.get(name)
+            if isinstance(record, Mapping)
+            else getattr(record, name, None)
+        )
+
+    bound = max(1, min(int(limit), MAX_PROMPT_STANCES))
+    # Admin-configured stances are curated character, not conversational
+    # history: keep them available (bounded) so the persona does not lose its
+    # principles just because the current wording shares no tokens.
+    selected: list = [r for r in candidates if field(r, "source") == "ADMIN"][:bound]
+    remaining = bound - len(selected)
+    if remaining <= 0:
+        return selected
+
+    topic_terms = _terms(topic or "")
+    query_terms = _terms(query_text or "") | topic_terms
+    if not query_terms:
+        return selected
+
+    scored: list[tuple[int, object]] = []
+    for record in candidates:
+        if field(record, "source") == "ADMIN":
+            continue
+        stance_text = field(record, "stance")
+        if not stance_text:
+            continue
+        stance_terms = _terms(f"{field(record, 'topic') or ''} {stance_text}")
+        overlap = len(stance_terms & query_terms)
+        if overlap == 0:
+            continue
+        score = overlap
+        if topic_terms and stance_terms & topic_terms:
+            score += 3
+        scored.append((score, record))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return selected + [record for _score, record in scored[:remaining]]
 
 
 @dataclass(frozen=True)
@@ -127,6 +216,13 @@ def extract_stance_candidates(
         if not sentence or len(sentence) < 6:
             continue
         if _QUESTION.search(sentence):
+            continue
+        if _TRANSIENT.search(sentence):
+            # A momentary mood ("我觉得今天真烦") is not a durable position.
+            continue
+        if _HYPOTHETICAL_OR_QUOTED.search(sentence):
+            # Hypotheticals, reported speech and quotations belong to someone
+            # else's view, not to the companion's own stance.
             continue
         if any(sentence.startswith(prefix) for prefix in _NON_STANCE_PREFIXES):
             continue

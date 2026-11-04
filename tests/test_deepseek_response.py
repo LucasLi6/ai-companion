@@ -149,14 +149,16 @@ async def test_prompt_includes_context_and_analysis():
         _analysis(event, meaning="用户在征求晚饭建议"),
         _context(event, turns=turns, memories=memories),
     )
-    user_msg = client.calls[0]["messages"][1]["content"]
-    assert "我在学做饭" in user_msg
-    assert "加油！" in user_msg
-    assert "Alice 喜欢川菜" in user_msg
-    assert "今晚吃什么好？" in user_msg
-    assert "用户在征求晚饭建议" in user_msg
+    messages = client.calls[0]["messages"]
+    system_msg = messages[0]["content"]
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+    assert messages[1]["content"] == "我在学做饭"
+    assert messages[2]["content"] == "加油！"
+    assert messages[-1]["content"] == "今晚吃什么好？"
+    assert "Alice 喜欢川菜" in system_msg
+    assert "用户在征求晚饭建议" in system_msg
     # memory ids are not shown to the response model
-    assert "mem_1" not in user_msg
+    assert "mem_1" not in system_msg
 
 
 async def test_permission_denied_raises():

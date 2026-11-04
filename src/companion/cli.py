@@ -1675,6 +1675,8 @@ async def cmd_agent_persona_core_show(args) -> int:
         print(f"revision: {core.revision}")
         print(f"updated_by: {core.updated_by}")
         print(f"updated_at: {core.updated_at}")
+        print("character_description:")
+        print(data["character_description"] or "（空）")
         for field in (
             "core_values",
             "quirks",

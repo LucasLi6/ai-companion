@@ -144,7 +144,7 @@ def test_topic_shift_lets_a_new_event_replace_stale_emotion():
     assert result.state.activations["FRUSTRATION"] < 0.4
 
 
-def test_legacy_mode_keeps_the_stale_label_to_prove_the_change_is_ours():
+def test_time_decay_mode_does_not_disable_conversation_transition():
     text = "你真厉害"
     affect = build_conversational_affect(
         pragmatic=_pragmatic(topic_transition="SHIFT"),
@@ -158,9 +158,13 @@ def test_legacy_mode_keeps_the_stale_label_to_prove_the_change_is_ours():
         config=_config(time_decay_mode="LEGACY"),
     )
 
-    # V0.4.1 behaviour: the old strong activation still wins.
-    assert result.emotion == "FRUSTRATION"
-    assert result.state.activations["FRUSTRATION"] >= 0.4
+    # V0.4.3: time decay and conversation-driven change are separate
+    # mechanisms. LEGACY keeps old decay maths, but a clearly new, relevant
+    # event still re-ranks the stale label.
+    assert result.emotion == "JOY"
+    assert result.state.activations["JOY"] > result.state.activations.get(
+        "FRUSTRATION", 0.0
+    )
 
 
 def test_continuing_topic_keeps_relevance_high():

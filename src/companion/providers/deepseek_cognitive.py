@@ -16,7 +16,10 @@ Trust boundaries enforced here (never delegated to the model):
   speaker gets a local ``PERMISSION_DENIED`` result, never a silent mock reply.
 
 One limited repair retry is attempted when the model returns invalid JSON or a
-schema-invalid object; a second failure raises :class:`CognitiveValidationError`.
+schema-invalid object. Since V0.4.3 the retry is **off by default**: a second
+request is a third model call in all but name, and the spec allows exactly one
+cognitive call per successful turn. It can be enabled explicitly for a
+deployment that prefers a recovery attempt over a retryable failure.
 """
 
 from __future__ import annotations
@@ -127,10 +130,15 @@ class DeepSeekCognitiveProvider:
         *,
         privacy_gateway=None,
         logger: Optional[logging.Logger] = None,
+        repair_enabled: bool = False,
     ) -> None:
         self.client = client
         self.privacy_gateway = privacy_gateway
         self.logger = logger or logging.getLogger("companion.deepseek.cognitive")
+        # Explicit operator opt-in. Default OFF keeps one cognitive request per
+        # turn; a malformed answer becomes a retryable failure instead of an
+        # automatic second call.
+        self.repair_enabled = bool(repair_enabled)
 
     async def analyze(
         self,
@@ -159,10 +167,15 @@ class DeepSeekCognitiveProvider:
         except CognitiveValidationError as exc:
             first_error = exc
             self.logger.warning(
-                "deepseek_analysis_invalid event_id=%s error=%s repair=1",
+                "deepseek_analysis_invalid event_id=%s error=%s repair=%d",
                 event.event_id,
                 first_error,
+                1 if self.repair_enabled else 0,
             )
+            if not self.repair_enabled:
+                # One cognitive call per turn by default. The event stays
+                # retryable; the orchestrator does not fabricate an analysis.
+                raise
 
         repair_messages = build_repair_messages(messages, content, str(first_error))
         repaired = await self._request(event, repair_messages)

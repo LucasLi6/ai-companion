@@ -2,7 +2,8 @@
 
 Covers: strict JSON parsing, trust-boundary sanitisation (ids come from the
 program, not the model), memory-id validation, the explicit-human guard, the
-one-repair-retry policy, and the privacy gate short-circuit.
+one-repair-retry policy (opt-in, off by default), and the privacy gate
+short-circuit.
 """
 
 from __future__ import annotations
@@ -190,12 +191,21 @@ async def test_explicit_human_addressee_never_responds():
     assert result.reason_code == ReasonCode.DIRECT_HUMAN_ADDRESS
 
 
-# -- repair retry -----------------------------------------------------------
+# -- repair retry (explicit opt-in since V0.4.3) ----------------------------
 
 
-async def test_repair_retry_succeeds():
+async def test_repair_is_off_by_default_one_cognitive_call_per_turn():
     client = FakeDeepSeekClient(["not json at all", _valid()])
     provider = DeepSeekCognitiveProvider(client)
+    event = _event()
+    with pytest.raises(CognitiveValidationError):
+        await provider.analyze(event, _context(event), [])
+    assert len(client.calls) == 1
+
+
+async def test_repair_retry_succeeds_when_explicitly_enabled():
+    client = FakeDeepSeekClient(["not json at all", _valid()])
+    provider = DeepSeekCognitiveProvider(client, repair_enabled=True)
     event = _event()
     result = await provider.analyze(event, _context(event), [])
     assert result.action == CognitiveAction.RESPOND
@@ -207,16 +217,16 @@ async def test_repair_retry_succeeds():
 
 async def test_repair_retry_fails_after_one_attempt():
     client = FakeDeepSeekClient(["bad", "still bad"])
-    provider = DeepSeekCognitiveProvider(client)
+    provider = DeepSeekCognitiveProvider(client, repair_enabled=True)
     event = _event()
     with pytest.raises(CognitiveValidationError):
         await provider.analyze(event, _context(event), [])
     assert len(client.calls) == 2  # exactly one repair
 
 
-async def test_invalid_action_triggers_repair():
+async def test_invalid_action_triggers_repair_when_enabled():
     client = FakeDeepSeekClient([_valid(action="SHOUT"), _valid()])
-    provider = DeepSeekCognitiveProvider(client)
+    provider = DeepSeekCognitiveProvider(client, repair_enabled=True)
     event = _event()
     result = await provider.analyze(event, _context(event), [])
     assert result.action == CognitiveAction.RESPOND

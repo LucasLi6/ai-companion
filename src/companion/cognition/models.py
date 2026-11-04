@@ -63,6 +63,14 @@ class CognitiveContext(BaseModel):
     # and (for the current speaker) relationship tier. Trusted application data,
     # never written by a model.
     agent_context: Optional[dict] = Field(default=None)
+    # V0.4.3: one trusted character view compiled once per turn and shared by
+    # the cognitive and response providers. It carries the persona revision so
+    # the two calls cannot silently disagree about who the character is.
+    character_snapshot: Optional[dict] = Field(default=None)
+    # V0.4.3: short, human-readable description of the current conversational
+    # affect (state, not an instruction). Computed locally from the emotion
+    # state and interaction frame.
+    affect_context: Optional[str] = Field(default=None)
     # Truthful results of the memory write-through for this turn. These are
     # trusted application data (the provider never fills them) so the response
     # can acknowledge only what was actually committed.

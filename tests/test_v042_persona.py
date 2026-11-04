@@ -109,16 +109,13 @@ async def test_persona_core_leads_the_response_request(db):
     await rt.orchestrator.process_utterance(_event(person.person_id, "你好"))
 
     request = client.response_requests()[-1]
-    assert "【角色核心】" in request
+    assert "【角色身份】" in request
     assert "宁可直说，也不假装同意" in request
     assert "偏爱安静的现场演出" in request
     assert "她说话不急，喜欢先听完再给判断。" in request
-    assert "表达优先级" in request
-    # Safety/facts come first, temporary style last.
-    precedence_line = next(
-        line for line in request.splitlines() if line.startswith("表达优先级")
-    )
-    assert precedence_line.index("安全与事实") < precedence_line.index("临时风格")
+    assert "【基本边界】" in request
+    # Identity comes before the current context; boundaries stay authoritative.
+    assert request.index("【角色身份】") < request.index("【当前相关的上下文】")
 
 
 async def test_full_description_import_is_admin_revisioned(db):
@@ -194,9 +191,9 @@ async def test_emitted_stance_reaches_the_next_response_request(db):
         _event(person.person_id, "那改到下周？")
     )
     request = client.response_requests()[-1]
-    assert "【既往立场】" in request
+    assert "与本轮相关的既往立场" in request
     assert "我不喜欢临时改计划。" in request
-    assert "不要因为对方换了个语气就无声地站到反面" in request
+    assert "保持连贯；若改变看法，自然说明原因" in request
 
     stances = await rt.agent_service.list_stances(
         await _agent_id(rt), person_id=person.person_id

@@ -313,12 +313,13 @@ async def test_pragmatic_reaches_response_and_interaction_scene(db):
     assert second_report.status == "COMPLETED"
 
     request = client.response_requests()[-1]
-    assert "【语用理解】" in request
-    assert "主要行为: QUESTION" in request
+    # V0.4.3: the pragmatic reading is a context hint for the cognitive layer,
+    # not a labelled instruction block dumped into the response prompt.
+    assert "【语用理解】" not in request
+    assert "主要行为: QUESTION" not in request
+    # The validated frame survives only as compact scene context, not as a
+    # labelled pragmatic instruction block.
     assert "互动框架: PLAYFUL" in request
-    assert "指向前文" in request
-    assert first.event_id in request
-    assert "想让我接住这个梗" in request  # implied reading is passed through
 
     snapshot = await rt.scene_manager.scene_repo.load("c1", person.person_id)
     assert snapshot is not None

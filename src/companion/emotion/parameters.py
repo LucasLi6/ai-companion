@@ -86,6 +86,18 @@ class EmotionDynamicsConfig(BaseModel):
     frame_transition_scale: float = Field(default=1.0, ge=0.0, le=2.0)
     frame_transition_min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
 
+    # -- V0.4.3 conversation transitions are independent of time decay ------
+    # Conversation-driven change (scene relevance, frame transitions, same
+    # frame progress) runs whenever this is enabled, in every time-decay mode
+    # including OFF. Time decay is a separate mechanism.
+    conversation_transition_enabled: bool = True
+    # A new, evidence-backed development *inside* an unchanged frame (a joke
+    # landing, a misunderstanding clearing) may still move affect. Merely
+    # repeating the same frame does not.
+    frame_same_event_enabled: bool = True
+    frame_same_event_scale: float = Field(default=0.4, ge=0.0, le=1.0)
+    frame_same_event_min_confidence: float = Field(default=0.60, ge=0.0, le=1.0)
+
     emotion_half_lives: dict[str, float] = Field(
         default_factory=lambda: dict(DEFAULT_EMOTION_HALF_LIVES)
     )
@@ -201,6 +213,18 @@ def load_emotion_config(
         ),
         frame_transition_min_confidence=_env_float(
             values, "EMOTION_FRAME_TRANSITION_MIN_CONFIDENCE", 0.55
+        ),
+        conversation_transition_enabled=_env_bool(
+            values, "EMOTION_CONVERSATION_TRANSITION_ENABLED", True
+        ),
+        frame_same_event_enabled=_env_bool(
+            values, "EMOTION_FRAME_SAME_EVENT_ENABLED", True
+        ),
+        frame_same_event_scale=_env_float(
+            values, "EMOTION_FRAME_SAME_EVENT_SCALE", 0.4
+        ),
+        frame_same_event_min_confidence=_env_float(
+            values, "EMOTION_FRAME_SAME_EVENT_MIN_CONFIDENCE", 0.60
         ),
     )
 

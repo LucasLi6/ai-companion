@@ -29,6 +29,10 @@ import logging
 import time
 from typing import Optional
 
+from companion.agent.character import (
+    build_character_snapshot,
+    load_emotional_dispositions,
+)
 from companion.agent.dialogue_pattern_monitor import DialoguePatternMonitor
 from companion.agent.dialogue_style import compile_dialogue_style
 from companion.agent.models import EffectiveAgentContext
@@ -55,7 +59,10 @@ from companion.domain.models import (
     new_id,
     utcnow,
 )
-from companion.emotion.expression_policy import compile_expression_influence
+from companion.emotion.expression_policy import (
+    compile_affect_context,
+    compile_expression_influence,
+)
 from companion.emotion.transition import build_conversational_affect
 from companion.memory.candidates import prepare_candidates
 from companion.people.registry import PersonRegistry
@@ -250,6 +257,13 @@ class Orchestrator:
                     scene_enabled=scene_enabled,
                     personality_enabled=personality_enabled,
                 )
+            else:
+                # A non-persistence turn still needs the same trusted character
+                # view for the two provider calls; only style compilation and
+                # scene writes are skipped.
+                cognitive_context = await self._attach_character_snapshot(
+                    event, cognitive_context
+                )
 
             # 5. Cognitive analysis: reuse a durable analysis, else compute.
             analysis = None
@@ -314,42 +328,10 @@ class Orchestrator:
                     if job is not None:
                         job_id = job.job_id
 
-            # 6. Bounded synchronous write-through for an explicit "remember
-            # this" request: the durable write must finish *before* the reply
-            # that acknowledges it. Ordinary candidates stay with the job.
-            memory_outcomes: list[dict] = []
-            if persist and learn and self.memory_writer is not None:
-                if explicit_remember:
-                    memory_outcomes = await self.memory_writer.consolidate_event(
-                        event.event_id, only_explicit=True
-                    )
-                    steps.append(
-                        "[MEMORY_WRITE] "
-                        + _summarize_outcomes(memory_outcomes)
-                    )
-                else:
-                    memory_outcomes = (
-                        await self.repos.analysis.list_candidate_writes(event.event_id)
-                    )
-
-            # 6b. Emotion runs only after the analysis exists (fresh or reused)
-            # and before any response is generated. It reads the model's
-            # locally-validated affect hint and the *privacy-filtered* provider
-            # memories, so a retry reuses the persisted analysis without another
-            # model call. Purely presentational; it can never change the action.
-            cognitive_context = await self._apply_emotion(
-                event,
-                person_id,
-                provider_memories,
-                cognitive_context,
-                analysis,
-                steps,
-                persist,
-            )
-
-            # 7. Policy decides the final action from the (reused or fresh)
-            # analysis. Hard local rules (permission, explicit silence, quiet
-            # mode, explicit human addressee) outrank the model suggestion.
+            # 6. Local policy decides the final action from the (reused or
+            # fresh) analysis before any further side effects. Hard local rules
+            # (permission, explicit silence, quiet mode, explicit human
+            # addressee) outrank the model suggestion.
             await self.policy.refresh(self.repos.settings)
             decision = self.policy.decide(
                 analysis,
@@ -357,7 +339,7 @@ class Orchestrator:
                 addressee_hint=event.addressee_hint.value,
                 explicit_silence=explicit_silence,
             )
-            # 7b. Independent safety floor. An explicit high-risk statement is
+            # 6b. Independent safety floor. An explicit high-risk statement is
             # answered by a fixed local reply, not by persona improvisation and
             # not by a model deferral. Only an explicit human addressee or a
             # denied permission can suppress it; quiet mode, a model WAIT and
@@ -381,7 +363,41 @@ class Orchestrator:
             if decision.overrode_model:
                 steps.append(f"[POLICY] {decision.override_reason}")
 
-            # 8. Reuse the durable action if it already exists, else generate a
+            # 7. Bounded synchronous write-through for an explicit "remember
+            # this" request: the durable write must finish *before* the reply
+            # that acknowledges it. Ordinary candidates stay with the job.
+            memory_outcomes: list[dict] = []
+            if persist and learn and self.memory_writer is not None:
+                if explicit_remember:
+                    memory_outcomes = await self.memory_writer.consolidate_event(
+                        event.event_id, only_explicit=True
+                    )
+                    steps.append(
+                        "[MEMORY_WRITE] "
+                        + _summarize_outcomes(memory_outcomes)
+                    )
+                else:
+                    memory_outcomes = (
+                        await self.repos.analysis.list_candidate_writes(event.event_id)
+                    )
+
+            # 8. Emotion runs only after the analysis exists (fresh or reused),
+            # after the local policy decision and memory outcomes, and before
+            # any response is generated. It reads the model's locally-validated
+            # affect hint and the *privacy-filtered* provider memories, so a
+            # retry reuses the persisted analysis without another model call.
+            # Purely presentational; it can never change the action.
+            cognitive_context = await self._apply_emotion(
+                event,
+                person_id,
+                provider_memories,
+                cognitive_context,
+                analysis,
+                steps,
+                persist,
+            )
+
+            # 9. Reuse the durable action if it already exists, else generate a
             # response and persist the action.
             existing_action = (
                 await self.repos.analysis.get_action(event.event_id)
@@ -639,12 +655,27 @@ class Orchestrator:
                 interaction = scene_view.get("interaction")
                 if isinstance(interaction, dict):
                     previous_frame = interaction.get("frame") or "UNKNOWN"
+            pragmatic = getattr(analysis, "pragmatic", None)
+            current_frame = "UNKNOWN"
+            if pragmatic is not None:
+                current_frame = getattr(pragmatic, "interaction_frame", "UNKNOWN")
+            frame_changed = (
+                str(current_frame or "UNKNOWN").upper()
+                not in ("UNKNOWN", "")
+                and str(current_frame).upper() != str(previous_frame).upper()
+            )
             conversational_affect = build_conversational_affect(
-                pragmatic=getattr(analysis, "pragmatic", None),
+                pragmatic=pragmatic,
                 signal=getattr(analysis, "affective_signal", None),
                 previous_frame=previous_frame,
                 actor_person_id=event.speaker_person_id,
             )
+            snapshot = getattr(cognitive_context, "character_snapshot", None)
+            dispositions = None
+            if isinstance(snapshot, dict):
+                raw_dispositions = snapshot.get("emotional_dispositions")
+                if isinstance(raw_dispositions, dict):
+                    dispositions = raw_dispositions
             state = await self.emotion_service.process_turn(
                 agent_id,
                 person_id,
@@ -658,13 +689,22 @@ class Orchestrator:
                 addressee_hint=event.addressee_hint.value,
                 actor_person_id=event.speaker_person_id,
                 conversational_affect=conversational_affect,
+                dispositions=dispositions,
             )
             speech_plan = await self.emotion_service.plan_speech(
                 agent_id, state=state, text=""
             )
+            emotion_config = getattr(self.emotion_service, "config", None)
             expression = compile_expression_influence(
                 state,
-                config=getattr(self.emotion_service, "config", None),
+                config=emotion_config,
+                interaction_frame=current_frame,
+            )
+            affect_context = compile_affect_context(
+                state,
+                interaction_frame=current_frame,
+                frame_changed=frame_changed,
+                config=emotion_config,
             )
             agent_name = None
             if isinstance(cognitive_context, CognitiveContext):
@@ -694,6 +734,7 @@ class Orchestrator:
                         "emotion_state": state.as_dict(),
                         "speech_plan": speech_plan.as_dict(),
                         "emotion_expression": expression.as_dict(),
+                        "affect_context": affect_context,
                         "dialogue_pattern_guidance": pattern_report.guidance,
                     }
                 )
@@ -768,6 +809,68 @@ class Orchestrator:
             "dialogue.personality_generation.enabled", True
         )
 
+    async def _attach_character_snapshot(
+        self,
+        event,
+        cognitive_context,
+        *,
+        effective=None,
+        stances=None,
+    ):
+        """Attach the one trusted CharacterSnapshot both calls will share.
+
+        Non-fatal by design: without a snapshot both prompts fall back to the
+        older agent-context rendering rather than failing the turn.
+        """
+        if not isinstance(cognitive_context, CognitiveContext):
+            return cognitive_context
+        if cognitive_context.character_snapshot is not None:
+            return cognitive_context
+        try:
+            if effective is None:
+                effective = await self._effective_context(
+                    event.speaker_person_id,
+                    cognitive_context.agent_context,
+                )
+            if effective is None:
+                return cognitive_context
+            scene_view = getattr(cognitive_context, "scene_state", None)
+            topic = (
+                scene_view.get("topic") if isinstance(scene_view, dict) else None
+            )
+            if stances is None:
+                stances = []
+                if self.agent_service is not None and effective.agent_id:
+                    try:
+                        stances = await self.agent_service.list_stances(
+                            effective.agent_id,
+                            person_id=event.speaker_person_id,
+                        )
+                    except Exception as exc:
+                        self.logger.warning(
+                            "stance_load_failed event_id=%s error=%s",
+                            event.event_id,
+                            exc,
+                        )
+            dispositions = await load_emotional_dispositions(self.repos.settings)
+            snapshot = build_character_snapshot(
+                effective,
+                stances=stances,
+                query_text=event.text,
+                topic=topic,
+                dispositions=dispositions,
+            )
+            return cognitive_context.model_copy(
+                update={"character_snapshot": snapshot.as_dict()}
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "character_snapshot_failed event_id=%s error=%s",
+                event.event_id,
+                exc,
+            )
+            return cognitive_context
+
     async def _prepare_dialogue(
         self,
         event,
@@ -778,7 +881,12 @@ class Orchestrator:
         scene_enabled: bool,
         personality_enabled: bool,
     ):
-        """Load scene state and compile local style/personality for this turn.
+        """Load scene state and compile this turn's character view/style.
+
+        The trusted :class:`CharacterSnapshot` is built once here and attached
+        to the shared context, so the cognitive and response calls see the same
+        persona revision and relevant stances. Style compilation is optional
+        and only adds legacy prompt fields; it never controls identity.
 
         This is intentionally non-fatal: a style or scene-loading error must
         not lose an otherwise valid turn. The scene *write* is separate and is
@@ -808,7 +916,7 @@ class Orchestrator:
                     "scene_load_failed event_id=%s error=%s", event.event_id, exc
                 )
 
-        if not personality_enabled or not isinstance(cognitive_context, CognitiveContext):
+        if not isinstance(cognitive_context, CognitiveContext):
             return cognitive_context, scene_record
 
         try:
@@ -817,19 +925,9 @@ class Orchestrator:
             )
             if effective is None:
                 return cognitive_context, scene_record
-            style = compile_dialogue_style(
-                effective,
-                memories=provider_memories,
-                current_text=event.text,
-            )
-            examples: list[dict] = []
-            if self.style_repo is not None and effective.agent_id:
-                examples = await self.style_repo.list_for_prompt(
-                    agent_id=effective.agent_id,
-                    person_id=event.speaker_person_id,
-                )
+
             scene_view = getattr(cognitive_context, "scene_state", None)
-            stances = []
+            stances: list = []
             if self.agent_service is not None and effective.agent_id:
                 try:
                     stances = await self.agent_service.list_stances(
@@ -842,6 +940,36 @@ class Orchestrator:
                         event.event_id,
                         exc,
                     )
+
+            # One trusted character view per turn, shared by the cognitive and
+            # response calls (same revision, same relevance-filtered stances).
+            # It is built even when the optional style compiler is disabled.
+            cognitive_context = await self._attach_character_snapshot(
+                event,
+                cognitive_context,
+                effective=effective,
+                stances=stances,
+            )
+            snapshot = getattr(cognitive_context, "character_snapshot", None)
+            if isinstance(snapshot, dict):
+                steps.append(
+                    f"[CHARACTER] Snapshot revision={snapshot.get('revision')}"
+                )
+
+            if not personality_enabled:
+                return cognitive_context, scene_record
+
+            style = compile_dialogue_style(
+                effective,
+                memories=provider_memories,
+                current_text=event.text,
+            )
+            examples: list[dict] = []
+            if self.style_repo is not None and effective.agent_id:
+                examples = await self.style_repo.list_for_prompt(
+                    agent_id=effective.agent_id,
+                    person_id=event.speaker_person_id,
+                )
             personality = (
                 self.personality_compiler.compile(
                     effective,

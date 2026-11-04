@@ -288,10 +288,15 @@ def test_prompts_render_action_history_as_action_not_speech():
 
     response_prompt = build_response_messages(
         ctx, _analysis(event, action=CognitiveAction.RESPOND, necessity=ReplyNecessity.REQUIRED)
-    )[1]["content"]
+    )[0]["content"]
     assert "【你之前实际执行的行为】" in response_prompt
     assert "AMBIGUOUS_ADDRESSEE" in response_prompt
     assert "不是你说过的话" in response_prompt
+    # The silent turn never becomes an assistant utterance.
+    response_messages = build_response_messages(
+        ctx, _analysis(event, action=CognitiveAction.RESPOND, necessity=ReplyNecessity.REQUIRED)
+    )
+    assert [m["role"] for m in response_messages] == ["system", "user", "user"]
 
 
 # -- end-to-end DeepSeek (fake client) --------------------------------------
@@ -388,9 +393,13 @@ async def test_two_turn_awareness_end_to_end_and_restart(db):
     assert "你在听吗？" in second_analysis
     assert "assistant:" not in second_analysis
 
-    response_prompt = client.calls[2]["messages"][1]["content"]
+    response_messages = client.calls[2]["messages"]
+    response_prompt = response_messages[0]["content"]
     assert "【你之前实际执行的行为】" in response_prompt
     assert "AMBIGUOUS_ADDRESSEE" in response_prompt
+    # The WAIT is never sent as an assistant message; only the human turn and
+    # the current turn are present.
+    assert [m["role"] for m in response_messages] == ["system", "user", "user"]
 
     first_action = await rt.repos.analysis.get_action(first.event_id)
     second_action = await rt.repos.analysis.get_action(second.event_id)

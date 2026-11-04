@@ -1,15 +1,23 @@
-"""V0.4 — prompt-level guarantees for natural, continuous dialogue.
+"""V0.4.3 — prompt-level guarantees for natural, continuous dialogue.
 
-These are offline assertions over the actual rendered messages. They do not
-claim a model will always obey; they pin that the prompt gives it the scene,
-the compiled style and the style references, while explicitly forbidding
-fixed replies, forced questions, invented environment details and a second
-"customer service" persona.
+These are offline assertions over the actually rendered messages. They do not
+claim a model will always obey; they pin the V0.4.3 contract:
+
+- the response request is native ``system`` + alternating history + current
+  user message, not one flattened user blob;
+- identity comes from the trusted snapshot/persona section, not a script;
+- numeric style vectors, response directions and cognitive JSON are gone;
+- fixed replies, forced questions, invented environment details and a second
+  "customer service" persona remain forbidden.
 """
 
 from __future__ import annotations
 
-from companion.cognition.models import CognitiveContext, CognitiveTurn
+from companion.cognition.models import (
+    ActionHistoryRecord,
+    CognitiveContext,
+    CognitiveTurn,
+)
 from companion.domain.enums import CognitiveAction, ReasonCode
 from companion.domain.models import CognitiveResult
 from companion.prompts.cognitive import (
@@ -49,33 +57,22 @@ def _context(**overrides):
                 speaker_person_id="person_1",
                 speaker_label="Alice",
                 text="我去了日本",
-            )
+            ),
+            CognitiveTurn(
+                event_id="evt_prev",
+                role="assistant",
+                speaker_label="assistant",
+                text="日本好玩吗？",
+            ),
         ],
         "scene_state": {
             "topic": "旅行",
-            "topic_stack": ["工作"],
-            "mode": "CONVERSATION",
-            "discourse_phase": "DEEPENING",
-            "tone": "WARM",
             "open_loops": [{"topic": "工作", "summary": "工作的事还没讲完"}],
             "environment": {
                 "location": "UNKNOWN",
                 "other_people_present": "UNKNOWN",
                 "provenance": "UNKNOWN",
             },
-        },
-        "dialogue_style": {
-            "formality": "LOW",
-            "directness": "BALANCED",
-            "typical_length": "SHORT",
-            "humor_tendency": "WHEN_NATURAL",
-            "warmth_expression": "MODERATE",
-            "questioning_style": "WHEN_USEFUL",
-            "explicit_request": "current_request_short",
-            "guidance": [
-                "先回应眼前这句话，不要机械复述对方或背诵人设。",
-                "不要每轮都用反问或追问推进对话。",
-            ],
         },
         "personality": {
             "display_name": "Ava",
@@ -89,17 +86,18 @@ def _context(**overrides):
                 "ideal_response": "先看复现路径，再看最近改了什么。",
             }
         ],
-        "pragmatic_guidance": [
-            "当前话题：旅行。先顺着语境回应，不要突然换题。"
-        ],
     }
     payload.update(overrides)
     return CognitiveContext(**payload)
 
 
+def _system(ctx=None):
+    return build_response_messages(ctx or _context(), _analysis())[0]["content"]
+
+
 def test_prompt_versions_are_bumped():
-    assert COGNITIVE_PROMPT_VERSION == "cognitive-v8"
-    assert RESPONSE_PROMPT_VERSION == "response-v7"
+    assert COGNITIVE_PROMPT_VERSION == "cognitive-v9"
+    assert RESPONSE_PROMPT_VERSION == "response-v8"
 
 
 def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():
@@ -108,7 +106,6 @@ def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():
     assert '"scene_proposal"' in COGNITIVE_SYSTEM
     assert "【当前场景】" in user
     assert "话题: 旅行" in user
-    assert "话题栈: 工作" in user
     assert "未完成: 工作 / 工作的事还没讲完" in user
     assert "场景判断只影响理解与措辞，不改变 action" in COGNITIVE_SYSTEM
     assert "不要输出 scene_id、loop_id、person_id、event_id" in COGNITIVE_SYSTEM
@@ -122,71 +119,224 @@ def test_cognitive_prompt_keeps_nonresponse_and_memory_rules():
     assert "不要决定权限、静音开关或是否保存" in COGNITIVE_SYSTEM
 
 
-def test_response_prompt_renders_scene_and_style_as_guidance():
-    user = build_response_messages(_context(), _analysis())[1]["content"]
-    assert "【人格准则】" in user
-    assert "【当前场景】" in user
-    assert "【对话风格】" in user
-    assert "【对话衔接提醒】" in user
-    assert "【风格参考】" in user
-    assert "话题: 旅行" in user
-    assert "本轮明确要求: current_request_short" in user
+# -- native message structure ------------------------------------------------
 
 
-def test_response_prompt_puts_persona_before_scene_and_emotion():
+def test_response_messages_are_native_turns_not_a_flattened_history():
+    messages = build_response_messages(_context(), _analysis())
+    assert messages[0]["role"] == "system"
+    assert messages[-1]["role"] == "user"
+    assert messages[-1]["content"] == "后来我还去了大阪"
+
+    history = messages[1:-1]
+    assert [m["role"] for m in history] == ["user", "assistant"]
+    assert history[0]["content"] == "我去了日本"
+    assert history[1]["content"] == "日本好玩吗？"
+
+    flattened = "\n".join(m["content"] for m in messages)
+    assert "【最近对话】" not in flattened
+    assert "【当前输入】" not in flattened
+    assert "【认知分析】" not in flattened
+
+
+def test_single_speaker_history_is_raw_text_without_labels():
+    messages = build_response_messages(_context(), _analysis())
+    assert messages[1]["content"] == "我去了日本"
+    assert "[Alice]" not in messages[1]["content"]
+
+
+def test_multi_speaker_history_and_current_turn_get_speaker_metadata():
     ctx = _context(
+        turns=[
+            CognitiveTurn(
+                event_id="e1",
+                role="human",
+                speaker_person_id="person_1",
+                speaker_label="Alice",
+                text="你们在聊什么？",
+            ),
+            CognitiveTurn(
+                event_id="e1",
+                role="assistant",
+                speaker_label="assistant",
+                text="在聊旅行。",
+            ),
+            CognitiveTurn(
+                event_id="e2",
+                role="human",
+                speaker_person_id="person_2",
+                speaker_label="Bob",
+                text="我也想去。",
+            ),
+        ],
+        current_speaker_id="person_2",
+        current_speaker_label="Bob",
+        current_text="大阪怎么样？",
+    )
+    messages = build_response_messages(ctx, _analysis())
+    assert messages[1]["content"].startswith("[Alice] 你们在聊什么？")
+    assert messages[3]["content"].startswith("[Bob] 我也想去。")
+    assert messages[-1]["content"].startswith("[Bob] 大阪怎么样？")
+    assert "多人群聊" in messages[0]["content"]
+
+
+def test_wait_and_ignore_are_never_rendered_as_assistant_messages():
+    ctx = _context(
+        turns=[
+            CognitiveTurn(
+                event_id="e1",
+                role="human",
+                speaker_person_id="person_1",
+                speaker_label="Alice",
+                text="在吗？",
+            )
+        ],
+        action_history=[
+            ActionHistoryRecord(
+                event_id="e1",
+                final_action="WAIT",
+                cause_code="low_urgency",
+                cause_source="policy",
+                pending_followup=True,
+            )
+        ],
+    )
+    messages = build_response_messages(ctx, _analysis())
+    assistant_messages = [m for m in messages if m["role"] == "assistant"]
+    assert assistant_messages == []
+    system = messages[0]["content"]
+    assert "【你之前实际执行的行为】" in system
+    assert "你没有回复。" in system
+
+
+def test_truncated_history_never_starts_with_an_orphan_assistant():
+    # The response builder receives whatever the context builder kept. A
+    # context that somehow starts with an assistant turn must not produce a
+    # first assistant message with no question.
+    ctx = _context(
+        turns=[
+            CognitiveTurn(
+                event_id="e1",
+                role="assistant",
+                speaker_label="assistant",
+                text="没有被问到的回答",
+            )
+        ]
+    )
+    messages = build_response_messages(ctx, _analysis())
+    assert [m["role"] for m in messages] == ["system", "user"]
+    assert messages[-1]["content"] == "后来我还去了大阪"
+
+
+# -- simplified system prompt ------------------------------------------------
+
+
+def test_response_prompt_has_identity_boundaries_and_context():
+    system = _system()
+    assert "【角色身份】" in system
+    assert "【基本边界】" in system
+    assert "【当前相关的上下文】" in system
+    assert "Ava" in system
+    assert "话题: 旅行" in system
+    assert "你怎么理解这句话" in system
+    assert "对方在继续聊旅行" in system
+    assert "只有在确实相关时自然使用" in system
+
+
+def test_response_prompt_drops_style_vectors_and_cognitive_json():
+    ctx = _context(
+        dialogue_style={
+            "formality": "LOW",
+            "directness": "BALANCED",
+            "guidance": ["不要每轮都用反问或追问推进对话。"],
+        },
         emotion_expression={
             "source_emotion": "CURIOSITY",
             "intensity": 0.4,
             "questioning_adjustment": 0.2,
+            "directness_adjustment": 0.1,
+            "explanation": "更愿意追问",
+        },
+        pragmatic_guidance=["当前话题：旅行。"],
+        dialogue_pattern_guidance=["连续三轮以问题结尾。"],
+        affect_context="此刻情绪偏向好奇（明显）；本轮对话气氛是轻松玩笑。",
+    )
+    messages = build_response_messages(ctx, _analysis())
+    system = messages[0]["content"]
+
+    assert "【对话风格】" not in system
+    assert "【情绪影响】" not in system
+    assert "【对话衔接提醒】" not in system
+    assert "【表达习惯提醒】" not in system
+    assert "questioning_adjustment" not in system
+    assert "+0.2" not in system
+    assert "【认知分析】" not in system
+    assert "想要的回应风格" not in system
+    assert "可考虑的方向" not in system
+
+    # The compact affect description is the only emotion signal, and it is
+    # state language rather than a numeric command.
+    assert "【此刻的状态】" in system
+    assert "此刻情绪偏向好奇" in system
+
+
+def test_response_prompt_renders_stances_and_style_examples_as_guidance():
+    ctx = _context(
+        character_snapshot={
+            "display_name": "Ava",
+            "revision": 4,
+            "character_description": "一个说话直接、偶尔嘴硬的人。",
+            "relationship_tier": "CLOSE",
+            "persona_core": {"core_values": ["诚实", "具体"]},
+            "relevant_stances": [
+                {"topic": "音乐", "stance": "我更喜欢老摇滚。", "source": "RESPONSE"}
+            ],
+            "emotional_dispositions": {"expressiveness": 0.6},
         }
     )
-    user = build_response_messages(ctx, _analysis())[1]["content"]
-    assert (
-        user.index("【角色核心】")
-        < user.index("【当前场景】")
-        < user.index("【情绪影响】")
-    )
-
-
-def test_response_prompt_does_not_forward_cozy_style_or_direction():
-    user = build_response_messages(_context(), _analysis())[1]["content"]
-    # ``response_style`` is a legacy label; it must not become a cozy script.
-    assert "想要的回应风格" not in user
-    assert "可考虑的方向" not in user
+    system = _system(ctx)
+    assert "一个说话直接、偶尔嘴硬的人。" in system
+    assert "核心价值: 诚实；具体" in system
+    assert "我更喜欢老摇滚。" in system
+    assert "保持连贯" in system
+    assert "风格参考（不是真实历史，也不是固定回复；只学语气，不照抄）" in system
+    assert "先看复现路径" in system
 
 
 def test_response_prompt_forbids_fixed_replies_and_category_templates():
+    assert "你不是客服" in RESPONSE_SYSTEM
     assert "没有固定回复" in RESPONSE_SYSTEM
-    assert "不要按ANSWER/SUPPORT/PLAYFUL 等分类套模板" in RESPONSE_SYSTEM
-    user = build_response_messages(_context(), _analysis())[1]["content"]
-    assert "不是真实历史，不是固定回复" in user
+    assert "永远附和" in RESPONSE_SYSTEM
 
 
 def test_response_prompt_forbids_forced_followup_questions():
-    assert "不要每轮以问题结尾" in RESPONSE_SYSTEM
-    assert "安慰、追问、总结都不是默认动作" in RESPONSE_SYSTEM
-    user = build_response_messages(_context(), _analysis())[1]["content"]
-    assert "不要每轮都用反问或追问推进对话" in user
+    assert "不是要报告的内容" in RESPONSE_SYSTEM
+    assert "不要为了显得有情绪而表演" in RESPONSE_SYSTEM
+    assert "不要每轮自我介绍" in RESPONSE_SYSTEM
 
 
 def test_response_prompt_forbids_unsupported_environment_claims():
-    assert "没有证据的物理环境" in RESPONSE_SYSTEM
-    assert "不要补全" in RESPONSE_SYSTEM
-    user = build_response_messages(_context(), _analysis())[1]["content"]
-    assert "没有证据的环境信息保持未知，不要自行补全" in user
-
-
-def test_response_prompt_keeps_personality_stable_without_self_intro():
-    assert "保持同一个人" in RESPONSE_SYSTEM
-    assert "不要每轮自我介绍" in RESPONSE_SYSTEM
-    assert "可以有不同意见、具体偏好" in RESPONSE_SYSTEM
+    system = _system()
+    assert "没有证据的环境信息保持未知，不要自行补全" in system
+    assert "地点=UNKNOWN" in system
+    assert "旁人在场=UNKNOWN" in system
+    assert "家里" not in system
 
 
 def test_response_prompt_keeps_truthful_memory_and_silence_rules():
-    assert "PENDING_REVIEW 必须说还需要确认" in RESPONSE_SYSTEM
+    system = _system(
+        _context(
+            memory_write_outcomes=[
+                {"outcome": "PENDING_REVIEW", "detail": "needs review"},
+                {"outcome": "SAVED"},
+            ]
+        )
+    )
+    assert "待人工确认" in system
+    assert "已保存" in system
+    assert "只有对方明确追问过去的沉默时才依据它解释" in RESPONSE_SYSTEM
     assert "不要编造心理活动" in RESPONSE_SYSTEM
-    assert "只有对方明确追问过去的沉默时" in RESPONSE_SYSTEM
+    assert "待确认、无权限或失败都必须如实说" in RESPONSE_SYSTEM
 
 
 def test_response_prompt_has_no_hard_coded_persona_lines():
@@ -200,20 +350,3 @@ def test_response_prompt_is_plain_text_only():
     assert "只输出回复正文" in RESPONSE_SYSTEM
     assert "不要 JSON" in RESPONSE_SYSTEM
     assert "不要 Markdown" in RESPONSE_SYSTEM
-
-
-def test_scene_unknown_is_rendered_as_unknown_not_invented():
-    ctx = _context(
-        scene_state={
-            "topic": "UNKNOWN",
-            "environment": {
-                "location": "UNKNOWN",
-                "other_people_present": "UNKNOWN",
-                "provenance": "UNKNOWN",
-            },
-        }
-    )
-    user = build_response_messages(ctx, _analysis())[1]["content"]
-    assert "地点=UNKNOWN" in user
-    assert "旁人在场=UNKNOWN" in user
-    assert "家里" not in user

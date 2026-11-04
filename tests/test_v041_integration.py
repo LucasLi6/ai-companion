@@ -214,13 +214,14 @@ def _analysis(**updates):
     return CognitiveResult(**payload)
 
 
-def test_response_prompt_renders_expression_patterns_and_impulse():
-    assert RESPONSE_PROMPT_VERSION == "response-v7"
+def test_response_prompt_renders_compact_affect_not_style_vectors():
+    assert RESPONSE_PROMPT_VERSION == "response-v8"
     influence = compile_expression_influence(
         _state(emotion="CONCERN", intensity=0.7)
     ).as_dict()
     ctx = _context(
         emotion_expression=influence,
+        affect_context="此刻情绪偏向关切（明显）。",
         dialogue_pattern_guidance=["最近几轮大多以问题收尾；这一轮如果没必要就不追问。"],
         speech_plan={
             "delivery_instruction": "SPEAK_CALMLY",
@@ -228,52 +229,50 @@ def test_response_prompt_renders_expression_patterns_and_impulse():
             "pitch": -0.1,
         },
     )
-    user = build_response_messages(ctx, _analysis())[1]["content"]
-    assert "【情绪影响】" in user
-    assert "不改变是否回复" in user
-    assert "【表达习惯提醒】" in user
-    assert "【本轮交流判断】" in user
-    assert "分享状态，不是请求建议" in user
-    assert "不说教" in user
+    system = build_response_messages(ctx, _analysis())[0]["content"]
+    # The compact state description replaces the numeric style vector.
+    assert "【此刻的状态】" in system
+    assert "此刻情绪偏向关切（明显）" in system
+    assert "【情绪影响】" not in system
+    assert "【表达习惯提醒】" not in system
+    assert "【本轮交流判断】" not in system
+    assert "分享状态，不是请求建议" not in system
+    assert "不说教" not in system
     # TTS delivery values stay out of the text prompt.
-    assert "speaking_rate" not in user
-    assert "SPEAK_CALMLY" not in user
-    assert "语速" not in user
+    assert "speaking_rate" not in system
+    assert "SPEAK_CALMLY" not in system
+    assert "语速" not in system
     assert "语速" not in RESPONSE_SYSTEM
 
 
 def test_response_prompt_renders_character_core_from_trusted_context():
     ctx = _context(
-        personality={
+        character_snapshot={
             "display_name": "Ava",
+            "revision": 3,
             "relationship_tier": "CLOSE",
-            "principles": ["保持同一个人格。"],
-            "identity": {
-                "character_description": "一个说话具体、不擅长空泛安慰的人。",
-            },
-            "character_guidance": [
-                "看重: 诚实、具体",
-                "偏好: music=老摇滚",
-                "习惯: 会指出含糊的说法",
-                "矛盾之处: 喜欢独处但也会主动找人",
-                "边界: 不编造经历",
-            ],
-            "character": {
+            "character_description": "一个说话具体、不擅长空泛安慰的人。",
+            "persona_core": {
+                "core_values": ["诚实", "具体"],
+                "preferences": {"music": "老摇滚"},
                 "temperament": {"humor": "dry"},
+                "conversational_boundaries": ["不编造经历"],
             },
+            "relevant_stances": [
+                {"topic": "安慰", "stance": "不喜欢空泛的安慰。", "source": "RESPONSE"}
+            ],
         }
     )
-    user = build_response_messages(ctx, _analysis())[1]["content"]
-    assert "【角色核心】" in user
-    assert "一个说话具体、不擅长空泛安慰的人。" in user
-    assert "看重: 诚实、具体" in user
-    assert "humor=dry" in user
-    assert "偏好: music=老摇滚" in user
-    assert "会指出含糊的说法" in user
-    assert "喜欢独处但也会主动找人" in user
-    assert "不编造经历" in user
+    system = build_response_messages(ctx, _analysis())[0]["content"]
+    assert "【角色身份】" in system
+    assert "一个说话具体、不擅长空泛安慰的人。" in system
+    assert "核心价值: 诚实；具体" in system
+    assert "humor=dry" in system
+    assert "重要偏好: music=老摇滚" in system
+    assert "交流边界: 不编造经历" in system
+    assert "不喜欢空泛的安慰。" in system
     # Character is guidance, not a fixed script.
-    assert "不要逐条复述" in user
+    assert "不要逐条复述" in system
 
 
 async def test_scene_preview_reaches_response_context_without_persisting(rt, register):
@@ -322,7 +321,7 @@ async def test_scene_preview_reaches_response_context_without_persisting(rt, reg
     assert updated.scene_state["environment"]["location"] == "大阪的酒店"
     # Preview is in-memory only; the CAS commit happens later in _commit_turn.
     assert await manager.scene_repo.load("c1", person.person_id) is None
-    user = build_response_messages(updated, analysis)[1]["content"]
+    user = build_response_messages(updated, analysis)[0]["content"]
     assert "话题: 旅行" in user
     assert "地点=大阪的酒店" in user
 

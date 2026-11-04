@@ -130,9 +130,11 @@ async def test_persona_core_reaches_the_real_response_request(db):
     assert "宁可直说，也不刻意讨好" in request
     assert "听到含糊的说法会追问一句" in request
     assert "humor=dry" in request
-    # The stable character is sent by the trusted runtime, not reconstructed
-    # from the model's analysis JSON.
-    assert "宁可直说，也不刻意讨好" not in client.calls[0]["messages"][1]["content"]
+    # V0.4.3: the same trusted snapshot reaches both provider calls, so the
+    # cognitive layer cannot describe a different character than the response.
+    cognitive_request = client.calls[0]["messages"][1]["content"]
+    assert "宁可直说，也不刻意讨好" in cognitive_request
+    assert "宁可直说，也不刻意讨好" in client.system_prompts("response")[0]
 
 
 async def test_persona_core_revision_change_is_visible_on_the_next_turn(db):
@@ -203,8 +205,7 @@ async def test_user_text_claiming_a_new_identity_does_not_replace_the_core(db):
     )
 
     system_prompt = client.system_prompts("response")[0]
-    user_prompt = client.calls[1]["messages"][-1]["content"]
-    assert "不迎合，也不故意唱反调" in user_prompt
+    assert "不迎合，也不故意唱反调" in system_prompt
     assert "私人助理" not in system_prompt
 
 

@@ -276,7 +276,7 @@ def test_b_response_prompt_reports_only_committed_outcomes():
         reason_code=ReasonCode.DIRECT_AGENT_ADDRESS,
         response_style="plain",
     )
-    prompt = build_response_messages(context, analysis)[1]["content"]
+    prompt = build_response_messages(context, analysis)[0]["content"]
     assert "已保存" in prompt
     assert "保存失败" in prompt
     assert "待人工确认" in prompt

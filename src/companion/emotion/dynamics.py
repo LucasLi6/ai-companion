@@ -280,12 +280,17 @@ def reaction_gain(
     profile: EmotionProfile | None,
     traits: Mapping[str, int] | None,
     config: EmotionDynamicsConfig | None = None,
+    dispositions: Mapping[str, float] | None = None,
 ) -> tuple[float, float]:
-    """Reaction strength from responsiveness and empathy.
+    """Reaction strength from responsiveness, empathy and character tendency.
 
     ``responsiveness`` 0.0/0.5/1.0 maps to gain 0.0/1.0/2.0. Empathy applies a
     modest ×0.8–×1.2 factor only to concern/sadness events, so a warm persona
     can soften or deepen a reaction but never flip its direction.
+
+    An optional, admin-configured ``expressiveness`` disposition applies a
+    further ×0.8–×1.2 factor. It is never inferred by searching the character
+    description; a missing value leaves the previous behaviour unchanged.
     """
     cfg = config or DEFAULT_CONFIG
     responsiveness = (
@@ -299,6 +304,15 @@ def reaction_gain(
     except (TypeError, ValueError):
         empathy = 0.5
     empathy = clamp(empathy, 0.0, 1.0)
+
+    if dispositions:
+        try:
+            expressiveness = clamp(
+                float(dispositions.get("expressiveness", 0.5)), 0.0, 1.0
+            )
+        except (TypeError, ValueError):
+            expressiveness = 0.5
+        gain *= 0.8 + 0.4 * expressiveness
     return clamp(gain, 0.0, 2.0), empathy
 
 
@@ -315,16 +329,31 @@ def _apply_tension(
     rule: AppraisalRule,
     impact: float,
     config: EmotionDynamicsConfig,
+    dispositions: Mapping[str, float] | None = None,
 ) -> float:
     name = rule.name
+    values = dispositions or {}
     if name in TENSION_RULES:
         delta = TENSION_RULES[name] * impact
+        try:
+            sensitivity = clamp(
+                float(values.get("conflict_sensitivity", 0.5)), 0.0, 1.0
+            )
+        except (TypeError, ValueError):
+            sensitivity = 0.5
+        delta *= 0.6 + 0.8 * sensitivity
         return clamp(current + delta * (1.0 - current), 0.0, 1.0)
     if name in ("agent_apology", "relationship_repair"):
-        # Repair lowers tension but never instantly zeroes it.
-        return clamp(
-            current - current * config.tension_decrease * impact, 0.0, 1.0
-        )
+        # Repair lowers tension but never instantly zeroes it. A character
+        # disposed to reconciliation lets go a little faster.
+        try:
+            openness = clamp(
+                float(values.get("reconciliation_openness", 0.5)), 0.0, 1.0
+            )
+        except (TypeError, ValueError):
+            openness = 0.5
+        decrease = config.tension_decrease * (0.6 + 0.8 * openness)
+        return clamp(current - current * decrease * impact, 0.0, 1.0)
     return current
 
 
@@ -336,10 +365,11 @@ def apply_emotional_stimulus(
     now: datetime,
     *,
     config: EmotionDynamicsConfig | None = None,
+    dispositions: Mapping[str, float] | None = None,
 ) -> EmotionState:
     """Pure function: compose one rule's stimulus with the decayed state."""
     cfg = config or DEFAULT_CONFIG
-    gain, empathy = reaction_gain(profile, traits, cfg)
+    gain, empathy = reaction_gain(profile, traits, cfg, dispositions)
     empathy_factor = (
         0.8 + 0.4 * empathy if rule.emotion in ("CONCERN", "SADNESS") else 1.0
     )
@@ -348,6 +378,18 @@ def apply_emotional_stimulus(
     impact = clamp(rule.intensity * gain, 0.0, 1.0)
     if impact <= 0.0:
         return current
+
+    # A character with a high tolerance for teasing takes a playful jab a
+    # little more lightly; one with low tolerance feels it a little more. The
+    # factor is bounded and only applies to the validated playful_teasing rule.
+    if rule.name == "playful_teasing" and dispositions:
+        try:
+            tolerance = clamp(
+                float(dispositions.get("tolerance_for_teasing", 0.5)), 0.0, 1.0
+            )
+        except (TypeError, ValueError):
+            tolerance = 0.5
+        impact = clamp(impact * (1.2 - 0.4 * tolerance), 0.0, 1.0)
 
     # Repeated *hostility* (selected locally after verified repeats) gets a
     # bounded extra weight. Ordinary repeated stimuli use the plain saturating
@@ -416,7 +458,7 @@ def apply_emotional_stimulus(
     )
 
     tension = _apply_tension(
-        current.relationship_tension, rule, impact, cfg
+        current.relationship_tension, rule, impact, cfg, dispositions
     )
 
     return EmotionState(

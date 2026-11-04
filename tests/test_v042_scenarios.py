@@ -244,15 +244,22 @@ def test_pragmatic_scenario_is_validated_and_rendered(
             },
         },
     )
-    user = build_response_messages(context, analysis)[1]["content"]
+    messages = build_response_messages(context, analysis)
+    system = messages[0]["content"]
+    user = messages[-1]["content"]
 
-    assert user.index("【角色核心】") < user.index("【当前场景】")
-    assert user.index("【当前场景】") < user.index("【语用理解】")
-    assert f"主要行为: {expected_act}" in user
-    assert "不要逐字复述" in user
-    assert "想要的回应风格" not in user
-    assert "可考虑的方向" not in user
-    assert "安慰、追问、总结都不是默认动作" in RESPONSE_SYSTEM
+    # Native structure: current utterance is its own user message, not a
+    # flattened 【最近对话】 block.
+    assert user == text
+    assert "【最近对话】" not in system
+    # Identity leads; the validated pragmatic reading is no longer dumped as a
+    # labelled instruction block into the response prompt.
+    assert "【角色身份】" in system
+    assert "【语用理解】" not in system
+    assert f"主要行为: {expected_act}" not in system
+    assert "想要的回应风格" not in system
+    assert "可考虑的方向" not in system
+    assert "没有固定回复" in RESPONSE_SYSTEM
 
 
 def test_reference_previous_keeps_only_a_visible_antecedent():
@@ -473,11 +480,13 @@ async def test_cross_turn_emitted_stance_reaches_the_next_response_request(db):
     second_response = [
         c for c in client.calls if c["request_type"] == "response"
     ][1]
-    content = second_response["messages"][1]["content"]
-    assert "【既往立场】" in content
-    assert "我更喜欢老摇滚" in content
-    assert "不是用户事实" in content
-    assert "自然说明为什么" in content
+    messages = second_response["messages"]
+    system = messages[0]["content"]
+    assert messages[-1]["role"] == "user"
+    assert messages[-1]["content"] == turn2
+    assert "与本轮相关的既往立场" in system
+    assert "我更喜欢老摇滚" in system
+    assert "保持连贯；若改变看法，自然说明原因" in system
 
 
 async def test_full_chain_request_capture_order_and_versions(db):
@@ -493,15 +502,17 @@ async def test_full_chain_request_capture_order_and_versions(db):
     assert analysis_call["request_type"] == "analysis"
     assert response_call["request_type"] == "response"
     assert analysis_call["messages"][0]["content"] == COGNITIVE_SYSTEM
-    assert response_call["messages"][0]["content"] == RESPONSE_SYSTEM
+    assert response_call["messages"][0]["content"].startswith(RESPONSE_SYSTEM)
 
-    response_user = response_call["messages"][1]["content"]
-    assert response_user.index("【角色核心】") < response_user.index("【当前场景】")
-    assert response_user.index("【当前场景】") < response_user.index("【语用理解】")
-    assert response_user.index("【语用理解】") < response_user.index("【认知分析】")
-    assert "【认知分析】" in response_user
-    assert "想要的回应风格" not in response_user
-    assert "可考虑的方向" not in response_user
+    response_user = response_call["messages"][-1]["content"]
+    assert response_user == text
+    response_system = response_call["messages"][0]["content"]
+    assert "【角色身份】" in response_system
+    assert "【当前场景】" in response_system
+    assert "【语用理解】" not in response_system
+    assert "【认知分析】" not in response_system
+    assert "想要的回应风格" not in response_system
+    assert "可考虑的方向" not in response_system
 
 
 async def test_safety_turn_makes_no_response_request(db):

@@ -11,8 +11,9 @@ understand the *current* utterance in light of the *recent* conversation:
   labelling), resolving names through the registry so the model sees *who*
   said what, not bare person ids.
 - Applies a bounded truncation (max turns, then max characters) that keeps the
-  most recent turns and drops the oldest first, so the prompt never grows
-  without limit.
+  most recent **segments** (a human turn plus its reply) and drops the oldest
+  first, so the prompt never grows without limit and never begins with an
+  assistant reply whose question was cut away.
 """
 
 from __future__ import annotations
@@ -200,15 +201,51 @@ class ContextBuilder:
         return records[-8:]
 
     def _truncate(self, turns: list[CognitiveTurn]) -> list[CognitiveTurn]:
-        turns = list(turns)
-        if self.max_turns is not None and len(turns) > self.max_turns:
-            turns = turns[-self.max_turns:]
+        """Drop oldest *segments* (a human turn plus its reply).
+
+        V0.4.3 uses native chat messages, so a bare assistant message with no
+        preceding user turn would be a malformed request. Truncation therefore
+        removes whole units and never leaves an orphan assistant reply, and the
+        remaining turns stay in chronological order. The most recent segment is
+        kept even when it alone exceeds the soft budget.
+        """
+        segments = self._segments(turns)
+        if not segments:
+            return []
+
+        if self.max_turns is not None:
+            while (
+                len(segments) > 1
+                and sum(len(segment) for segment in segments) > self.max_turns
+            ):
+                segments.pop(0)
+            # A single segment may exceed max_turns by one (human + reply).
+            # Dropping half of it would be worse than a soft boundary.
+
         if self.max_chars is not None:
-            total = sum(len(t.text) for t in turns)
-            while total > self.max_chars and len(turns) > 1:
-                total -= len(turns[0].text)
-                turns.pop(0)
-        return turns
+            total = sum(len(turn.text) for segment in segments for turn in segment)
+            while total > self.max_chars and len(segments) > 1:
+                dropped = segments.pop(0)
+                total -= sum(len(turn.text) for turn in dropped)
+
+        return [turn for segment in segments for turn in segment]
+
+    @staticmethod
+    def _segments(turns: list[CognitiveTurn]) -> list[list[CognitiveTurn]]:
+        segments: list[list[CognitiveTurn]] = []
+        current: list[CognitiveTurn] = []
+        for turn in turns:
+            if turn.role == ROLE_HUMAN:
+                if current:
+                    segments.append(current)
+                current = [turn]
+            elif turn.role == ROLE_ASSISTANT and current:
+                current.append(turn)
+            # An assistant turn without a preceding human turn is never kept:
+            # it has no visible question to answer.
+        if current:
+            segments.append(current)
+        return segments
 
     async def _person(self, person_id: str):
         if person_id not in self._people:

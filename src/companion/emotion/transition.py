@@ -35,6 +35,7 @@ from companion.emotion.parameters import DEFAULT_CONFIG, EmotionDynamicsConfig
 
 EVENT = "EVENT"
 FRAME_CHANGE = "FRAME_CHANGE"
+SAME_FRAME_EVENT = "SAME_FRAME_EVENT"
 REPAIR = "REPAIR"
 NONE = "NONE"
 
@@ -184,12 +185,18 @@ def transition_affect(
     traits: Optional[Mapping[str, int]] = None,
     now: Optional[datetime] = None,
     config: Optional[EmotionDynamicsConfig] = None,
+    dispositions: Optional[Mapping[str, float]] = None,
 ) -> AffectTransition:
     """Compose one conversational event/frame change with the current state.
 
     ``rule`` is an already-selected, locally validated appraisal rule. When it
-    is ``None`` only a real frame change can move affect. The function is pure
-    aside from reading its arguments; callers persist the returned state.
+    is ``None`` only a real frame change or an evidence-backed same-frame
+    development can move affect. The function is pure aside from reading its
+    arguments; callers persist the returned state.
+
+    Since V0.4.3 the conversation-driven mechanisms are independent of the
+    time-decay mode: they run in OFF, AUXILIARY and LEGACY alike when
+    ``conversation_transition_enabled`` is set.
     """
     cfg = config or DEFAULT_CONFIG
     moment = now or datetime.now(timezone.utc)
@@ -205,18 +212,26 @@ def transition_affect(
         and frame_confidence >= cfg.frame_transition_min_confidence
         else None
     )
+    same_frame_spec = (
+        _same_frame_stimulus(affect, cfg)
+        if frame_spec is None and rule is None
+        else None
+    )
 
     prepared = current
-    mode = str(getattr(cfg, "time_decay_mode", "AUXILIARY")).upper()
+    conversation_enabled = bool(
+        getattr(cfg, "conversation_transition_enabled", True)
+    )
+    active_spec = frame_spec or same_frame_spec
     if (
-        mode == "AUXILIARY"
-        and (rule is not None or frame_spec is not None)
+        conversation_enabled
+        and (rule is not None or active_spec is not None)
         and getattr(cfg, "scene_relevance_suppression", 0.0) > 0.0
     ):
         # Old, unrelated activations belong to the previous scene. They are
         # reduced before the new event is added; the event's own category is
         # kept so a repeated insult can still compound.
-        keep = rule.emotion if rule is not None else frame_spec[0]
+        keep = rule.emotion if rule is not None else active_spec[0]
         retention = 1.0 - (1.0 - relevance) * cfg.scene_relevance_suppression
         if affect.frame_changed:
             retention *= 1.0 - cfg.frame_change_suppression
@@ -246,7 +261,13 @@ def transition_affect(
 
     if rule is not None:
         state = apply_emotional_stimulus(
-            prepared, rule, profile, traits, moment, config=cfg
+            prepared,
+            rule,
+            profile,
+            traits,
+            moment,
+            config=cfg,
+            dispositions=dispositions,
         )
         cause = EmotionalTransitionCause(
             code=EVENT,
@@ -262,8 +283,9 @@ def transition_affect(
             state = _adjust_tension(state, -cfg.tension_decrease * 0.5, moment)
         return AffectTransition(state=state, cause=cause, changed=True)
 
-    if frame_spec is not None:
-        emotion, intensity, tension_delta = frame_spec
+    spec = frame_spec or same_frame_spec
+    if spec is not None:
+        emotion, intensity, tension_delta = spec
         frame_rule = AppraisalRule(
             rule_id=f"frame_{frame.lower()}",
             agent_id="frame_transition",
@@ -271,7 +293,12 @@ def transition_affect(
             trigger_type="frame",
             pattern={},
             emotion=emotion,
-            intensity=clamp(intensity * cfg.frame_transition_scale, 0.0, 1.0),
+            intensity=clamp(
+                intensity
+                * (cfg.frame_transition_scale if frame_spec is not None else 1.0),
+                0.0,
+                1.0,
+            ),
             priority=0,
             status="ACTIVE",
             source="system",
@@ -279,13 +306,30 @@ def transition_affect(
             updated_at=moment,
         )
         state = apply_emotional_stimulus(
-            prepared, frame_rule, profile, traits, moment, config=cfg
+            prepared,
+            frame_rule,
+            profile,
+            traits,
+            moment,
+            config=cfg,
+            dispositions=dispositions,
         )
         if tension_delta:
             state = _adjust_tension(state, tension_delta, moment)
+        code = (
+            SAME_FRAME_EVENT
+            if frame_spec is None
+            else REPAIR
+            if frame == "REPAIR"
+            else FRAME_CHANGE
+        )
         cause = EmotionalTransitionCause(
-            code=REPAIR if frame == "REPAIR" else FRAME_CHANGE,
-            reason=f"frame_{frame.lower()}",
+            code=code,
+            reason=(
+                "same_frame_progress"
+                if frame_spec is None
+                else f"frame_{frame.lower()}"
+            ),
             previous_frame=previous_frame,
             frame=frame,
             event_type=affect.event_type,
@@ -306,6 +350,43 @@ def transition_affect(
         ),
         changed=False,
     )
+
+
+def _same_frame_stimulus(
+    affect: ConversationalAffect, cfg: EmotionDynamicsConfig
+) -> Optional[tuple[str, float, float]]:
+    """A new development inside an unchanged frame, not mere repetition.
+
+    Only a validated structural signal counts: a setup/payoff turn that refers
+    back to a visible previous turn. Three PLAYFUL turns in a row add nothing
+    unless the conversation actually develops (the joke lands, a clarification
+    changes the reading).
+    """
+    if not bool(getattr(cfg, "frame_same_event_enabled", True)):
+        return None
+    frame = str(affect.interaction_frame or "UNKNOWN").upper()
+    spec = _FRAME_STIMULI.get(frame)
+    if spec is None:
+        return None
+    if str(affect.setup_payoff_role or "NONE").upper() not in ("SETUP", "PAYOFF"):
+        return None
+    if not affect.refers_to_previous_turn:
+        return None
+    try:
+        confidence = float(affect.confidence or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    threshold = max(
+        float(getattr(cfg, "frame_transition_min_confidence", 0.55)),
+        float(getattr(cfg, "frame_same_event_min_confidence", 0.60)),
+    )
+    if confidence < threshold:
+        return None
+    scale = clamp(
+        float(getattr(cfg, "frame_same_event_scale", 0.4)), 0.0, 1.0
+    )
+    emotion, intensity, tension_delta = spec
+    return emotion, intensity * scale, tension_delta * scale
 
 
 def _dominant(state: EmotionState) -> Optional[str]:

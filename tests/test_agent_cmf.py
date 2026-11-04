@@ -329,6 +329,7 @@ async def test_prompt_includes_identity_and_style_boundary(rt, register):
         response_style="plain",
     )
     messages = build_response_messages(context, analysis)
-    prompt = messages[-1]["content"]
+    prompt = messages[0]["content"]
+    assert messages[-1]["content"] == "你好"
     assert "Ava" in prompt
     assert "权限" in prompt or "permission" in prompt.lower()

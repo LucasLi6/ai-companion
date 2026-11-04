@@ -601,12 +601,16 @@ async def test_thirty_turns_keep_revision_and_personality_stable(db):
     assert len(client.requests("analysis")) == 30
     assert len(client.requests("response")) == 30
 
-    first_response_prompt = client.requests("response")[0]["messages"][1]["content"]
-    last_response_prompt = client.requests("response")[-1]["messages"][1]["content"]
+    first_response_prompt = client.requests("response")[0]["messages"][0]["content"]
+    last_response_prompt = client.requests("response")[-1]["messages"][0]["content"]
     for prompt in (first_response_prompt, last_response_prompt):
-        assert "【人格准则】" in prompt
-        assert "【对话风格】" in prompt
-        assert "关系层级:" in prompt
+        assert "【角色身份】" in prompt
+        assert "【基本边界】" in prompt
+        assert "与当前说话者的关系:" in prompt
+    # Both calls see the same trusted character view.
+    assert first_response_prompt.split("【当前相关的上下文】")[0] == (
+        last_response_prompt.split("【当前相关的上下文】")[0]
+    )
     # The 30th analysis sees the 29th scene, not a stale early one.
     last_analysis_prompt = client.requests("analysis")[-1]["messages"][1]["content"]
     assert "话题: 话题28" in last_analysis_prompt
@@ -734,11 +738,11 @@ async def test_style_example_is_prompt_guidance_not_dialogue_history(db):
     )
     await _say(rt, alice.person_id, "支付回调失败了", 1)
 
-    response_prompt = client.requests("response")[0]["messages"][1]["content"]
+    response_prompt = client.requests("response")[0]["messages"][0]["content"]
     analysis_prompt = client.requests("analysis")[0]["messages"][1]["content"]
-    assert "【风格参考】" in response_prompt
+    assert "风格参考" in response_prompt
     assert "先确认回调有没有到网关，再看签名。" in response_prompt
-    assert "不是真实历史，不是固定回复" in response_prompt
+    assert "不是真实历史，也不是固定回复" in response_prompt
     # The analysis prompt never receives the style reference as history.
     assert "先确认回调有没有到网关，再看签名。" not in analysis_prompt
     turns = await rt.repos.utterance.recent_context("c1", None, 20)

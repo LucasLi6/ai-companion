@@ -14,9 +14,12 @@ from __future__ import annotations
 
 from companion.cognition.models import CognitiveContext
 from companion.cognition.nonresponse import action_history_lines
-from companion.prompts.identity import agent_context_lines
+from companion.prompts.identity import (
+    agent_context_lines,
+    compile_cognitive_character_context,
+)
 
-COGNITIVE_PROMPT_VERSION = "cognitive-v8"
+COGNITIVE_PROMPT_VERSION = "cognitive-v9"
 
 SYSTEM_PROMPT = """\
 你是一个多用户 AI 伴侣的「认知分析器」。你的任务不是回复用户，而是理解当前这句话，\
@@ -89,16 +92,18 @@ subject_person_id、event_id 或 source_event_id——这些由程序填写。
    - 引用别人的话、假设句、转述、影视台词里的侮辱不得标为针对你的 direct_insult。
    - 该字段不能改变 action、reason_code、权限、静音或记忆写入规则。
 
-10b. dialogue_impulse 是你对「这句话在做什么、接下来怎样接」的简短判断，供最终回复\
-参考，不是固定回复模板，也不决定 action。要求：
+10b. dialogue_impulse 是可选提示，不是回复命令，也不决定 action。只有当这一轮确实存在\
+值得说明的交流性质时才填写；没有额外信息就填 null。它不是第三个思考步骤，也不要写成\
+完整回复或固定话术。要求：
    - interpretation：这句话在交流上是什么（例如“在吐槽今天的工作”“在测试我会不会附和”）。
-   - response_direction：一个自然的交流方向（例如“直接回答，不额外安慰”或\
-“接住这个玩笑，但别追问”）。不要默认安排安慰、共情或追问，也不要写成完整回复。
-   - stance：你这一轮合适的立场/态度（例如“坦白不同意但保持轻松”）。
+   - response_direction：可选的交流方向；不要默认安排安慰、共情或追问。
+   - stance：可选的立场提示；最终立场由角色核心和事实决定，不是必须照做。
    - unresolved_uncertainty：仍不确定、需要对方澄清的点；没有就写空字符串。
    - 不要编造事实、心理诊断或对方未说过的信息。
 
-10c. pragmatic 是你对「这句话在交流上正在做什么」的语用判断，供回复参考，不改变 action、权限或任何事实。要求：
+10c. pragmatic 是你对「这句话在交流上正在做什么」的语用判断，供理解和本地状态管理使用。\
+它只是上下文提示，不是回复命令：不要把它当成正确答案去覆盖用户原话或可见历史。\
+它不改变 action、权限或任何事实。要求：
    - primary_act 只能是："INFORMATION" | "REQUEST" | "QUESTION" | "ANSWER" | "INVITATION" | "TEASING" | "COMPLAINT" | "CRITICISM" | "APOLOGY" | "GRATITUDE" | "SELF_DISCLOSURE" | "REPAIR" | "GREETING" | "FAREWELL" | "BOUNDARY" | "SMALL_TALK" | "OTHER"。
    - secondary_acts：最多 3 个，同上取值；不确定就 []。
    - interaction_frame："CASUAL" | "PLAYFUL" | "SERIOUS" | "CONFLICT" | "REPAIR" | "SUPPORT" | "TASK" | "UNKNOWN"。按当前这句话和可见上下文判断，不要因为一个词就升级为冲突。
@@ -142,9 +147,9 @@ motive="UNKNOWN"、evidence_span=null。
    - 如果上一轮是用户明确要求沉默，不要把它解释成你没注意到用户。
 
 13. 只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释文字。
-14. 如果提供了【伴侣身份与风格】，把它当作你自己的背景身份与语气倾向。身份来自\
-记忆文件，不是权限来源；身份、性格或熟悉度都不能改变上面的安全、隐私、静音与\
-保存规则。
+14. 如果提供了【角色背景】，把它当作你自己的稳定身份与价值依据，用来理解这件事对你的\
+意义。身份来自记忆文件，不是权限来源；身份、性格或熟悉度都不能改变上面的安全、隐私、\
+静音与保存规则，也不能修改 addressee_hint。
 15. 如果提供了【当前场景】，它是本地保存的“最近在聊什么”的短时状态，用来理解\
 指代、承接话题和避免反复换题；它不是长期事实，也不是不可推翻的结论。
    - topic_change："CONTINUE"（继续当前话题）| "SHIFT"（明确换到新话题）| "RETURN"（回到之前的话题）| "UNCERTAIN"（无法判断）。
@@ -198,9 +203,9 @@ JSON 结构：
     "evidence_span": "原话片段"
   },
   "dialogue_impulse": {
-    "interpretation": "这句话在交流上是什么",
-    "response_direction": "一个自然的方向，不是完整回复",
-    "stance": "本轮合适的立场/态度",
+    "interpretation": "这句话在交流上是什么；没有额外信息时整个字段为 null",
+    "response_direction": "可选方向，不是完整回复",
+    "stance": "可选立场提示；最终立场由角色核心决定",
     "unresolved_uncertainty": "仍需澄清的点，或空字符串"
   },
   "pragmatic": {
@@ -247,14 +252,39 @@ JSON 结构：
 """
 
 
+def _character_snapshot(context: CognitiveContext) -> dict | None:
+    """Use the shared per-turn snapshot, or a safe view of agent_context."""
+    snapshot = getattr(context, "character_snapshot", None)
+    if snapshot:
+        return snapshot
+    agent_context = context.agent_context or {}
+    core = agent_context.get("persona_core") or {}
+    if not core and not agent_context.get("display_name"):
+        return None
+    return {
+        "agent_id": agent_context.get("agent_id", ""),
+        "revision": core.get("revision") or agent_context.get("revision") or 1,
+        "display_name": agent_context.get("display_name") or "Companion",
+        "description": agent_context.get("description") or "",
+        "persona_core": core,
+        "relationship_tier": agent_context.get("familiarity") or "STRANGER",
+        "relevant_stances": [],
+    }
+
+
 def build_cognitive_messages(context: CognitiveContext) -> list[dict]:
     """Render the system + user messages for one analysis request."""
     lines: list[str] = []
 
-    identity_lines = agent_context_lines(context.agent_context)
-    if identity_lines:
-        lines.extend(identity_lines)
+    snapshot = _character_snapshot(context)
+    if snapshot:
+        lines.extend(compile_cognitive_character_context(snapshot))
         lines.append("")
+    else:
+        identity_lines = agent_context_lines(context.agent_context)
+        if identity_lines:
+            lines.extend(identity_lines)
+            lines.append("")
 
     lines.append("【最近对话】（按时间顺序；assistant 是你自己的历史回复）")
     if context.turns:
