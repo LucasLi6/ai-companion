@@ -34,56 +34,52 @@ def build_idle_scheduler(
 ) -> IdleScheduler:
     """Wire the idle pipeline over a running :class:`~companion.runtime.Runtime`.
 
-    ``deepseek`` and ``web_search`` default to mock providers; callers may pass
-    real ones (e.g. a settings-gated web search) without touching the engines.
-    Every engine reads externally-authorised context through one shared
-    :class:`IdleMemoryContextBuilder`, and research is gated by the
-    ``research.enabled`` / ``web_search.enabled`` settings.
+    The runtime owns exactly one research engine and has already registered
+    its ``RESEARCH_TASK`` handler with the worker. This builder reuses that
+    engine unconditionally; injecting ``deepseek``/``web_search`` only affects
+    the foreground reflection/curiosity providers used by tests, never the
+    executing Worker's global handler. That avoids a second research engine
+    (and a second provider) racing the real one.
     """
-    custom_providers = deepseek is not None or web_search is not None
-    deepseek = deepseek or DeepSeekProvider()
-    web_search = web_search or MockWebSearchProvider()
+    reflection_provider = deepseek or DeepSeekProvider()
     settings = settings or runtime.repos.settings
     builder = IdleMemoryContextBuilder(
         runtime.memory_service, runtime.registry, audit=runtime.repos.audit
     )
     task_service = getattr(runtime, "task_service", None)
-    # The normal runtime already owns a research engine and has registered its
-    # handler. Reuse it so scheduling, execution and ownership all refer to
-    # the same engine. A caller that injects explicit providers (the CLI's
-    # settings-aware wiring) still gets its own engine, which is then
-    # registered in place of the default one.
-    research = None if custom_providers else getattr(runtime, "research_engine", None)
+    research = getattr(runtime, "research_engine", None)
     if research is None:
+        # Only a runtime built without the normal wiring needs a fallback.
+        # This is not registered over an existing handler.
+        from .sources import ResearchSourceGuard
+
         research = ResearchEngine(
             runtime.memory_service,
             runtime.repos.research,
-            web_search,
-            deepseek,
+            web_search or MockWebSearchProvider(),
+            reflection_provider,
             settings=settings,
             state=runtime.repos.research_state,
+            source_guard=ResearchSourceGuard(
+                runtime.memory_service, runtime.registry
+            ),
         )
     reflection = ReflectionEngine(
-        runtime.memory_service, deepseek, builder, learning=runtime.repos.learning
+        runtime.memory_service,
+        reflection_provider,
+        builder,
+        learning=runtime.repos.learning,
     )
     curiosity = CuriosityEngine(
         runtime.memory_service,
-        deepseek,
+        reflection_provider,
         runtime.repos.research,
         builder,
         learning=runtime.repos.learning,
         task_service=task_service,
+        source_guard=getattr(research, "source_guard", None),
+        settings=settings,
     )
-    # Register the same engine with the unified off-task worker. This does not
-    # start a second scheduler: it only makes an enqueued RESEARCH_TASK job
-    # durable and resumable through the existing worker.
-    if task_service is not None:
-        from companion.domain.enums import JobType
-        from companion.tasks.handlers import build_research_task_handler
-
-        task_service.register_handler(
-            JobType.RESEARCH_TASK, build_research_task_handler(research)
-        )
     return IdleScheduler(
         runtime.repos.settings,
         reflection,

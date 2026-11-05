@@ -76,9 +76,9 @@ async def _build_version_21(path):
 
 @pytest.mark.asyncio
 async def test_fresh_database_is_v22_with_cascading_route_foreign_keys(db):
-    assert SCHEMA_VERSION == 23
+    assert SCHEMA_VERSION == 24
     cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-    assert (await cur.fetchone())["v"] == 23
+    assert (await cur.fetchone())["v"] == 24
 
     for table in ("route_decisions", "route_tool_calls"):
         cur = await db.execute(f"PRAGMA foreign_key_list({table})")
@@ -175,7 +175,7 @@ async def test_migration_from_v21_keeps_valid_rows_and_drops_orphans(tmp_path):
         await db.initialize()
 
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == 23
+        assert (await cur.fetchone())["v"] == 24
 
         cur = await db.execute(
             "SELECT event_id, execution_status FROM route_tool_calls"

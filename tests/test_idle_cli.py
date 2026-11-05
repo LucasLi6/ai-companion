@@ -30,8 +30,11 @@ def test_research_queue_list_run(tmp_path, capsys):
         "--question", "OTA 为什么不稳定？",
         "--source-kind", "manual",
     ]) == 0
-    task_id = capsys.readouterr().out.strip()
+    queued = capsys.readouterr().out
+    task_id = queued.splitlines()[0].strip()
     assert task_id.startswith("research_")
+    # The command also reports the durable worker job it created.
+    assert "job_status=PENDING" in queued
 
     assert main(["--db", db, "research", "list"]) == 0
     out = capsys.readouterr().out

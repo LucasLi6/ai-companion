@@ -26,6 +26,76 @@ class IdleProviderNotAuthorised(RuntimeError):
     pass
 
 
+class GatedDeepSeekIdleProvider:
+    """Settings-gated provider used by the runtime research engine.
+
+    With ``idle.real_deepseek.enabled=false`` every call uses the deterministic
+    mock provider, so background research stays offline by default. Turning the
+    setting on makes the *next* call use the real DeepSeek idle provider; a
+    missing API key is then a clear configuration error, never a silent mock
+    that could be reported as real research. The real client is built lazily so
+    a default runtime never asks for credentials.
+    """
+
+    name = "gated-deepseek-idle"
+
+    def __init__(self, gate, *, logger=None) -> None:
+        self.gate = gate
+        self.logger = logger
+        self._mock = None
+        self._real = None
+
+    async def _enabled(self) -> bool:
+        if self.gate is None:
+            return False
+        return bool(await self.gate.get_bool("idle.real_deepseek.enabled", False))
+
+    async def _target(self):
+        if not await self._enabled():
+            if self._mock is None:
+                from companion.providers.deepseek import DeepSeekProvider
+
+                self._mock = DeepSeekProvider()
+            return self._mock
+        if self._real is None:
+            from companion.providers.deepseek_client import (
+                build_deepseek_client,
+                load_deepseek_config,
+            )
+
+            client = build_deepseek_client(load_deepseek_config())
+            self._real = DeepSeekIdleProvider(
+                client, gate=self.gate, logger=self.logger
+            )
+        return self._real
+
+    async def mode(self) -> str:
+        return "real" if await self._enabled() else "mock"
+
+    async def describe(self) -> tuple[str, str]:
+        mode = await self.mode()
+        return mode, self.name if mode == "real" else "mock-deepseek"
+
+    async def reflect(self, memories: list[dict]) -> list[dict]:
+        return await (await self._target()).reflect(memories)
+
+    async def ask_questions(self, memories: list[dict]) -> list[str]:
+        return await (await self._target()).ask_questions(memories)
+
+    async def ask_question_proposals(self, memories: list[dict]) -> list[dict]:
+        target = await self._target()
+        method = getattr(target, "ask_question_proposals", None)
+        if method is None:
+            return [
+                {"question": question, "source_memory_ids": []}
+                for question in await target.ask_questions(memories)
+            ]
+        return await method(memories)
+
+    async def synthesize(self, question: str, sources: list[dict]) -> str:
+        return await (await self._target()).synthesize(question, sources)
+
+
 class DeepSeekIdleProvider:
     name = "deepseek-idle"
 
@@ -99,6 +169,15 @@ class DeepSeekIdleProvider:
         return out
 
     async def ask_questions(self, memories: list[dict]) -> list[str]:
+        proposals = await self.ask_question_proposals(memories)
+        return [item["question"] for item in proposals]
+
+    async def ask_question_proposals(self, memories: list[dict]) -> list[dict]:
+        """Questions plus the exact memory ids each one was derived from.
+
+        The model may only cite ids from the supplied payload; ``curiosity``
+        re-validates them against the authorised set before persisting a task.
+        """
         await self._authorised()
         if not memories:
             return []
@@ -113,7 +192,9 @@ class DeepSeekIdleProvider:
                     "content": (
                         "Given the supplied memories, propose at most three short"
                         " research questions that would check whether a claim is"
-                        " still accurate. Return JSON as {\"questions\": [\"...\"]}."
+                        " still accurate. Return JSON as {\"questions\":"
+                        " [{\"question\": \"...\", \"source_memory_ids\":"
+                        " [\"memory_id\"]}]}. Cite only ids present in the input."
                         " Do not reveal private details beyond the supplied text."
                     ),
                 },
@@ -122,7 +203,32 @@ class DeepSeekIdleProvider:
             json_mode=True,
         )
         data = json.loads(content)
-        return [str(q).strip()[:300] for q in data.get("questions", [])[:3] if str(q).strip()]
+        proposals: list[dict] = []
+        for item in data.get("questions", [])[:3]:
+            if isinstance(item, str):
+                text = item.strip()
+                ids: list[str] = []
+            elif isinstance(item, dict):
+                text = str(item.get("question", "")).strip()
+                raw_ids = item.get("source_memory_ids")
+                ids = (
+                    [str(value) for value in raw_ids if value]
+                    if isinstance(raw_ids, list)
+                    else []
+                )
+            else:
+                continue
+            if text:
+                proposals.append(
+                    {"question": text[:300], "source_memory_ids": ids}
+                )
+        return proposals
+
+    async def mode(self) -> str:
+        return "real"
+
+    async def describe(self) -> tuple[str, str]:
+        return "real", self.name
 
     async def synthesize(self, question: str, sources: list[dict]) -> str:
         await self._authorised()

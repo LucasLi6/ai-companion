@@ -1363,36 +1363,47 @@ def cmd_ui(args) -> int:
 
 
 async def _build_idle_scheduler(rt, *, real_provider: bool = False):
-    """Build the idle scheduler with a settings-aware (mock-first) web search.
+    """Reuse the runtime's single research engine.
 
-    The real DeepSeek idle provider is constructed only when explicitly
-    requested; it also re-checks ``idle.real_deepseek.enabled`` on every call.
+    Providers are resolved by the runtime (settings-aware, offline by
+    default). The caller must build the runtime with ``real_idle_provider``
+    when a real idle provider is wanted; this function must never construct a
+    second engine or replace the worker's global handler.
     """
     from companion.idle import build_idle_scheduler
-    from companion.providers.websearch import make_web_search
 
-    web_search = await make_web_search(rt.repos.settings)
-    deepseek = None
-    if real_provider:
-        from companion.providers.deepseek_client import (
-            build_deepseek_client,
-            load_deepseek_config,
-        )
-        from companion.providers.deepseek_idle import DeepSeekIdleProvider
+    return build_idle_scheduler(rt)
 
-        client = build_deepseek_client(load_deepseek_config())
-        deepseek = DeepSeekIdleProvider(client, gate=rt.repos.settings)
-    return build_idle_scheduler(rt, web_search=web_search, deepseek=deepseek)
+
+async def _provider_report_line(rt) -> str:
+    engine = getattr(rt, "research_engine", None)
+    if engine is None or not hasattr(engine, "provider_report"):
+        return "search=mock synthesis=mock"
+    try:
+        report = await engine.provider_report()
+    except Exception as exc:  # a missing credential is reported, not hidden
+        return f"provider_error={type(exc).__name__}"
+    return (
+        f"search={report.get('search_mode')}:{report.get('search_provider')}"
+        f" synthesis={report.get('synthesis_mode')}:{report.get('synthesis_provider')}"
+        f" real_research={report.get('real_research')}"
+    )
 
 
 async def cmd_idle_run(args) -> int:
     db = await _connect(args.db)
     try:
-        rt = build_runtime(db)
         try:
-            scheduler = await _build_idle_scheduler(
-                rt, real_provider=bool(getattr(args, "real_provider", False))
+            rt = build_runtime(
+                db,
+                real_idle_provider=bool(getattr(args, "real_provider", False)),
             )
+        except Exception as exc:  # missing DEEPSEEK_API_KEY / config
+            print(f"error: {exc}")
+            return 1
+        try:
+            scheduler = await _build_idle_scheduler(rt)
+            print(f"provider: {await _provider_report_line(rt)}")
         except Exception as exc:  # missing key / unauthorised real provider
             print(f"error: {exc}")
             return 1
@@ -1404,6 +1415,11 @@ async def cmd_idle_run(args) -> int:
                 f"reflections={result['reflections']} questions={result['questions']}"
                 f" research={result['research']}"
             )
+            # Execution stays on the worker path. Draining here makes the CLI
+            # useful end-to-end without introducing a second executor.
+            if rt.worker is not None:
+                processed = await rt.worker.run_until_idle()
+                print(f"worker_processed={processed}")
     finally:
         await db.close()
     return 0
@@ -1415,9 +1431,10 @@ async def cmd_research_list(args) -> int:
         rt = build_runtime(db)
         tasks = await rt.repos.research.list(status=args.status)
         for t in tasks:
+            detail = f"  error={t['error']}" if t.get("error") else ""
             print(
                 f"{t['task_id']}  {t['status']}  p={t['priority']}"
-                f"  {t['source_kind']}  {t['question']}"
+                f"  {t['source_kind']}  {t['question']}{detail}"
             )
         if not tasks:
             print("no research tasks")
@@ -1427,30 +1444,74 @@ async def cmd_research_list(args) -> int:
 
 
 async def cmd_research_queue(args) -> int:
+    from companion.idle.scheduling import schedule_research
+
     db = await _connect(args.db)
     try:
         rt = build_runtime(db)
-        task_id = await rt.repos.research.create(
-            args.question, source_kind=args.source_kind, priority=args.priority
+        report = await schedule_research(
+            rt.db,
+            rt.repos.research,
+            rt.task_service,
+            args.question,
+            origin="user",
+            source_kind=args.source_kind,
+            priority=args.priority,
         )
-        print(task_id)
+        if not report.get("task_id"):
+            print(f"not queued: {report.get('reason')}")
+            return 0
+        job = (
+            await rt.repos.job.get(report["job_id"])
+            if report.get("job_id")
+            else None
+        )
+        print(report["task_id"])
+        print(
+            f"created={report.get('created')} reason={report.get('reason')}"
+            f" job={report.get('job_id') or '-'}"
+            f" job_status={job.status.value if job is not None else '-'}"
+        )
     finally:
         await db.close()
     return 0
 
 
 async def cmd_research_run(args) -> int:
+    from companion.idle.scheduling import enqueue_existing_research
+
     db = await _connect(args.db)
     try:
         rt = build_runtime(db)
+        print(f"provider: {await _provider_report_line(rt)}")
         if not await rt.repos.settings.get_bool("research.enabled", False):
             print("research is disabled (set research.enabled=true to enable)")
             return 0
-        scheduler = await _build_idle_scheduler(rt)
-        tasks = await scheduler.research.run_all(limit=args.limit)
-        for t in tasks:
-            print(f"{t['task_id']}  {t['status']}  {t['question']}")
-        if not tasks:
+        pending = await rt.repos.research.list(status="PENDING", limit=args.limit)
+        task_ids: list[str] = []
+        for task in pending:
+            task_id = str(task["task_id"])
+            try:
+                await enqueue_existing_research(rt.task_service, task_id)
+            except Exception as exc:  # TaskRejected or config error
+                print(f"{task_id}  NOT_SCHEDULED  {type(exc).__name__}: {exc}")
+                continue
+            task_ids.append(task_id)
+        if rt.worker is not None:
+            await rt.worker.run_until_idle(max_iterations=50)
+        for task_id in task_ids:
+            task = await rt.repos.research.get(task_id)
+            if task is None:
+                continue
+            job = await rt.repos.job.get_by_key(f"research:{task_id}")
+            job_status = job.status.value if job is not None else "-"
+            job_error = (job.last_error or "") if job is not None else ""
+            print(
+                f"{task_id}  task={task['status']}  job={job_status}"
+                f"  error={task.get('error') or job_error or '-'}"
+                f"  {task['question']}"
+            )
+        if not task_ids:
             print("no pending research tasks")
     finally:
         await db.close()

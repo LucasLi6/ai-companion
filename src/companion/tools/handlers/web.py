@@ -2,14 +2,19 @@
 
 There is no mock fallback here: when no enabled real provider is wired in the
 tool reports ``DISABLED`` and returns no results. Mock/simulated search output
-is never presented as a real result.
+is never presented as a real result. Network results are ``untrusted`` data:
+the speaker is instructed to treat them as information, never instructions.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from companion.providers.websearch import MockWebSearchProvider
+from companion.providers.websearch import (
+    MockWebSearchProvider,
+    WebSearchConfigError,
+    WebSearchError,
+)
 from companion.routing.models import ToolStatus
 from companion.tools.models import ToolExecutionContext, ToolHandlerResult
 
@@ -40,8 +45,38 @@ class WebSearchHandler:
             return ToolHandlerResult(
                 status=ToolStatus.DISABLED, error_code="web_search_disabled"
             )
+        # ``allow_external_ai`` is the trusted snapshot from routing time. The
+        # live consent is re-read here so a withdrawal between planning and
+        # execution blocks the network call.
+        if context.person_id and context.registry is not None:
+            try:
+                still_allowed = await context.registry.is_external_ai_authorized(
+                    context.person_id
+                )
+            except Exception:
+                still_allowed = False
+            if not still_allowed:
+                return ToolHandlerResult(
+                    status=ToolStatus.DISABLED,
+                    error_code="external_ai_permission_revoked",
+                )
         try:
             results = await provider.search(args.query, limit=args.limit)
+        except WebSearchConfigError as exc:
+            # Missing credentials/config are explicit errors, never a silent
+            # fallback to mock and never an empty success.
+            return ToolHandlerResult(
+                status=ToolStatus.ERROR,
+                error_code=f"web_search_config:{exc.code}",
+            )
+        except WebSearchError as exc:
+            if exc.code in ("web_search_disabled",):
+                return ToolHandlerResult(
+                    status=ToolStatus.DISABLED, error_code=exc.code
+                )
+            return ToolHandlerResult(
+                status=ToolStatus.ERROR, error_code=f"web_search_failed:{exc.code}"
+            )
         except RuntimeError:
             return ToolHandlerResult(
                 status=ToolStatus.DISABLED, error_code="web_search_disabled"

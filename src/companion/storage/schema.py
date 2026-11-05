@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1653,6 +1653,54 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON processing_jobs(status, priority, created_at);
         CREATE INDEX IF NOT EXISTS idx_jobs_mode
             ON processing_jobs(execution_mode, status);
+        """,
+    ),
+    # Version 24 (V0.9.2): research dedupe + provenance. New rows may carry a
+    # normalized question key, the memory ids a curiosity question was derived
+    # from, and an origin ('curiosity'/'user'/'legacy'). The partial unique
+    # index only constrains *active* rows, so a completed research task can be
+    # re-researched once its recheck window expires. Existing rows keep NULL /
+    # 'legacy' and are treated conservatively (never sent to a real network
+    # search without verifiable sources).
+    (
+        24,
+        """
+        -- A legacy/synthetic database may declare a version at or above 9
+        -- without the research table ever having been materialised (its
+        -- migrations were skipped). Ensure the base table exists before the
+        -- additive ALTERs; a normal database keeps its existing rows.
+        CREATE TABLE IF NOT EXISTS research_tasks (
+            task_id      TEXT PRIMARY KEY,
+            question     TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'PENDING',
+            priority     INTEGER NOT NULL DEFAULT 0,
+            source_kind  TEXT NOT NULL DEFAULT 'curiosity',
+            source_ref   TEXT,
+            result       TEXT,
+            error        TEXT,
+            created_at   TEXT NOT NULL,
+            started_at   TEXT,
+            completed_at TEXT,
+            owner_id     TEXT,
+            lease_expires_at TEXT,
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            memory_id    TEXT,
+            project_id   TEXT,
+            run_id       TEXT
+        );
+
+        ALTER TABLE research_tasks ADD COLUMN dedupe_key TEXT;
+        ALTER TABLE research_tasks ADD COLUMN source_memory_ids TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE research_tasks ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy';
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_research_active_dedupe
+            ON research_tasks(dedupe_key)
+            WHERE dedupe_key IS NOT NULL AND status IN ('PENDING', 'RUNNING');
+        CREATE INDEX IF NOT EXISTS idx_research_tasks_status
+            ON research_tasks(status);
+        CREATE INDEX IF NOT EXISTS idx_research_origin_status
+            ON research_tasks(origin, status);
         """,
     ),
 ]

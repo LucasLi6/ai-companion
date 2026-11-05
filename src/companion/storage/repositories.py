@@ -7,7 +7,11 @@ timestamps are stored as timezone-aware UTC ISO-8601 strings.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -78,6 +82,58 @@ class JobCapacityError(RuntimeError):
         super().__init__(f"autonomous research queue is full ({pending}/{limit})")
         self.pending = pending
         self.limit = limit
+
+
+class ResearchCapacityError(RuntimeError):
+    """Too many *unfinished* autonomous research detail rows.
+
+    Unlike a job-count limit, this counts the research records themselves, so
+    a task that has no job (for example after a rejected enqueue) still
+    consumes a slot until it is completed, failed or cancelled.
+    """
+
+    def __init__(self, active: int, limit: int) -> None:
+        super().__init__(
+            f"too many unfinished autonomous research tasks ({active}/{limit})"
+        )
+        self.active = active
+        self.limit = limit
+
+
+_QUESTION_PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
+_QUESTION_WHITESPACE = re.compile(r"\s+", re.UNICODE)
+
+
+def normalize_research_question(question: str) -> str:
+    """Canonical form used only for dedupe, never for display or search.
+
+    NFKC folds compatibility variants (full-width characters), casefold folds
+    case, punctuation is dropped and whitespace collapsed. This makes
+    ``"OTA 为什么不稳定？"`` and ``"ota 为什么不稳定?"`` the same key without an
+    LLM call or a second question classifier.
+    """
+    text = unicodedata.normalize("NFKC", str(question or ""))
+    text = text.casefold()
+    text = _QUESTION_PUNCTUATION.sub(" ", text)
+    return _QUESTION_WHITESPACE.sub(" ", text).strip()
+
+
+def research_dedupe_key(
+    question: str,
+    source_memory_ids: tuple[str, ...] | list[str] = (),
+    *,
+    origin: str = "curiosity",
+) -> str:
+    """Stable identity of a research need within one source/permission scope."""
+    normalized = normalize_research_question(question)
+    sources = sorted({str(item) for item in source_memory_ids if str(item)})
+    payload = json.dumps(
+        {"q": normalized, "sources": sources, "origin": str(origin)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class PersonRepository:
@@ -2097,7 +2153,8 @@ class ResearchRepository:
     _COLUMNS = (
         "task_id, question, status, priority, source_kind, source_ref, result,"
         " error, created_at, started_at, completed_at, owner_id, lease_expires_at,"
-        " attempts, max_attempts, memory_id, project_id, run_id"
+        " attempts, max_attempts, memory_id, project_id, run_id, dedupe_key,"
+        " source_memory_ids, origin"
     )
 
     def __init__(self, db: Database) -> None:
@@ -2111,17 +2168,143 @@ class ResearchRepository:
         source_ref: str | None = None,
         priority: int = 0,
         max_attempts: int = 3,
+        origin: str = "legacy",
+        source_memory_ids: list[str] | tuple[str, ...] = (),
     ) -> str:
+        """Insert one research row unconditionally.
+
+        This low-level path is retained for tests and data migration. New
+        scheduling code uses :meth:`create_unique`, which also normalizes the
+        question and records the dedupe key/provenance.
+        """
         from companion.domain.models import new_id
 
         task_id = new_id("research")
         await self.db.execute(
             "INSERT INTO research_tasks(task_id, question, status, priority,"
-            " source_kind, source_ref, max_attempts, created_at)"
-            " VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?)",
-            (task_id, question, priority, source_kind, source_ref, max_attempts, _iso(utcnow())),
+            " source_kind, source_ref, max_attempts, created_at, origin,"
+            " source_memory_ids)"
+            " VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                question,
+                priority,
+                source_kind,
+                source_ref,
+                max_attempts,
+                _iso(utcnow()),
+                origin,
+                json.dumps(sorted({str(i) for i in source_memory_ids}), ensure_ascii=False),
+            ),
         )
         return task_id
+
+    async def create_unique(
+        self,
+        question: str,
+        *,
+        origin: str,
+        source_kind: str = "curiosity",
+        source_memory_ids: list[str] | tuple[str, ...] = (),
+        source_ref: str | None = None,
+        priority: int = 0,
+        max_attempts: int = 3,
+        max_active: int | None = None,
+        recheck_seconds: int | None = None,
+    ) -> tuple[str, bool, str]:
+        """Create a research record unless the same need is already covered.
+
+        Returns ``(task_id, created, reason)``. A duplicate active row (or a
+        recently completed row, unless the caller asks for re-research) is
+        returned with ``created=False`` and the matching reason; the caller
+        must not enqueue another job for it. No LLM is involved.
+
+        ``max_active`` bounds *unfinished autonomous research rows*, not jobs:
+        a research detail row without a job still occupies its slot. User
+        submitted research (``origin='user'``) is authoritative and is never
+        rejected by this autonomous limit.
+        """
+        from companion.domain.models import new_id
+
+        source_ids = sorted({str(item) for item in source_memory_ids if str(item)})
+        key = research_dedupe_key(question, source_ids, origin=origin)
+        autonomous = str(origin) != "user"
+
+        cur = await self.db.execute(
+            "SELECT task_id FROM research_tasks"
+            " WHERE dedupe_key = ? AND status IN ('PENDING', 'RUNNING')"
+            " ORDER BY created_at ASC LIMIT 1",
+            (key,),
+        )
+        existing = await cur.fetchone()
+        if existing is not None:
+            return str(existing["task_id"]), False, "active_duplicate"
+
+        if recheck_seconds is not None and recheck_seconds > 0 and autonomous:
+            cutoff = _iso(utcnow() - timedelta(seconds=int(recheck_seconds)))
+            cur = await self.db.execute(
+                "SELECT task_id FROM research_tasks"
+                " WHERE dedupe_key = ? AND status = 'COMPLETED'"
+                " AND completed_at IS NOT NULL AND completed_at >= ?"
+                " ORDER BY completed_at DESC LIMIT 1",
+                (key, cutoff),
+            )
+            fresh = await cur.fetchone()
+            if fresh is not None:
+                return str(fresh["task_id"]), False, "recently_completed"
+
+        # Capacity is checked only when this call would create a *new*
+        # unfinished research row; an idempotent duplicate above is free.
+        if autonomous and max_active is not None:
+            cur = await self.db.execute(
+                "SELECT COUNT(*) AS n FROM research_tasks"
+                " WHERE status IN ('PENDING', 'RUNNING') AND origin != 'user'"
+            )
+            active = int((await cur.fetchone())["n"])
+            if active >= int(max_active):
+                raise ResearchCapacityError(active, int(max_active))
+
+        task_id = new_id("research")
+        try:
+            await self.db.execute(
+                "INSERT INTO research_tasks(task_id, question, status, priority,"
+                " source_kind, source_ref, max_attempts, created_at, dedupe_key,"
+                " source_memory_ids, origin)"
+                " VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    question,
+                    priority,
+                    source_kind,
+                    source_ref,
+                    max_attempts,
+                    _iso(utcnow()),
+                    key,
+                    json.dumps(source_ids, ensure_ascii=False),
+                    str(origin),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # A concurrent creator won the partial-unique race. Re-read its
+            # row instead of surfacing a constraint error.
+            cur = await self.db.execute(
+                "SELECT task_id FROM research_tasks"
+                " WHERE dedupe_key = ? AND status IN ('PENDING', 'RUNNING')"
+                " LIMIT 1",
+                (key,),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                return str(row["task_id"]), False, "active_duplicate"
+            raise
+        return task_id, True, "created"
+
+    async def active_count(self, *, autonomous_only: bool = True) -> int:
+        sql = "SELECT COUNT(*) AS n FROM research_tasks WHERE status IN ('PENDING','RUNNING')"
+        if autonomous_only:
+            sql += " AND origin != 'user'"
+        cur = await self.db.execute(sql)
+        return int((await cur.fetchone())["n"])
 
     async def get(self, task_id: str) -> dict | None:
         cur = await self.db.execute(

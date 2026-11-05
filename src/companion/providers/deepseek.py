@@ -43,14 +43,31 @@ class DeepSeekProvider:
 
     async def ask_questions(self, memories: list[dict]) -> list[str]:
         """Derive one question per factual/state memory, capped at three."""
-        questions: list[str] = []
+        proposals = await self.ask_question_proposals(memories)
+        return [item["question"] for item in proposals]
+
+    async def ask_question_proposals(self, memories: list[dict]) -> list[dict]:
+        """Questions with the exact memory ids each one was derived from."""
+        proposals: list[dict] = []
         for m in memories:
             kind = m.get("kind")
             if kind in ("PROJECT_STATE", "WORLD_KNOWLEDGE", "PERSONAL_FACT"):
-                questions.append(f"[mock] 关于「{_preview(m)}」是否仍然准确、有无更新？")
-            if len(questions) >= 3:
+                memory_id = m.get("memory_id")
+                proposals.append(
+                    {
+                        "question": f"[mock] 关于「{_preview(m)}」是否仍然准确、有无更新？",
+                        "source_memory_ids": [str(memory_id)] if memory_id else [],
+                    }
+                )
+            if len(proposals) >= 3:
                 break
-        return questions
+        return proposals
+
+    async def mode(self) -> str:
+        return "mock"
+
+    async def describe(self) -> tuple[str, str]:
+        return "mock", self.name
 
     async def synthesize(self, question: str, sources: list[dict]) -> str:
         """Combine search results into a short, clearly-labelled summary."""

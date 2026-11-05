@@ -16,9 +16,9 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from companion.domain.enums import JobType, TaskMode, TaskPriority, TaskSource
+from companion.domain.enums import JobType
 from companion.learning.state import LearningRepository
-from companion.tasks.models import TaskRejected, TaskRequest
+from companion.tasks.models import TaskRejected
 
 
 class IdleScheduler:
@@ -59,6 +59,12 @@ class IdleScheduler:
         JobWorker is the only executor. Existing PENDING rows (including ones
         created before this change) are taken over idempotently through the
         stable ``research:<task_id>`` job key.
+
+        When the active search provider would make a real network request,
+        each row's provenance is checked before a job is scheduled. A legacy
+        row without source ids, or one whose source consent was revoked, is
+        never handed to the network: it is failed/cancelled with a truthful
+        reason instead of being silently retried forever.
         """
         task_service = self.task_service
         if task_service is None or (
@@ -70,21 +76,40 @@ class IdleScheduler:
         pending = await self.research.research_repo.list(
             status="PENDING", limit=limit
         )
+        network_required = False
+        guard = getattr(self.research, "source_guard", None)
+        report = getattr(self.research, "provider_report", None)
+        if callable(report):
+            try:
+                network_required = (
+                    (await report()).get("search_mode") == "real"
+                )
+            except Exception:
+                network_required = True
         scheduled: list[str] = []
         for task in pending:
             task_id = str(task["task_id"])
-            try:
-                await task_service.enqueue(
-                    TaskRequest(
-                        type=JobType.RESEARCH_TASK.value,
-                        payload={"research_task_id": task_id},
-                        mode=TaskMode.BACKGROUND,
-                        source=TaskSource.SYSTEM,
-                        priority=TaskPriority.LOW,
-                        source_ref=task_id,
-                        job_key=f"research:{task_id}",
+            if network_required and guard is not None:
+                decision = await guard.check(task, network_required=True)
+                if not decision.allowed:
+                    if decision.reason == "permission_revoked":
+                        await self.research.research_repo.cancel_for_job(
+                            task_id, ""
+                        )
+                    else:
+                        await self.research.research_repo.fail(
+                            task_id, f"source_blocked:{decision.reason}"
+                        )
+                    self.logger.info(
+                        "research_not_scheduled research_id=%s reason=%s",
+                        task_id,
+                        decision.reason,
                     )
-                )
+                    continue
+            try:
+                from .scheduling import enqueue_existing_research
+
+                await enqueue_existing_research(task_service, task_id)
             except TaskRejected as exc:
                 # No silent drop: the row stays PENDING and the reason is
                 # recorded for the cycle report.

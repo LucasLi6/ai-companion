@@ -54,7 +54,7 @@ from companion.providers.deepseek_cognitive import DeepSeekCognitiveProvider
 from companion.providers.deepseek_response import DeepSeekResponseProvider
 from companion.providers.deepseek_router import DeepSeekRouterProvider
 from companion.providers.mock import MockCognitiveProvider, MockResponseProvider
-from companion.providers.websearch import HttpWebSearchProvider
+from companion.providers.websearch import SettingsWebSearchProvider
 from companion.routing.context import RoutingContextBuilder
 from companion.routing.service import RoutingService
 from companion.routing.validator import RoutingValidator
@@ -134,6 +134,7 @@ def build_runtime(
     tool_registry=None,
     web_search_provider=None,
     turn_analysis_delay_seconds: Optional[float] = None,
+    real_idle_provider: Optional[bool] = None,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
 
@@ -297,6 +298,10 @@ def build_runtime(
     tool_executor = None
     tool_registry = tool_registry
     web_search = web_search_provider
+    # Research keeps an explicit injection, but otherwise uses its own
+    # mock-capable wrapper: offline background research must not inherit the
+    # Router's "real results only" provider.
+    research_search_provider = web_search_provider
     if resolved_mode == "semantic":
         if router_provider is None:
             if provider != "deepseek" or deepseek_client is None:
@@ -309,11 +314,13 @@ def build_runtime(
         if tool_registry is None:
             tool_registry = build_default_tool_registry()
         if web_search is None:
-            # Capability is inert until the operator's execution-time setting
-            # enables it. Building the provider with enabled=True means the
-            # tool handler — not composition time — owns the gate and reads
-            # ``web_search.enabled`` on every call.
-            web_search = HttpWebSearchProvider(enabled=True)
+            # Resolve provider/enabled/key at execution time. The handler owns
+            # the ``web_search.enabled`` gate; this wrapper never substitutes
+            # mock results for the Router (``allow_mock=False``), so a missing
+            # credential is reported truthfully instead of faked.
+            web_search = SettingsWebSearchProvider(
+                repos.settings, allow_mock=False, logger=logger
+            )
         if gateway is None:
             gateway = ForegroundPrivacyGateway(registry, logger=logger)
         routing_builder = RoutingContextBuilder(
@@ -348,23 +355,45 @@ def build_runtime(
         logger=logger,
     )
 
-    # V0.9.1: one research engine belongs to the runtime itself, and its
+    # V0.9.2: one research engine belongs to the runtime itself, and its
     # RESEARCH_TASK handler is registered with the normal worker. Curiosity
     # and the idle scheduler enqueue through TaskService; they never start a
-    # second research scheduler. The engine is offline by default (mock search
-    # and mock synthesis); a real search provider is only used when the
-    # operator has wired one and enabled it by setting.
+    # second research scheduler. Search and synthesis each resolve their
+    # provider at call time:
+    #   - research search defaults to offline mock when network search is off;
+    #   - real Brave search requires web_search.enabled plus a key;
+    #   - synthesis uses mock unless idle.real_deepseek.enabled is on, in which
+    #     case a missing key is a clear configuration error (never a silent
+    #     mock reported as real research).
     from companion.idle.research import ResearchEngine
-    from companion.providers.deepseek import DeepSeekProvider
-    from companion.providers.websearch import MockWebSearchProvider
+    from companion.idle.sources import ResearchSourceGuard
+    from companion.providers.deepseek_idle import (
+        DeepSeekIdleProvider,
+        GatedDeepSeekIdleProvider,
+    )
 
+    research_search = research_search_provider or SettingsWebSearchProvider(
+        repos.settings, allow_mock=True, logger=logger
+    )
+    if real_idle_provider:
+        idle_client = deepseek_client
+        if idle_client is None:
+            idle_client = build_deepseek_client(
+                deepseek_config or load_deepseek_config(), logger=logger
+            )
+        research_synth = DeepSeekIdleProvider(idle_client, gate=repos.settings)
+    else:
+        research_synth = GatedDeepSeekIdleProvider(repos.settings, logger=logger)
     research_engine = ResearchEngine(
         memory_service,
         repos.research,
-        web_search or MockWebSearchProvider(),
-        DeepSeekProvider(),
+        research_search,
+        research_synth,
         settings=repos.settings,
         state=repos.research_state,
+        source_guard=ResearchSourceGuard(
+            memory_service, registry, logger=logger
+        ),
         logger=logger,
     )
 
@@ -453,12 +482,25 @@ def build_runtime(
             allowed = allowed and bool(consent.allow_memory_learning)
         return allowed
 
+    async def task_claim_gate(request):
+        """Defer research while disabled instead of claiming/cancelling it.
+
+        The check reads the setting at claim time, so re-enabling resumes the
+        existing rows and checkpoints. A withdrawal of permission is a
+        different, terminal decision made by ``task_permission`` above.
+        """
+        if request.type == JobType.RESEARCH_TASK.value:
+            if not await repos.settings.get_bool("research.enabled", False):
+                return "RESEARCH_DISABLED"
+        return None
+
     task_service = TaskService(
         repos,
         handlers=worker.handlers if worker is not None else {},
         worker=worker,
         logger=logger,
         permission_checker=task_permission,
+        claim_gate=task_claim_gate,
     )
 
     # V0.6 runtime context. Timezone resolution is always on (it needs no

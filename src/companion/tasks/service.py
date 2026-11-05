@@ -68,6 +68,7 @@ class TaskService:
         resume_idle_seconds: float = 0.5,
         permission_checker: Optional[Callable[[TaskRequest], Any]] = None,
         necessity_checker: Optional[Callable[[TaskRequest], Any]] = None,
+        claim_gate: Optional[Callable[[TaskRequest], Any]] = None,
     ) -> None:
         self.repos = repos
         self.logger = logger or logging.getLogger("companion.tasks")
@@ -79,6 +80,10 @@ class TaskService:
         self.lease_seconds = int(getattr(worker, "lease_seconds", 300) or 300)
         self.permission_checker = permission_checker
         self.necessity_checker = necessity_checker
+        # Optional non-terminal deferral (for example ``research.enabled=false``):
+        # returning a reason leaves the job PENDING without consuming an attempt
+        # or cancelling the work. A None return allows the claim.
+        self.claim_gate = claim_gate
         self._handlers: dict[str, TaskHandler] = {}
         self._revoked_sources: set[tuple[str, str]] = set()
         self.worker = worker
@@ -740,6 +745,12 @@ class TaskService:
                 await self._check_permission(request)
             except TaskRejected:
                 return False, "PERMISSION_REVOKED"
+        if self.claim_gate is not None:
+            reason = self.claim_gate(request)
+            if hasattr(reason, "__await__"):
+                reason = await reason
+            if reason:
+                return False, str(reason)
         job_type = job.job_type.value if isinstance(job.job_type, JobType) else str(job.job_type)
         if job_type in self.heavy_types:
             running = await self.repos.job.count_running(self.heavy_types)

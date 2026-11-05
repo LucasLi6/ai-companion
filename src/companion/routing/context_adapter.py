@@ -71,6 +71,11 @@ def attach_semantic_tool_signals(
 
     If the router did not request a fact, the field stays ``none``/``None``.
     A denied or failed tool is never reported as an empty successful lookup.
+
+    Real external results (``web.search``) are also attached as
+    ``tool_results`` so the speaker receives the snippets/URLs and can cite
+    them. The response prompt renders them as ``UNTRUSTED_EXTERNAL`` data,
+    never as instructions.
     """
     results = list(results or [])
     memory_results = [
@@ -110,6 +115,15 @@ def attach_semantic_tool_signals(
             if isinstance(data, Mapping):
                 conversation_stats = dict(data)
 
+    # Memory records already reach the prompt through ``memory_samples``;
+    # everything else (notably real web results) is forwarded verbatim so the
+    # speaker can use and cite actual executed output.
+    tool_payloads = [
+        _tool_payload(item)
+        for item in results
+        if getattr(item, "tool_name", None) not in _MEMORY_TOOLS
+    ][:8]
+
     history_loaded = len(getattr(routing_view, "recent_turns", ()) or ())
     return context.model_copy(
         update={
@@ -118,8 +132,31 @@ def attach_semantic_tool_signals(
             "history_excerpt": history_excerpt,
             "history_loaded": history_loaded,
             "conversation_stats": conversation_stats,
+            "tool_results": tool_payloads,
         }
     )
+
+
+def _tool_payload(result: Any) -> dict:
+    if hasattr(result, "model_dump"):
+        payload = result.model_dump(mode="json")
+    elif isinstance(result, Mapping):
+        payload = dict(result)
+    else:
+        payload = {
+            "tool_name": getattr(result, "tool_name", None),
+            "status": str(getattr(result, "status", "")),
+            "data": getattr(result, "data", None),
+            "error_code": getattr(result, "error_code", None),
+            "source_refs": list(getattr(result, "source_refs", ()) or []),
+            "untrusted": bool(getattr(result, "untrusted", False)),
+        }
+    status = payload.get("status")
+    if hasattr(status, "value"):
+        payload["status"] = status.value
+    elif status is not None:
+        payload["status"] = str(status)
+    return payload
 
 
 def _aggregate_status(statuses: Iterable[Any]) -> str:
