@@ -58,7 +58,7 @@ class StreamingClient:
 
 
 async def _setup(db, client):
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await rt.registry.register(
         "Alice",
         "owner",

@@ -29,6 +29,43 @@ DEFAULT_HISTORY_LIMIT = 8
 DEFAULT_MAX_CHARS = 1600
 
 
+def truncate_dialogue_turns(turns: list[dict], max_chars: int) -> list[dict]:
+    """Drop the oldest *complete* dialogue units until the budget fits.
+
+    A unit is one human turn plus the assistant reply produced for it. Whole
+    units are removed from the front, so the remaining history never starts
+    with an orphan assistant reply whose question was cut away. Speaker
+    identity and chronological order are untouched, and an assistant reply is
+    attached only to the human turn immediately before it. The most recent
+    unit is kept even if it alone exceeds the soft budget.
+    """
+    units: list[list[dict]] = []
+    current: list[dict] = []
+    for turn in turns:
+        role = turn.get("role")
+        if role == ROLE_HUMAN:
+            if current:
+                units.append(current)
+            current = [turn]
+        elif role == ROLE_ASSISTANT and current:
+            current.append(turn)
+        # An assistant turn with no preceding human turn is never kept: it has
+        # no visible question in this window.
+    if current:
+        units.append(current)
+
+    total = sum(
+        len(str(turn.get("text") or ""))
+        for unit in units
+        for turn in unit
+    )
+    while total > max_chars and len(units) > 1:
+        dropped = units.pop(0)
+        total -= sum(len(str(turn.get("text") or "")) for turn in dropped)
+
+    return [turn for unit in units for turn in unit]
+
+
 class RoutingContextBuilder:
     def __init__(
         self,
@@ -172,11 +209,7 @@ class RoutingContextBuilder:
 
     @staticmethod
     def _truncate(turns: list[dict], max_chars: int) -> list[dict]:
-        total = sum(len(str(turn.get("text") or "")) for turn in turns)
-        while total > max_chars and len(turns) > 1:
-            dropped = turns.pop(0)
-            total -= len(str(dropped.get("text") or ""))
-        return turns
+        return truncate_dialogue_turns(turns, max_chars)
 
     @staticmethod
     def _action_history(history, actions, turns) -> list[dict]:

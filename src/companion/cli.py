@@ -1589,6 +1589,7 @@ async def cmd_repl(args) -> int:
         print("AI Companion REPL. Type /help for commands.")
         print(f"speaking as {person.person_id} ({person.display_name})")
         print(f"provider: {rt.provider}")
+        print(f"router mode: {rt.router_mode}")
         if provider == "deepseek":
             print("addressee: agent (single-person session; use /to human|unknown to override)")
         if provider == "deepseek":
@@ -1634,6 +1635,7 @@ async def cmd_repl(args) -> int:
                     elif cmd == "/status":
                         ctx = await rt.repos.conversation.get(args.conversation)
                         print(f"provider: {rt.provider}")
+                        print(f"router mode: {rt.router_mode}")
                         print(f"person: {person.person_id} ({person.display_name})")
                         print(f"conversation: {args.conversation}")
                         print(f"addressee: {addressee}")

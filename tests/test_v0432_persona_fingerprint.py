@@ -131,7 +131,8 @@ async def _runtime(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     return rt, client, person
 

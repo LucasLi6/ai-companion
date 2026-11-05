@@ -81,6 +81,7 @@ class ToolExecutor:
         context: ToolExecutionContext,
         *,
         tool_call_id: str,
+        restored: bool = False,
     ) -> ToolResult:
         registered = self.registry.get(request.tool_name)
         if registered is None:
@@ -89,6 +90,7 @@ class ToolExecutor:
                 request,
                 ToolStatus.DENIED,
                 error_code="unknown_tool",
+                restored=restored,
             )
 
         spec = registered.spec
@@ -98,6 +100,7 @@ class ToolExecutor:
                 request,
                 ToolStatus.DENIED,
                 error_code="permission_denied",
+                restored=restored,
             )
 
         try:
@@ -108,6 +111,7 @@ class ToolExecutor:
                 request,
                 ToolStatus.ERROR,
                 error_code="invalid_arguments",
+                restored=restored,
             )
 
         try:
@@ -124,6 +128,7 @@ class ToolExecutor:
                 request,
                 ToolStatus.TIMEOUT,
                 error_code="timeout",
+                restored=restored,
             )
         except Exception as exc:  # never turn a failure into a filled success
             self.logger.warning(
@@ -137,6 +142,7 @@ class ToolExecutor:
                 request,
                 ToolStatus.ERROR,
                 error_code=type(exc).__name__,
+                restored=restored,
             )
 
         try:
@@ -149,6 +155,7 @@ class ToolExecutor:
                 request,
                 ToolStatus.ERROR,
                 error_code="non_json_result",
+                restored=restored,
             )
         if len(encoded) > spec.max_result_chars:
             return self._result(
@@ -156,6 +163,7 @@ class ToolExecutor:
                 request,
                 ToolStatus.ERROR,
                 error_code="result_too_large",
+                restored=restored,
             )
 
         return ToolResult(
@@ -166,6 +174,7 @@ class ToolExecutor:
             error_code=outcome.error_code,
             source_refs=list(outcome.source_refs)[:20],
             untrusted=outcome.untrusted,
+            restored=restored,
         )
 
     @staticmethod
@@ -185,12 +194,14 @@ class ToolExecutor:
         status: ToolStatus,
         *,
         error_code: Optional[str] = None,
+        restored: bool = False,
     ) -> ToolResult:
         return ToolResult(
             tool_call_id=tool_call_id,
             tool_name=request.tool_name,
             status=status,
             error_code=error_code,
+            restored=restored,
         )
 
 

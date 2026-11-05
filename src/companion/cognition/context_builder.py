@@ -31,6 +31,7 @@ from companion.storage.repositories import Repositories
 from .models import (
     ROLE_ASSISTANT,
     ROLE_HUMAN,
+    ActionHistoryRecord,
     CognitiveContext,
     CognitiveTurn,
 )
@@ -128,6 +129,57 @@ class ContextBuilder:
         )
 
     # -- internals ----------------------------------------------------------
+
+    async def build_from_authorized_turns(
+        self,
+        event: UtteranceEvent,
+        memories: list[dict],
+        routing,
+    ) -> CognitiveContext:
+        """Reuse history the routing builder already authorized.
+
+        Semantic mode builds its own minimal, privacy-filtered history window
+        before the router. Re-querying and re-filtering the same rows would
+        double the work and could observe a different permission state. This
+        path converts those already-authorized turns without a second query;
+        it never caches data across turns, so a withdrawn grant still takes
+        effect on the next turn.
+        """
+        turns = [
+            CognitiveTurn.model_validate(turn)
+            for turn in (getattr(routing, "recent_turns", None) or [])
+        ]
+        action_history = [
+            ActionHistoryRecord.model_validate(item)
+            for item in (
+                getattr(routing, "recent_nonresponse_actions", None) or []
+            )
+        ]
+        agent_context = None
+        if self.agent_service is not None:
+            policy_config = await load_policy_config(self.repos.settings)
+            effective = await self.agent_service.effective(
+                event.speaker_person_id, policy=policy_config
+            )
+            agent_context = effective.as_dict()
+        return CognitiveContext(
+            conversation_id=event.conversation_id,
+            current_event_id=event.event_id,
+            current_speaker_id=event.speaker_person_id,
+            current_speaker_label=getattr(
+                routing, "current_speaker_label", "unknown"
+            ),
+            current_text=event.text,
+            current_addressee_hint=event.addressee_hint.value,
+            quiet_mode=bool(getattr(routing, "quiet_mode", False)),
+            turns=turns,
+            action_history=action_history,
+            memories=memories,
+            agent_context=agent_context,
+            person_profile_context=getattr(
+                routing, "compact_person_profile", None
+            ),
+        )
 
     async def _resolve_labels(
         self, history: list[UtteranceEvent], event: UtteranceEvent

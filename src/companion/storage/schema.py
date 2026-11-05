@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1530,6 +1530,91 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE INDEX IF NOT EXISTS idx_route_tool_calls_event
             ON route_tool_calls(event_id, route_step_index);
+        """,
+    ),
+    (
+        22,
+        """
+        CREATE TABLE route_decisions_v22 (
+            event_id           TEXT NOT NULL
+                               REFERENCES utterances(event_id) ON DELETE CASCADE,
+            phase              TEXT NOT NULL,
+            step_index         INTEGER NOT NULL,
+            schema_version     INTEGER NOT NULL,
+            router_version     TEXT NOT NULL,
+            provider           TEXT NOT NULL,
+            model              TEXT NOT NULL,
+            decision_json      TEXT NOT NULL,
+            validation_status  TEXT NOT NULL DEFAULT 'VALID',
+            created_at         TEXT NOT NULL,
+            UNIQUE (event_id, step_index)
+        );
+
+        INSERT INTO route_decisions_v22(
+            event_id, phase, step_index, schema_version, router_version,
+            provider, model, decision_json, validation_status, created_at)
+        SELECT event_id, phase, step_index, schema_version, router_version,
+               provider, model, decision_json, validation_status, created_at
+        FROM route_decisions
+        WHERE event_id IN (SELECT event_id FROM utterances);
+
+        DROP TABLE route_decisions;
+
+        ALTER TABLE route_decisions_v22 RENAME TO route_decisions;
+
+        CREATE INDEX idx_route_decisions_event
+            ON route_decisions(event_id, step_index);
+
+        CREATE TABLE route_tool_calls_v22 (
+            tool_call_id          TEXT PRIMARY KEY,
+            event_id              TEXT NOT NULL
+                                  REFERENCES utterances(event_id) ON DELETE CASCADE,
+            route_step_index      INTEGER NOT NULL,
+            tool_name             TEXT NOT NULL,
+            arguments_json        TEXT NOT NULL DEFAULT '{}',
+            arguments_hash        TEXT NOT NULL,
+            status                TEXT NOT NULL,
+            execution_status      TEXT NOT NULL DEFAULT 'COMPLETED',
+            result_reference_json TEXT NOT NULL DEFAULT '{}',
+            error_code            TEXT,
+            created_at            TEXT NOT NULL,
+            completed_at          TEXT
+        );
+
+        INSERT INTO route_tool_calls_v22(
+            tool_call_id, event_id, route_step_index, tool_name,
+            arguments_json, arguments_hash, status, execution_status,
+            result_reference_json, error_code, created_at, completed_at)
+        SELECT tool_call_id, event_id, route_step_index, tool_name,
+               arguments_json, arguments_hash, status, 'COMPLETED',
+               result_reference_json, error_code, created_at, completed_at
+        FROM route_tool_calls
+        WHERE event_id IN (SELECT event_id FROM utterances);
+
+        DROP TABLE route_tool_calls;
+
+        ALTER TABLE route_tool_calls_v22 RENAME TO route_tool_calls;
+
+        CREATE INDEX idx_route_tool_calls_event
+            ON route_tool_calls(event_id, route_step_index);
+
+        CREATE TABLE IF NOT EXISTS data_control_operations (
+            operation_id  TEXT PRIMARY KEY,
+            person_id     TEXT NOT NULL
+                          REFERENCES persons(person_id) ON DELETE CASCADE,
+            operation     TEXT NOT NULL,
+            target_type   TEXT NOT NULL,
+            target_id     TEXT,
+            status        TEXT NOT NULL,
+            detail        TEXT,
+            result_json   TEXT NOT NULL DEFAULT '{}',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL,
+            expires_at    TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_data_control_person
+            ON data_control_operations(person_id, status);
         """,
     ),
 ]

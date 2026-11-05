@@ -358,6 +358,19 @@ class MemoryRepository:
         row = await cur.fetchone()
         return row["memory_id"] if row is not None else None
 
+    async def list_memory_ids_for_source_event(self, event_id: str) -> list[str]:
+        """Memories derived from one utterance, via committed provenance.
+
+        A privacy deletion of the source event must also remove what was
+        learned from it; this is the trusted lookup for that scope.
+        """
+        cur = await self.db.execute(
+            "SELECT DISTINCT memory_id FROM memory_provenance"
+            " WHERE source_event_id = ?",
+            (event_id,),
+        )
+        return [row["memory_id"] for row in await cur.fetchall()]
+
     async def list_for_subject(
         self,
         subject_id: str,

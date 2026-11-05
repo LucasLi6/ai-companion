@@ -124,7 +124,8 @@ async def test_duplicate_model_candidates_are_persisted_once(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -144,7 +145,8 @@ async def test_uncertain_candidate_is_stored_as_candidate_not_active(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -180,7 +182,8 @@ async def test_consolidation_rerun_changes_nothing(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -206,7 +209,8 @@ async def test_no_candidates_persisted_without_learning_consent(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt, learning=False)
     event = _event(person.person_id)
 

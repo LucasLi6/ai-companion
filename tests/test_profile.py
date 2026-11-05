@@ -416,6 +416,7 @@ async def test_legacy_active_persons_are_backfilled(tmp_path):
             person_id TEXT PRIMARY KEY, relationship_tier TEXT NOT NULL DEFAULT 'STRANGER',
             style_overrides TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL);
         CREATE TABLE memory_items (memory_id TEXT PRIMARY KEY);
+        CREATE TABLE utterances (event_id TEXT PRIMARY KEY);
         INSERT INTO persons VALUES
             ('p_active', 'Active', 'friend', 'active', 't', 't'),
             ('p_revoked', 'Revoked', 'friend', 'revoked', 't', 't'),

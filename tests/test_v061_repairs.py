@@ -297,8 +297,9 @@ async def _remember(rt, person, content):
 async def test_per_speaker_timezone_wins_over_the_application_default(db):
     client = _FakeClient()
     rt = build_runtime(
-        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False
-    )
+        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False,
+        router_mode="legacy",
+)
     person = await _person(rt)
     await rt.repos.settings.set("runtime.timezone", "America/New_York")
     await rt.repos.settings.set(
@@ -323,8 +324,9 @@ async def test_per_speaker_timezone_wins_over_the_application_default(db):
 async def test_wait_and_ignore_do_not_count_as_last_interaction(db):
     client = _FakeClient(analysis_action="WAIT")
     rt = build_runtime(
-        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False
-    )
+        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False,
+        router_mode="legacy",
+)
     person = await _person(rt)
     start = datetime(2026, 11, 4, 10, 0, tzinfo=timezone.utc)
 
@@ -374,8 +376,9 @@ async def test_wait_and_ignore_do_not_count_as_last_interaction(db):
 async def test_memory_status_distinguishes_no_db_empty_and_hits(db):
     client = _FakeClient()
     rt = build_runtime(
-        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False
-    )
+        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False,
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     await rt.orchestrator.process_utterance(_event(person_id=person.person_id))
@@ -401,8 +404,9 @@ async def test_memory_status_distinguishes_no_db_empty_and_hits(db):
 async def test_explicit_memory_sample_and_earliest_history(db):
     client = _FakeClient()
     rt = build_runtime(
-        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False
-    )
+        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False,
+        router_mode="legacy",
+)
     person = await _person(rt)
     await _remember(rt, person, "Alice 喜欢猫。")
 
@@ -432,8 +436,9 @@ async def test_explicit_memory_sample_and_earliest_history(db):
 async def test_memory_sample_never_leaks_another_person(db):
     client = _FakeClient()
     rt = build_runtime(
-        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False
-    )
+        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False,
+        router_mode="legacy",
+)
     alice = await _person(rt, "Alice")
     bob = await _person(rt, "Bob")
     await _remember(rt, bob, "Bob 的私密事实：他的银行卡密码。")
@@ -502,8 +507,9 @@ async def test_runtime_inspect_shows_metadata_without_conversation_text(
 ):
     client = _FakeClient()
     rt = build_runtime(
-        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False
-    )
+        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False,
+        router_mode="legacy",
+)
     person = await _person(rt)
     event = _event("这是不能打印的私密正文", person_id=person.person_id)
     await rt.orchestrator.process_utterance(event)
@@ -525,8 +531,9 @@ async def test_runtime_inspect_shows_metadata_without_conversation_text(
 async def test_dropped_memory_does_not_claim_a_retrieval_hit(db):
     client = _FakeClient()
     rt = build_runtime(
-        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False
-    )
+        db, provider="deepseek", deepseek_client=client, fast_path_enabled=False,
+        router_mode="legacy",
+)
     alice = await _person(rt, "Alice")
     bob = await rt.registry.register(
         "Bob",

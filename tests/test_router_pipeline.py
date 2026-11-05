@@ -220,6 +220,9 @@ async def test_non_persistence_turn_writes_no_route_or_tool_rows(semantic_runtim
     assert await rt.repos.routing.list_tool_calls(event.event_id) == []
     assert await rt.repos.analysis.get_action(event.event_id) is None
     assert await rt.repos.utterance.get(event.event_id) is None
+    assert (
+        await rt.repos.job.get_by_key(f"turn_analysis:{event.event_id}")
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -313,8 +316,247 @@ def test_semantic_mode_is_not_the_mock_default_and_requires_a_router(db):
     with pytest.raises(ValueError):
         build_runtime(db, provider="mock", router_mode="semantic")
 
+    # A real DeepSeek wiring is semantic even when the client is injected:
+    # an injected model boundary is not evidence that keyword routing is
+    # wanted. Only an explicit legacy request opts out.
     injected_client = build_runtime(
-        db, provider="deepseek", deepseek_client=object()
-    )
-    assert injected_client.router_mode == "legacy"
+        db, provider="deepseek", deepseek_client=object())
+    assert injected_client.router_mode == "semantic"
 
+    legacy_opt_out = build_runtime(
+        db, provider="deepseek", deepseek_client=object(),
+        router_mode="legacy")
+    assert legacy_opt_out.router_mode == "legacy"
+
+
+
+@pytest.mark.asyncio
+async def test_semantic_mode_streams_the_composed_reply(db):
+    from companion.providers.deepseek_client import ChatResponse, StreamDelta
+
+    class StreamingClient:
+        def __init__(self):
+            self.calls = []
+            self.messages = None
+
+        async def complete(self, messages, *, request_type, **kwargs):
+            self.calls.append(request_type)
+            return ChatResponse(
+                content="unused",
+                model="fake",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+                total_tokens=2,
+            )
+
+        async def stream_completion(
+            self, messages, *, request_type="response", **kwargs
+        ):
+            self.calls.append(request_type)
+            self.messages = messages
+            for chunk in ("你", "好"):
+                yield StreamDelta(content=chunk)
+            yield StreamDelta(
+                finish_reason="stop",
+                prompt_tokens=3,
+                completion_tokens=4,
+                total_tokens=7,
+                usage_reported=True,
+            )
+
+    router = FakeRouter()
+    client = StreamingClient()
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        router_mode="semantic",
+        router_provider=router,
+        deepseek_client=client,
+        cognitive=ExplodingCognitive(),
+        allow_mixed_providers=True,
+        fast_path_enabled=False,
+    )
+    person = await rt.registry.register(
+        "Lucas",
+        "friend",
+        allow_processing=True,
+        allow_persistence=True,
+        allow_memory_learning=True,
+        allow_external_ai=True,
+    )
+    event = make_utterance_event(
+        conversation_id="conv",
+        text="hello",
+        addressee_hint="agent",
+        speaker_person_id=person.person_id,
+        source=EventSource.TEST,
+    )
+
+    events = [
+        item async for item in rt.orchestrator.process_utterance_stream(event)
+    ]
+
+    assert router.calls == 1
+    assert client.calls == ["response"]  # no legacy analysis call
+    assert [item.type for item in events] == [
+        "response_started",
+        "response_delta",
+        "response_delta",
+        "response_completed",
+    ]
+    assert events[-1].text == "你好"
+    assert events[-1].status == "COMPLETED"
+    # The speaker request went through the same background pipeline; the route
+    # judgment reached it without a separate retrieval call.
+    assert client.messages is not None
+    stored = await rt.repos.analysis.get_action(event.event_id)
+    assert stored.action_type == CognitiveAction.RESPOND
+
+
+@pytest.mark.asyncio
+async def test_semantic_mode_never_retrieves_memory_without_a_tool(
+    semantic_runtime, monkeypatch
+):
+    router = FakeRouter()
+    rt = semantic_runtime(router, provider="deepseek")
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("semantic mode must not retrieve memory unconditionally")
+
+    monkeypatch.setattr(rt.memory, "retrieve", forbidden)
+
+    person = await rt.registry.register(
+        "Lucas",
+        "friend",
+        allow_processing=True,
+        allow_persistence=True,
+        allow_memory_learning=True,
+        allow_external_ai=True,
+    )
+
+    _, report = await _say(rt, person.person_id, "hello")
+
+    assert report.status == ReportStatus.COMPLETED.value
+    context = rt.response.calls[0][2]
+    assert context.memories == []
+    assert context.tool_results == []
+
+
+@pytest.mark.asyncio
+async def test_memory_reaches_the_speaker_only_through_an_authorized_tool(
+    semantic_runtime,
+):
+    router = FakeRouter(
+        tools=[
+            {
+                "tool_name": "memory.search",
+                "arguments": {"query": "tea"},
+                "purpose": "recall a preference",
+                "required": True,
+            }
+        ]
+    )
+    rt = semantic_runtime(router, provider="deepseek")
+    person = await rt.registry.register(
+        "Lucas",
+        "friend",
+        allow_processing=True,
+        allow_persistence=True,
+        allow_memory_learning=True,
+        allow_external_ai=True,
+    )
+    from companion.memory.models import AccessContext
+
+    await rt.memory_service.create(
+        kind="PERSONAL_FACT",
+        content="Lucas likes tea",
+        access=AccessContext("admin", is_admin=True),
+        visibility="PRIVATE",
+        subjects=[("PERSON", person.person_id)],
+    )
+
+    _, report = await _say(rt, person.person_id, "what do I like?")
+
+    assert report.status == ReportStatus.COMPLETED.value
+    context = rt.response.calls[0][2]
+    assert context.tool_results[0]["tool_name"] == "memory.search"
+    assert context.tool_results[0]["status"] == "SUCCESS"
+    assert context.memories
+    assert context.memories[0]["content"] == "Lucas likes tea"
+
+
+@pytest.mark.asyncio
+async def test_router_succeeds_but_a_disabled_tool_is_reported_truthfully(
+    semantic_runtime,
+):
+    router = FakeRouter(
+        tools=[
+            {
+                "tool_name": "web.search",
+                "arguments": {"query": "news"},
+                "purpose": "look something up",
+                "required": True,
+            }
+        ]
+    )
+    rt = semantic_runtime(router, provider="deepseek")
+    person = await rt.registry.register(
+        "Lucas",
+        "friend",
+        allow_processing=True,
+        allow_persistence=True,
+        allow_memory_learning=True,
+        allow_external_ai=True,
+    )
+
+    _, report = await _say(rt, person.person_id, "search the news")
+
+    assert report.status == ReportStatus.COMPLETED.value
+    assert len(rt.response.calls) == 1
+    context = rt.response.calls[0][2]
+    assert context.tool_results[0]["tool_name"] == "web.search"
+    assert context.tool_results[0]["status"] == "DISABLED"
+    # The router's judgment still reaches the speaker; it is not upgraded or
+    # hidden because a tool failed.
+    assert context.route_context["action"] == "RESPOND"
+    rows = await rt.repos.routing.list_tool_calls(report.event_id)
+    assert len(rows) == 1
+    assert rows[0]["execution_status"] == "FAILED"
+    assert rows[0]["error_code"] == "web_search_disabled"
+
+
+@pytest.mark.asyncio
+async def test_tools_succeed_but_a_speaker_failure_is_not_a_reply(
+    semantic_runtime,
+):
+    class FailingResponse:
+        def __init__(self):
+            self.calls = 0
+
+        async def generate(self, event, analysis, context):
+            self.calls += 1
+            raise RuntimeError("speaker provider exploded")
+
+    router = FakeRouter(
+        tools=[{"tool_name": "runtime.current_time", "arguments": {}}]
+    )
+    response = FailingResponse()
+    rt = semantic_runtime(router, provider="deepseek", response=response)
+    person = await rt.registry.register(
+        "Lucas",
+        "friend",
+        allow_processing=True,
+        allow_persistence=True,
+        allow_memory_learning=True,
+        allow_external_ai=True,
+    )
+    event, report = await _say(rt, person.person_id, "what time is it")
+
+    assert response.calls == 1
+    assert report.status == ReportStatus.FAILED.value
+    assert report.response_text is None
+    action = await rt.repos.analysis.get_action(event.event_id)
+    assert action is None or action.status == "FAILED"
+    stored = await rt.repos.utterance.get(event.event_id)
+    assert stored.processing_status == ProcessingStatus.FAILED

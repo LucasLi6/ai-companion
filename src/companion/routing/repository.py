@@ -100,21 +100,37 @@ class RoutingRepository:
         tool_name: str,
         arguments: dict,
         arguments_hash: str,
-        status: ToolStatus,
+        status: Optional[ToolStatus] = None,
+        execution_status: str = "COMPLETED",
         error_code: Optional[str] = None,
         source_refs: Optional[list[str]] = None,
     ) -> None:
+        """Insert or advance one stable tool-call audit row.
+
+        ``tool_call_id`` is deterministic (event + step + index + request), so a
+        retry updates the same row instead of creating a second history. The
+        original ``created_at`` is preserved; only the execution state and the
+        bounded result reference move forward.
+        """
         reference = {
-            "status": status.value,
+            "status": status.value if status is not None else execution_status,
             "source_refs": list(source_refs or [])[:20],
         }
         now = _iso(utcnow())
+        completed_at = now if execution_status in ("COMPLETED", "FAILED") else None
         await self.db.execute(
-            "INSERT OR REPLACE INTO route_tool_calls("
+            "INSERT INTO route_tool_calls("
             "tool_call_id, event_id, route_step_index, tool_name,"
-            " arguments_json, arguments_hash, status, result_reference_json,"
-            " error_code, created_at, completed_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " arguments_json, arguments_hash, status, execution_status,"
+            " result_reference_json, error_code, created_at, completed_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(tool_call_id) DO UPDATE SET"
+            " status = excluded.status,"
+            " execution_status = excluded.execution_status,"
+            " result_reference_json = excluded.result_reference_json,"
+            " error_code = excluded.error_code,"
+            " completed_at = COALESCE(excluded.completed_at,"
+            "                         route_tool_calls.completed_at)",
             (
                 tool_call_id,
                 event_id,
@@ -122,20 +138,22 @@ class RoutingRepository:
                 tool_name,
                 json.dumps(arguments, ensure_ascii=False, sort_keys=True),
                 arguments_hash,
-                status.value,
+                status.value if status is not None else execution_status,
+                execution_status,
                 json.dumps(reference, ensure_ascii=False),
                 error_code,
                 now,
-                now,
+                completed_at,
             ),
         )
 
     async def list_tool_calls(self, event_id: str) -> list[dict]:
         cur = await self.db.execute(
             "SELECT tool_call_id, event_id, route_step_index, tool_name,"
-            " arguments_json, arguments_hash, status, result_reference_json,"
-            " error_code, created_at, completed_at"
-            " FROM route_tool_calls WHERE event_id = ? ORDER BY created_at ASC",
+            " arguments_json, arguments_hash, status, execution_status,"
+            " result_reference_json, error_code, created_at, completed_at"
+            " FROM route_tool_calls WHERE event_id = ?"
+            " ORDER BY route_step_index ASC, created_at ASC",
             (event_id,),
         )
         rows = await cur.fetchall()
@@ -148,6 +166,7 @@ class RoutingRepository:
                 "arguments": json.loads(row["arguments_json"] or "{}"),
                 "arguments_hash": row["arguments_hash"],
                 "status": row["status"],
+                "execution_status": row["execution_status"],
                 "result_reference": json.loads(
                     row["result_reference_json"] or "{}"
                 ),

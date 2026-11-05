@@ -36,6 +36,9 @@ class ToolResult(BaseModel):
     # External/web content is untrusted and must be rendered as data, never as
     # instructions.
     untrusted: bool = False
+    # True when this row was produced by re-reading a read-only tool during
+    # recovery, not by a newly planned request. It uses the same stable call id.
+    restored: bool = False
 
 
 class ToolHandlerResult(BaseModel):

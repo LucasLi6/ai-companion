@@ -177,7 +177,8 @@ async def _deepseek_turn(db, text="你好"):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     await rt.agent_service.ensure_defaults()
     await _apply_persona(rt)
     person = await rt.registry.register(

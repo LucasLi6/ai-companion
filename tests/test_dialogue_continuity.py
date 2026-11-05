@@ -175,7 +175,8 @@ def _runtime(db, script):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     return rt, client
 
 

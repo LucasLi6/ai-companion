@@ -95,7 +95,7 @@ async def _agent_id(rt):
 
 async def test_persona_core_leads_the_response_request(db):
     client = _FakeClient(responses=["好。"])
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
     await rt.agent_service.set_persona_core(
         {
@@ -183,7 +183,7 @@ async def test_emitted_stance_reaches_the_next_response_request(db):
     client = _FakeClient(
         responses=["我不喜欢临时改计划。", "那我们换个时间。"]
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
 
     await rt.orchestrator.process_utterance(
@@ -209,7 +209,7 @@ async def test_emitted_stance_reaches_the_next_response_request(db):
 
 async def test_admin_stance_is_available_before_any_response(db):
     client = _FakeClient(responses=["好。"])
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
     await rt.agent_service.add_stance("我更喜欢先听完再评价。", topic="交流")
 
@@ -222,7 +222,7 @@ async def test_admin_stance_is_available_before_any_response(db):
 
 async def test_retry_does_not_duplicate_stance_rows(db):
     client = _FakeClient(responses=["我不喜欢反复改口。"])
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
     event = _event(person.person_id, "行吧")
 

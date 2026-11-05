@@ -176,7 +176,8 @@ async def _runtime_with_recorders(db):
         response=response,
         allow_mixed_providers=True,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     return runtime, cognitive, response
 
 

@@ -102,7 +102,7 @@ def _event(person_id, text="你好"):
 
 async def test_analysis_failure_is_retryable(db):
     client = ScriptedClient(analysis_failures=1)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -123,7 +123,7 @@ async def test_analysis_failure_is_retryable(db):
 
 async def test_response_failure_keeps_analysis_and_reuses_it_on_retry(db):
     client = ScriptedClient(response_failures=1)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -144,7 +144,7 @@ async def test_response_failure_keeps_analysis_and_reuses_it_on_retry(db):
 
 async def test_duplicate_delivery_makes_no_further_call(db):
     client = ScriptedClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -166,7 +166,7 @@ async def test_quiet_mode_withholds_response_but_still_learns(db):
     background job so the conversation is not silently lost.
     """
     client = ScriptedClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
     await rt.conversations.set_quiet_mode("c1", True)
     event = _event(person.person_id)
@@ -215,7 +215,8 @@ async def test_key_and_prompt_are_never_written_to_sqlite(db):
         provider="deepseek",
         deepseek_client=client,
         deepseek_config=DeepSeekConfig(api_key=SENTINEL_KEY),
-    )
+        router_mode="legacy",
+)
     person = await _person(runtime)
     await runtime.orchestrator.process_utterance(_event(person.person_id))
 

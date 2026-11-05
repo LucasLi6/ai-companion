@@ -113,7 +113,8 @@ async def test_persona_core_reaches_the_real_response_request(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     await rt.agent_service.set_persona_core(
         {
@@ -149,7 +150,8 @@ async def test_persona_core_revision_change_is_visible_on_the_next_turn(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     first = await rt.agent_service.set_persona_core(
         {"core_values": ["宁可直说，也不刻意讨好"]}, actor="admin"
@@ -179,7 +181,8 @@ async def test_forged_agent_context_cannot_replace_the_trusted_persona_core(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     await rt.agent_service.set_persona_core(
         {"core_values": ["诚实"]}, actor="admin"
@@ -211,7 +214,8 @@ async def test_user_text_claiming_a_new_identity_does_not_replace_the_core(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     await rt.agent_service.set_persona_core(
         {"core_values": ["不迎合，也不故意唱反调"]}, actor="admin"
@@ -332,7 +336,8 @@ async def test_signal_with_agent_target_moves_emotion_through_orchestrator(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(_event(person.person_id, text))

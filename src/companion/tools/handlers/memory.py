@@ -34,6 +34,10 @@ def _compact(memory: dict, limit: int) -> list[dict]:
             "memory_id": item.get("memory_id"),
             "kind": item.get("kind"),
             "content": str(item.get("content") or "")[:MAX_ITEM_CHARS],
+            "visibility": item.get("visibility"),
+            "status": item.get("status"),
+            "subjects": item.get("subjects") or [],
+            "sources": (item.get("sources") or [])[:3],
             "updated_at": item.get("updated_at"),
         }
         for item in memory[:limit]

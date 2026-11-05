@@ -76,7 +76,8 @@ async def _runtime(db, client):
         deepseek_client=client,
         # Tests exercise the batched job without waiting a real minute.
         turn_analysis_delay_seconds=0,
-    )
+        router_mode="legacy",
+)
     person = await rt.registry.register(
         "Alice",
         "owner",
@@ -251,7 +252,8 @@ async def test_small_batch_is_delayed_until_it_fills_or_times_out(db):
         provider="deepseek",
         deepseek_client=client,
         turn_analysis_delay_seconds=60,
-    )
+        router_mode="legacy",
+)
     person = await rt.registry.register(
         "Alice",
         "owner",

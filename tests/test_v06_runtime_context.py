@@ -38,7 +38,7 @@ class CapturingClient:
 
 
 async def _runtime(db, client):
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await rt.registry.register(
         "Alice",
         "owner",

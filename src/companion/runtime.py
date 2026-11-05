@@ -37,12 +37,14 @@ from companion.jobs.worker import JobWorker
 from companion.memory.consolidation import MemoryWriter
 from companion.memory.embedding_repository import EmbeddingRepository
 from companion.memory.embedding_service import EmbeddingService
+from companion.memory.explicit_operations import ExplicitMemoryOperationService
 from companion.memory.hybrid_retriever import HybridRetriever
 from companion.memory.service import MemoryService, build_memory_service
 from companion.memory.store import SqliteMemoryStore
 from companion.people.registry import PersonRegistry
 from companion.people.profile_learning import PersonProfileLearningService
 from companion.people.profile_service import PersonProfileService
+from companion.privacy.data_control import DataControlService
 from companion.providers.deepseek_client import (
     DeepSeekConfigError,
     build_deepseek_client,
@@ -100,6 +102,8 @@ class Runtime:
     tool_registry: object = None
     tool_executor: object = None
     web_search: object = None
+    explicit_memory_operations: object = None
+    data_control: object = None
 
 
 def build_runtime(
@@ -135,7 +139,6 @@ def build_runtime(
     provider = (provider or "mock").lower()
     if provider not in PROVIDERS:
         raise ValueError(f"unknown provider {provider!r}; expected one of {PROVIDERS}")
-    client_injected = deepseek_client is not None
 
     repos = make_repositories(db)
     profile_service = PersonProfileService(
@@ -270,21 +273,17 @@ def build_runtime(
         cognitive = cognitive or MockCognitiveProvider()
         response = response or MockResponseProvider()
 
-    # V0.8 router mode. Real DeepSeek wirings default to semantic routing; the
-    # mock path and tests that inject their own fake DeepSeek client default to
-    # legacy unless they opt in explicitly (an injected client alone is not
-    # proof that semantic routing is wanted). An explicit argument or
-    # AVA_ROUTER_MODE always wins.
+    # V0.8 router mode. A real DeepSeek wiring always defaults to semantic
+    # routing, even when a client was injected by a test: an injected client is
+    # the model boundary, not evidence that keyword routing is wanted. Only an
+    # explicit argument or AVA_ROUTER_MODE=legacy opts out. Mock stays legacy.
     resolved_mode = (router_mode or os.environ.get("AVA_ROUTER_MODE") or "").strip().lower()
     if resolved_mode and resolved_mode not in ("semantic", "legacy"):
         raise ValueError(
             f"unknown router mode {resolved_mode!r}; expected 'semantic' or 'legacy'"
         )
     if not resolved_mode:
-        if provider == "deepseek" and (router_provider is not None or not client_injected):
-            resolved_mode = "semantic"
-        else:
-            resolved_mode = "legacy"
+        resolved_mode = "semantic" if provider == "deepseek" else "legacy"
 
     routing_builder = None
     routing_service = None
@@ -303,9 +302,11 @@ def build_runtime(
         if tool_registry is None:
             tool_registry = build_default_tool_registry()
         if web_search is None:
-            # Inert by default: web.search reports DISABLED rather than
-            # presenting mock results as real search results.
-            web_search = HttpWebSearchProvider(enabled=False)
+            # Capability is inert until the operator's execution-time setting
+            # enables it. Building the provider with enabled=True means the
+            # tool handler — not composition time — owns the gate and reads
+            # ``web_search.enabled`` on every call.
+            web_search = HttpWebSearchProvider(enabled=True)
         if gateway is None:
             gateway = ForegroundPrivacyGateway(registry, logger=logger)
         routing_builder = RoutingContextBuilder(
@@ -326,6 +327,19 @@ def build_runtime(
             repository=repos.routing,
             logger=logger,
         )
+
+    explicit_memory_operations = ExplicitMemoryOperationService(
+        repos=repos,
+        cognitive=cognitive,
+        memory_writer=memory_writer,
+        logger=logger,
+    )
+    data_control = DataControlService(
+        repos=repos,
+        memory_service=memory_service,
+        profile_service=profile_service,
+        logger=logger,
+    )
 
     worker = None
     if with_worker:
@@ -399,6 +413,8 @@ def build_runtime(
         routing_service=routing_service,
         tool_executor=tool_executor,
         web_search=web_search,
+        explicit_memory_operations=explicit_memory_operations,
+        data_control=data_control,
         turn_analysis_delay_seconds=float(turn_analysis_delay_seconds),
         logger=logger,
     )
@@ -434,4 +450,6 @@ def build_runtime(
         tool_registry=tool_registry,
         tool_executor=tool_executor,
         web_search=web_search,
+        explicit_memory_operations=explicit_memory_operations,
+        data_control=data_control,
     )

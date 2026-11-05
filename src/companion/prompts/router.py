@@ -60,6 +60,7 @@ ROUTER_SYSTEM_PROMPT = """你是 Ava 的语义路由器（router）。你的唯�
   "pragmatic": null,
   "affective_signal": null,
   "scene_proposal": null,
+  "data_control_request": null,
   "reason": "简短、可审计的语义理由",
   "evidence": [{"event_id": "当前或可见历史事件 id，或 null", "quote": "逐字引用"}],
   "silence_requested": false
@@ -92,6 +93,16 @@ processing_intents：除回复之外的内部操作。可以同时有多个，�
 - PRIVACY_REQUEST：用户明确要求删除、忘记或停止保存某些个人数据。
 判断必须以语义为准：转述、引用、假设、玩笑或否定都不等于请求。
 内部操作与 action 相互独立：同一轮可以既保存记忆又需要/不需要可见回复。
+
+data_control_request：仅当 processing_intents 含 PRIVACY_REQUEST 时填写结构化请求，
+否则为 null。不要复述原文，也不要自行决定删除范围：
+{"operation": "DELETE | FORGET | UNKNOWN",
+ "target_type": "MEMORY | EVENT | PROFILE | UNKNOWN",
+ "target_id": "上下文可见的明确 id，或 null",
+ "scope": "SELF",
+ "requires_confirmation": true}
+无法确定具体 target_type 或 target_id 时留 UNKNOWN/null；本地程序会要求澄清，
+不会执行模糊删除。
 
 tool_requests：只在确实需要外部只读信息时请求。要求：
 - tool_name 必须来自 available_tools；arguments 必须符合其 arguments schema。

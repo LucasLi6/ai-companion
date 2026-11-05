@@ -265,7 +265,7 @@ class _StreamingClient:
 
 async def _stream_turn(db, text, chunks):
     client = _StreamingClient(chunks)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await rt.registry.register(
         "Alice",
         "owner",

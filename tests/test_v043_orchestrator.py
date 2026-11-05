@@ -89,7 +89,8 @@ async def test_successful_respond_turn_is_exactly_two_requests(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -122,7 +123,8 @@ async def test_wait_turn_makes_no_response_request(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -140,7 +142,8 @@ async def test_response_failure_is_retryable_without_a_second_analysis(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     event = _event(person.person_id, "帮我看个东西")
 
@@ -169,7 +172,8 @@ async def test_explicit_human_addressee_is_not_sent_to_the_model(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -188,7 +192,8 @@ async def test_response_context_is_built_from_the_same_snapshot(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     await rt.agent_service.set_persona_core(
         {"character_description": "一个说话很直接的人。"}, actor="admin"

@@ -114,7 +114,8 @@ async def test_unauthorized_memory_never_reaches_the_response_request(db):
         cognitive=_FixedCognitive(),
         response=None,
         allow_mixed_providers=True,
-    )
+        router_mode="legacy",
+)
     person = await rt.registry.register(
         "Ada",
         "friend",

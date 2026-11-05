@@ -59,7 +59,7 @@ async def test_migration_15_is_additive_from_a_version_14_database(tmp_path):
     try:
         await db.initialize()
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 21
+        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 22
 
         # Old snapshot values are untouched; new layers start neutral.
         cur = await db.execute(

@@ -53,14 +53,23 @@ from companion.prompts.addressee import (
 from companion.prompts.identity import compile_trait_tendencies
 from companion.runtime_context.assembler import compile_runtime_context
 
-RESPONSE_PROMPT_VERSION = "response-v15"
+RESPONSE_PROMPT_VERSION = "response-v16"
 
 # Bounded background data. These limits keep one hostile turn from flooding the
-# prompt and keep the untrusted block predictable.
-MAX_BACKGROUND_CHARS = 1200
+# prompt and keep the untrusted block predictable. Each section has its own
+# budget so a long web page cannot crowd out a route or a scene, and the
+# overall cap is the hard ceiling.
+MAX_BACKGROUND_CHARS = 4000
+MAX_ROUTE_CONTEXT_CHARS = 700
+MAX_TOOL_CONTEXT_CHARS = 1800
+MAX_MEMORY_CONTEXT_CHARS = 1200
+MAX_SCENE_CONTEXT_CHARS = 800
+MAX_TOOL_FIELD_CHARS = 600
+MAX_TOOL_ITEMS = 8
+MAX_TOOL_LIST_FIELDS = 8
 MAX_BACKGROUND_MEMORIES = 3
 MAX_BACKGROUND_ACTIONS = 0
-MAX_MEMORY_CHARS = 160
+MAX_MEMORY_CHARS = 300
 MAX_ACTION_TEXT_CHARS = 300
 MAX_SCENE_TOPIC_CHARS = 200
 MAX_OPEN_LOOPS = 5
@@ -533,20 +542,21 @@ def _background_payload(
                 "content": content,
             }
         )
+    memories = _bounded_records(memories, MAX_MEMORY_CONTEXT_CHARS)
     if memories:
         data["memories"] = memories
 
     scene = _scene_payload(context.scene_state)
     if scene:
-        data["scene"] = scene
+        data["scene"] = _bounded_value(scene, MAX_SCENE_CONTEXT_CHARS)
 
     actions = _action_payload(context, include=include_actions)
     if actions:
-        data["actions"] = actions
+        data["actions"] = _bounded_records(actions, MAX_SCENE_CONTEXT_CHARS)
 
     route = _route_payload(context.route_context)
     if route:
-        data["route"] = route
+        data["route"] = _bounded_value(route, MAX_ROUTE_CONTEXT_CHARS)
 
     tools = _tool_payload(context.tool_results)
     if tools:
@@ -576,10 +586,139 @@ def _route_payload(route: Mapping[str, Any] | None) -> dict | None:
     }
 
 
-def _tool_payload(results: list[dict]) -> list[dict]:
-    """Bounded tool results with an explicit trust label per item."""
+# -- tool result projection -------------------------------------------------
+#
+# Tool payloads are projected field by field. They are never serialized and
+# then sliced: a mid-string cut would hand the model malformed JSON, and it
+# would also silently drop the trust label and the tool identity.
+
+
+def _project_memory_result(data: Any) -> Any:
     items: list[dict] = []
-    for result in (results or [])[:4]:
+    for item in _as_list(data)[:MAX_TOOL_ITEMS]:
+        if not isinstance(item, Mapping):
+            continue
+        items.append(
+            {
+                "memory_id": _clip(item.get("memory_id"), 128),
+                "kind": _clip(item.get("kind"), 40),
+                "content": _clip(item.get("content"), MAX_TOOL_FIELD_CHARS),
+                "visibility": _clip(item.get("visibility"), 24),
+                "status": _clip(item.get("status"), 24),
+                "subjects": _bounded_strings(item.get("subjects"), 4, 128),
+                "sources": _bounded_strings(item.get("sources"), 4, 300),
+            }
+        )
+    return items
+
+
+def _project_history_result(data: Any, *, stats: bool = False) -> Any:
+    if stats:
+        return _project_stats_result(data)
+    items: list[dict] = []
+    for item in _as_list(data)[:MAX_TOOL_ITEMS]:
+        if not isinstance(item, Mapping):
+            continue
+        items.append(
+            {
+                "occurred_at": _clip(item.get("occurred_at"), 40),
+                "speaker": _clip(item.get("speaker"), 80),
+                "text": _clip(item.get("text"), MAX_TOOL_FIELD_CHARS),
+            }
+        )
+    return items
+
+
+def _project_stats_result(data: Any) -> dict:
+    if not isinstance(data, Mapping):
+        return {}
+    allowed = (
+        "user_messages",
+        "assistant_replies",
+        "sessions",
+        "conversations",
+        "first_message_at",
+        "last_message_at",
+        "total_messages",
+    )
+    return {
+        key: (
+            _clip(data.get(key), 40)
+            if isinstance(data.get(key), str)
+            else data.get(key)
+        )
+        for key in allowed
+        if data.get(key) is not None
+    }
+
+
+def _project_time_result(data: Any) -> Any:
+    if not isinstance(data, Mapping):
+        return _bounded_value(data, MAX_TOOL_CONTEXT_CHARS)
+    allowed = (
+        "local_time",
+        "timezone",
+        "timezone_name",
+        "utc_time",
+        "date",
+        "weekday",
+        "utc_offset",
+        "timezone_source",
+        "reentry_state",
+        "elapsed_since_last_turn_seconds",
+    )
+    rendered: dict[str, Any] = {}
+    for key in allowed:
+        if key not in data:
+            continue
+        value = data.get(key)
+        rendered[key] = _clip(value, 120) if isinstance(value, str) else value
+    if rendered:
+        return rendered
+    return _bounded_value(data, MAX_TOOL_CONTEXT_CHARS)
+
+
+def _project_web_result(data: Any) -> list[dict]:
+    items: list[dict] = []
+    for item in _as_list(data)[:5]:
+        if not isinstance(item, Mapping):
+            continue
+        items.append(
+            {
+                "title": _clip(item.get("title"), 200),
+                "url": _clip(item.get("url"), 500),
+                "snippet": _clip(item.get("snippet"), 400),
+            }
+        )
+    return items
+
+
+def _project_tool_data(tool_name: str, data: Any) -> Any:
+    if tool_name in ("memory.search", "memory.browse"):
+        return _project_memory_result(data)
+    if tool_name == "history.stats":
+        return _project_stats_result(data)
+    if tool_name in ("history.recent", "history.earliest"):
+        return _project_history_result(data)
+    if tool_name.startswith("runtime.") or tool_name in (
+        "time.current",
+        "time.local",
+    ):
+        return _project_time_result(data)
+    if tool_name in ("web.search", "web.fetch"):
+        return _project_web_result(data)
+    return _bounded_value(data, MAX_TOOL_CONTEXT_CHARS)
+
+
+def _tool_payload(results: list[dict]) -> list[dict]:
+    """Bounded tool results with an explicit trust label per item.
+
+    Every result is projected (phase 1 and phase 2), not just the first few.
+    When the section budget is exceeded, whole trailing items are omitted and
+    the omission is stated explicitly instead of cutting a JSON string.
+    """
+    items: list[dict] = []
+    for result in results or []:
         if not isinstance(result, Mapping):
             continue
         trust = (
@@ -587,20 +726,121 @@ def _tool_payload(results: list[dict]) -> list[dict]:
             if result.get("untrusted")
             else "LOCAL_READ"
         )
-        data = result.get("data")
-        try:
-            rendered = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        except (TypeError, ValueError):
-            rendered = ""
+        tool_name = _clip(result.get("tool_name"), 64)
         items.append(
             {
-                "tool": _clip(result.get("tool_name"), 64),
+                "tool": tool_name,
+                "tool_call_id": _clip(result.get("tool_call_id"), 64),
                 "status": _clip(result.get("status"), 16),
                 "trust": trust,
-                "data": rendered[:360],
+                "restored": bool(result.get("restored", False)),
+                "data": _project_tool_data(tool_name, result.get("data")),
+            }
+        )
+    if not items:
+        return []
+    omitted = 0
+    while (
+        _serialized_len(items) > MAX_TOOL_CONTEXT_CHARS
+        and len(items) > 1
+    ):
+        items.pop()
+        omitted += 1
+    if _serialized_len(items) > MAX_TOOL_CONTEXT_CHARS:
+        # A single oversized result: keep identity and a bounded projection,
+        # never a raw slice.
+        items[0] = {
+            "tool": items[0]["tool"],
+            "tool_call_id": items[0]["tool_call_id"],
+            "status": items[0]["status"],
+            "trust": items[0]["trust"],
+            "restored": items[0]["restored"],
+            "data": _bounded_value(items[0]["data"], MAX_TOOL_CONTEXT_CHARS - 200),
+            "truncated": True,
+        }
+    if omitted:
+        items.append(
+            {
+                "tool": "_budget",
+                "status": "TRUNCATED",
+                "omitted_results": omitted,
+                "note": "更多工具结果因上下文预算被省略。",
             }
         )
     return items
+
+
+def _as_list(value: Any) -> list:
+    if isinstance(value, list):
+        return value
+    if value is None:
+        return []
+    return [value]
+
+
+def _bounded_strings(value: Any, limit: int, chars: int) -> list[str]:
+    if isinstance(value, str):
+        return [_clip(value, chars)] if value.strip() else []
+    result: list[str] = []
+    for item in _as_list(value)[:limit]:
+        if isinstance(item, Mapping):
+            text = item.get("title") or item.get("name") or item.get("content")
+        else:
+            text = item
+        clipped = _clip(text, chars)
+        if clipped:
+            result.append(clipped)
+    return result
+
+
+def _bounded_value(value: Any, limit: int) -> Any:
+    """Bound a JSON-able value by clipping strings/keys/lists, never by slicing
+    its serialized form."""
+    if isinstance(value, str):
+        return value[:limit]
+    if isinstance(value, Mapping):
+        rendered: dict[str, Any] = {}
+        used = 0
+        for key in list(value.keys())[:MAX_TOOL_LIST_FIELDS]:
+            clipped_key = str(key)[:64]
+            item = _bounded_value(
+                value[key], max(80, min(MAX_TOOL_FIELD_CHARS, limit - used))
+            )
+            rendered[clipped_key] = item
+            used += _serialized_len(item) + len(clipped_key) + 4
+            if used >= limit:
+                break
+        return rendered
+    if isinstance(value, (list, tuple)):
+        rendered_list: list[Any] = []
+        used = 2
+        for item in list(value)[:MAX_TOOL_LIST_FIELDS]:
+            bounded = _bounded_value(item, max(80, MAX_TOOL_FIELD_CHARS))
+            size = _serialized_len(bounded) + 2
+            if rendered_list and used + size > limit:
+                break
+            rendered_list.append(bounded)
+            used += size
+            if used >= limit:
+                break
+        return rendered_list
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return _clip(value, min(limit, MAX_TOOL_FIELD_CHARS))
+
+
+def _bounded_records(records: list[dict], limit: int) -> list[dict]:
+    kept = list(records)
+    while kept and _serialized_len(kept) > limit:
+        kept.pop()
+    return kept
+
+
+def _serialized_len(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return MAX_BACKGROUND_CHARS + 1
 
 
 def _dump_background(data: dict) -> str:
@@ -608,16 +848,11 @@ def _dump_background(data: dict) -> str:
 
 
 def _drop_low_value_item(data: dict) -> bool:
-    """Remove one whole low-priority item. Never cuts inside a JSON string."""
-    if data.get("tool_results"):
-        data["tool_results"].pop()
-        return True
-    if data.get("actions"):
-        data["actions"].pop()
-        return True
-    if data.get("memories"):
-        data["memories"].pop()
-        return True
+    """Remove one whole low-priority item. Never cuts inside a JSON string.
+
+    Priority (kept longest): required tool results, then internal operation
+    results, memories, route judgment, actions and finally scene detail.
+    """
     scene = data.get("scene") or {}
     if isinstance(scene, dict) and scene.get("open_loops"):
         scene["open_loops"].pop()
@@ -629,8 +864,17 @@ def _drop_low_value_item(data: dict) -> bool:
     if scene:
         data.pop("scene", None)
         return True
+    if data.get("actions"):
+        data["actions"].pop()
+        return True
+    if data.get("memories"):
+        data["memories"].pop()
+        return True
     if data.get("route"):
         data.pop("route", None)
+        return True
+    if data.get("tool_results"):
+        data["tool_results"].pop()
         return True
     return False
 

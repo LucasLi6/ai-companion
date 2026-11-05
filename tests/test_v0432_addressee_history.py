@@ -317,7 +317,7 @@ async def test_real_history_preserves_agent_and_human_addressees(db):
         ],
         ["第一答", "第二答", "第三答"],
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     await rt.agent_service.set_name("Ava")
     alice = await _register(rt, "Alice")
     bob = await _register(rt, "Bob")
@@ -346,7 +346,7 @@ async def test_withdrawn_consent_removes_protected_history(db):
         [_payload("RESPOND"), _payload("RESPOND"), _payload("RESPOND")],
         ["Alice 的回复", "Bob 的回复", "Alice 的第二次回复"],
     )
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     await rt.agent_service.set_name("Ava")
     alice = await _register(rt, "Alice")
     bob = await _register(rt, "Bob")

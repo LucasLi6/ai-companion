@@ -99,7 +99,7 @@ async def _runtime(
     db = await Database(tmp_path / "regressions.db").connect()
     await db.initialize()
     client = RecordingClient(analysis, response_text)
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await rt.registry.register(
         name,
         "owner",

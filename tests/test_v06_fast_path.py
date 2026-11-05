@@ -79,7 +79,7 @@ def _event(person_id, text="你好", *, to="agent"):
 
 async def test_direct_turn_makes_one_response_call(db):
     client = FakeClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(_event(person.person_id))
@@ -98,7 +98,7 @@ async def test_direct_turn_makes_one_response_call(db):
 
 async def test_latency_metrics_expose_p50_and_p95(db):
     client = FakeClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
 
     await rt.orchestrator.process_utterance(_event(person.person_id))
@@ -114,7 +114,7 @@ async def test_latency_metrics_expose_p50_and_p95(db):
 
 async def test_text_mentioning_ava_does_not_force_the_fast_path(db):
     client = FakeClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
 
     # The name is not a routing signal: an unclear addressee still deliberates
@@ -129,7 +129,7 @@ async def test_text_mentioning_ava_does_not_force_the_fast_path(db):
 
 async def test_explicit_remember_uses_deliberation_and_waits_for_the_write(db):
     client = FakeClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -153,7 +153,7 @@ async def test_explicit_remember_uses_deliberation_and_waits_for_the_write(db):
 
 async def test_fast_path_is_not_taken_without_external_ai_consent(db):
     client = FakeClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt, external_ai=False)
 
     report = await rt.orchestrator.process_utterance(_event(person.person_id))
@@ -166,7 +166,7 @@ async def test_fast_path_is_not_taken_without_external_ai_consent(db):
 
 async def test_fast_path_queues_a_durable_analysis_job(db):
     client = FakeClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(_event(person.person_id))

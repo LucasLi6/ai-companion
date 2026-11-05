@@ -89,6 +89,10 @@ from .safety import assess_safety, detect_language, safety_response
 
 from companion.routing.adapter import route_to_cognitive_result
 from companion.routing.context import RoutingContextBuilder, build_speaker_context
+from companion.routing.context_adapter import (
+    attach_semantic_tool_signals,
+    tool_results_to_memory_context,
+)
 from companion.routing.errors import RouterError, RouterUnavailable
 from companion.routing.models import ProcessingIntent, RouteAction
 from companion.tools.models import ToolExecutionContext
@@ -131,6 +135,8 @@ class Orchestrator:
         routing_service=None,
         tool_executor=None,
         web_search=None,
+        explicit_memory_operations=None,
+        data_control=None,
         turn_analysis_delay_seconds: float = 60.0,
         turn_analysis_batch_size: int = 5,
         logger: Optional[logging.Logger] = None,
@@ -191,6 +197,11 @@ class Orchestrator:
         self.routing_service = routing_service
         self.tool_executor = tool_executor
         self.web_search = web_search
+        # V0.8 repair: explicit MEMORY_SAVE / MEMORY_CORRECTION intents use the
+        # existing extraction -> candidates -> MemoryWriter chain. Privacy
+        # intents go through a separate, confirmation-gated trusted service.
+        self.explicit_memory_operations = explicit_memory_operations
+        self.data_control = data_control
         # V0.6.1: a Fast Path turn only queues lightweight extraction. The job
         # waits up to ``delay`` seconds so several turns can share one small
         # request; once ``batch_size`` events are waiting it runs immediately.
@@ -407,8 +418,15 @@ class Orchestrator:
                     safety_triggered=safety.triggered,
                     persist=persist,
                 )
-                memories = await self.memory.retrieve(event.text, person_id)
-                steps.append(f"[MEMORY] Retrieved {len(memories)} items")
+                # Long-term memory reaches this turn only through the
+                # read-only tools the router requested. There is deliberately
+                # no unconditional ``memory.retrieve`` in semantic mode.
+                route_tool_results = (
+                    routing_outcome.tool_results
+                    if routing_outcome is not None
+                    else []
+                )
+                memories = tool_results_to_memory_context(route_tool_results)
                 self.logger.info(
                     "semantic_route_ready event_id=%s routed=%s memories=%d",
                     event.event_id,
@@ -420,11 +438,22 @@ class Orchestrator:
             # labels, memories) when the real provider is wired in. Mock mode
             # keeps the lightweight ConversationContext exactly as before.
             cognitive_context, provider_memories = await self._prepare_context(
-                event, context, memories, steps
+                event, context, memories, steps, routing_view=routing_view
             )
-            cognitive_context = await self._attach_memory_signals(
-                event, person_id, memories, cognitive_context, steps
-            )
+            if semantic_mode:
+                if (
+                    routing_view is not None
+                    and isinstance(cognitive_context, CognitiveContext)
+                ):
+                    cognitive_context = attach_semantic_tool_signals(
+                        cognitive_context,
+                        routing_view,
+                        route_tool_results,
+                    )
+            else:
+                cognitive_context = await self._attach_memory_signals(
+                    event, person_id, memories, cognitive_context, steps
+                )
 
             # 4c. Load the short-horizon scene and compile this turn's local
             # style/personality. Scene data is only attached to the rich
@@ -526,8 +555,31 @@ class Orchestrator:
                             persona=self._persona_record(cognitive_context),
                         )
                         # Background extraction still runs, but never as a
-                        # second full cognitive call on the critical path.
-                        if learn and self.jobs is not None and not safety.triggered:
+                        # second full cognitive call on the critical path. An
+                        # explicit memory intent is extracted and written
+                        # synchronously below, so queueing a racing background
+                        # pass would only duplicate candidates.
+                        route_intents = (
+                            set(route.processing_intents)
+                            if route is not None
+                            else set()
+                        )
+                        explicit_memory = bool(
+                            route_intents
+                            & {
+                                ProcessingIntent.MEMORY_SAVE,
+                                ProcessingIntent.MEMORY_CORRECTION,
+                            }
+                        )
+                        if (
+                            learn
+                            and self.jobs is not None
+                            and not safety.triggered
+                            and not (
+                                explicit_memory
+                                and self.explicit_memory_operations is not None
+                            )
+                        ):
                             job_id = await self._enqueue_turn_analysis(event)
                             steps.append("[MEMORY_JOB] Background analysis queued")
             else:
@@ -758,33 +810,78 @@ class Orchestrator:
             # this" request: the durable write must finish *before* the reply
             # that acknowledges it. Ordinary candidates stay with the job.
             memory_outcomes: list[dict] = []
+            data_control_result = None
             if semantic_mode:
                 intents = (
                     set(route.processing_intents)
                     if route is not None
                     else set()
                 )
-                if persist and learn:
-                    if ProcessingIntent.PRIVACY_REQUEST in intents:
-                        # Never delete from model output. Record the request in
-                        # the append-only audit trail; the trusted privacy
-                        # command path performs any destructive change.
-                        await self.repos.audit.record(
-                            event.speaker_person_id or "unknown",
-                            "privacy_request",
-                            "utterance",
-                            event.event_id,
-                            "semantic_router",
-                        )
-                        steps.append(
-                            "[PRIVACY] Request recorded for trusted handling"
-                        )
-                    memory_outcomes = (
-                        await self.repos.analysis.list_candidate_writes(
-                            event.event_id
+                explicit_intent = bool(
+                    intents
+                    & {
+                        ProcessingIntent.MEMORY_SAVE,
+                        ProcessingIntent.MEMORY_CORRECTION,
+                    }
+                )
+                if (
+                    persist
+                    and learn
+                    and route is not None
+                    and explicit_intent
+                    and self.explicit_memory_operations is not None
+                ):
+                    # WAIT/IGNORE may still perform this authorized internal
+                    # write; the action only decides whether a reply follows.
+                    memory_operation = (
+                        await self.explicit_memory_operations.execute(
+                            event, route, consent, routing_view
                         )
                     )
-                elif persist:
+                    memory_outcomes = memory_operation.outcomes
+                    steps.append(
+                        "[MEMORY_WRITE] "
+                        f"intent={memory_operation.intent} "
+                        f"status={memory_operation.status} "
+                        f"candidates={memory_operation.candidate_count}"
+                    )
+                    self.logger.info(
+                        "explicit_memory_operation event_id=%s intent=%s"
+                        " status=%s candidates=%d",
+                        event.event_id,
+                        memory_operation.intent,
+                        memory_operation.status,
+                        memory_operation.candidate_count,
+                    )
+                if (
+                    persist
+                    and ProcessingIntent.PRIVACY_REQUEST in intents
+                    and self.data_control is not None
+                ):
+                    # A privacy request is a *request*: this only validates it
+                    # and records a pending, confirmation-gated operation. It
+                    # never deletes anything and never treats the audit trail
+                    # as evidence that data was removed.
+                    data_control_result = await self.data_control.resolve_request(
+                        route.data_control_request, event, consent
+                    )
+                    steps.append(
+                        "[PRIVACY] "
+                        f"{data_control_result.status}"
+                        + (
+                            f":{data_control_result.detail}"
+                            if data_control_result.detail
+                            else ""
+                        )
+                    )
+                    self.logger.info(
+                        "privacy_request_resolved event_id=%s status=%s"
+                        " operation_id=%s",
+                        event.event_id,
+                        data_control_result.status,
+                        data_control_result.operation_id,
+                    )
+                if persist and not memory_outcomes:
                     memory_outcomes = (
                         await self.repos.analysis.list_candidate_writes(
                             event.event_id
@@ -1230,7 +1327,9 @@ class Orchestrator:
             )
             return context
 
-    async def _prepare_context(self, event, context, memories, steps):
+    async def _prepare_context(
+        self, event, context, memories, steps, routing_view=None
+    ):
         """Return (provider_context, provider_memories) for this utterance.
 
         Without a builder this is exactly the old behaviour: the lightweight
@@ -1238,9 +1337,37 @@ class Orchestrator:
         DeepSeek mode) the context is privacy-filtered before it can reach the
         network, and the providers get the same filtered memory list that the
         CognitiveContext carries.
+
+        Semantic mode already built and privacy-filtered a minimal history
+        window for the router. Reusing those authorized turns avoids a second
+        query that could observe a different permission state mid-turn.
         """
         if self.context_builder is None:
             return context, memories
+        if routing_view is not None:
+            cognitive_context = (
+                await self.context_builder.build_from_authorized_turns(
+                    event, memories, routing_view
+                )
+            )
+            cognitive_context = cognitive_context.model_copy(
+                update={"quiet_mode": context.quiet_mode}
+            )
+            provider_memories = list(cognitive_context.memories or [])
+            gateway = getattr(self.context_builder, "privacy_gateway", None)
+            if gateway is not None:
+                provider_memories, _dropped = await gateway.filter_memories(
+                    provider_memories, self._subject_ids_of
+                )
+                if len(provider_memories) != len(memories):
+                    steps.append(
+                        "[PRIVACY] Filtered "
+                        f"{len(memories) - len(provider_memories)} memories"
+                    )
+                cognitive_context = cognitive_context.model_copy(
+                    update={"memories": provider_memories}
+                )
+            return cognitive_context, provider_memories
         cognitive_context = await self.context_builder.build(event, memories)
         cognitive_context = cognitive_context.model_copy(
             update={"quiet_mode": context.quiet_mode}

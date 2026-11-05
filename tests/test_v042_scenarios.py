@@ -369,7 +369,8 @@ async def test_cross_turn_conflict_repair_then_neutral_continuation(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     agent_id = await _agent_id(rt)
 
@@ -425,7 +426,8 @@ async def test_cross_turn_topic_shift_suppresses_the_old_emotion(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     agent_id = await _agent_id(rt)
 
@@ -461,7 +463,8 @@ async def test_cross_turn_playful_setup_payoff_stays_playful(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     agent_id = await _agent_id(rt)
 
@@ -491,7 +494,8 @@ async def test_cross_turn_emitted_stance_reaches_the_next_response_request(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     await rt.orchestrator.process_utterance(_event(person.person_id, turn1))
@@ -517,7 +521,8 @@ async def test_full_chain_request_capture_order_and_versions(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     await rt.orchestrator.process_utterance(_event(person.person_id, text))
@@ -552,7 +557,8 @@ async def test_safety_turn_makes_no_response_request(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(_event(person.person_id, text))

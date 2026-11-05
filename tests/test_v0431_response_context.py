@@ -225,7 +225,8 @@ async def test_real_response_request_never_contains_the_inference(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -247,7 +248,8 @@ async def test_analysis_action_still_drives_local_policy(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -282,7 +284,8 @@ async def test_scene_proposal_is_still_applied_even_without_meaning(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -306,7 +309,8 @@ async def test_neutral_turn_has_no_filler_but_keeps_state_and_tts(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(

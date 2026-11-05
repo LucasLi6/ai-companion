@@ -34,11 +34,15 @@ class FakeMemory:
         return []
 
 
-def context(memory=None, *, person_id="p1", web_search=None, allow=True):
+def context(memory=None, *, person_id="p1", web_search=None, allow=True, web_enabled=False):
+    class _Settings:
+        async def get_bool(self, key, default=False):
+            return web_enabled
+
     return ToolExecutionContext(
         event=SimpleNamespace(event_id="evt", conversation_id="conv"),
         person_id=person_id,
-        repos=SimpleNamespace(),
+        repos=SimpleNamespace(settings=_Settings()),
         memory=memory or FakeMemory(),
         web_search=web_search,
         allow_external_ai=allow,
@@ -90,9 +94,26 @@ async def test_web_is_disabled_without_a_real_provider_and_untrusted_with_one():
     executor = ToolExecutor(build_default_tool_registry())
     disabled = await executor.execute_many(
         [ToolRequest(tool_name="web.search", arguments={"query": "news"})],
-        context(web_search=HttpWebSearchProvider(enabled=False)),
+        context(web_search=HttpWebSearchProvider(enabled=False), web_enabled=True),
     )
     assert disabled[0].status == ToolStatus.DISABLED
+
+    # The operator setting is authoritative: even a real provider is not
+    # called while web_search.enabled is false.
+    class _Forbidden:
+        calls = 0
+
+        async def search(self, query, limit=5):
+            self.calls += 1
+            raise AssertionError("network call while disabled")
+
+    forbidden = _Forbidden()
+    gated = await executor.execute_many(
+        [ToolRequest(tool_name="web.search", arguments={"query": "news"})],
+        context(web_search=forbidden, web_enabled=False),
+    )
+    assert gated[0].status == ToolStatus.DISABLED
+    assert forbidden.calls == 0
 
     class Realish:
         async def search(self, query, limit=5):
@@ -104,7 +125,7 @@ async def test_web_is_disabled_without_a_real_provider_and_untrusted_with_one():
 
     allowed = await executor.execute_many(
         [ToolRequest(tool_name="web.search", arguments={"query": "news"})],
-        context(web_search=Realish()),
+        context(web_search=Realish(), web_enabled=True),
     )
     assert allowed[0].status == ToolStatus.SUCCESS
     assert allowed[0].untrusted is True

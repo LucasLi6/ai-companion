@@ -27,9 +27,16 @@ class WebSearchHandler:
     ) -> ToolHandlerResult:
         args = WebSearchArguments.model_validate(arguments)
         provider = context.web_search
-        if not context.allow_external_ai or provider is None or isinstance(
-            provider, MockWebSearchProvider
+        # The operator's setting is the authority, read at execution time (not
+        # at composition time) so a change takes effect on the next call.
+        enabled = await _web_search_enabled(context)
+        if (
+            not enabled
+            or not context.allow_external_ai
+            or provider is None
+            or isinstance(provider, MockWebSearchProvider)
         ):
+            # A mock provider is never presented as a real search result.
             return ToolHandlerResult(
                 status=ToolStatus.DISABLED, error_code="web_search_disabled"
             )
@@ -38,6 +45,13 @@ class WebSearchHandler:
         except RuntimeError:
             return ToolHandlerResult(
                 status=ToolStatus.DISABLED, error_code="web_search_disabled"
+            )
+        except Exception as exc:
+            # A network/provider failure is an error, never a fake success
+            # and never an empty-but-successful lookup.
+            return ToolHandlerResult(
+                status=ToolStatus.ERROR,
+                error_code=f"web_search_failed:{type(exc).__name__}",
             )
         data = [
             {
@@ -57,3 +71,14 @@ class WebSearchHandler:
             source_refs=[item["url"] for item in data if item["url"]],
             untrusted=True,
         )
+
+
+async def _web_search_enabled(context: ToolExecutionContext) -> bool:
+    settings = getattr(getattr(context, "repos", None), "settings", None)
+    if settings is None:
+        return False
+    try:
+        return bool(await settings.get_bool("web_search.enabled", False))
+    except Exception:
+        # A settings read failure must not silently enable the network.
+        return False

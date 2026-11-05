@@ -94,6 +94,43 @@ class EvidenceReference(BaseModel):
         return str(value or "")[:512]
 
 
+class DataControlRequest(BaseModel):
+    """A structured, non-executable privacy request proposed by the router.
+
+    The router can only *describe* what it understood. ``DataControlService``
+    validates the scope against trusted identity, asks for confirmation and
+    only then calls an existing trusted data-management API. Free-text reasons
+    are never parsed into operations.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: str = Field(default="UNKNOWN", max_length=64)
+    target_type: str = Field(default="UNKNOWN", max_length=32)
+    target_id: Optional[str] = Field(default=None, max_length=128)
+    scope: str = Field(default="SELF", max_length=32)
+    requires_confirmation: bool = True
+    evidence: list[EvidenceReference] = Field(default_factory=list)
+
+    @field_validator("operation", "target_type", "scope", mode="before")
+    @classmethod
+    def _clean_name(cls, value: Any) -> str:
+        return str(value or "UNKNOWN").strip().upper()[:64]
+
+    @field_validator("target_id", mode="before")
+    @classmethod
+    def _clean_target(cls, value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        return text[:128] or None
+
+    @field_validator("evidence")
+    @classmethod
+    def _bounded_evidence(
+        cls, value: list[EvidenceReference]
+    ) -> list[EvidenceReference]:
+        return value[:MAX_EVIDENCE_ITEMS]
+
+
 class ToolRequest(BaseModel):
     """A model's *request*; the executor decides whether it may run."""
 
@@ -140,6 +177,7 @@ class RawRouteDecision(BaseModel):
     pragmatic: Optional[dict] = None
     affective_signal: Optional[dict] = None
     scene_proposal: Optional[dict] = None
+    data_control_request: Optional[DataControlRequest] = None
     reason: str = Field(default="", max_length=MAX_REASON_CHARS)
     evidence: list[EvidenceReference] = Field(default_factory=list)
     # Explicit, semantic "do not answer this turn" signal. It is only used to
@@ -202,6 +240,7 @@ class ValidatedRouteDecision(BaseModel):
     pragmatic: Optional[PragmaticAnalysis] = None
     affective_signal: Optional[AffectiveSignal] = None
     scene_proposal: Optional[SceneProposal] = None
+    data_control_request: Optional[DataControlRequest] = None
     reason: str = Field(default="", max_length=MAX_REASON_CHARS)
     evidence: list[EvidenceReference] = Field(default_factory=list)
     silence_requested: bool = False
@@ -222,12 +261,24 @@ class ValidatedRouteDecision(BaseModel):
 
     def core_fingerprint(self) -> tuple:
         """Fields a follow-up plan may not silently rewrite."""
+        control = self.data_control_request
+        control_key = (
+            (
+                control.operation,
+                control.target_type,
+                control.target_id,
+                control.scope,
+            )
+            if control is not None
+            else None
+        )
         return (
             self.action,
             self.reply_necessity,
             self.addressee_assessment,
             tuple(self.processing_intents),
             self.silence_requested,
+            control_key,
         )
 
 

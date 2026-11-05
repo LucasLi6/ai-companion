@@ -302,7 +302,8 @@ async def test_pragmatic_reaches_response_and_interaction_scene(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     first = _event(person.person_id, "我给你讲个冷笑话")
@@ -347,7 +348,8 @@ async def test_pragmatic_does_not_override_the_local_action(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     report = await rt.orchestrator.process_utterance(
         _event(person.person_id, "你刚才那句是什么意思？")

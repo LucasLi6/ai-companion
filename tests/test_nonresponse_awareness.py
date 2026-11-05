@@ -377,7 +377,8 @@ async def test_two_turn_awareness_end_to_end_and_restart(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     alice = await _register(rt, external_ai=True)
 
     first = _event(alice.person_id, "你在听吗？", at=1)
@@ -423,7 +424,7 @@ async def test_two_turn_awareness_end_to_end_and_restart(db):
     db2 = await Database(path).connect()
     await db2.initialize()
     try:
-        rt2 = build_runtime(db2, provider="deepseek", deepseek_client=client)
+        rt2 = build_runtime(db2, provider="deepseek", deepseek_client=client, router_mode="legacy")
         ctx = await rt2.context_builder.build(
             _event(alice.person_id, "这是重启后的新一句", to="agent", at=3), []
         )

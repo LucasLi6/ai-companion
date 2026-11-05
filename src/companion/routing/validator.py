@@ -84,6 +84,17 @@ class RoutingValidator:
             current_text=context.current_text,
             authorized_texts=allowed_texts[1:],
         )
+        control = raw.data_control_request
+        if control is not None:
+            # The model may describe a request but can never waive confirmation
+            # or widen the scope. Both are enforced again by DataControlService.
+            control = control.model_copy(
+                update={
+                    "requires_confirmation": True,
+                    "scope": "SELF",
+                    "evidence": self._filter_evidence(control.evidence, context),
+                }
+            )
 
         return ValidatedRouteDecision(
             schema_version=raw.schema_version,
@@ -97,6 +108,7 @@ class RoutingValidator:
             pragmatic=pragmatic,
             affective_signal=affective,
             scene_proposal=scene,
+            data_control_request=control,
             reason=raw.reason,
             evidence=evidence,
             silence_requested=bool(

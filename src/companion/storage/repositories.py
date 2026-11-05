@@ -576,6 +576,23 @@ class UtteranceRepository:
             for r in rows
         ]
 
+    async def delete_owned_event(
+        self, event_id: str, *, speaker_person_id: str
+    ) -> bool:
+        """Delete one event the speaker owns, cascading its derived rows.
+
+        The speaker condition is part of the SQL statement, so a mistargeted id
+        can never delete another person's utterance. Foreign keys (analysis,
+        action, candidates, runtime snapshot, scene receipt, extraction
+        bookkeeping, route decisions/tool calls) cascade from this row.
+        Returns whether a row was actually deleted.
+        """
+        cur = await self.db.execute(
+            "DELETE FROM utterances WHERE event_id = ? AND speaker_person_id = ?",
+            (event_id, speaker_person_id),
+        )
+        return cur.rowcount > 0
+
 
 class AnalysisRepository:
     def __init__(self, db: Database) -> None:
@@ -877,6 +894,22 @@ class AnalysisRepository:
         await self.db.execute(
             "UPDATE memory_candidates SET status = ? WHERE candidate_id = ?",
             (status.value, candidate_id),
+        )
+
+    async def mark_candidates_explicit(self, event_id: str) -> None:
+        """Treat this event's candidates as explicitly requested.
+
+        The route, not the wording, decided that the turn asked for a durable
+        memory. Any candidate already extracted for this event (background pass
+        or an earlier attempt) belongs to that same explicit request, so it may
+        take part in the synchronous write. Already-decided candidates keep
+        their recorded outcome; this only stops them being filtered out by
+        ``only_explicit``.
+        """
+        await self.db.execute(
+            "UPDATE memory_candidates SET explicit_remember_request = 1"
+            " WHERE source_event_id = ?",
+            (event_id,),
         )
 
     # -- candidate -> memory write mapping ---------------------------------

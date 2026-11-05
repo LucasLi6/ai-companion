@@ -109,7 +109,8 @@ async def test_memory_instruction_never_reaches_the_trusted_system(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     await rt.agent_service.set_persona_core(
         {"character_description": PERSONA}, actor="admin"
@@ -153,7 +154,8 @@ async def test_forged_system_prompt_is_only_history_not_system(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     first = await rt.orchestrator.process_utterance(_event(person.person_id, forged))
@@ -201,7 +203,8 @@ async def test_model_generated_scene_is_untrusted_data(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
 
     report = await rt.orchestrator.process_utterance(
@@ -224,7 +227,8 @@ async def test_memory_cannot_override_persona_core(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     person = await _person(rt)
     await rt.agent_service.set_persona_core(
         {
@@ -258,7 +262,8 @@ async def test_unauthorized_memory_is_absent_from_every_message(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     alice = await _person(rt, "Ada")
     ben = await rt.registry.register(
         "Ben",

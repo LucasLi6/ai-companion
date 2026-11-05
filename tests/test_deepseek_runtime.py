@@ -111,7 +111,7 @@ async def test_mock_is_default_and_unchanged(db):
 
 async def test_deepseek_wires_both_real_providers(db):
     client = FakeDeepSeekClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     assert rt.provider == "deepseek"
     assert isinstance(rt.cognitive, DeepSeekCognitiveProvider)
     assert isinstance(rt.response, DeepSeekResponseProvider)
@@ -122,7 +122,7 @@ async def test_deepseek_wires_both_real_providers(db):
 async def test_deepseek_without_key_raises_instead_of_mocking(db, monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     with pytest.raises(DeepSeekConfigError):
-        build_runtime(db, provider="deepseek")
+        build_runtime(db, provider="deepseek", router_mode="legacy")
 
 
 async def test_mixed_real_cognitive_mock_response_is_rejected(db):
@@ -132,7 +132,8 @@ async def test_mixed_real_cognitive_mock_response_is_rejected(db):
             provider="deepseek",
             deepseek_client=FakeDeepSeekClient(),
             response=MockResponseProvider(),
-        )
+            router_mode="legacy",
+)
 
 
 async def test_mixed_mock_cognitive_real_response_is_rejected(db):
@@ -142,7 +143,8 @@ async def test_mixed_mock_cognitive_real_response_is_rejected(db):
             provider="deepseek",
             deepseek_client=FakeDeepSeekClient(),
             cognitive=MockCognitiveProvider(),
-        )
+            router_mode="legacy",
+)
 
 
 async def test_mixed_allowed_only_when_explicit(db):
@@ -152,7 +154,8 @@ async def test_mixed_allowed_only_when_explicit(db):
         deepseek_client=FakeDeepSeekClient(),
         cognitive=MockCognitiveProvider(),
         allow_mixed_providers=True,
-    )
+        router_mode="legacy",
+)
     assert isinstance(rt.cognitive, MockCognitiveProvider)
     assert isinstance(rt.response, DeepSeekResponseProvider)
 
@@ -167,7 +170,7 @@ async def test_unknown_provider_is_rejected(db):
 
 async def test_deepseek_responds_through_the_real_pipeline(db):
     client = FakeDeepSeekClient(response_text="你好！很高兴见到你。")
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
     event = _event(person.person_id)
 
@@ -189,7 +192,7 @@ async def test_deepseek_responds_through_the_real_pipeline(db):
 
 async def test_deepseek_denies_network_without_external_ai(db):
     client = FakeDeepSeekClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt, external_ai=False)
     event = _event(person.person_id)
 
@@ -207,7 +210,7 @@ async def test_deepseek_denies_network_without_external_ai(db):
 
 async def test_deepseek_quiet_mode_suppresses_only_the_response(db):
     client = FakeDeepSeekClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
     await rt.conversations.set_quiet_mode("c1", True)
 
@@ -224,7 +227,7 @@ async def test_deepseek_quiet_mode_suppresses_only_the_response(db):
 
 async def test_deepseek_second_turn_sees_prior_history(db):
     client = FakeDeepSeekClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt)
 
     await rt.orchestrator.process_utterance(
@@ -245,7 +248,7 @@ async def test_deepseek_second_turn_sees_prior_history(db):
 
 async def test_deepseek_non_persistence_calls_ai_but_writes_nothing(db):
     client = FakeDeepSeekClient()
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(db, provider="deepseek", deepseek_client=client, router_mode="legacy")
     person = await _person(rt, external_ai=True, persistence=False)
     event = _event(person.person_id)
 

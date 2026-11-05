@@ -114,7 +114,8 @@ async def _runtime(db, *, pragmatic, response_text="好的。"):
         response=response,
         allow_mixed_providers=True,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     await rt.agent_service.ensure_defaults()
     person = await rt.registry.register(
         "Alice",
@@ -251,7 +252,8 @@ async def test_real_deepseek_providers_receive_the_unified_speaking_block(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     await rt.agent_service.ensure_defaults()
     person = await rt.registry.register(
         "Alice",

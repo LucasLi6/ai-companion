@@ -279,7 +279,8 @@ async def test_orchestrator_off_blocks_the_frame_but_keeps_the_rule(db):
         provider="deepseek",
         deepseek_client=client,
         fast_path_enabled=False,
-    )
+        router_mode="legacy",
+)
     off = _config(conversation_transition_enabled=False)
     rt.emotion_service.config = off
     rt.emotion_service.appraisal.config = off
