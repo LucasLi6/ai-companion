@@ -122,6 +122,13 @@ python -m companion recovery retry evt_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 python -m companion demo      # scripted demo on an isolated temp database
 python -m companion repl --person person_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
+# 7a. Real web search (opt-in; off by default)
+python -m companion web status                     # enabled/provider/key presence/consent
+python -m companion web enable                     # brave if BRAVE_SEARCH_API_KEY set, else duckduckgo
+python -m companion web enable --provider duckduckgo
+python -m companion web disable
+python -m companion web test "青霉素是什么" --limit 3   # one real search, bypassing the Router
+
 # 8. Long-term memory inspection and assignment
 python -m companion memory search "川菜"
 python -m companion memory show mem_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

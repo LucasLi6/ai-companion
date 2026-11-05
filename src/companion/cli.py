@@ -64,6 +64,13 @@ from companion.providers.deepseek_client import (
     build_deepseek_client,
     load_deepseek_config,
 )
+from companion.providers.websearch import (
+    BRAVE_KEY_ENV,
+    BraveWebSearchProvider,
+    HttpWebSearchProvider,
+    WebSearchConfigError,
+    WebSearchError,
+)
 from companion.recovery import RecoveryError, RecoveryManager
 from companion.runtime import build_runtime
 from companion.runtime_context.assembler import compile_runtime_context
@@ -593,6 +600,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_esim.add_argument("--elapsed-seconds", type=int, required=True,
                         help="Seconds to advance the clock before decaying")
     p_esim.set_defaults(func=cmd_emotion_simulate)
+
+    p_web = sub.add_parser("web", parents=[_common_parser()], help="Inspect and control real web search")
+    p_web_sub = p_web.add_subparsers(dest="web_command")
+    p_ws = p_web_sub.add_parser("status", parents=[_common_parser()], help="Show web-search state and config")
+    p_ws.set_defaults(func=cmd_web_status)
+    p_we = p_web_sub.add_parser("enable", parents=[_common_parser()], help="Turn real web search on")
+    p_we.add_argument(
+        "--provider",
+        choices=["brave", "duckduckgo"],
+        default=None,
+        help="Provider to use (default: brave if BRAVE_SEARCH_API_KEY is set, else duckduckgo)",
+    )
+    p_we.set_defaults(func=cmd_web_enable)
+    p_wd = p_web_sub.add_parser("disable", parents=[_common_parser()], help="Turn real web search off")
+    p_wd.set_defaults(func=cmd_web_disable)
+    p_wt = p_web_sub.add_parser("test", parents=[_common_parser()], help="Run one real search, bypassing the Router")
+    p_wt.add_argument("query")
+    p_wt.add_argument(
+        "--provider",
+        choices=["brave", "duckduckgo"],
+        default=None,
+        help="Provider to test (default: the configured provider, or duckduckgo when no Brave key)",
+    )
+    p_wt.add_argument("--limit", type=int, default=5)
+    p_wt.set_defaults(func=cmd_web_test)
 
     return parser
 
@@ -1742,6 +1774,20 @@ async def cmd_repl(args) -> int:
                         print(f"conversation: {args.conversation}")
                         print(f"addressee: {addressee}")
                         print(f"quiet_mode: {'on' if ctx and ctx.quiet_mode else 'off'}")
+                        try:
+                            web_enabled = await rt.repos.settings.get_bool(
+                                "web_search.enabled", False
+                            )
+                            web_provider = (
+                                await rt.repos.settings.get("web_search.provider") or ""
+                            ).strip().lower() or "brave"
+                        except Exception:
+                            web_enabled, web_provider = False, "unknown"
+                        print(
+                            f"web search: {'on' if web_enabled else 'off'}"
+                            f" (provider={web_provider},"
+                            f" brave_key={'configured' if _brave_key_configured() else 'missing'})"
+                        )
                     elif cmd == "/help":
                         print(
                             "commands: /to agent|human|unknown  /quiet on|off"
@@ -1851,6 +1897,139 @@ async def _run_streaming_turn(rt, event, *, debug: bool = False) -> None:
         return
     reason = f" ({action.reason_code.value})" if action.reason_code else ""
     print(f"[{action.action_type.value}{reason}]")
+
+
+def _brave_key_configured() -> bool:
+    """Whether a Brave Search key is present — its value is never printed."""
+    return bool(os.environ.get(BRAVE_KEY_ENV, "").strip())
+
+
+def _valid_web_provider(name: str | None) -> str:
+    """Normalise a provider choice; default auto-selects Brave when a key exists."""
+    name = (name or "").strip().lower()
+    if name in ("", "auto"):
+        return "brave" if _brave_key_configured() else "duckduckgo"
+    return name
+
+
+async def cmd_web_status(args) -> int:
+    db = await _connect(args.db)
+    try:
+        settings = make_repositories(db).settings
+        enabled = await settings.get_bool("web_search.enabled", False)
+        provider = (await settings.get("web_search.provider") or "").strip().lower() or "brave"
+        print("web search:")
+        print(f"  enabled: {str(enabled).lower()}")
+        print(f"  provider: {provider}")
+        print(f"  brave_api_key: {'configured' if _brave_key_configured() else 'missing'}")
+        errors: list[str] = []
+        if provider not in ("brave", "duckduckgo", "http", "html", "mock", "offline"):
+            errors.append(f"unknown provider {provider!r}")
+        if provider in ("brave", "") and not _brave_key_configured():
+            errors.append("brave selected but BRAVE_SEARCH_API_KEY is missing")
+        if errors:
+            for error in errors:
+                print(f"  config_error: {error}")
+        else:
+            print("  config_error: none")
+        rt = build_runtime(db)
+        people = await rt.registry.list()
+        if not people:
+            print("  allow_external_ai: (no people registered)")
+        for p in people:
+            consent = await rt.registry.get_consent(p.person_id)
+            allowed = bool(consent and consent.allow_external_ai)
+            print(f"  allow_external_ai[{p.display_name}]: {str(allowed).lower()}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_web_enable(args) -> int:
+    db = await _connect(args.db)
+    try:
+        provider = _valid_web_provider(getattr(args, "provider", None))
+        if provider not in ("brave", "duckduckgo"):
+            print(f"error: unsupported provider {provider!r} (brave or duckduckgo)")
+            return 1
+        if provider == "brave" and not _brave_key_configured():
+            print(
+                "error: BRAVE_SEARCH_API_KEY is not set;"
+                " use --provider duckduckgo or set the key"
+            )
+            return 1
+        settings = make_repositories(db).settings
+        await settings.set("web_search.enabled", "true")
+        await settings.set("web_search.provider", provider)
+        print(f"web search enabled (provider={provider})")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_web_disable(args) -> int:
+    db = await _connect(args.db)
+    try:
+        settings = make_repositories(db).settings
+        await settings.set("web_search.enabled", "false")
+        print("web search disabled")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_web_test(args) -> int:
+    db = await _connect(args.db)
+    try:
+        settings = make_repositories(db).settings
+        explicit = getattr(args, "provider", None)
+        if explicit:
+            provider_name = explicit.strip().lower()
+        else:
+            # No explicit provider: follow the stored config, and report a
+            # precise error rather than silently switching provider.
+            stored = (await settings.get("web_search.provider") or "").strip().lower() or "brave"
+            if stored in ("duckduckgo", "http", "html"):
+                provider_name = "duckduckgo"
+            elif stored == "brave":
+                provider_name = "brave"
+            elif stored in ("mock", "offline"):
+                print(f"error: configured provider {stored!r} cannot run a real test")
+                return 1
+            else:
+                print(f"error: unsupported provider {stored!r}")
+                return 1
+        if provider_name in ("duckduckgo", "http", "html"):
+            provider = HttpWebSearchProvider(enabled=True)
+        elif provider_name == "brave":
+            provider = BraveWebSearchProvider()
+        else:
+            print(f"error: unsupported provider {provider_name!r}")
+            return 1
+        print(f"provider: {provider.name}")
+        try:
+            results = await provider.search(args.query, limit=args.limit)
+        except WebSearchConfigError as exc:
+            print(f"error: web_search_config:{exc.code} ({exc})")
+            return 1
+        except WebSearchError as exc:
+            print(f"error: web_search_failed:{exc.code} (retryable={exc.retryable})")
+            return 1
+        except Exception as exc:
+            print(f"error: web_search_failed:{type(exc).__name__}: {exc}")
+            return 1
+        if not results:
+            print("results: 0 (no results for this query)")
+            return 0
+        print(f"results: {len(results)}")
+        for index, result in enumerate(results, 1):
+            print(f"[{index}] {result.title}")
+            print(f"    url: {result.url}")
+            if result.snippet:
+                print(f"    snippet: {result.snippet[:200]}")
+    finally:
+        await db.close()
+    return 0
 
 
 async def cmd_deepseek_check(args) -> int:

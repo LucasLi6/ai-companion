@@ -145,7 +145,11 @@ def build_default_tool_registry(
                 ),
                 argument_model=WebSearchArguments,
                 permission="web.read",
-                timeout_seconds=12.0,
+                # The outer timeout must cover the provider's own retries:
+                # Brave and DuckDuckGo each retry with backoff, so a 12s outer
+                # cap cancelled the later attempts. 40s keeps the retries alive
+                # while still bounding a hung provider.
+                timeout_seconds=40.0,
                 max_result_chars=6000,
             ),
             WebSearchHandler(),

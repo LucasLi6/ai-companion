@@ -74,81 +74,200 @@ class MockWebSearchProvider:
 
 
 class HttpWebSearchProvider:
-    """Experimental real search via DuckDuckGo's HTML endpoint.
+    """Real search via DuckDuckGo's HTML endpoint (no API key required).
 
     Constructing this provider is not enough to search: :meth:`search` refuses
     to make a network call unless ``enabled`` is ``True``. It is not the
     default real provider; Brave is. No API key is required by this endpoint.
+
+    DuckDuckGo serves an "anomaly" challenge page (HTTP 202) to clients it
+    identifies as bots. Sending a normal browser ``User-Agent`` avoids it; if a
+    challenge page is still returned, it is reported as a retryable error
+    rather than parsed into an empty (and therefore falsely "no results")
+    success.
     """
 
     name = "http-web-search"
     is_real_network = True
 
-    def __init__(self, enabled: bool = False, *, timeout: float = 10.0) -> None:
+    USER_AGENT = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        *,
+        timeout: float = 8.0,
+        retries: int = 2,
+        backoff_base: float = 0.25,
+        transport=None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
         self.enabled = enabled
         self.timeout = timeout
+        self.retries = max(0, int(retries))
+        self.backoff_base = max(0.0, float(backoff_base))
+        self.transport = transport
+        self.logger = logger or logging.getLogger("companion.websearch")
 
     async def network_state(self) -> str:
         return "real" if self.enabled else "disabled"
 
     async def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        import html as html_module
+        import httpx
+        import re
+
         if not self.enabled:
             raise WebSearchError(
                 "web_search_disabled",
                 "real web search is disabled; set web_search.enabled=true to use it",
             )
-        import httpx
-        import re
+        query = str(query or "").strip()
+        if not query:
+            raise WebSearchError("empty_query")
 
         url = "https://html.duckduckgo.com/html/"
-        try:
-            async with httpx.AsyncClient(
-                follow_redirects=True, timeout=self.timeout
-            ) as client:
-                resp = await client.post(url, data={"q": query})
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            raise WebSearchError(
-                "duckduckgo_network_error", retryable=True
-            ) from exc
-        if resp.status_code in (401, 403):
-            raise WebSearchError(
-                "duckduckgo_auth_failed", status_code=resp.status_code
-            )
-        if resp.status_code == 429:
-            raise WebSearchError(
-                "duckduckgo_rate_limited",
-                status_code=429,
-                retryable=True,
-            )
-        if resp.status_code >= 500:
-            raise WebSearchError(
-                "duckduckgo_server_error",
-                status_code=resp.status_code,
-                retryable=True,
-            )
-        if resp.status_code != 200:
-            raise WebSearchError(
-                "duckduckgo_http_error", status_code=resp.status_code
-            )
-        html = resp.text
+        attempts = self.retries + 1
+        last_error: Optional[WebSearchError] = None
 
+        for attempt in range(attempts):
+            last_error = None
+            try:
+                async with httpx.AsyncClient(
+                    follow_redirects=True,
+                    timeout=self.timeout,
+                    transport=self.transport,
+                    headers={"User-Agent": self.USER_AGENT},
+                ) as client:
+                    resp = await client.get(url, params={"q": query})
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = WebSearchError(
+                    "duckduckgo_timeout"
+                    if isinstance(exc, httpx.TimeoutException)
+                    else "duckduckgo_network_error",
+                    retryable=True,
+                )
+                if attempt + 1 < attempts:
+                    await self._backoff(attempt)
+                    continue
+                raise last_error from exc
+
+            status = resp.status_code
+            body = resp.text or ""
+            lower = body.lower()
+            # The anti-bot challenge page is an error, never an empty success.
+            if status == 202 or ("anomaly" in lower and "challenge" in lower):
+                last_error = WebSearchError(
+                    "duckduckgo_anomaly",
+                    status_code=status,
+                    retryable=True,
+                )
+                if attempt + 1 < attempts:
+                    await self._backoff(attempt)
+                    continue
+                raise last_error
+            if status in (401, 403):
+                raise WebSearchError(
+                    "duckduckgo_auth_failed", status_code=status
+                )
+            if status == 429:
+                last_error = WebSearchError(
+                    "duckduckgo_rate_limited",
+                    status_code=status,
+                    retryable=True,
+                )
+            elif status >= 500:
+                last_error = WebSearchError(
+                    "duckduckgo_server_error",
+                    status_code=status,
+                    retryable=True,
+                )
+            elif status != 200:
+                raise WebSearchError(
+                    "duckduckgo_http_error", status_code=status
+                )
+            if last_error is not None:
+                if attempt + 1 < attempts:
+                    await self._backoff(attempt)
+                    continue
+                raise last_error
+
+            return self._parse(body, html_module, re, limit)
+        raise last_error or WebSearchError("duckduckgo_search_failed")
+
+    async def _backoff(self, attempt: int) -> None:
+        if self.backoff_base > 0:
+            await asyncio.sleep(min(self.backoff_base * (2**attempt), 2.0))
+
+    @staticmethod
+    def _parse(body: str, html_module, re, limit: int) -> list[SearchResult]:
+        """Parse the DuckDuckGo HTML result page.
+
+        Result titles live in ``<a class="result__a">`` and snippets in
+        ``<a class="result__snippet">``; the two lists are paired in document
+        order. DDG result links are redirects (``//duckduckgo.com/l/?uddg=…``)
+        and are decoded to the real target URL before being surfaced.
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        titles = HttpWebSearchProvider._anchors(
+            body, "result__a", html_module, re
+        )
+        snippets = HttpWebSearchProvider._anchors(
+            body, "result__snippet", html_module, re
+        )
         results: list[SearchResult] = []
-        for m in re.finditer(
-            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html
-        ):
-            title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-            href = m.group(1)
+        for index, (href, title) in enumerate(titles):
+            if not title:
+                continue
+            snippet = snippets[index][1] if index < len(snippets) else ""
             results.append(
                 SearchResult(
-                    title=title,
-                    url=href,
-                    snippet="",
+                    title=title[:300],
+                    url=HttpWebSearchProvider._decode_url(href, parse_qs, urlparse)[:2000],
+                    snippet=snippet[:2000],
                     provider="duckduckgo",
                 )
             )
             if len(results) >= limit:
                 break
         return results
+
+    @staticmethod
+    def _anchors(body: str, class_name: str, html_module, re) -> list[tuple[str, str]]:
+        """Return ``(href, text)`` for every anchor with the given class."""
+        pattern = re.compile(
+            r'<a\b([^>]*class="' + re.escape(class_name) + r'"[^>]*)>(.*?)</a>',
+            re.DOTALL,
+        )
+        out: list[tuple[str, str]] = []
+        for m in pattern.finditer(body):
+            attrs = m.group(1)
+            inner = m.group(2)
+            href_match = re.search(r'href="([^"]+)"', attrs)
+            href = html_module.unescape(href_match.group(1)) if href_match else ""
+            text = html_module.unescape(re.sub(r"<[^>]+>", "", inner)).strip()
+            out.append((href, text))
+        return out
+
+    @staticmethod
+    def _decode_url(href: str, parse_qs, urlparse) -> str:
+        href = (href or "").strip()
+        if not href:
+            return ""
+        if "uddg=" in href:
+            target = parse_qs(urlparse(href).query).get("uddg", [""])[0]
+            if target:
+                return target
+        if href.startswith(("http://", "https://")):
+            return href
+        if href.startswith("//"):
+            return "https:" + href
+        return href
 
 
 class BraveWebSearchProvider:
