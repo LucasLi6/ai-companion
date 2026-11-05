@@ -5,24 +5,37 @@ persona prefix, so the stable identity text stays a cache-friendly prefix.
 Only fields that are actually known are rendered; an unknown location or gap
 is omitted rather than filled with a placeholder.
 
-The wording deliberately reports state, not a script. It never says "greet the
-user"; a long gap is a fact the model may use if the moment calls for it.
+V0.6.1 separates two instants that used to be conflated:
+
+- ``event_time`` is fixed when the input event is accepted and never changes on
+  a retry;
+- ``time`` is read when the response is generated, so a reply always knows the
+  real current time even if it is produced later.
+
+The wording reports state, not a script. It never says "greet the user"; a long
+gap is a fact the model may use if the moment calls for it, and no fixed
+opening sentence is prescribed.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from companion.domain.models import utcnow
 
 from .snapshot import RuntimeSnapshot
-from .temporal import humanize_gap, reentry_state as classify_gap
+from .temporal import humanize_gap
 
 MAX_RUNTIME_BLOCK_CHARS = 1200
 
-_REENTRY_LABEL = {
-    "NEW": "首次交流",
-    "ACTIVE": "正在对话",
-    "CONTINUING": "间歇交流",
-    "RETURNING": "间隔较久后回来",
+_SOURCE_LABEL = {
+    "user_config": "用户设置",
+    "trusted_device": "设备时区",
+    "ip_geo": "网络出口推断",
+    "system_default": "系统时区",
+    "utc": "UTC",
 }
 
 
@@ -32,81 +45,113 @@ def _value(snapshot, name: str, default=None):
     return getattr(snapshot, name, default)
 
 
+def _as_datetime(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    else:
+        try:
+            moment = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def _zone_of(snapshot):
+    name = str(_value(snapshot, "timezone") or "").strip()
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def _local(moment: Optional[datetime], zone, snapshot) -> Optional[datetime]:
+    if moment is None:
+        return None
+    if zone is not None:
+        return moment.astimezone(zone)
+    try:
+        offset = int(_value(snapshot, "utc_offset_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    return moment.astimezone(timezone(timedelta(seconds=offset)))
+
+
+def _stamp(moment: Optional[datetime]) -> str:
+    return f"{moment:%Y-%m-%d %H:%M}" if moment is not None else ""
+
+
+def _single_line(value, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
 def compile_runtime_context(
     snapshot: Optional[RuntimeSnapshot | dict],
     *,
+    now: Optional[datetime] = None,
     max_chars: int = MAX_RUNTIME_BLOCK_CHARS,
 ) -> str:
     if snapshot is None:
         return ""
 
-    local_time = " ".join(str(_value(snapshot, "local_time") or "").split())
-    zone = " ".join(str(_value(snapshot, "timezone") or "").split())
-    zone_source = str(_value(snapshot, "timezone_source") or "")
-    lines: list[str] = []
-
-    clock: list[str] = []
-    if local_time:
-        clock.append(f"现在 {local_time}")
-    if zone:
-        suffix = ""
-        if zone_source == "ip_geo":
-            suffix = "（按网络出口推断）"
-        elif zone_source == "trusted_device":
-            suffix = "（设备时区）"
-        elif zone_source == "user_config":
-            suffix = "（用户设置）"
-        clock.append(f"时区 {zone}{suffix}")
-    if clock:
-        lines.append("；".join(clock))
-
-    heard = humanize_gap(_value(snapshot, "last_heard_gap_seconds"))
-    interaction = humanize_gap(_value(snapshot, "last_interaction_gap_seconds"))
-    meaningful = humanize_gap(
-        _value(snapshot, "last_meaningful_context_gap_seconds")
+    zone = _zone_of(snapshot)
+    zone_name = _single_line(_value(snapshot, "timezone"), 64)
+    source = str(_value(snapshot, "timezone_source") or "")
+    current = _local(now or utcnow(), zone, snapshot)
+    event_time = _local(
+        _as_datetime(_value(snapshot, "occurred_at_utc")), zone, snapshot
     )
-    gaps: list[str] = []
-    if heard:
-        gaps.append(f"上次听对方说话: {heard}前")
-    if interaction:
-        gaps.append(f"上次轮到回应: {interaction}前")
-    if meaningful and meaningful != heard:
-        gaps.append(f"上次有实质交流: {meaningful}前")
-    if gaps:
-        lines.append("；".join(gaps))
+    speaker = _single_line(_value(snapshot, "speaker_label"), 60)
+    last_interaction = _local(
+        _as_datetime(_value(snapshot, "last_interaction_at_utc")), zone, snapshot
+    )
+    mood = _single_line(_value(snapshot, "ava_emotion"), 40)
 
-    state = str(_value(snapshot, "reentry_state") or "NEW")
-    label = _REENTRY_LABEL.get(state)
-    if label:
-        lines.append(f"连续性: {label}")
+    lines: list[str] = ["【运行状态】（本地可信数据）"]
+    if current is not None:
+        source_label = _SOURCE_LABEL.get(source)
+        detail = "，".join(
+            part for part in (zone_name, source_label) if part
+        )
+        lines.append(
+            f"time={_stamp(current)}" + (f"（{detail}）" if detail else "")
+        )
+    elif zone_name or source:
+        source_label = _SOURCE_LABEL.get(source)
+        detail = "，".join(part for part in (zone_name, source_label) if part)
+        lines.append(f"timezone={detail}")
+    if event_time is not None:
+        lines.append(f"event_time={_stamp(event_time)}")
+    if speaker:
+        lines.append(f"speaker={speaker}")
+    if last_interaction is not None:
+        gap = humanize_gap(
+            _value(snapshot, "last_interaction_gap_seconds")
+        )
+        suffix = f"（{gap}前）" if gap else ""
+        lines.append(f"last_interaction={_stamp(last_interaction)}{suffix}")
+    if mood:
+        lines.append(f"mood={mood}")
 
     location = _value(snapshot, "location")
     if location:
-        def field(name):
-            return _value(location, name)
-
         parts = [
-            str(part)
-            for part in (
-                field("city"),
-                field("subdivision"),
-                field("country"),
-            )
-            if part
+            str(_value(location, name))
+            for name in ("city", "subdivision", "country")
+            if _value(location, name)
         ]
         if parts:
+            # IP-derived, coarse, and explicitly not the person's location.
             lines.append(
-                "网络出口位置（近似，不代表本人当前所在地）: " + "，".join(parts)
+                "ip_location=" + "，".join(parts) + "（网络出口推断，不代表本人位置）"
             )
 
-    if not lines:
+    if len(lines) == 1:
         return ""
-    text = "【当前时间与状态】（本地可信数据）\n" + "\n".join(lines)
-    text += (
-        "\n时间间隔只是事实状态，不是固定话术；是否需要提到由当前对话决定，"
-        "不要每轮重复“好久不见”之类的开场。"
-    )
-    return text[:max_chars]
+    return "\n".join(lines)[:max_chars]
 
 
 def runtime_snapshot_with_state(snapshot, emotion_state) -> Optional[dict]:
@@ -126,5 +171,4 @@ def runtime_snapshot_with_state(snapshot, emotion_state) -> Optional[dict]:
 __all__ = [
     "compile_runtime_context",
     "runtime_snapshot_with_state",
-    "classify_gap",
 ]

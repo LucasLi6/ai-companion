@@ -133,23 +133,23 @@ async def test_exactly_one_model_call_per_generation():
 # -- prompt structure --------------------------------------------------------
 
 
-def test_prompt_version_is_v13():
-    assert RESPONSE_PROMPT_VERSION == "response-v13"
+def test_prompt_version_is_v14():
+    assert RESPONSE_PROMPT_VERSION == "response-v14"
 
 
 def test_base_prompt_has_generation_goal_and_stopping_rule():
-    assert "【生成目标】" in BASE_RESPONSE_PROMPT
-    assert "交流已经到达自然结束点，就停止" in BASE_RESPONSE_PROMPT
-    assert "你不是客服" in BASE_RESPONSE_PROMPT
-    assert "只输出回复正文" in BASE_RESPONSE_PROMPT
+    assert "【交流】" in BASE_RESPONSE_PROMPT
+    assert "一个意思说清楚就够" in BASE_RESPONSE_PROMPT
+    assert "不需要每轮表现个性" in BASE_RESPONSE_PROMPT
+    assert "只输出自然回复正文" in BASE_RESPONSE_PROMPT
 
 
 def test_speaking_style_is_one_unified_block_not_mode_switched():
     system = _system(build_response_messages(_context(), _analysis()))
 
-    assert "【说话方式】" in system
-    assert "像日常聊天一样说话" in system
-    assert "没有固定长度，也没有固定结构" in system
+    assert "【交流】" in system
+    assert "像日常聊天一样自然说话" in system
+    assert "不习惯性另起一段补充解释、劝告或总结" in system
     # No per-turn SOCIAL/TASK strategy is injected any more.
     assert "【当前交流模式：SOCIAL】" not in system
     assert "【当前交流模式：TASK】" not in system
@@ -157,12 +157,10 @@ def test_speaking_style_is_one_unified_block_not_mode_switched():
 
 
 def test_length_is_guidance_not_a_hard_cap():
-    # V0.6 removed the "default short" rule: length follows what the turn needs.
-    assert "没有固定长度，也没有固定结构" in BASE_RESPONSE_PROMPT
-    assert "该展开就展开" in BASE_RESPONSE_PROMPT
-    # Task detail lives in the same block rather than a second guidance string.
-    assert "允许多段回答" in BASE_RESPONSE_PROMPT
-    assert "详细解释" in BASE_RESPONSE_PROMPT
+    # V0.6.1: length follows the turn; there is no character-count cap.
+    assert "简单交流直接接话，一个意思说清楚就够" in BASE_RESPONSE_PROMPT
+    assert "对方要求详细解释、教程、推导、代码或完整分析时，认真展开" in BASE_RESPONSE_PROMPT
+    assert "复杂任务需要结构化时，可以正常使用段落、步骤、代码和公式" in BASE_RESPONSE_PROMPT
 
 
 def test_style_examples_are_not_injected():

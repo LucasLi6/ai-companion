@@ -220,8 +220,12 @@ async def test_retry_restores_snapshot_when_only_traits_changed(db):
     retry = await rt.orchestrator.process_utterance(event)
     assert retry.status == "COMPLETED"
     system = client.last_system()
+    # No character description exists here, so structured traits are rendered.
     assert "温暖=中等" in system
     assert "温暖=高" not in system
+    persona = await rt.repos.analysis.get_analysis_persona(event.event_id)
+    assert persona is not None and persona["snapshot"] is not None
+    assert persona["snapshot"]["traits"]["warmth"] == 55
     assert client.count("analysis") == 1
 
 
@@ -235,8 +239,8 @@ async def test_retry_restores_snapshot_when_relationship_tier_changed(db):
     retry = await rt.orchestrator.process_utterance(event)
     assert retry.status == "COMPLETED"
     system = client.last_system()
-    assert "与当前说话者的关系: STRANGER" in system
-    assert "与当前说话者的关系: CLOSE" not in system
+    assert "与当前说话者的关系：STRANGER" in system
+    assert "与当前说话者的关系：CLOSE" not in system
 
 
 async def test_retry_restores_snapshot_when_only_dispositions_changed(db):

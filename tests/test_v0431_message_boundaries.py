@@ -193,16 +193,10 @@ def test_past_silence_is_background_data_not_an_assistant_message(action):
         ],
     )
     messages = build_response_messages(ctx, build_analysis())
-    assert [m["role"] for m in messages] == [
-        "system",
-        "user",
-        "user",
-        "user",
-    ]
-    background = _background(messages)
-    assert background is not None
-    assert '"source": "LOCAL_ACTION_HISTORY"' in background
-    assert f'"final_action": "{action}"' in background
+    # V0.6.1 sets the past-action budget to zero, so the WAIT/IGNORE produces
+    # no background message and no assistant utterance.
+    assert [m["role"] for m in messages] == ["system", "user", "user"]
+    assert _background(messages) is None
     assert "LOCAL_ACTION_HISTORY" not in messages[0]["content"]
     assert messages[-1]["content"] == "所以呢？"
 
@@ -315,9 +309,7 @@ async def test_orchestrator_keeps_two_user_turns_and_no_fake_assistant(
     assert messages[-2] == {"role": "user", "content": "嗯。"}
     assert messages[-1] == {"role": "user", "content": "你到底在不在？"}
     assert all(message["role"] != "assistant" for message in messages)
-    background = _background(messages)
-    assert background is not None
-    assert f'"final_action": "{action}"' in background
+    assert _background(messages) is None
 
 
 async def test_orchestrator_labels_two_speakers_without_merging(db):

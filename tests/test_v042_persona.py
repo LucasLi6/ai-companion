@@ -110,10 +110,12 @@ async def test_persona_core_leads_the_response_request(db):
 
     request = client.response_requests()[-1]
     assert "【角色身份】" in request
-    assert "宁可直说，也不假装同意" in request
-    assert "偏爱安静的现场演出" in request
+    # V0.6.1: the explicit character description is the identity source; the
+    # structured persona fields are not duplicated into the same block.
     assert "她说话不急，喜欢先听完再给判断。" in request
-    assert "【基本边界】" in request
+    assert "宁可直说，也不假装同意" not in request
+    assert "偏爱安静的现场演出" not in request
+    assert "【边界】" in request
     # Identity precedes any untrusted background data; boundaries stay
     # authoritative in the system message.
     if "【背景资料" in request:

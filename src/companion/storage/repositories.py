@@ -46,6 +46,7 @@ from companion.domain.models import (
 )
 
 from companion.cognition.nonresponse import NonresponseTrace
+from companion.core.fast_path import LOCAL_PROVIDER
 from companion.learning.state import LearningRepository
 from companion.research.state import ResearchStateRepository
 from companion.goals.state import GoalRepository
@@ -431,6 +432,52 @@ class UtteranceRepository:
             occurred_at=_dt(row["occurred_at"]),
             processing_status=ProcessingStatus(row["processing_status"]),
         )
+
+    async def earliest_for_speaker(
+        self,
+        person_id: str,
+        conversation_id: str | None = None,
+        *,
+        exclude_event_id: str | None = None,
+        limit: int = 3,
+    ) -> list[UtteranceEvent]:
+        """The oldest utterances by ``person_id``, oldest first.
+
+        Used when the speaker explicitly asks what they said first. It is
+        scoped to one conversation when given, so a request in a current
+        conversation never silently pulls text from another one.
+        """
+        where = "speaker_person_id = ?"
+        params: list = [person_id]
+        if conversation_id is not None:
+            where += " AND conversation_id = ?"
+            params.append(conversation_id)
+        if exclude_event_id is not None:
+            where += " AND event_id != ?"
+            params.append(exclude_event_id)
+        sql = (
+            "SELECT event_id, conversation_id, speaker_person_id, speaker_label,"
+            " text, source, addressee_hint, occurred_at, processing_status"
+            f" FROM utterances WHERE {where}"
+            " ORDER BY occurred_at ASC, event_id ASC LIMIT ?"
+        )
+        params.append(limit)
+        cur = await self.db.execute(sql, tuple(params))
+        rows = await cur.fetchall()
+        return [
+            UtteranceEvent(
+                event_id=r["event_id"],
+                conversation_id=r["conversation_id"],
+                speaker_person_id=r["speaker_person_id"],
+                speaker_label=r["speaker_label"],
+                text=r["text"],
+                source=EventSource(r["source"]),
+                addressee_hint=AddresseeHint(r["addressee_hint"]),
+                occurred_at=_dt(r["occurred_at"]),
+                processing_status=ProcessingStatus(r["processing_status"]),
+            )
+            for r in rows
+        ]
 
     async def list_events(
         self, person_id: str | None = None, limit: int = 100
@@ -1102,10 +1149,21 @@ class JobRepository:
         return self._to_job(row)
 
     async def pending(self, limit: int = 100) -> list[ProcessingJob]:
+        """Jobs that are due now, oldest first.
+
+        ``next_run_at`` delays a job (used by the batched background
+        extraction). A job whose delay has not elapsed is still ``PENDING`` in
+        the database — it is simply not claimable yet, so a restart or a manual
+        ``jobs list`` still sees it.
+        """
+        from companion.domain.models import utcnow
+
         cur = await self.db.execute(
             f"SELECT {self._COLUMNS} FROM processing_jobs"
-            " WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT ?",
-            (limit,),
+            " WHERE status = 'PENDING'"
+            "   AND (next_run_at IS NULL OR next_run_at <= ?)"
+            " ORDER BY created_at ASC LIMIT ?",
+            (_iso(utcnow()), limit),
         )
         rows = await cur.fetchall()
         return [self._to_job(r) for r in rows]
@@ -1258,6 +1316,79 @@ class JobRepository:
         )
 
 
+class ExtractionRepository:
+    """Bookkeeping for the lightweight background event-extraction job.
+
+    A row exists once an event has been handed to the extraction pass. The row
+    is the idempotency marker: a retried or restarted job sees it and does not
+    call the model again. Only ``local_fast_path`` events are candidates;
+    deliberation turns already have a full, locally validated analysis.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def get(self, event_id: str) -> dict | None:
+        cur = await self.db.execute(
+            "SELECT event_id, status, candidate_count, created_at, processed_at"
+            " FROM turn_extractions WHERE event_id = ?",
+            (event_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row is not None else None
+
+    async def pending_events(
+        self,
+        conversation_id: str,
+        person_id: str,
+        *,
+        limit: int = 5,
+    ) -> list[str]:
+        """Eligible events for one speaker, oldest first.
+
+        The speaker scope is deliberate: one batch must never mix different
+        people's private material.
+        """
+        cur = await self.db.execute(
+            "SELECT u.event_id FROM utterances u"
+            " JOIN cognitive_analyses a ON a.event_id = u.event_id"
+            " LEFT JOIN turn_extractions x ON x.event_id = u.event_id"
+            " WHERE u.conversation_id = ? AND u.speaker_person_id = ?"
+            "   AND u.processing_status = ?"
+            "   AND a.provider = ?"
+            "   AND x.event_id IS NULL"
+            " ORDER BY u.occurred_at ASC, u.event_id ASC"
+            " LIMIT ?",
+            (
+                conversation_id,
+                person_id,
+                ProcessingStatus.COMPLETED.value,
+                LOCAL_PROVIDER,
+                limit,
+            ),
+        )
+        rows = await cur.fetchall()
+        return [row["event_id"] for row in rows]
+
+    async def mark(
+        self, event_id: str, status: str, candidate_count: int = 0
+    ) -> None:
+        now = utcnow().isoformat()
+        await self.db.execute(
+            "INSERT OR IGNORE INTO turn_extractions("
+            " event_id, status, candidate_count, created_at, processed_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (event_id, status, candidate_count, now, now),
+        )
+        # A retry may mark a previously skipped row as processed; the first
+        # terminal status wins, so the row is never re-opened.
+        await self.db.execute(
+            "UPDATE turn_extractions SET candidate_count = ?, processed_at = ?"
+            " WHERE event_id = ? AND status = ?",
+            (candidate_count, now, event_id, status),
+        )
+
+
 @dataclass
 class Repositories:
     """Convenience container holding every repository for a single database."""
@@ -1276,6 +1407,7 @@ class Repositories:
     learning: LearningRepository
     goals: GoalRepository
     runtime_snapshot: RuntimeSnapshotRepository
+    extraction: ExtractionRepository
 
     async def persist_cognitive_outcome(
         self,
@@ -1324,6 +1456,7 @@ def make_repositories(db: Database) -> Repositories:
         learning=LearningRepository(db),
         goals=GoalRepository(db),
         runtime_snapshot=RuntimeSnapshotRepository(db),
+        extraction=ExtractionRepository(db),
     )
 
 

@@ -324,7 +324,7 @@ async def test_pragmatic_reaches_response_and_interaction_scene(db):
     assert "主要行为: QUESTION" not in request
     # The validated frame survives only as untrusted scene data, not as a
     # labelled pragmatic instruction block in the system message.
-    assert '"frame": "PLAYFUL"' in request
+    assert '"frame":"PLAYFUL"' in request
     assert "【当前场景】" not in request
 
     snapshot = await rt.scene_manager.scene_repo.load("c1", person.person_id)

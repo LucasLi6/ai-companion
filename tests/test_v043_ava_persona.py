@@ -115,11 +115,24 @@ def test_personality_compiler_allows_truthful_self_description():
     assert all("不要自称 AI/模型" not in item for item in principles)
 
 
-def test_response_prompt_renders_full_core_without_truncation():
+def test_response_prompt_renders_full_description_without_duplication():
     system = build_response_messages(_context(), _analysis())[0]["content"]
 
     assert LONG_DESCRIPTION in system
     assert "最后一句必须原样到达两个请求：她始终是 Ava。" in system
+    # V0.6.1: the description already contains the character; structured
+    # fields are not rendered a second time alongside it.
+    assert "可以保留的张力" not in system
+    assert "tone=自然、俏皮" not in system
+    assert "self_reference=" not in system
+
+
+def test_structured_core_is_the_fallback_when_no_description_exists():
+    system = build_response_messages(
+        _context(character_snapshot=_snapshot(character_description="")),
+        _analysis(),
+    )[0]["content"]
+
     assert "可以保留的张力（不要强行磨平）: 理论丰富但缺少直接感官体验" in system
     assert "tone=自然、俏皮，底色冷静" in system
     assert "self_reference=被问及身份时坦然承认自己是人工智能" in system
@@ -128,13 +141,18 @@ def test_response_prompt_renders_full_core_without_truncation():
 def test_response_system_requires_truthful_identity_without_constant_reminders():
     system = build_response_messages(_context(), _analysis())[0]["content"]
 
-    assert "不要无缘无故反复强调自己是人工智能" in system
-    assert "但当对方询问你的存在形式、能力或体验时" in system
-    assert "不要假装自己是人类" in system
+    # The fixed V0.6.1 base prompt carries the truthfulness rule; identity is
+    # not a separate hard-coded persona reminder.
+    assert "你是人工智能" in system
+    assert "不能亲身感受某件事，不等于不能通过工具了解它" in system
+    assert "没有获得的感官信息、位置、记忆和现实经历，不能假装知道" in system
 
 
 def test_response_traits_are_tendencies_not_probabilities():
-    system = build_response_messages(_context(), _analysis())[0]["content"]
+    system = build_response_messages(
+        _context(character_snapshot=_snapshot(character_description="")),
+        _analysis(),
+    )[0]["content"]
 
     assert "表达倾向: 幽默=较高；温暖=中等；好奇=高；正式=较低" in system
     assert "俏皮=高" in system

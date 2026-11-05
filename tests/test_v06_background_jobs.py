@@ -1,26 +1,44 @@
-"""V0.6 background analysis: durable, idempotent, ordered and retryable."""
+"""V0.6.1 background extraction: durable, batched, idempotent and retryable."""
 
 from __future__ import annotations
 
 import json
+import re
 
 from companion.domain.enums import EventSource, JobStatus, JobType
 from companion.domain.models import Consent, make_utterance_event, utcnow
 from companion.providers.deepseek_client import ChatResponse
 from companion.runtime import build_runtime
 
-ANALYSIS_JSON = json.dumps(
-    {
-        "meaning": "用户在说自己喜欢猫",
-        "action": "RESPOND",
-        "reason_code": "direct_agent_address",
-        "referenced_memory_ids": [],
-        "memory_candidates": [{"content": "Alice 喜欢猫"}],
-        "response_style": "warm",
-        "reply_necessity": "REQUIRED",
-    },
-    ensure_ascii=False,
-)
+_EVENT_ID = re.compile(r"event_id=(\S+)")
+
+
+def _extraction_json(messages: list[dict]) -> str:
+    """Answer an extraction prompt with one candidate per event id."""
+    text = "\n".join(str(m.get("content") or "") for m in messages)
+    event_ids = _EVENT_ID.findall(text)
+    return json.dumps(
+        {
+            "results": [
+                {
+                    "event_id": event_id,
+                    "memory_candidates": [
+                        {
+                            "content": "Alice 喜欢猫",
+                            "operation": "ADD",
+                            "assertion_type": "SELF_REPORT",
+                            "certainty": "DIRECT",
+                            "topic": "preference",
+                            "kind": "PERSONAL_FACT",
+                            "evidence_span": "猫",
+                        }
+                    ],
+                }
+                for event_id in event_ids
+            ]
+        },
+        ensure_ascii=False,
+    )
 
 
 class FakeClient:
@@ -38,7 +56,7 @@ class FakeClient:
             if self.analysis_failures:
                 self.analysis_failures -= 1
                 raise RuntimeError("scripted analysis failure")
-            content = ANALYSIS_JSON
+            content = _extraction_json(messages)
         else:
             content = "我也喜欢猫。"
         return ChatResponse(
@@ -52,7 +70,13 @@ class FakeClient:
 
 
 async def _runtime(db, client):
-    rt = build_runtime(db, provider="deepseek", deepseek_client=client)
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        # Tests exercise the batched job without waiting a real minute.
+        turn_analysis_delay_seconds=0,
+    )
     person = await rt.registry.register(
         "Alice",
         "owner",
@@ -85,12 +109,14 @@ async def test_fast_path_learning_runs_as_a_durable_job(db):
 
     job = await rt.repos.job.get_by_key(f"turn_analysis:{event.event_id}")
     assert job is not None and job.status == JobStatus.COMPLETED
+    # The truthful local decision record is never replaced by a model claim.
     analysis = await rt.repos.analysis.get_analysis(event.event_id)
-    assert analysis is not None and analysis.provider == "deepseek"
+    assert analysis is not None and analysis.provider == "local_fast_path"
     candidates = await rt.repos.analysis.get_candidates(event.event_id)
     assert len(candidates) == 1
-    # The reply happened before the analysis, and the analysis is the only
-    # extra model call.
+    marked = await rt.repos.extraction.get(event.event_id)
+    assert marked is not None and marked["status"] == "processed"
+    # The reply happened before the extraction, which is the only extra call.
     assert client.calls == ["response", "analysis"]
 
 
@@ -111,7 +137,7 @@ async def test_re_running_the_job_is_idempotent(db):
 
     assert client.calls == calls_after_first
     analysis = await rt.repos.analysis.get_analysis(event.event_id)
-    assert analysis is not None and analysis.provider == "deepseek"
+    assert analysis is not None and analysis.provider == "local_fast_path"
 
 
 async def test_job_is_retried_after_a_transient_failure(db):
@@ -126,13 +152,16 @@ async def test_job_is_retried_after_a_transient_failure(db):
     # One failed attempt, one successful attempt, plus the Fast Path response.
     assert client.calls == ["response", "analysis", "analysis"]
     analysis = await rt.repos.analysis.get_analysis(event.event_id)
-    assert analysis is not None and analysis.provider == "deepseek"
+    assert analysis is not None and analysis.provider == "local_fast_path"
 
 
 async def test_job_uses_history_only_before_the_event(db):
     client = FakeClient()
     rt, event = await _runtime(db, client)
     await rt.orchestrator.process_utterance(event)
+    # Run the batch before the later turn exists, so the first event's request
+    # cannot contain words that were spoken after it.
+    await rt.worker.run_until_idle()
 
     later = make_utterance_event(
         conversation_id="c1",
@@ -144,7 +173,7 @@ async def test_job_uses_history_only_before_the_event(db):
     await rt.orchestrator.process_utterance(later)
 
     await rt.worker.run_until_idle()
-    # The deferred analysis of the first event sees only what came before it:
+    # The deferred extraction of the first event sees only what came before it:
     # the later turn is not part of that event's history.
     first_event_prompts = [
         messages
@@ -156,7 +185,7 @@ async def test_job_uses_history_only_before_the_event(db):
         assert "后来说的话" not in json.dumps(messages, ensure_ascii=False)
     analysis = await rt.repos.analysis.get_analysis(event.event_id)
     assert analysis is not None and analysis.event_id == event.event_id
-    assert analysis.provider == "deepseek"
+    assert analysis.provider == "local_fast_path"
 
 
 async def test_consent_revocation_cancels_the_background_analysis(db):
@@ -181,3 +210,77 @@ async def test_consent_revocation_cancels_the_background_analysis(db):
     analysis = await rt.repos.analysis.get_analysis(event.event_id)
     assert analysis is not None and analysis.provider == "local_fast_path"
     assert client.calls == ["response"]
+
+
+async def test_five_waiting_events_share_one_extraction_request(db):
+    client = FakeClient()
+    rt, first = await _runtime(db, client)
+    events = [first]
+    for index in range(1, 5):
+        events.append(
+            make_utterance_event(
+                conversation_id="c1",
+                text=f"我还喜欢第{index}只猫",
+                addressee_hint="agent",
+                speaker_person_id=first.speaker_person_id,
+                source=EventSource.TEST,
+            )
+        )
+    for event in events:
+        assert (await rt.orchestrator.process_utterance(event)).status == "COMPLETED"
+    assert client.calls == ["response"] * 5
+
+    await rt.worker.run_until_idle()
+
+    analysis_calls = [
+        messages for _, messages in client.analysis_messages
+    ]
+    assert len(analysis_calls) == 1
+    prompt = json.dumps(analysis_calls[0], ensure_ascii=False)
+    for event in events:
+        assert f"event_id={event.event_id}" in prompt
+    for event in events:
+        marked = await rt.repos.extraction.get(event.event_id)
+        assert marked is not None and marked["status"] == "processed"
+
+
+async def test_small_batch_is_delayed_until_it_fills_or_times_out(db):
+    client = FakeClient()
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        turn_analysis_delay_seconds=60,
+    )
+    person = await rt.registry.register(
+        "Alice",
+        "owner",
+        allow_processing=True,
+        allow_persistence=True,
+        allow_memory_learning=True,
+        allow_external_ai=True,
+    )
+    event = make_utterance_event(
+        conversation_id="c1",
+        text="我喜欢猫",
+        addressee_hint="agent",
+        speaker_person_id=person.person_id,
+        source=EventSource.TEST,
+    )
+    await rt.orchestrator.process_utterance(event)
+
+    job = await rt.repos.job.get_by_key(f"turn_analysis:{event.event_id}")
+    assert job is not None and job.status == JobStatus.PENDING
+    assert job.next_run_at is not None
+
+    # A delayed job is invisible to the worker until its due time.
+    await rt.worker.run_until_idle()
+    assert "analysis" not in client.calls
+
+    await db.conn.execute(
+        "UPDATE processing_jobs SET next_run_at = NULL WHERE job_id = ?",
+        (job.job_id,),
+    )
+    await db.conn.commit()
+    await rt.worker.run_until_idle()
+    assert client.calls.count("analysis") == 1

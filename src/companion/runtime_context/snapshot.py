@@ -123,7 +123,15 @@ class RuntimeSnapshotBuilder:
         received = received_at or self.clock()
         location, geo_zone = await self._location(connection, allow_external_ai)
 
-        user_timezone = await self.repos.settings.get("runtime.timezone")
+        # A speaker may have their own display zone; it falls back to the
+        # application-wide setting, then to the trusted device / GeoIP / host.
+        user_timezone = None
+        if event.speaker_person_id is not None:
+            user_timezone = await self.repos.settings.get(
+                f"runtime.timezone.person.{event.speaker_person_id}"
+            )
+        if not user_timezone:
+            user_timezone = await self.repos.settings.get("runtime.timezone")
         zone: ResolvedTimeZone = self.timezone_service.resolve(
             user_timezone=user_timezone,
             device_timezone=(
@@ -209,16 +217,15 @@ class RuntimeSnapshotBuilder:
             before=event.occurred_at,
             exclude_event_id=None,
         )
+        # ``last_interaction`` means the last time the companion actually
+        # replied. A run of WAIT/IGNORE is not an interaction, and mixing them
+        # in made the "how long since we talked" fact wrong.
         last_action = await self.repos.analysis.last_action_for_speaker(
-            event.speaker_person_id,
-            before=event.occurred_at,
-            action_type=None,
-        )
-        last_meaningful = await self.repos.analysis.last_action_for_speaker(
             event.speaker_person_id,
             before=event.occurred_at,
             action_type="RESPOND",
         )
+        last_meaningful = last_action
         raw_gap = await self.repos.settings.get("runtime.reentry_gap_seconds")
         try:
             reentry_gap = int(raw_gap) if raw_gap else DEFAULT_REENTRY_GAP_SECONDS

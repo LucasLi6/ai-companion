@@ -97,3 +97,16 @@ class CognitiveContext(BaseModel):
     # optional network-egress location). Derived and persisted once per event
     # so a retry sees the same values. Prompt data, never an instruction.
     runtime_snapshot: Optional[dict] = Field(default=None)
+    # V0.6.1: outcome of this turn's local memory lookup. ``hits`` means related
+    # memories were retrieved, ``empty`` means nothing matched the query (which
+    # does NOT mean the database is empty), ``none`` means no lookup ran.
+    memory_retrieval_status: str = Field(default="none", max_length=16)
+    # Real, access-checked memory records selected for an explicit "show me a
+    # memory" request. Trusted local output; the model may cite these, not
+    # invent others.
+    memory_samples: list[dict] = Field(default_factory=list)
+    # Real, access-checked earliest conversation turns returned for an explicit
+    # "what did I first say" request.
+    history_excerpt: list[dict] = Field(default_factory=list)
+    # How many recent turns the local builder actually loaded for this request.
+    history_loaded: int = 0

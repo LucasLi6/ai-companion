@@ -35,9 +35,9 @@ from .models import (
 )
 from .nonresponse import build_action_history_record
 
-DEFAULT_HISTORY_LIMIT = 20
-DEFAULT_MAX_TURNS = 40
-DEFAULT_MAX_CHARS = 8000
+DEFAULT_HISTORY_LIMIT = 8
+DEFAULT_MAX_TURNS = 16
+DEFAULT_MAX_CHARS = 1800
 
 
 class ContextBuilder:

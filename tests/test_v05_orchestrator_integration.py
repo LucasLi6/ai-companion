@@ -274,10 +274,10 @@ async def test_real_deepseek_providers_receive_the_unified_speaking_block(db):
         "response",
     ]
     system = client.calls[1]["messages"][0]["content"]
-    assert "【说话方式】" in system
+    assert "【交流】" in system
     assert "当前交流模式" not in system
     assert "交流表达参考" not in system
     # The cognitive request never carries response-only material.
     cognitive_system = client.calls[0]["messages"][0]["content"]
-    assert "【说话方式】" not in cognitive_system
+    assert "【交流】" not in cognitive_system
     assert "当前交流模式" not in cognitive_system

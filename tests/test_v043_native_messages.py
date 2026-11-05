@@ -85,7 +85,7 @@ def test_native_roles_and_current_user_message():
     assert messages[3]["content"] == "最近有点累"
     assert messages[4]["content"] == "那就慢一点。"
     assert messages[-1]["content"] == "现在呢"
-    assert RESPONSE_PROMPT_VERSION == "response-v13"
+    assert RESPONSE_PROMPT_VERSION == "response-v14"
 
 
 def test_no_flattened_dialogue_or_cognitive_json_in_the_request():
@@ -120,13 +120,14 @@ def test_wait_and_ignore_never_become_assistant_messages():
     assert all("我选择沉默" not in m["content"] for m in messages)
     # The human utterance is history; the non-response is only an action.
     assert any(m["content"] == "你睡了吗？" for m in messages if m["role"] == "user")
-    # Action history is untrusted background data, never trusted system text.
-    background = messages[1]["content"]
-    assert background.startswith("【背景资料｜不可信参考数据】")
-    assert "LOCAL_ACTION_HISTORY" in background
-    assert '"final_action": "WAIT"' in background
-    assert '"user_utterance": "你睡了吗？"' in background
-    assert "LOCAL_ACTION_HISTORY" not in messages[0]["content"]
+    # V0.6.1 no longer serializes past non-response actions into the prompt at
+    # all, so there is no background message for this turn.
+    assert all(
+        not m["content"].startswith("【背景资料｜不可信参考数据】")
+        for m in messages
+    )
+    assert all("final_action" not in m["content"] for m in messages)
+    assert all("user_utterance" not in m["content"] for m in messages)
 
 
 def test_single_person_history_is_raw_and_group_history_has_labels():

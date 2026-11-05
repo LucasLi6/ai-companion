@@ -213,18 +213,19 @@ async def test_full_character_description_reaches_the_final_request_once(db):
     assert report.status == "COMPLETED"
     system = _response_system(client)
     assert system.count(DESCRIPTION_MARKER) == 1
-    # Structured fields render too, and the whole persona block is singular.
-    assert system.count("【角色身份】（你是谁") == 1
-    assert "核心价值:" in system
-    assert "性情:" in system
-    assert "交流边界:" in system
+    # V0.6.1: one identity block, sourced from the description; structured
+    # fields are not duplicated alongside it.
+    assert system.count("【角色身份】") == 2  # fixed base prompt + identity section
+    assert "核心价值:" not in system
+    assert "性情:" not in system
+    assert "交流边界:" not in system
 
 
 async def test_no_mode_guidance_or_style_reference_in_the_final_request(db):
     _, client, _ = await _deepseek_turn(db)
 
     system = _response_system(client)
-    assert "【说话方式】" in system
+    assert "【交流】" in system
     assert "当前交流模式" not in system
     assert "交流表达参考" not in system
     assert "SOCIAL" not in system

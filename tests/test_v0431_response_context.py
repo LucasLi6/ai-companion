@@ -296,7 +296,7 @@ async def test_scene_proposal_is_still_applied_even_without_meaning(db):
 
     background = _background(client.response_messages())
     assert background is not None
-    assert '"topic": "旅行"' in background
+    assert '"topic":"旅行"' in background
 
 
 async def test_neutral_turn_has_no_filler_but_keeps_state_and_tts(db):

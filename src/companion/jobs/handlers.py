@@ -9,19 +9,32 @@ is denied rather than written.
 The handler is idempotent: each candidate has at most one durable
 candidate -> memory mapping, and re-running the job reads those mappings
 instead of writing a second memory.
+
+``turn_analysis`` is the V0.6.1 lightweight extraction pass. It no longer runs
+a full cognitive analysis after every Fast Path reply: it batches up to a few
+already-answered events from the *same* speaker and asks one small prompt for
+evidence-backed memory candidates. The local ``local_fast_path`` analysis
+remains untouched, so an audit never shows a fabricated model judgement.
 """
 
 from __future__ import annotations
 
 import logging
 
-from companion.core.fast_path import LOCAL_PROVIDER
 from companion.core.safety import assess_safety
-from companion.domain.models import new_id
+from companion.domain.enums import JobType
 from companion.memory.candidates import prepare_candidates
 from companion.memory.consolidation import MemoryWriter
 from companion.memory.service import build_memory_service
+from companion.providers.deepseek_cognitive import CognitivePermissionDenied
 from companion.storage.repositories import Repositories
+
+# Five ordinary turns or roughly one minute, whichever comes first. The job is
+# scheduled with a delay by the orchestrator; when enough events are already
+# waiting it runs immediately and drains the batch.
+EXTRACTION_BATCH_SIZE = 5
+EXTRACTION_STATUS_PROCESSED = "processed"
+EXTRACTION_STATUS_SKIPPED = "skipped"
 
 
 class JobError(Exception):
@@ -66,17 +79,25 @@ async def memory_consolidation(
     )
 
 
-def build_turn_analysis_handler(*, cognitive, context_builder, memory):
-    """Deferred cognitive analysis for a Fast Path turn.
+def build_turn_analysis_handler(
+    *,
+    cognitive,
+    context_builder=None,
+    memory=None,
+    batch_size: int = EXTRACTION_BATCH_SIZE,
+):
+    """Deferred, lightweight extraction for Fast Path turns.
 
-    The reply already happened with one model call. This job runs the richer
-    analysis afterwards, using only history the speaker could see before the
-    event (never the reply that followed), and keeps the durable memory
-    pipeline working. It is idempotent: the placeholder local analysis is
-    replaced at most once, and re-running after a real analysis is a no-op.
+    The reply already happened with one model call. This job only extracts
+    memory candidates from a same-speaker batch, so an ordinary turn never
+    pays for a second full cognitive prompt. Consent is re-checked at
+    execution time and each event is marked at most once in
+    ``turn_extractions``; a retry after a successful batch is a no-op.
     """
 
-    async def turn_analysis(payload: dict, repos: Repositories, logger: logging.Logger) -> None:
+    async def turn_analysis(
+        payload: dict, repos: Repositories, logger: logging.Logger
+    ) -> None:
         event_id = payload.get("event_id")
         if not event_id:
             raise JobError("turn_analysis payload missing 'event_id'")
@@ -97,57 +118,128 @@ def build_turn_analysis_handler(*, cognitive, context_builder, memory):
             logger.info("turn_analysis_skipped event_id=%s reason=consent", event_id)
             return
 
-        existing = await repos.analysis.get_analysis(event_id)
-        if existing is not None and existing.provider != LOCAL_PROVIDER:
+        extract = getattr(cognitive, "extract_events", None)
+        if extract is None:
+            # A provider without the lightweight pass is not silently given a
+            # full analysis instead: that would reintroduce the cost this job
+            # exists to remove.
             logger.info(
-                "turn_analysis_skipped event_id=%s reason=already_analysed", event_id
+                "turn_analysis_skipped event_id=%s reason=provider", event_id
             )
             return
 
-        safety = assess_safety(event.text)
-        if safety.triggered:
-            logger.info("turn_analysis_skipped event_id=%s reason=safety", event_id)
-            return
-
-        memories = await memory.retrieve(event.text, event.speaker_person_id)
-        if context_builder is None:
-            # The Fast Path is only taken when a context builder is wired, so
-            # this is a defensive guard rather than an expected state.
-            raise JobError("turn_analysis requires a context builder")
-        try:
-            context = await context_builder.build(
-                event, memories, before_event=event
-            )
-            analysis = await cognitive.analyze(event, context, memories)
-        except Exception as exc:  # surfaced to the worker for retry
-            raise JobError(f"turn analysis failed: {exc}") from exc
-
-        if analysis.event_id != event_id:
-            raise JobError(
-                f"analysis event_id mismatch: {analysis.event_id!r} != {event_id!r}"
-            )
-
-        candidates = await prepare_candidates(
-            repos,
-            event,
-            analysis.memory_candidates,
-            explicit_remember_request=False,
+        # One batch, one speaker. Another person's private events are never
+        # mixed in, even if they are waiting for extraction too.
+        pending_ids = await repos.extraction.pending_events(
+            event.conversation_id,
+            event.speaker_person_id,
+            limit=max(1, batch_size),
         )
-        async with repos.db.transaction():
-            await repos.analysis.delete_analysis(event_id)
-            await repos.persist_cognitive_outcome(
-                analysis,
-                new_id("ana"),
-                candidates=candidates,
-                job_key=f"memory:{event_id}",
-                job_payload={"event_id": event_id},
-                persona=None,
+        if not pending_ids:
+            return
+        by_id = await repos.utterance.get_many(pending_ids)
+        events = [by_id[i] for i in pending_ids if i in by_id]
+
+        eligible = []
+        for candidate_event in events:
+            if assess_safety(candidate_event.text).triggered:
+                await repos.extraction.mark(
+                    candidate_event.event_id, EXTRACTION_STATUS_SKIPPED, 0
+                )
+                logger.info(
+                    "turn_analysis_skipped event_id=%s reason=safety",
+                    candidate_event.event_id,
+                )
+                continue
+            eligible.append(candidate_event)
+        if not eligible:
+            return
+
+        prior_turns = await _prior_turns(
+            repos, context_builder, eligible[0], event.speaker_person_id
+        )
+        try:
+            extracted = await extract(
+                eligible,
+                speaker_label=event.speaker_label
+                or event.speaker_person_id
+                or "unknown",
+                prior_turns=prior_turns,
             )
+        except CognitivePermissionDenied as exc:
+            for candidate_event in eligible:
+                await repos.extraction.mark(
+                    candidate_event.event_id, EXTRACTION_STATUS_SKIPPED, 0
+                )
+            logger.info(
+                "turn_analysis_skipped event_id=%s reason=permission error=%s",
+                event_id,
+                exc,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — surfaced to the worker for retry
+            raise JobError(f"event extraction failed: {exc}") from exc
+
+        async with repos.db.transaction():
+            for candidate_event in eligible:
+                prepared = await prepare_candidates(
+                    repos,
+                    candidate_event,
+                    extracted.get(candidate_event.event_id, []),
+                    explicit_remember_request=False,
+                )
+                for candidate in prepared:
+                    await repos.analysis.save_candidate(candidate)
+                await repos.extraction.mark(
+                    candidate_event.event_id,
+                    EXTRACTION_STATUS_PROCESSED,
+                    len(prepared),
+                )
+                if prepared:
+                    await repos.job.enqueue(
+                        JobType.MEMORY_CONSOLIDATION,
+                        f"memory:{candidate_event.event_id}",
+                        {"event_id": candidate_event.event_id},
+                    )
+
         logger.info(
-            "turn_analysis_done event_id=%s provider=%s candidates=%d",
+            "turn_analysis_done event_id=%s events=%d candidates=%d",
             event_id,
-            analysis.provider,
-            len(candidates),
+            len(eligible),
+            sum(
+                len(extracted.get(candidate_event.event_id, []))
+                for candidate_event in eligible
+            ),
         )
 
     return turn_analysis
+
+
+async def _prior_turns(
+    repos: Repositories,
+    context_builder,
+    first_event,
+    speaker_person_id: str,
+) -> list[dict]:
+    """A couple of this speaker's preceding turns, for pronoun resolution.
+
+    Only this speaker's own words are included, and only turns the privacy
+    gateway still authorises. The batch itself is never visible before its
+    first event.
+    """
+    history = await repos.utterance.recent_context(
+        first_event.conversation_id,
+        exclude_event_id=None,
+        limit=4,
+        before_event=first_event,
+    )
+    history = [
+        turn for turn in history if turn.speaker_person_id == speaker_person_id
+    ]
+    gateway = getattr(context_builder, "privacy_gateway", None)
+    if gateway is not None:
+        history = await gateway.filter_utterances(history)
+    return [
+        {"occurred_at": turn.occurred_at.isoformat(), "text": turn.text}
+        for turn in history[-2:]
+    ]

@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import ipaddress
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -64,6 +66,7 @@ from companion.providers.deepseek_client import (
 )
 from companion.recovery import RecoveryError, RecoveryManager
 from companion.runtime import build_runtime
+from companion.runtime_context.assembler import compile_runtime_context
 from companion.runtime_context.timezone import TimeZoneService, valid_zone
 from companion.storage.database import Database
 from companion.storage.repositories import make_repositories
@@ -340,9 +343,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_runtime_set = p_runtime_sub.add_parser(
         "set", parents=[_common_parser()], help="Set one runtime context setting"
     )
-    p_runtime_set.add_argument("key", choices=list(RUNTIME_SETTING_KEYS))
+    p_runtime_set.add_argument("key")
     p_runtime_set.add_argument("value")
     p_runtime_set.set_defaults(func=cmd_runtime_set)
+    p_runtime_inspect = p_runtime_sub.add_parser(
+        "inspect",
+        parents=[_common_parser()],
+        help="Diagnose the runtime block used for one event",
+    )
+    p_runtime_inspect.add_argument("--event", required=True, dest="event_id")
+    p_runtime_inspect.set_defaults(func=cmd_runtime_inspect)
 
     p_ui = sub.add_parser("ui", parents=[_common_parser()], help="Start the management web UI (NiceGUI)")
     p_ui.add_argument("--host", default="127.0.0.1")
@@ -1206,7 +1216,11 @@ async def cmd_runtime_show(args) -> int:
 
 async def cmd_runtime_set(args) -> int:
     key, value = args.key, args.value.strip()
-    if key == RUNTIME_SETTING_TIMEZONE:
+    person_zone_prefix = f"{RUNTIME_SETTING_TIMEZONE}.person."
+    if key == RUNTIME_SETTING_TIMEZONE or key.startswith(person_zone_prefix):
+        if key.startswith(person_zone_prefix) and not key[len(person_zone_prefix):]:
+            print("person time zone key needs a person id")
+            return 1
         zone = valid_zone(value)
         if zone is None:
             print(
@@ -1250,6 +1264,76 @@ async def cmd_runtime_set(args) -> int:
     try:
         await make_repositories(db).settings.set(key, normalised)
         print(f"{key} = {normalised}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_runtime_inspect(args) -> int:
+    """Explain what runtime data one event could have given the reply.
+
+    Shows trusted metadata only: timestamps, the resolved zone and its source,
+    and the rendered block. It never prints prompt text, conversation content or
+    a raw IP address.
+    """
+    db = await _connect(args.db)
+    try:
+        repos = make_repositories(db)
+        event = await repos.utterance.get(args.event_id)
+        if event is None:
+            print(f"event not found: {args.event_id}")
+            return 1
+        snapshot = await repos.runtime_snapshot.get(args.event_id)
+        if snapshot is None:
+            print(f"event: {event.event_id}")
+            print("runtime snapshot: (none)")
+            print(
+                "error: no snapshot was persisted for this event; the reply"
+                " could not include a runtime block."
+            )
+            return 0
+
+        block = compile_runtime_context(snapshot)
+        action = await repos.analysis.get_action(args.event_id)
+        print(f"event: {snapshot.event_id}")
+        print(f"occurred_at_utc: {snapshot.occurred_at_utc.isoformat()}")
+        print(f"received_at_utc: {snapshot.received_at_utc.isoformat()}")
+        print(f"timezone: {snapshot.timezone} (source={snapshot.timezone_source})")
+        print(f"utc_offset_seconds: {snapshot.utc_offset_seconds}")
+        print(f"snapshot_local_time: {snapshot.local_time or '-'}")
+        print(
+            "last_interaction_at_utc: "
+            f"{snapshot.last_interaction_at_utc.isoformat() if snapshot.last_interaction_at_utc else '-'}"
+        )
+        print(
+            "last_interaction_gap_seconds: "
+            f"{snapshot.last_interaction_gap_seconds}"
+        )
+        print(f"runtime_block_chars: {len(block)}")
+        if block:
+            # The block is trusted local data, not conversation content.
+            print("-- rendered block --")
+            print(block)
+        else:
+            print("runtime_block: (empty)")
+        if action is not None and action.action_type.value == "RESPOND":
+            print(
+                "final_request: the response provider builds the system message"
+                " from this snapshot; a non-empty block above is included."
+            )
+        elif action is not None:
+            print(
+                f"final_request: no response was generated"
+                f" (action={action.action_type.value}); the block was not sent."
+            )
+        else:
+            print("final_request: no action recorded yet.")
+        errors = []
+        if not block:
+            errors.append("rendered block is empty")
+        if snapshot.timezone_source == "utc" and not snapshot.utc_offset_seconds:
+            errors.append("time zone fell back to UTC")
+        print(f"errors: {'; '.join(errors) if errors else 'none'}")
     finally:
         await db.close()
     return 0
@@ -1508,66 +1592,145 @@ async def cmd_repl(args) -> int:
                     "warning: this person has not granted --allow-external-ai;"
                     " every DeepSeek call will be denied"
                 )
-        while True:
-            try:
-                line = input("you> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            if not line:
-                continue
-            if line.startswith("/"):
-                parts = line.split()
-                cmd = parts[0].lower()
-                if cmd == "/quit" or cmd == "/exit":
+        # One managed worker for the session. Starting/stopping it once avoids
+        # the old per-turn ``run_once`` which blocked the next input.
+        worker_started = False
+        if rt.worker is not None:
+            await rt.worker.start()
+            worker_started = True
+        try:
+            while True:
+                try:
+                    line = (
+                        await asyncio.to_thread(input, "you> ")
+                    ).strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
                     break
-                elif cmd == "/quiet" and len(parts) == 2:
-                    await rt.conversations.set_quiet_mode(
-                        args.conversation, parts[1] == "on"
-                    )
-                    print(f"quiet_mode={'on' if parts[1] == 'on' else 'off'}")
-                elif cmd == "/to" and len(parts) == 2 and parts[1] in ("agent", "human", "unknown"):
-                    addressee = parts[1]
-                    print(f"addressee -> {addressee}")
-                elif cmd == "/history":
-                    for e in await rt.repos.utterance.list_events(None, 20):
-                        print(f"  {e.event_id} to={e.addressee_hint.value} {e.text}")
-                elif cmd == "/status":
-                    ctx = await rt.repos.conversation.get(args.conversation)
-                    print(f"provider: {rt.provider}")
-                    print(f"person: {person.person_id} ({person.display_name})")
-                    print(f"conversation: {args.conversation}")
-                    print(f"addressee: {addressee}")
-                    print(f"quiet_mode: {'on' if ctx and ctx.quiet_mode else 'off'}")
-                elif cmd == "/help":
-                    print(
-                        "commands: /to agent|human|unknown  /quiet on|off"
-                        "  /history  /status  /quit"
-                    )
-                else:
-                    print("unknown command (see /help)")
-                continue
-            event = make_utterance_event(
-                conversation_id=args.conversation,
-                text=line,
-                addressee_hint=addressee,
-                speaker_person_id=person.person_id,
-                source=EventSource.CLI,
-            )
-            report = await rt.orchestrator.process_utterance(event)
-            if report.response_text:
-                print(f"assistant> {report.response_text}")
-            elif report.status != "COMPLETED":
-                print(f"[{report.status}] {report.error or ''}".rstrip())
-            else:
-                reason = f" ({report.reason_code.value})" if report.reason_code else ""
-                action = report.action.value if report.action else "no action"
-                print(f"[{action}{reason}]")
-            if rt.worker is not None:
-                await rt.worker.run_once()
+                if not line:
+                    continue
+                if line.startswith("/"):
+                    parts = line.split()
+                    cmd = parts[0].lower()
+                    if cmd == "/quit" or cmd == "/exit":
+                        break
+                    elif cmd == "/quiet" and len(parts) == 2:
+                        await rt.conversations.set_quiet_mode(
+                            args.conversation, parts[1] == "on"
+                        )
+                        print(f"quiet_mode={'on' if parts[1] == 'on' else 'off'}")
+                    elif cmd == "/to" and len(parts) == 2 and parts[1] in ("agent", "human", "unknown"):
+                        addressee = parts[1]
+                        print(f"addressee -> {addressee}")
+                    elif cmd == "/history":
+                        for e in await rt.repos.utterance.list_events(None, 20):
+                            print(f"  {e.event_id} to={e.addressee_hint.value} {e.text}")
+                    elif cmd == "/status":
+                        ctx = await rt.repos.conversation.get(args.conversation)
+                        print(f"provider: {rt.provider}")
+                        print(f"person: {person.person_id} ({person.display_name})")
+                        print(f"conversation: {args.conversation}")
+                        print(f"addressee: {addressee}")
+                        print(f"quiet_mode: {'on' if ctx and ctx.quiet_mode else 'off'}")
+                    elif cmd == "/help":
+                        print(
+                            "commands: /to agent|human|unknown  /quiet on|off"
+                            "  /history  /status  /quit"
+                        )
+                    else:
+                        print("unknown command (see /help)")
+                    continue
+                event = make_utterance_event(
+                    conversation_id=args.conversation,
+                    text=line,
+                    addressee_hint=addressee,
+                    speaker_person_id=person.person_id,
+                    source=EventSource.CLI,
+                )
+                await _run_streaming_turn(rt, event)
+        finally:
+            if worker_started:
+                await rt.worker.stop()
     finally:
         await db.close()
     return 0
+
+
+async def _run_streaming_turn(rt, event) -> None:
+    """Render one turn from the real streaming API.
+
+    Deltas are written and flushed as they arrive; the full text is never
+    printed a second time. A turn that produces no response event (WAIT /
+    IGNORE) is reported from the persisted action, and a failure or interruption
+    is reported as such rather than as a completed reply.
+    """
+    saw_started = False
+    saw_delta = False
+    saw_terminal = False
+    stream = rt.orchestrator.process_utterance_stream(event)
+    try:
+        async for item in stream:
+            if item.type == "response_started":
+                saw_started = True
+                sys.stdout.write("assistant> ")
+                sys.stdout.flush()
+            elif item.type == "response_delta":
+                saw_delta = True
+                sys.stdout.write(item.delta or "")
+                sys.stdout.flush()
+            elif item.type == "response_completed":
+                saw_terminal = True
+                if not saw_started:
+                    sys.stdout.write("assistant> ")
+                    saw_started = True
+                if not saw_delta and item.text:
+                    # A provider without incremental chunks still produces a
+                    # real reply; show it once, here, not twice.
+                    sys.stdout.write(item.text)
+                if item.status == "TRUNCATED":
+                    sys.stdout.write("\n[truncated: token limit]\n")
+                else:
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+            elif item.type == "response_failed":
+                saw_terminal = True
+                if not saw_delta and item.text:
+                    sys.stdout.write(item.text)
+                if saw_started:
+                    sys.stdout.write("\n")
+                print(f"[failed] {item.error or ''}".rstrip())
+            elif item.type == "response_cancelled":
+                saw_terminal = True
+                if saw_started:
+                    sys.stdout.write("\n")
+                print("[cancelled]")
+    except KeyboardInterrupt:
+        # Let the orchestrator persist the partial reply as CANCELLED and
+        # release its conversation lock before returning to the prompt.
+        with contextlib.suppress(Exception):
+            await stream.aclose()
+        if saw_started:
+            sys.stdout.write("\n")
+        print("[cancelled]")
+        return
+    except Exception as exc:  # provider/validation failure is shown truthfully
+        if saw_started:
+            sys.stdout.write("\n")
+        print(f"[failed] {type(exc).__name__}: {exc}")
+        return
+
+    if saw_terminal:
+        return
+    # No response event was emitted: the local policy chose WAIT or IGNORE.
+    # Read the persisted decision instead of inventing a status.
+    action = None
+    with contextlib.suppress(Exception):
+        action = await rt.repos.analysis.get_action(event.event_id)
+    if action is None:
+        print("[no action]")
+        return
+    reason = f" ({action.reason_code.value})" if action.reason_code else ""
+    print(f"[{action.action_type.value}{reason}]")
 
 
 async def cmd_deepseek_check(args) -> int:

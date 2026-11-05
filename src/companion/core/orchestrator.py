@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from datetime import timedelta
 from typing import Optional
 
 from companion.agent.character import (
@@ -68,6 +69,10 @@ from companion.domain.models import (
 from companion.emotion.expression_policy import compile_affect_context
 from companion.emotion.transition import build_conversational_affect
 from companion.memory.candidates import prepare_candidates
+from companion.memory.requests import (
+    is_earliest_history_request,
+    is_memory_sample_request,
+)
 from companion.people.registry import PersonRegistry
 from companion.runtime_context.connection import ConnectionInfo
 from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
@@ -112,6 +117,8 @@ class Orchestrator:
         runtime_snapshot_builder: Optional[RuntimeSnapshotBuilder] = None,
         metrics: Optional[LatencyMetrics] = None,
         fast_path_enabled: bool = True,
+        turn_analysis_delay_seconds: float = 60.0,
+        turn_analysis_batch_size: int = 5,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repos = repos
@@ -154,6 +161,11 @@ class Orchestrator:
         # deliberation pipeline) can turn it off; routing still never looks at
         # message text.
         self.fast_path_enabled = fast_path_enabled
+        # V0.6.1: a Fast Path turn only queues lightweight extraction. The job
+        # waits up to ``delay`` seconds so several turns can share one small
+        # request; once ``batch_size`` events are waiting it runs immediately.
+        self.turn_analysis_delay_seconds = max(0.0, float(turn_analysis_delay_seconds))
+        self.turn_analysis_batch_size = max(1, int(turn_analysis_batch_size))
         self.logger = logger or logging.getLogger("companion.orchestrator")
         self._conversation_locks: dict[str, asyncio.Lock] = {}
 
@@ -343,6 +355,9 @@ class Orchestrator:
             cognitive_context, provider_memories = await self._prepare_context(
                 event, context, memories, steps
             )
+            cognitive_context = await self._attach_memory_signals(
+                event, person_id, memories, cognitive_context, steps
+            )
 
             # 4c. Load the short-horizon scene and compile this turn's local
             # style/personality. Scene data is only attached to the rich
@@ -443,11 +458,7 @@ class Orchestrator:
                     # a durable, idempotent job extracts candidates after the
                     # reply. Nothing is acknowledged before a real write.
                     if learn and self.jobs is not None and not safety.triggered:
-                        job_id = await self.repos.job.enqueue(
-                            JobType.TURN_ANALYSIS,
-                            f"turn_analysis:{event.event_id}",
-                            {"event_id": event.event_id},
-                        )
+                        job_id = await self._enqueue_turn_analysis(event)
                         steps.append("[MEMORY_JOB] Background analysis queued")
             elif analysis is None:
                 analysis = await self.cognitive.analyze(
@@ -505,11 +516,7 @@ class Orchestrator:
                     if job is not None:
                         job_id = job.job_id
                     if str(getattr(analysis, "provider", "")) == LOCAL_PROVIDER:
-                        job_id = await self.repos.job.enqueue(
-                            JobType.TURN_ANALYSIS,
-                            f"turn_analysis:{event.event_id}",
-                            {"event_id": event.event_id},
-                        ) or job_id
+                        job_id = await self._enqueue_turn_analysis(event) or job_id
             timings["analysis_ms"] = (time.monotonic() - t_analysis) * 1000
 
             # 5b. A retried analysis must be answered by the same trusted
@@ -924,6 +931,102 @@ class Orchestrator:
             )
         return cognitive_context, provider_memories
 
+    async def _attach_memory_signals(
+        self, event, person_id, memories, context, steps
+    ):
+        """Tell the model what the local lookup actually did.
+
+        Three different situations must not collapse into one silence:
+
+        - no long-term memory exists for this person;
+        - the store has memories but this query matched none;
+        - history was not available to this request.
+
+        Only the rich provider context can carry these facts; the mock path is
+        unchanged. Explicit sample/history requests use the same access-checked
+        service the admin UI uses, so no cross-person leak is possible.
+        """
+        if not isinstance(context, CognitiveContext):
+            return context
+        if self.context_builder is None:
+            return context
+
+        # Retrieval is already privacy-filtered in the provider context. The
+        # raw list may contain memories the gateway dropped; using it would
+        # tell the model "found relevant memories" when the background is
+        # actually empty.
+        visible_memories = list(context.memories or [])
+        status = "hits" if visible_memories else "empty"
+        samples: list[dict] = []
+        history_excerpt: list[dict] = []
+        history_loaded = len(getattr(context, "turns", []) or [])
+
+        if not visible_memories:
+            visible_any = await self.memory.browse(person_id, limit=1)
+            status = "empty" if visible_any else "no_memories"
+
+        if is_memory_sample_request(event.text):
+            samples = await self._visible_memory_samples(person_id)
+            if samples:
+                status = "hits"
+            elif status == "hits":
+                # Keyword hits exist but none survived the explicit sample
+                # lookup; report it truthfully as an empty retrieval.
+                status = "empty"
+            steps.append(f"[MEMORY] Explicit sample requested ({len(samples)})")
+
+        if is_earliest_history_request(event.text):
+            history_excerpt = await self._earliest_history(event, person_id)
+            if history_excerpt:
+                history_loaded = max(history_loaded, len(history_excerpt))
+            steps.append(f"[HISTORY] Earliest excerpt ({len(history_excerpt)})")
+
+        return context.model_copy(
+            update={
+                "memory_retrieval_status": status,
+                "memory_samples": samples,
+                "history_excerpt": history_excerpt,
+                "history_loaded": history_loaded,
+            }
+        )
+
+    async def _visible_memory_samples(self, person_id: str) -> list[dict]:
+        samples = await self.memory.browse(person_id, limit=3)
+        gateway = getattr(self.context_builder, "privacy_gateway", None)
+        if gateway is not None:
+            samples, _dropped = await gateway.filter_memories(
+                samples, self._subject_ids_of
+            )
+        return samples
+
+    async def _earliest_history(self, event, person_id: str) -> list[dict]:
+        turns = await self.repos.utterance.earliest_for_speaker(
+            person_id,
+            event.conversation_id,
+            exclude_event_id=event.event_id,
+            limit=3,
+        )
+        gateway = getattr(self.context_builder, "privacy_gateway", None)
+        if gateway is not None:
+            turns = await gateway.filter_utterances(turns)
+        return [
+            {
+                "occurred_at": turn.occurred_at.isoformat(),
+                "speaker": turn.speaker_label or "unknown",
+                "text": turn.text,
+            }
+            for turn in turns
+        ]
+
+    @staticmethod
+    async def _subject_ids_of(memory: dict) -> list[str]:
+        """PERSON subject ids, matching the privacy gateway's async contract."""
+        return [
+            subject["subject_id"]
+            for subject in memory.get("subjects", [])
+            if subject.get("subject_type") == "PERSON"
+        ]
+
     @staticmethod
     def _attach_runtime_snapshot(context, snapshot):
         """Attach the per-event runtime data to the provider context.
@@ -935,6 +1038,34 @@ class Orchestrator:
         if snapshot is None or not isinstance(context, CognitiveContext):
             return context
         return context.model_copy(update={"runtime_snapshot": snapshot.as_dict()})
+
+    async def _enqueue_turn_analysis(self, event: UtteranceEvent) -> Optional[str]:
+        """Queue the batched extraction job for an already-answered turn.
+
+        The event's local analysis is already persisted at this point, so it is
+        visible to ``pending_events``. A small number of waiting events is
+        delayed so they can share one request; once the batch is full the job
+        is due immediately. The job key keeps this idempotent.
+        """
+        if self.jobs is None:
+            return None
+        next_run_at = None
+        if event.speaker_person_id is not None and self.turn_analysis_delay_seconds:
+            waiting = await self.repos.extraction.pending_events(
+                event.conversation_id,
+                event.speaker_person_id,
+                limit=self.turn_analysis_batch_size,
+            )
+            if len(waiting) < self.turn_analysis_batch_size:
+                next_run_at = utcnow() + timedelta(
+                    seconds=self.turn_analysis_delay_seconds
+                )
+        return await self.repos.job.enqueue(
+            JobType.TURN_ANALYSIS,
+            f"turn_analysis:{event.event_id}",
+            {"event_id": event.event_id},
+            next_run_at=next_run_at,
+        )
 
     @staticmethod
     def _local_fast_path_analysis(event) -> CognitiveResult:

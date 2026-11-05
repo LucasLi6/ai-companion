@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+import socket
+
+import pytest
 import pytest_asyncio
 
 from companion.domain.enums import EventSource
 from companion.domain.models import make_utterance_event
 from companion.runtime import build_runtime
 from companion.storage.database import Database
+
+
+@pytest.fixture(autouse=True)
+def _block_real_network(monkeypatch):
+    """Every test is offline: an INET connect is a test bug, not a fixture.
+
+    Local files (SQLite) do not use sockets, so this also catches a fake
+    provider accidentally falling back to a real HTTP client.
+    """
+    real_connect = socket.socket.connect
+
+    def guarded_connect(self, address):
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            raise RuntimeError("real network access is disabled in tests")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
 
 
 @pytest_asyncio.fixture

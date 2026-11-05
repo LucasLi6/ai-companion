@@ -610,8 +610,8 @@ async def test_thirty_turns_keep_revision_and_personality_stable(db):
     last_response_prompt = client.requests("response")[-1]["messages"][0]["content"]
     for prompt in (first_response_prompt, last_response_prompt):
         assert "【角色身份】" in prompt
-        assert "【基本边界】" in prompt
-        assert "与当前说话者的关系:" in prompt
+        assert "【边界】" in prompt
+        assert "与当前说话者的关系：" in prompt
     # Both calls see the same trusted character view.
     assert first_response_prompt.split("【当前相关的上下文】")[0] == (
         last_response_prompt.split("【当前相关的上下文】")[0]

@@ -54,12 +54,17 @@ from companion.domain.models import (
 )
 from companion.memory.store import validate_referenced_memory_ids
 from companion.prompts.cognitive import build_cognitive_messages, build_repair_messages
+from companion.prompts.extraction import build_extraction_messages
 
 PROVIDER_NAME = "deepseek"
 
 
 class CognitiveValidationError(Exception):
     """The model returned output that is not valid JSON or fails validation."""
+
+
+class CognitivePermissionDenied(Exception):
+    """External AI is not authorised for this speaker; no request was sent."""
 
 
 class _RawCandidate(BaseModel):
@@ -77,7 +82,6 @@ class _RawCandidate(BaseModel):
 
 class _RawAnalysis(BaseModel):
     model_config = ConfigDict(extra="ignore")
-
     meaning: str = Field(min_length=1, max_length=2048)
     topic: Optional[str] = Field(default=None, max_length=512)
     intent: str = Field(default="unknown", max_length=128)
@@ -98,6 +102,19 @@ class _RawAnalysis(BaseModel):
     scene_proposal: Optional[object] = None
     dialogue_impulse: Optional[object] = None
     pragmatic: Optional[object] = None
+
+
+class _RawExtractionItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    event_id: str = Field(min_length=1, max_length=128)
+    memory_candidates: list[_RawCandidate] = Field(default_factory=list)
+
+
+class _RawExtraction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    results: list[_RawExtractionItem] = Field(default_factory=list)
 
 
 def _parse_json_object(content: str) -> dict:
@@ -186,6 +203,85 @@ class DeepSeekCognitiveProvider:
                 f"model output invalid after one repair retry: {second_error}"
             ) from second_error
 
+    # -- lightweight background extraction ----------------------------------
+
+    async def extract_events(
+        self,
+        events: list[UtteranceEvent],
+        *,
+        speaker_label: str,
+        prior_turns: list[dict] | None = None,
+    ) -> dict[str, list[MemoryCandidate]]:
+        """Extract memory candidates for one same-speaker batch.
+
+        This is the cheap background pass used after a Fast Path turn. It does
+        not decide an action, does not see persona or retrieval context, and
+        never replaces the truthful local analysis. Trust rules are the same
+        as :meth:`analyze`: ids and subjects come from trusted metadata, and an
+        evidence span is kept only when it is a verbatim part of *that* event.
+        """
+        if not events:
+            return {}
+        by_id = {event.event_id: event for event in events}
+        speaker_id = events[0].speaker_person_id
+        if self.privacy_gateway is not None:
+            auth = await self.privacy_gateway.authorize_event(speaker_id)
+            if not auth.allowed:
+                self.logger.info(
+                    "deepseek_extraction_denied speaker=%s reason=%s",
+                    speaker_id,
+                    auth.reason,
+                )
+                raise CognitivePermissionDenied(auth.reason)
+
+        messages = build_extraction_messages(
+            [
+                {
+                    "event_id": event.event_id,
+                    "occurred_at": event.occurred_at.isoformat(),
+                    "text": event.text,
+                }
+                for event in events
+            ],
+            speaker_label=speaker_label,
+            prior_turns=prior_turns,
+        )
+        response = await self.client.complete(
+            messages,
+            request_type="analysis",
+            event_id=events[-1].event_id,
+            json_mode=True,
+        )
+        try:
+            raw = _RawExtraction.model_validate(_parse_json_object(response.content))
+        except ValidationError as exc:
+            details = "; ".join(
+                f"{'.'.join(str(p) for p in err['loc'])}:{err['type']}"
+                for err in exc.errors()
+            )
+            raise CognitiveValidationError(
+                f"extraction schema validation failed ({details})"
+            ) from exc
+
+        extracted: dict[str, list[MemoryCandidate]] = {
+            event.event_id: [] for event in events
+        }
+        for item in raw.results:
+            event = by_id.get(item.event_id)
+            if event is None:
+                # A model-invented id, or an id for another speaker's event.
+                # Either way it is not trusted and is dropped.
+                self.logger.info(
+                    "deepseek_extraction_unknown_event event_id=%s",
+                    item.event_id[:64],
+                )
+                continue
+            extracted[event.event_id].extend(
+                self._candidate(candidate, event)
+                for candidate in item.memory_candidates
+            )
+        return extracted
+
     # -- request/parse ------------------------------------------------------
 
     async def _request(self, event: UtteranceEvent, messages: list[dict]) -> str:
@@ -244,19 +340,7 @@ class DeepSeekCognitiveProvider:
         )
 
         candidates = [
-            MemoryCandidate(
-                candidate_id=new_id("memc"),
-                source_event_id=event.event_id,  # trusted
-                subject_person_id=event.speaker_person_id,  # trusted
-                content=c.content,
-                operation=self._operation(c.operation),
-                assertion_type=self._assertion(c.assertion_type),
-                certainty_category=self._certainty(c.certainty),
-                topic=c.topic,
-                kind=self._kind(c.kind),
-                source_evidence_span=self._evidence(c.evidence_span, event),
-            )
-            for c in raw.memory_candidates
+            self._candidate(c, event) for c in raw.memory_candidates
         ]
 
         signal = validate_affective_signal(raw.affective_signal, event.text)
@@ -329,6 +413,24 @@ class DeepSeekCognitiveProvider:
             scene_proposal=scene_proposal,
             dialogue_impulse=dialogue_impulse,
             pragmatic=pragmatic,
+        )
+
+    @staticmethod
+    def _candidate(raw: _RawCandidate, event: UtteranceEvent) -> MemoryCandidate:
+        """Build one candidate with trusted ids and per-event evidence."""
+        return MemoryCandidate(
+            candidate_id=new_id("memc"),
+            source_event_id=event.event_id,  # trusted
+            subject_person_id=event.speaker_person_id,  # trusted
+            content=raw.content,
+            operation=DeepSeekCognitiveProvider._operation(raw.operation),
+            assertion_type=DeepSeekCognitiveProvider._assertion(raw.assertion_type),
+            certainty_category=DeepSeekCognitiveProvider._certainty(raw.certainty),
+            topic=raw.topic,
+            kind=DeepSeekCognitiveProvider._kind(raw.kind),
+            source_evidence_span=DeepSeekCognitiveProvider._evidence(
+                raw.evidence_span, event
+            ),
         )
 
     @staticmethod

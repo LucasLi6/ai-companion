@@ -102,6 +102,7 @@ def build_runtime(
     personality_generation_enabled: Optional[bool] = None,
     cognitive_repair_enabled: Optional[bool] = None,
     fast_path_enabled: Optional[bool] = None,
+    turn_analysis_delay_seconds: Optional[float] = None,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
 
@@ -280,6 +281,13 @@ def build_runtime(
         fast_path_enabled = os.environ.get(
             "AVA_FAST_PATH_ENABLED", "true"
         ).strip().lower() in ("1", "true", "yes", "on")
+    if turn_analysis_delay_seconds is None:
+        try:
+            turn_analysis_delay_seconds = float(
+                os.environ.get("AVA_TURN_ANALYSIS_DELAY_SECONDS", "60")
+            )
+        except ValueError:
+            turn_analysis_delay_seconds = 60.0
 
     orchestrator = Orchestrator(
         repos=repos,
@@ -300,6 +308,7 @@ def build_runtime(
         runtime_snapshot_builder=runtime_snapshot_builder,
         metrics=metrics,
         fast_path_enabled=bool(fast_path_enabled),
+        turn_analysis_delay_seconds=float(turn_analysis_delay_seconds),
         logger=logger,
     )
     return Runtime(

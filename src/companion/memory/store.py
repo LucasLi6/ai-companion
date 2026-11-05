@@ -207,6 +207,24 @@ class SqliteMemoryStore:
             )
         return merged
 
+    async def browse(self, person_id: Optional[str], *, limit: int = 3) -> list[dict]:
+        """Any visible ``ACTIVE`` memories, newest first, with no keyword.
+
+        Used only when the speaker explicitly asks to see a memory sample. The
+        same access-checked service path as retrieval applies, so a sample can
+        never reveal a memory this person may not see.
+        """
+        if person_id is None:
+            return []
+        access = AccessContext(actor_id=person_id, is_admin=False, role="cognitive")
+        return await self.service.search(
+            access=access,
+            query=None,
+            statuses=["ACTIVE"],
+            kinds=RETRIEVAL_KINDS,
+            limit=max(1, limit),
+        )
+
     async def _visible_result(
         self, memory_id: str, access: AccessContext
     ) -> dict | None:

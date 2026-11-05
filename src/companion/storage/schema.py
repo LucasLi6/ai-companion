@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1350,6 +1350,30 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE INDEX IF NOT EXISTS idx_runtime_snapshots_conversation
             ON runtime_snapshots(conversation_id, created_at);
+        """,
+    ),
+    # Version 19 (V0.6.1): lightweight background extraction bookkeeping.
+    #
+    # V0.6 ran a full cognitive analysis after every Fast Path reply, which
+    # re-sent the persona and history for a one-line chat message. V0.6.1
+    # replaces that with a batch-oriented, evidence-only extraction job. This
+    # table records which events have already been processed (idempotency across
+    # retries and restarts) and how many candidates were proposed. It is
+    # additive: no existing analysis, candidate or memory row is modified.
+    (
+        19,
+        """
+        CREATE TABLE IF NOT EXISTS turn_extractions (
+            event_id        TEXT PRIMARY KEY
+                            REFERENCES utterances(event_id) ON DELETE CASCADE,
+            status          TEXT NOT NULL,
+            candidate_count INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            processed_at    TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_turn_extractions_status
+            ON turn_extractions(status, created_at);
         """,
     ),
 ]

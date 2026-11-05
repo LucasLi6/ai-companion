@@ -199,7 +199,7 @@ def _analysis(**updates):
 
 
 def test_response_prompt_renders_compact_affect_not_style_vectors():
-    assert RESPONSE_PROMPT_VERSION == "response-v13"
+    assert RESPONSE_PROMPT_VERSION == "response-v14"
     ctx = _context(
         affect_context="此刻情绪偏向关切（明显）。",
         # Legacy fields are ignored by the model: V0.5 removed the numeric
@@ -250,13 +250,15 @@ def test_response_prompt_renders_character_core_from_trusted_context():
     system = build_response_messages(ctx, _analysis())[0]["content"]
     assert "【角色身份】" in system
     assert "一个说话具体、不擅长空泛安慰的人。" in system
-    assert "核心价值: 诚实；具体" in system
-    assert "humor=dry" in system
-    assert "重要偏好: music=老摇滚" in system
-    assert "交流边界: 不编造经历" in system
+    # V0.6.1: the description is the identity source; structured values are
+    # not duplicated when it is present.
+    assert "核心价值" not in system
+    assert "humor=dry" not in system
+    assert "重要偏好" not in system
+    assert "交流边界" not in system
     assert "不喜欢空泛的安慰。" in system
-    # Character is guidance, not a fixed script.
-    assert "不要逐条复述" in system
+    # Character guidance is not a fixed script.
+    assert "保持连贯" in system
 
 
 async def test_scene_preview_reaches_response_context_without_persisting(rt, register):
@@ -311,8 +313,8 @@ async def test_scene_preview_reaches_response_context_without_persisting(rt, reg
         for m in messages
         if m["content"].startswith("【背景资料｜不可信参考数据】")
     )
-    assert '"topic": "旅行"' in background
-    assert '"location": "大阪的酒店"' in background
+    assert '"topic":"旅行"' in background
+    assert '"location":"大阪的酒店"' in background
     # Scene data is untrusted reference, not trusted system text.
     assert "大阪的酒店" not in messages[0]["content"]
 

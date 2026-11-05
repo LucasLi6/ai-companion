@@ -195,12 +195,15 @@ async def test_runtime_block_is_trusted_data_after_the_persona_prefix(db):
     await rt.orchestrator.process_utterance(_event(person.person_id, "你好"))
 
     system = client.messages[0][0]["content"]
-    assert "【当前时间与状态】（本地可信数据）" in system
+    assert "【运行状态】（本地可信数据）" in system
+    assert "time=" in system
+    assert "event_time=" in system
     identity = system.index("【角色身份】")
-    runtime_block = system.index("【当前时间与状态】")
+    runtime_block = system.index("【运行状态】")
     assert identity < runtime_block
-    # The prompt says the gap is a fact, not a greeting script.
-    assert "不是固定话术" in system
+    # The block is state, not a greeting script, and carries no anti-script
+    # instruction either.
+    assert "不是固定话术" not in system
 
 
 async def test_two_turns_produce_real_gaps_in_the_prompt(db):
@@ -218,6 +221,8 @@ async def test_two_turns_produce_real_gaps_in_the_prompt(db):
     snapshot = await rt.repos.runtime_snapshot.get(second.event_id)
     assert snapshot is not None
     assert snapshot.last_heard_gap_seconds == 2 * 3600
+    # Only a real reply counts as an interaction.
+    assert snapshot.last_interaction_gap_seconds == 2 * 3600
     assert snapshot.last_meaningful_context_gap_seconds == 2 * 3600
     assert snapshot.reentry_state == REENTRY_CONTINUING
 

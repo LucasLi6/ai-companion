@@ -1,4 +1,4 @@
-"""V0.6 schema 18: additive runtime snapshots, plus a real backup/rollback."""
+"""V0.6.1 schema 19: extraction markers, additive migration, backup/rollback."""
 
 from __future__ import annotations
 
@@ -37,9 +37,9 @@ async def _build_version(path, version: int):
     await db.close()
 
 
-async def test_fresh_database_is_version_18_with_runtime_snapshots(db):
+async def test_fresh_database_is_version_19_with_runtime_snapshots(db):
     cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 18
+    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 19
     cur = await db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
         " AND name='runtime_snapshots'"
@@ -52,7 +52,7 @@ async def test_fresh_database_is_version_18_with_runtime_snapshots(db):
     assert await cur.fetchone() is not None
 
 
-async def test_migration_18_is_additive_from_version_17(tmp_path):
+async def test_migration_19_is_additive_from_version_17(tmp_path):
     path = tmp_path / "v17.memory"
     await _build_version(path, 17)
 
@@ -60,12 +60,17 @@ async def test_migration_18_is_additive_from_version_17(tmp_path):
     try:
         await db.initialize()
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 18
+        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 19
         cur = await db.execute("SELECT text FROM utterances WHERE event_id='evt_old'")
         assert (await cur.fetchone())["text"] == "旧消息"
         cur = await db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
             " AND name='runtime_snapshots'"
+        )
+        assert await cur.fetchone() is not None
+        cur = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='turn_extractions'"
         )
         assert await cur.fetchone() is not None
     finally:
@@ -82,14 +87,14 @@ async def test_backup_restores_a_pre_migration_version(tmp_path):
 
         await db.initialize()
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == 18
+        assert (await cur.fetchone())["v"] == 19
 
         restored = await Database(backup).connect()
         try:
             await restored.initialize()
             # Re-opening a backup stays usable; it is itself migrated forward.
             cur = await restored.execute("SELECT MAX(version) AS v FROM schema_version")
-            assert (await cur.fetchone())["v"] == 18
+            assert (await cur.fetchone())["v"] == 19
             cur = await restored.execute(
                 "SELECT text FROM utterances WHERE event_id='evt_old'"
             )

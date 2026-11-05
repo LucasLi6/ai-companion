@@ -215,9 +215,11 @@ def test_wait_and_ignore_never_become_a_fake_reply(action):
         ],
     )
     messages = build_response_messages(ctx, _analysis())
-    assert [m["role"] for m in messages] == ["system", "user", "user", "user"]
-    assert any(
-        f'"final_action": "{action}"' in m["content"] for m in messages
+    # V0.6.1 no longer replays WAIT/IGNORE into the response prompt.
+    assert [m["role"] for m in messages] == ["system", "user", "user"]
+    assert all(m["role"] != "assistant" for m in messages)
+    assert all(
+        f'"final_action": "{action}"' not in m["content"] for m in messages
     )
     assert all(m["role"] != "assistant" for m in messages)
 
