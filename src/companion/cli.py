@@ -1653,7 +1653,9 @@ async def cmd_repl(args) -> int:
                     speaker_person_id=person.person_id,
                     source=EventSource.CLI,
                 )
-                await _run_streaming_turn(rt, event)
+                await _run_streaming_turn(
+                    rt, event, debug=bool(getattr(args, "debug", False))
+                )
         finally:
             if worker_started:
                 await rt.worker.stop()
@@ -1662,13 +1664,18 @@ async def cmd_repl(args) -> int:
     return 0
 
 
-async def _run_streaming_turn(rt, event) -> None:
+async def _run_streaming_turn(rt, event, *, debug: bool = False) -> None:
     """Render one turn from the real streaming API.
 
     Deltas are written and flushed as they arrive; the full text is never
-    printed a second time. A turn that produces no response event (WAIT /
-    IGNORE) is reported from the persisted action, and a failure or interruption
-    is reported as such rather than as a completed reply.
+    printed a second time. A failure or interruption is reported as such rather
+    than as a completed reply.
+
+    A turn that produces no response event (WAIT / IGNORE) is complete silence
+    in the normal chat surface: the user asked for no reply, and no
+    ``assistant>`` line or action label is invented. With ``debug=True`` the
+    persisted action and reason are printed, so the same decision stays
+    inspectable without leaking into ordinary conversation.
     """
     saw_started = False
     saw_delta = False
@@ -1728,7 +1735,10 @@ async def _run_streaming_turn(rt, event) -> None:
     if saw_terminal:
         return
     # No response event was emitted: the local policy chose WAIT or IGNORE.
-    # Read the persisted decision instead of inventing a status.
+    # In the ordinary chat surface this is intentional silence, so nothing is
+    # printed. Diagnostics remain available behind ``--debug``.
+    if not debug:
+        return
     action = None
     with contextlib.suppress(Exception):
         action = await rt.repos.analysis.get_action(event.event_id)

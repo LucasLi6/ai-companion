@@ -356,6 +356,19 @@ def _trusted_turn_lines(
             "【对话历史】本次请求没有可用历史；不要声称记得更早的对话。"
         )
 
+    if context.conversation_stats:
+        stats = context.conversation_stats
+        lines.append(
+            "【对话统计】（本地只读计数；范围仅限当前说话人自己的记录，"
+            "不含其他人的消息，也不代表其他设备上的数据）"
+        )
+        lines.append(
+            f"对方发来的消息={stats.get('user_messages', 0)} 条；"
+            f"Ava 可见回复={stats.get('assistant_replies', 0)} 条；"
+            f"会话数={stats.get('sessions', 0)} 个。"
+        )
+        lines.append("被问到对话条数时只能引用这些数字，不得估算或推测。")
+
     if context.memory_samples:
         lines.append("【你实际的长期记忆样本】（本地读取，只能基于这些真实记录）")
         for sample in context.memory_samples[:3]:

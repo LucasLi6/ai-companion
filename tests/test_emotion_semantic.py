@@ -566,3 +566,107 @@ def rt_admin():
     from companion.memory.models import AccessContext
 
     return AccessContext("admin", is_admin=True)
+
+
+# -- continuous dialogue: criticism -> third party -> quoted -> repair -------
+
+
+class _ScriptedCognitive:
+    """Returns one prepared analysis per turn; the emotion layer is the subject."""
+
+    def __init__(self, results: list[CognitiveResult]) -> None:
+        self._results = list(results)
+        self.calls = 0
+
+    async def analyze(self, event, context, memories):
+        self.calls += 1
+        result = self._results.pop(0)
+        return result.model_copy(update={"event_id": event.event_id})
+
+
+def _signal_result(
+    event_type,
+    evidence,
+    *,
+    target="AGENT",
+    subject="speaker",
+    intent="HOSTILE",
+    factuality="asserted",
+):
+    return CognitiveResult(
+        event_id="placeholder",
+        meaning="scripted affect",
+        action=CognitiveAction.RESPOND,
+        reason_code=ReasonCode.DIRECT_AGENT_ADDRESS,
+        provider="fake",
+        affective_signal=AffectiveSignal(
+            event_type=event_type,
+            subject=subject,
+            target=target,
+            social_intent=intent,
+            factuality=factuality,
+            confidence=0.95,
+            evidence_span=evidence,
+        ),
+    )
+
+
+async def test_continuous_criticism_repair_and_topic_switch(rt, register, say):
+    """One scene must not poison the next: subject, quotes and recovery.
+
+    - criticism aimed at Ava moves affect once;
+    - criticism of a third party is not about Ava;
+    - a quoted insult is not an assertion;
+    - reconciliation lowers tension;
+    - a later technical question is answered normally.
+    """
+    person = await register("Alice")
+    rt.orchestrator.cognitive = _ScriptedCognitive(
+        [
+            _signal_result("criticism", "完全错了"),
+            _signal_result(
+                "criticism",
+                "批评了我",
+                target="OTHER",
+                subject="other",
+                intent="SINCERE",
+            ),
+            _signal_result("criticism", "你完全错了", factuality="quoted"),
+            _signal_result("reconciliation", "不怪你了", intent="SINCERE"),
+            _signal_result(
+                "none",
+                None,
+                target="UNKNOWN",
+                subject="unknown",
+                intent="UNCERTAIN",
+                factuality="uncertain",
+            ),
+        ]
+    )
+    texts = [
+        "你刚才那个回答完全错了",
+        "我老板今天批评了我",
+        '我朋友说“你完全错了”',
+        "好了，不怪你了，我们继续吧",
+        "现在帮我看看 Python 的列表推导式怎么写",
+    ]
+    states = []
+    agent_id = await _agent_id(rt)
+    for text in texts:
+        report = await say(person.person_id, "agent", text, conversation="emotion")
+        assert report.status == "COMPLETED", text
+        states.append(
+            await rt.emotion_service.get_state(agent_id, person.person_id)
+        )
+
+    events = await rt.emotion_service.repo.list_events(agent_id)
+    # Only the direct criticism and the repair applied; the third-party
+    # criticism and the quoted insult were rejected by local validation.
+    applied = [e for e in events if e.get("appraisal_rule_id")]
+    assert len(applied) == 2
+
+    assert states[0].emotion == "CONCERN"
+    assert states[0].relationship_tension > 0
+    assert states[3].relationship_tension < states[0].relationship_tension
+    # After the topic switch, tension neither rises nor re-fires criticism.
+    assert states[4].relationship_tension <= states[3].relationship_tension + 0.01

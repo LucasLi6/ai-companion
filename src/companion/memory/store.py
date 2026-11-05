@@ -47,19 +47,62 @@ _PER_KEYWORD_LIMIT = 20
 _RETRIEVAL_LIMIT = 50
 _CJK_RE = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
 
+# An unbroken CJK run longer than this is a whole clause, not a term. Storing
+# it would consume one of the few keyword slots without ever matching a real
+# memory (a memory is not a substring of the question).
+_MAX_FULL_CJK_KEYWORD = 8
+
+# High-frequency grammatical characters. A two-character window containing one
+# ("我想", "一下", "的项") is a poor search key, so it is tried only after the
+# content windows. Ordering only: none of these windows are discarded, so a
+# term that happens to contain one is still searchable when the budget allows.
+_CJK_FUNCTION_CHARS = frozenset(
+    "我你他她它您咱们的了着过是在有无和与及跟就都也还很太更最要会能可"
+    "以把被给对从到向于说想问请帮让使为而但如因所之其这那个一下上中里"
+    "吗呢吧啊呀嘛呗么什怎谁哪"
+)
+
 
 def _has_cjk(text: str) -> bool:
     return bool(_CJK_RE.search(text))
 
 
+def _cjk_keyword_candidates(token: str) -> list[str]:
+    """Order a CJK run's bigrams so content terms survive the keyword budget.
+
+    Both parities are used (start 0 and start 1), which together cover every
+    adjacent two-character window exactly once; content windows are emitted
+    first in text order, function-word windows afterwards. This reaches terms
+    at the end of a long clause instead of spending the budget on the leading
+    "我想 / 想问 / 问一" sequence.
+    """
+    windows: list[str] = []
+    for offset in (0, 1):
+        for i in range(offset, len(token) - 1, 2):
+            pair = token[i : i + 2]
+            if len(pair) == 2:
+                windows.append(pair)
+
+    def _rank(pair: str) -> tuple[bool, bool]:
+        # Pure-CJK content windows first, then mixed/ASCII content windows,
+        # then function-word windows. Ties keep text order (stable sort).
+        has_function = any(ch in _CJK_FUNCTION_CHARS for ch in pair)
+        pure_cjk = all(_CJK_RE.fullmatch(ch) for ch in pair)
+        return (has_function, not pure_cjk)
+
+    return sorted(windows, key=_rank)
+
+
 def extract_keywords(text: str | None, max_keywords: int = _MAX_KEYWORDS) -> list[str]:
     """Split free text into a small, ordered, de-duplicated keyword list.
 
-    Full whitespace/punctuation-delimited tokens come first. For CJK runs of
-    three or more characters, overlapping two-character windows are appended as
-    a segmenter-free fallback, so a clause like "机器学习是什么" can still
-    retrieve a memory containing "机器学习". No vector search, no segmenter —
-    both are explicitly out of scope.
+    Full whitespace/punctuation-delimited tokens come first, except that a long
+    unbroken CJK clause is never used whole (it cannot be a stored substring).
+    For CJK runs of three or more characters, two-character windows are added
+    as a segmenter-free fallback, content windows before function-word ones, so
+    a clause like "我想问一下关于机器学习的项目进度" still searches "机器",
+    "项目" and "进度". No vector search, no segmenter — both are explicitly out
+    of scope.
     """
     if not text:
         return []
@@ -84,13 +127,27 @@ def extract_keywords(text: str | None, max_keywords: int = _MAX_KEYWORDS) -> lis
         return len(out) >= max_keywords
 
     for token in tokens:
+        if _has_cjk(token) and len(token) > _MAX_FULL_CJK_KEYWORD:
+            # Do not lose an embedded ASCII term ("Python") just because it is
+            # glued to a long Chinese run.
+            for ascii_token in re.findall(r"[A-Za-z][A-Za-z0-9_+#.-]*", token):
+                if _add(ascii_token):
+                    return out
+            continue
         if _add(token):
             return out
-    for token in tokens:
-        if _has_cjk(token) and 3 <= len(token) <= 32:
-            for i in range(len(token) - 1):
-                if _add(token[i : i + 2]):
-                    return out
+
+    # Interleave the per-token candidate lists so one long clause cannot take
+    # the whole remaining budget before another token is considered.
+    candidate_lists = [
+        _cjk_keyword_candidates(token)
+        for token in tokens
+        if _has_cjk(token) and 3 <= len(token) <= 32
+    ]
+    for position in range(max((len(c) for c in candidate_lists), default=0)):
+        for candidates in candidate_lists:
+            if position < len(candidates) and _add(candidates[position]):
+                return out
     return out
 
 
@@ -155,6 +212,10 @@ class SqliteMemoryStore:
         by_id: dict[str, dict] = {
             memory["memory_id"]: memory for memory in identity
         }
+        # How many distinct query keywords each memory matched. Used only for
+        # ordering: a memory matching "机器/学习/项目" is more relevant than one
+        # that merely shares "今天", and the caller only sees the first few.
+        match_counts: dict[str, int] = {}
         if keywords:
             for keyword in keywords:
                 hits = await self.service.search(
@@ -165,7 +226,9 @@ class SqliteMemoryStore:
                     limit=_PER_KEYWORD_LIMIT,
                 )
                 for memory in hits:
-                    by_id.setdefault(memory["memory_id"], memory)
+                    memory_id = memory["memory_id"]
+                    match_counts[memory_id] = match_counts.get(memory_id, 0) + 1
+                    by_id.setdefault(memory_id, memory)
         elif not identity:
             for memory in await self.service.search(
                 access=access,
@@ -190,6 +253,7 @@ class SqliteMemoryStore:
         merged.sort(
             key=lambda m: (
                 1 if m.get("memory_id") in identity_ids else 0,
+                match_counts.get(m.get("memory_id"), 0),
                 m.get("updated_at") or "",
                 m.get("memory_id") or "",
             ),

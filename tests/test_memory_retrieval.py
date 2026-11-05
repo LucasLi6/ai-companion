@@ -57,6 +57,27 @@ def test_extract_keywords_cjk_bigrams():
     assert "学习" in kws
 
 
+def test_extract_keywords_reaches_the_end_of_a_long_cjk_clause():
+    # A long clause used to spend its whole keyword budget on the leading
+    # function words ("我想", "想问", "问一", ...), so the important terms at
+    # the end were never searched.
+    kws = extract_keywords("我想问一下关于机器学习的项目进度")
+    assert "机器" in kws
+    assert "项目" in kws
+    assert "进度" in kws
+    # The whole 18-character clause is not itself a useful search key: it can
+    # never be a substring of a stored memory.
+    assert "我想问一下关于机器学习的项目进度" not in kws
+
+
+def test_extract_keywords_keeps_short_cjk_phrases_whole():
+    # Short phrases remain first-class keywords; the change only affects long
+    # unpunctuated runs.
+    kws = extract_keywords("你好，今天怎么样？")
+    assert "你好" in kws
+    assert "今天怎么样" in kws
+
+
 # -- retrieval --------------------------------------------------------------
 
 
@@ -76,6 +97,54 @@ async def test_retrieve_cjk_bigram_matches(rt, register):
     ml = await _create(rt, person.person_id, "我喜欢机器学习")
     results = await rt.memory.retrieve("机器学习是什么？", person.person_id)
     assert ml.memory_id in {r["memory_id"] for r in results}
+
+
+async def test_retrieve_long_cjk_query_with_keyword_at_the_end(rt, register):
+    person = await register("Alice")
+    project = await _create(
+        rt, person.person_id, "Alice 的机器学习项目这个月进入部署阶段"
+    )
+    unrelated = await _create(rt, person.person_id, "Alice 周末喜欢去爬山")
+
+    results = await rt.memory.retrieve(
+        "我想问一下关于机器学习的项目进度", person.person_id
+    )
+    ids = {r["memory_id"] for r in results}
+    assert project.memory_id in ids
+    assert unrelated.memory_id not in ids
+
+
+async def test_retrieve_returns_every_matching_memory(rt, register):
+    # OR semantics: one turn may legitimately touch two memories.
+    person = await register("Alice")
+    project = await _create(rt, person.person_id, "机器学习项目进入部署阶段")
+    course = await _create(rt, person.person_id, "机器学习课程下周开课")
+    unrelated = await _create(rt, person.person_id, "我家猫很可爱")
+
+    results = await rt.memory.retrieve(
+        "机器学习项目现在怎么样了", person.person_id
+    )
+    ids = {r["memory_id"] for r in results}
+    assert project.memory_id in ids
+    assert course.memory_id in ids
+    assert unrelated.memory_id not in ids
+
+
+async def test_retrieve_ranks_multi_keyword_match_above_one_generic_word(
+    rt, register
+):
+    # Keyword retrieval is permissive (OR semantics), so a memory sharing only
+    # "今天" may still be returned. It must not outrank one that matches
+    # "机器/学习/项目", because only the first few reach the prompt.
+    person = await register("Alice")
+    unrelated = await _create(rt, person.person_id, "今天下雨了")
+    project = await _create(rt, person.person_id, "机器学习项目进入部署阶段")
+
+    results = await rt.memory.retrieve("今天机器学习项目进度", person.person_id)
+    ids = [r["memory_id"] for r in results]
+    assert project.memory_id in ids
+    assert unrelated.memory_id in ids  # documented keyword-OR limitation
+    assert ids.index(project.memory_id) < ids.index(unrelated.memory_id)
 
 
 async def test_retrieve_only_active(rt, register):

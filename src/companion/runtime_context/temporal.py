@@ -3,11 +3,12 @@
 These are three different questions and must not be collapsed into one:
 
 - **Last Heard** — when this speaker last said anything to the companion.
-- **Last Interaction** — when the companion last *did* something for this
-  speaker, including choosing silence (WAIT/IGNORE). It answers "did we have a
-  turn recently?", not "did we talk?".
-- **Last Meaningful Context** — when the companion last actually *said*
-  something (a visible RESPOND). A run of WAITs is not a conversation.
+- **Last Interaction** — when the companion last actually *replied* to this
+  speaker (a visible RESPOND). WAIT/IGNORE turns are not interactions: a run of
+  silence says nothing about when the two last talked.
+- **Last Meaningful Context** — currently the same RESPOND timestamp, kept as a
+  separate field so a future notion of "meaningful" can narrow it without
+  changing the answer to "how long since we talked?".
 
 Gaps are data. They are never converted into a fixed reply rule such as
 ``if gap > 86400: reply = "好久不见"``. The generation model receives the facts

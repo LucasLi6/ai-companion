@@ -70,6 +70,7 @@ from companion.emotion.expression_policy import compile_affect_context
 from companion.emotion.transition import build_conversational_affect
 from companion.memory.candidates import prepare_candidates
 from companion.memory.requests import (
+    is_conversation_count_request,
     is_earliest_history_request,
     is_memory_sample_request,
 )
@@ -1019,12 +1020,27 @@ class Orchestrator:
                 history_loaded = max(history_loaded, len(history_excerpt))
             steps.append(f"[HISTORY] Earliest excerpt ({len(history_excerpt)})")
 
+        # Exact counts are local facts. The model must cite these numbers
+        # rather than estimate them from the last chat time or the visible
+        # history window. Only this speaker's own records are counted.
+        conversation_stats = None
+        if is_conversation_count_request(event.text):
+            conversation_stats = await self.repos.utterance.conversation_stats(
+                person_id
+            )
+            steps.append(
+                f"[STATS] messages={conversation_stats['user_messages']}"
+                f" replies={conversation_stats['assistant_replies']}"
+                f" sessions={conversation_stats['sessions']}"
+            )
+
         return context.model_copy(
             update={
                 "memory_retrieval_status": status,
                 "memory_samples": samples,
                 "history_excerpt": history_excerpt,
                 "history_loaded": history_loaded,
+                "conversation_stats": conversation_stats,
             }
         )
 

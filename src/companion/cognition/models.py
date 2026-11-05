@@ -110,6 +110,10 @@ class CognitiveContext(BaseModel):
     history_excerpt: list[dict] = Field(default_factory=list)
     # How many recent turns the local builder actually loaded for this request.
     history_loaded: int = 0
+    # Trusted, read-only counts for the current speaker when they explicitly ask
+    # how much conversation history exists. ``None`` means no count was
+    # requested (never a guess of zero).
+    conversation_stats: Optional[dict] = Field(default=None)
     # V0.7: short, trusted summary of the *current* speaker's confirmed
     # understanding profile. It is background data about this person only,
     # never another person's profile and never an instruction.

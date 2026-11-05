@@ -45,8 +45,11 @@ def test_repl_mock_chat_and_commands(tmp_path, capsys, monkeypatch):
     assert "quiet_mode: off" in out
     assert "quiet_mode=on" in out
     assert "addressee -> human" in out
-    # Explicit human addressee is IGNORE, independent of the model.
-    assert "[IGNORE (direct_human_address)]" in out
+    # Explicit human addressee is IGNORE, independent of the model. In the
+    # ordinary chat surface that is complete silence: no assistant line and no
+    # internal action label. Only the greeting ("你好") got a reply.
+    assert "[IGNORE" not in out
+    assert out.count("assistant> ") == 1
 
 
 def test_repl_deepseek_without_key_fails_loudly(tmp_path, capsys, monkeypatch):
@@ -96,7 +99,28 @@ def test_repl_deepseek_defaults_to_agent_and_to_unknown_overrides(
         in out
     )
     assert "assistant> 模拟回复：我收到你的话了。" in out
-    assert "[WAIT (unknown_addressee)]" in out
+    # The unknown-addressee turn is a conservative WAIT: silent in chat mode.
+    assert "[WAIT" not in out
+
+
+def test_repl_debug_mode_shows_the_nonresponse_action(tmp_path, capsys, monkeypatch):
+    """``--debug`` keeps the action/reason visible without polluting chat."""
+    import companion.cli as climod
+
+    db = str(tmp_path / "cli.db")
+    main(["--db", db, "init"])
+    person_id = _add_person(capsys, db)
+
+    def fake_build(database, provider):
+        return climod.build_runtime(database, provider="mock")
+
+    monkeypatch.setattr(climod, "_build_foreground_runtime", fake_build)
+    _feed(["/to human", "自言自语", "/quit"], monkeypatch)
+    code = main(["--db", db, "repl", "--person", person_id, "--debug"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[IGNORE (direct_human_address)]" in out
 
 
 def test_say_deepseek_without_key_fails_loudly(tmp_path, capsys, monkeypatch):

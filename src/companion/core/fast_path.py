@@ -59,6 +59,10 @@ _WAIT_RE = re.compile(
     r"(?:说|聊|继续)?"
     r"|(?:我|我们)(?:先|还在|在)等(?:别人|朋友|其他人)"
     r"|(?:我|我们)(?:还)?(?:没|没有)说完"
+    # A whole-utterance thinking pause. Extra words after it ("我再想想这个
+    # 方案怎么改") do not match, so a real follow-up is still answered.
+    r"|(?:让我|容我|我)\s*(?:再|先)?\s*(?:想|考虑)"
+    r"(?:(?:想|考虑)|一下|一会儿?)?"
     r"|(?:先)?别急(?:着)?(?:回|回复|说)?)\s*[。.!！…]*\s*$"
 )
 
@@ -69,6 +73,23 @@ def looks_like_wait_request(text: str | None) -> bool:
     if not value or "?" in value or "？" in value:
         return False
     return bool(_WAIT_RE.search(value))
+
+
+# A pure backchannel ("嗯", "哦", "……") is a brief pause, not a turn that asks
+# for a reply. The match covers the *whole* utterance, so a filler inside a real
+# sentence ("嗯，那你觉得呢？") is still answered normally.
+_BACKCHANNEL_RE = re.compile(
+    r"^(?:嗯+|哦+|呃+|唔+|啊+|噢+|诶+|欸+|呵+|哈+|嘿+|…+|\.{2,}|。{2,})"
+    r"\s*[。.!！…，,]?\s*$"
+)
+
+
+def looks_like_backchannel(text: str | None) -> bool:
+    """Whether the utterance is a bare filler that does not expect a reply."""
+    value = " ".join(str(text or "").split())
+    if not value or "?" in value or "？" in value:
+        return False
+    return bool(_BACKCHANNEL_RE.search(value))
 
 
 def looks_like_direct_request(text: str | None) -> bool:
@@ -183,6 +204,17 @@ def assess_turn(
             reason=ReasonCode.RESPONSE_NOT_NECESSARY,
             reply_necessity=ReplyNecessity.UNNECESSARY,
             rule="local_wait_request",
+            addressee=hint,
+        )
+
+    # 3c. A bare backchannel ("嗯", "……") is a brief pause, not a request for
+    # an answer. A filler inside a longer sentence does not match.
+    if looks_like_backchannel(text):
+        return TurnAssessment(
+            action=CognitiveAction.WAIT,
+            reason=ReasonCode.RESPONSE_NOT_NECESSARY,
+            reply_necessity=ReplyNecessity.UNNECESSARY,
+            rule="local_backchannel",
             addressee=hint,
         )
 

@@ -333,6 +333,40 @@ class UtteranceRepository:
         rows = await cur.fetchall()
         return [r["event_id"] for r in rows]
 
+    async def conversation_stats(self, person_id: str) -> dict:
+        """Read-only counts for one speaker's own records.
+
+        Scope is exactly ``utterances.speaker_person_id = person_id``: a
+        conversation the speaker shares with other people contributes only
+        their own messages, and another person's messages/replies are never
+        attributed to them. Replies are counted by joining the action to its
+        source utterance, so only visible RESPOND turns are included.
+
+        This is a bounded stat query, not a general history dump: no message
+        text is read and no caller-supplied SQL is involved.
+        """
+        cur = await self.db.execute(
+            "SELECT COUNT(*) AS messages,"
+            " COUNT(DISTINCT conversation_id) AS sessions"
+            " FROM utterances WHERE speaker_person_id = ?",
+            (person_id,),
+        )
+        row = await cur.fetchone()
+        cur = await self.db.execute(
+            "SELECT COUNT(*) AS replies FROM agent_actions a"
+            " JOIN utterances u ON u.event_id = a.event_id"
+            " WHERE u.speaker_person_id = ?"
+            " AND a.action_type = 'RESPOND'"
+            " AND a.status IN ('COMPLETED', 'TRUNCATED')",
+            (person_id,),
+        )
+        replies = await cur.fetchone()
+        return {
+            "user_messages": int(row["messages"] if row else 0),
+            "assistant_replies": int(replies["replies"] if replies else 0),
+            "sessions": int(row["sessions"] if row else 0),
+        }
+
     async def recent_context(
         self,
         conversation_id: str,

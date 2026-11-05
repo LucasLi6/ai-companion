@@ -89,6 +89,32 @@ _SILENCE_PATTERNS = [
         r"\b(?:no|skip)\s+(?:reply|response)\s+(?:to\s+(?:this|that)\b|needed\b)",
         re.IGNORECASE,
     ),
+    # "不回答我说的话。" — bare 不 + verb, but only with an explicit object
+    # that is the speaker's *own* utterance. A question about why the AI was
+    # silent ("为什么 AI 有时候不回答？") and "不得不回答这个问题" (have to
+    # answer) do not carry that object, so they stay ordinary turns.
+    re.compile(
+        r"(?<!得)不\s*(?:回复|回答|回应)\s*"
+        r"我\s*(?:说|讲|打|发|写)?\s*(?:的)?\s*(?:话|消息|信息|内容|字)"
+    ),
+]
+
+# "跳过这个话。" / "这段先略过。" — skip the *current* message. These are
+# separate from the silence patterns so a preceding negation ("不要略过这段" =
+# don't skip it) is correctly *not* treated as a request to stay silent. The
+# object must refer to the current message; "跳过刚才的话题，现在帮我解释
+# Python。" refers to a previous topic and carries a new task, so the model
+# still sees it.
+_SKIP_PATTERNS = [
+    re.compile(
+        r"(?:跳过|略过)\s*(?:这|那|此|该)\s*(?:一)?\s*"
+        r"(?:(?:句|条|段|个)(?:话|消息|信息|内容|输入)?"
+        r"|(?:话|消息|信息|内容|输入))"
+    ),
+    re.compile(
+        r"(?:这|那|此|该)\s*(?:一)?\s*(?:句|条|段|个)"
+        r"(?:话|消息|信息|内容|输入)?\s*(?:先|暂时|现在)?\s*(?:跳过|略过)"
+    ),
 ]
 
 _REMEMBER_PATTERNS = [
@@ -144,10 +170,17 @@ def _has_direct_match(
 
 
 def detect_explicit_silence(text: str | None) -> bool:
-    """True when the speaker explicitly asks the agent not to reply now."""
+    """True when the speaker explicitly asks the agent not to reply now.
+
+    This covers both "don't answer" requests and "skip this message"
+    requests. A skip request that is itself negated ("不要略过这段" = don't
+    skip it) is not silence.
+    """
     if not text:
         return False
-    return _has_direct_match(text, _SILENCE_PATTERNS)
+    if _has_direct_match(text, _SILENCE_PATTERNS):
+        return True
+    return _has_direct_match(text, _SKIP_PATTERNS, skip_negated=True)
 
 
 def detect_explicit_remember(text: str | None) -> bool:

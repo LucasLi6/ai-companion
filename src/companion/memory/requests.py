@@ -34,6 +34,18 @@ _EARLIEST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# An explicit question about how much conversation history exists. Only an
+# unambiguous "how many conversations/messages/times" phrasing matches; a
+# topical "how many suggestions were in that conversation" does not.
+_COUNT_RE = re.compile(
+    r"(?:"
+    r"(?:多少|几)\s*(?:条|句|次|轮|个)\s*(?:对话|消息|聊天|交流)"
+    r"|(?:聊|说)(?:过|了)?\s*(?:多少|几)\s*(?:次|句|条|轮)"
+    r"|(?:how\s+many\s+(?:messages|conversations|times))\b"
+    r")",
+    re.IGNORECASE,
+)
+
 # Used only to decide whether the *past silence record* should accompany the
 # ordinary prompt. It does not change the reply decision.
 _PAST_SILENCE_RE = re.compile(
@@ -61,8 +73,18 @@ def is_past_silence_question(text: str | None) -> bool:
     return bool(text and _PAST_SILENCE_RE.search(text))
 
 
+def is_conversation_count_request(text: str | None) -> bool:
+    """An explicit question asking for a number of messages/conversations.
+
+    A match only attaches real, access-scoped counts to the prompt; it does not
+    change the reply decision and never reaches another speaker's records.
+    """
+    return bool(text and _COUNT_RE.search(text))
+
+
 __all__ = [
     "is_memory_sample_request",
     "is_earliest_history_request",
     "is_past_silence_question",
+    "is_conversation_count_request",
 ]

@@ -180,12 +180,20 @@ async def test_repl_reports_failure_truncation_and_cancellation(capsys):
     assert "[cancelled]" in capsys.readouterr().out
 
 
-async def test_repl_reports_wait_from_the_persisted_action(capsys):
+async def test_repl_is_silent_for_wait_but_debug_shows_the_action(capsys):
     action = SimpleNamespace(
         action_type=CognitiveAction.WAIT,
         reason_code=ReasonCode.AMBIGUOUS_ADDRESSEE,
     )
-    await _run_streaming_turn(_stub_runtime([], action=action), _event())
+    rt = _stub_runtime([], action=action)
+
+    # Ordinary chat: WAIT is intentional silence, with no assistant line and
+    # no internal action label.
+    await _run_streaming_turn(rt, _event())
+    assert capsys.readouterr().out == ""
+
+    # Diagnostics remain available explicitly.
+    await _run_streaming_turn(rt, _event(), debug=True)
     assert capsys.readouterr().out.strip() == "[WAIT (ambiguous_addressee)]"
 
 
