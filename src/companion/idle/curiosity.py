@@ -1,8 +1,9 @@
 """Curiosity engine: turn memory gaps into queued research questions.
 
 Questions are derived only from externally-authorised memories (via the
-context builder), so the text of a queued question can never leak a private
-memory of a person who has not granted ``allow_external_ai``.
+context builder), and the same consent filter is re-applied immediately before
+the provider call, so the text of a queued question can never leak a private
+memory of a person who has not granted — or has just revoked — ``allow_external_ai``.
 """
 
 from __future__ import annotations
@@ -78,6 +79,14 @@ class CuriosityEngine:
         real network search.
         """
         memories = await self.context_builder.external_context(limit=limit)
+        if self.source_guard is not None:
+            # Second pass immediately before the provider call: a person may
+            # have revoked ``allow_external_ai`` after the context was read.
+            memories = await self.source_guard.filter_external_safe(memories)
+        if not memories:
+            # Nothing may leave the machine, so do not call the model at all.
+            self.logger.info("curiosity_skipped reason=no_external_context")
+            return []
         moment_ids = {
             str(m.get("memory_id")) for m in memories if m.get("memory_id")
         }

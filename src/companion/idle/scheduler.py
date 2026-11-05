@@ -21,6 +21,24 @@ from companion.learning.state import LearningRepository
 from companion.tasks.models import TaskRejected
 
 
+async def _provider_label(provider) -> str | None:
+    """Name the mode this provider would actually use right now.
+
+    A settings-gated adapter keeps its class name (``gated-deepseek-idle``)
+    regardless of mode, so the run record must ask ``describe()`` for the
+    effective provider name instead of reading ``.name`` — otherwise a mock
+    cycle would be recorded under a real-looking name.
+    """
+    describe = getattr(provider, "describe", None)
+    if callable(describe):
+        try:
+            _, name = await describe()
+            return str(name)
+        except Exception:
+            pass
+    return getattr(provider, "name", None)
+
+
 class IdleScheduler:
     def __init__(
         self,
@@ -133,8 +151,8 @@ class IdleScheduler:
             "curiosity_limit": await self._int_setting("idle.curiosity_limit", 50),
             "research_limit": await self._int_setting("idle.research_limit", 3),
         }
-        provider_name = getattr(
-            getattr(self.reflection, "provider", None), "name", None
+        provider_name = await _provider_label(
+            getattr(self.reflection, "provider", None)
         )
         run_id = None
         if self.learning is not None:

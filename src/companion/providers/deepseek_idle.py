@@ -225,10 +225,19 @@ class DeepSeekIdleProvider:
         return proposals
 
     async def mode(self) -> str:
+        """Report the mode the *next call* would use, not a stale claim.
+
+        Real mode is only possible while the runtime gate is on; otherwise the
+        per-call gate raises on use, so reporting ``real`` would be a lie.
+        """
+        try:
+            await self._authorised()
+        except IdleProviderNotAuthorised:
+            return "unauthorised"
         return "real"
 
     async def describe(self) -> tuple[str, str]:
-        return "real", self.name
+        return await self.mode(), self.name
 
     async def synthesize(self, question: str, sources: list[dict]) -> str:
         await self._authorised()

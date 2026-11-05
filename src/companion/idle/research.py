@@ -35,7 +35,12 @@ from companion.tasks.models import (
 )
 
 from . import SYSTEM_ADMIN
-from .sources import ResearchSourceGuard, SourceDecision
+from .sources import (
+    ResearchSourceGuard,
+    SourceDecision,
+    authorize_external_operation,
+    source_ids_from_task,
+)
 
 
 class ResearchSourceBlocked(RuntimeError):
@@ -142,38 +147,75 @@ class ResearchEngine:
             "real_research": search_state == "real" and synth_mode == "real",
         }
 
-    async def _authorize_execution(self, task: dict) -> None:
-        """Refuse a real network call unless enabled and sources are valid.
+    async def _external_modes(self) -> tuple[str, str]:
+        """Resolve (search, synthesis) modes at call time."""
+        search_mode = await self._search_state()
+        synth_mode = await self._provider_mode(self.deepseek, default="mock")
+        return search_mode, synth_mode
 
-        Offline/mock providers remain usable for tests and local demos. A real
-        provider needs the live setting *and* an origin whose source memories
-        are still safe to export. Legacy rows without source ids are refused
-        conservatively rather than sending a potentially private query.
+    async def _authorize_execution(
+        self, task: dict, *, operation: str = "AI_SYNTHESIS"
+    ) -> None:
+        """Authorise an external send immediately before it happens.
+
+        Permission is required whenever *any* data may leave the machine: a
+        real web search **or** a real DeepSeek synthesis. A mock-only run
+        (both stages local) stays offline and is not gated. When either stage
+        is real, the task's originating memories must still exist and every
+        PERSON subject must still hold ``allow_external_ai`` — storing a fact
+        locally (``allow_memory_learning``) is not permission to export it.
+
+        User-submitted (``origin='user'``) public questions take the separate
+        ``user_submitted`` source path but still pass the web-search setting
+        checks. A configuration error (disabled/missing key) is raised as a
+        retryable ``RuntimeError``; a source/consent failure raises
+        :class:`ResearchSourceBlocked`, which the caller maps to a terminal
+        cancellation (revoked) or failure (unverifiable source).
         """
-        state = await self._search_state()
-        real_provider = getattr(self.web_search, "is_real_network", False) or (
-            getattr(self.web_search, "name", "") == "http-web-search"
-        )
-        if state in ("disabled",):
+        search_mode, synth_mode = await self._external_modes()
+
+        # A broken real-search configuration is reported truthfully instead of
+        # being silently replaced by mock results. Only a search attempt needs
+        # a working search provider; a resumed synthesis must not be blocked
+        # by a search setting that no longer matters to it.
+        if operation == "WEB_SEARCH" and search_mode == "disabled":
             raise RuntimeError(
                 "real web search is not authorised (web_search.enabled=false)"
             )
-        if state in ("unconfigured", "misconfigured"):
+        if operation == "WEB_SEARCH" and search_mode in (
+            "unconfigured",
+            "misconfigured",
+        ):
             raise RuntimeError(
                 "real web search is not configured (brave_api_key_missing)"
             )
-        if state != "real":
-            return
-        if real_provider and self.settings is not None:
+        external_search = search_mode == "real"
+        external_synthesis = synth_mode == "real"
+        if external_search and self.settings is not None:
             if not await self.settings.get_bool("web_search.enabled", False):
                 raise RuntimeError(
-                    "real web search is not authorised (web_search.enabled=false)"
+                    "real web search is not authorised"
+                    " (web_search.enabled=false)"
                 )
+        if not (external_search or external_synthesis):
+            return
         if self.source_guard is None:
             return
-        decision = await self.source_guard.check(task, network_required=True)
+        decision = await authorize_external_operation(
+            self.source_guard,
+            source_memory_ids=source_ids_from_task(task),
+            origin=str(task.get("origin") or "legacy"),
+            operation=operation,
+        )
         if decision.allowed:
             return
+        self.logger.info(
+            "research_external_send_blocked research_id=%s operation=%s"
+            " reason=%s",
+            task.get("task_id"),
+            operation,
+            decision.reason,
+        )
         raise ResearchSourceBlocked(
             decision.reason,
             terminal_cancel=decision.reason == "permission_revoked",
@@ -225,6 +267,23 @@ class ResearchEngine:
             else:
                 await self._run_new(task)
                 self.logger.info("research_completed research_id=%s", task_id)
+        except ResearchSourceBlocked as blocked:
+            # A permission denial is not a transient failure: retrying the
+            # same task cannot succeed, so it terminates here. A revoked
+            # grant cancels; an unverifiable source fails truthfully.
+            task = await self.research_repo.get(task_id)
+            if task is not None and task["status"] == "RUNNING":
+                if blocked.terminal_cancel:
+                    await self.research_repo.cancel_owned(task_id, owner)
+                else:
+                    await self.research_repo.fail_owned(
+                        task_id, owner, blocked.reason
+                    )
+            self.logger.warning(
+                "research_source_blocked research_id=%s reason=%s",
+                task_id,
+                blocked.reason,
+            )
         except Exception as exc:  # noqa: BLE001 — retryable vs permanent.
             task = await self.research_repo.get(task_id)
             if task and task["attempts"] >= task["max_attempts"]:
@@ -236,10 +295,9 @@ class ResearchEngine:
         return await self.research_repo.get(task_id)
 
     async def _run_new(self, task: dict) -> None:
-        # Real network search must be both currently enabled and authorised,
-        # and every originating memory source must still be exportable. A
-        # mock provider never hits the network; a real one refuses otherwise.
-        await self._authorize_execution(task)
+        # Every external send (real search and/or real synthesis) is gated on
+        # live settings and source consent; a mock-only run stays local.
+        await self._authorize_execution(task, operation="WEB_SEARCH")
 
         search_limit = max(1, await self._setting_int("research.search_limit", self.search_limit))
         excerpt_chars = max(80, await self._setting_int("research.excerpt_chars", 500))
@@ -287,8 +345,12 @@ class ResearchEngine:
                 result_count=len(results),
             )
             sources, excerpts = await self._persist_sources(
-                task, results, run_id, excerpt_chars, refresh_seconds
+                task, results, run_id, excerpt_chars, refresh_seconds,
+                provider_name=web_name,
             )
+            # Re-check immediately before the provider receives any data: a
+            # consent change after the search must still block the synthesis.
+            await self._authorize_execution(task, operation="AI_SYNTHESIS")
             summary = await self.deepseek.synthesize(
                 task["question"], [asdict(r) for r in results]
             )
@@ -329,14 +391,24 @@ class ResearchEngine:
             raise
 
     async def _persist_sources(
-        self, task: dict, results, run_id: str, excerpt_chars: int, refresh_seconds: int
+        self,
+        task: dict,
+        results,
+        run_id: str,
+        excerpt_chars: int,
+        refresh_seconds: int,
+        *,
+        provider_name: str | None = None,
     ) -> tuple[list[MemorySource], list[str]]:
         """Record durable sources + bounded excerpts, returning memory sources.
 
         A search hit is stored as an UNVERIFIED source candidate. Its snippet
-        is quoted (bounded) material, never an instruction.
+        is quoted (bounded) material, never an instruction. ``provider_name``
+        is the *resolved* provider (for example ``brave-web-search``), not the
+        settings wrapper's name, so a stored source keeps a truthful label.
         """
-        provider_name = getattr(self.web_search, "name", None)
+        if provider_name is None:
+            provider_name = await self._provider_name(self.web_search)
         sources: list[MemorySource] = []
         excerpt_ids: list[str] = []
         for i, r in enumerate(results):
@@ -652,10 +724,18 @@ class ResearchEngine:
         commit=None,
     ) -> None:
         started_from_checkpoint = bool(state.get("stage"))
+        stage = str(state.get("stage") or "START")
         # Re-checked on every resume: a disabled network, revoked consent or an
         # unverifiable legacy source stops the task before any external send,
         # including the synthesis call for a task whose search already ran.
-        await self._authorize_execution(task)
+        # The mode used by each completed stage is checkpointed below so a
+        # config change mid-task cannot relabel old mock evidence as real.
+        resume_operation = (
+            "AI_SYNTHESIS"
+            if stage in {"SEARCHED", "ANALYZED", "SAVING", "SAVED", "DONE"}
+            else "WEB_SEARCH"
+        )
+        await self._authorize_execution(task, operation=resume_operation)
 
         search_limit = max(
             1, await self._setting_int("research.search_limit", self.search_limit)
@@ -704,10 +784,13 @@ class ResearchEngine:
                 )
             await save({"stage": "START", "project_id": project_id, "run_id": run_id})
 
-        stage = str(state.get("stage") or "START")
         if stage not in {"SEARCHED", "ANALYZED", "SAVING", "SAVED", "DONE"}:
             await pause_if_needed()
             # -- SEARCH ----------------------------------------------------
+            # Re-authorise immediately before the search request: the pause
+            # boundary above may have yielded long enough for consent to be
+            # revoked.
+            await self._authorize_execution(task, operation="WEB_SEARCH")
             results = await self.web_search.search(
                 task["question"], limit=search_limit
             )
@@ -718,7 +801,8 @@ class ResearchEngine:
                 result_count=len(results),
             )
             sources, excerpts = await self._persist_sources(
-                task, results, run_id, excerpt_chars, refresh_seconds
+                task, results, run_id, excerpt_chars, refresh_seconds,
+                provider_name=web_name,
             )
             state["search_results"] = [asdict(r) for r in results]
             state["source_ids"] = [source.source_id for source in sources]
@@ -734,6 +818,11 @@ class ResearchEngine:
                 for source in sources
             ]
             state["excerpt_ids"] = excerpt_ids
+            # Record the mode that *actually* produced these results. A later
+            # resume may see a different provider configuration, but old mock
+            # results must never be relabelled as real search evidence.
+            state["search_mode_used"] = web_state
+            state["search_provider_used"] = web_name
             state["stage"] = "SEARCHED"
             await save(dict(state))
             stage = "SEARCHED"
@@ -743,9 +832,15 @@ class ResearchEngine:
             # -- ANALYZE ---------------------------------------------------
             summary = state.get("summary")
             if not summary:
+                # The synthesis question and snippets leave the machine for a
+                # real provider; re-check consent right before the call even
+                # though a SEARCHED checkpoint already exists.
+                await self._authorize_execution(task, operation="AI_SYNTHESIS")
                 summary = await self.deepseek.synthesize(
                     task["question"], list(state.get("search_results") or [])
                 )
+                state["synthesis_mode_used"] = synth_mode
+                state["synthesis_provider_used"] = synth_name
                 claim_id = f"claim:{task['task_id']}"
                 await self.state.record_claim(
                     summary,
@@ -784,6 +879,19 @@ class ResearchEngine:
             # -- SAVE ------------------------------------------------------
             summary = state.get("summary") or ""
             sources = self._sources_from_state(task, state)
+            # The job result must describe the modes that actually produced
+            # this knowledge, not whatever the provider happens to be now.
+            result_metadata = {
+                "search_provider": state.get("search_provider_used") or web_name,
+                "search_mode": state.get("search_mode_used") or web_state,
+                "synthesis_provider": state.get("synthesis_provider_used")
+                or synth_name,
+                "synthesis_mode": state.get("synthesis_mode_used") or synth_mode,
+            }
+            result_metadata["real_research"] = (
+                result_metadata["search_mode"] == "real"
+                and result_metadata["synthesis_mode"] == "real"
+            )
             state["stage"] = "SAVING"
             await save(dict(state))
             await self._consolidate(
@@ -793,7 +901,7 @@ class ResearchEngine:
                 sources=sources,
                 owner_id=owner_id,
                 commit=commit,
-                metadata=metadata,
+                metadata=result_metadata,
             )
             try:
                 await self.state.finish_run(
@@ -878,7 +986,11 @@ class ResearchEngine:
         metadata: dict | None = None,
     ) -> None:
         memory_id = f"mem:{task['task_id']}"
-        provider_name = getattr(self.web_search, "name", None)
+        provider_name = (
+            sources[0].provider
+            if sources and getattr(sources[0], "provider", None)
+            else getattr(self.web_search, "name", None)
+        )
         if sources is None:
             sources = []
             for i, r in enumerate(results):

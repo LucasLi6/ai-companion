@@ -1,7 +1,8 @@
 """Source and permission checks for autonomous research.
 
 A curiosity question is derived from one or more memory records. That origin
-is recorded with the task and re-validated before every real network search:
+is recorded with the task and re-validated before every *external send* — a
+real web search **or** a real DeepSeek synthesis, not only a network search:
 
 - every source id must still exist and be ``ACTIVE``;
 - a ``PUBLIC`` memory is safe to send;
@@ -19,6 +20,7 @@ is a separate source mechanism and does not read private memories.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -53,11 +55,18 @@ class ResearchSourceGuard:
     def __init__(self, memory_service, registry, *, logger=None) -> None:
         self.memory_service = memory_service
         self.registry = registry
-        self.logger = logger
+        self.logger = logger or logging.getLogger("companion.idle.sources")
 
     async def check(
         self, task: dict, *, network_required: bool
     ) -> SourceDecision:
+        """Authorise the task's sources for an *external send*.
+
+        ``network_required`` is retained for compatibility, but its meaning is
+        broader than web search: ``True`` means at least one real external
+        provider will receive data (real search **or** real synthesis).
+        ``False`` is the offline/mock path, where nothing leaves the machine.
+        """
         origin = str(task.get("origin") or "legacy")
         if origin == "user":
             # The query is the user's own public submission, not extracted
@@ -107,6 +116,34 @@ class ResearchSourceGuard:
                 allowed.add(str(memory_id))
         return allowed
 
+    async def filter_external_safe(self, memories: list[dict]) -> list[dict]:
+        """Drop memories that lost external-send consent after being read.
+
+        Used by reflection and curiosity immediately before the provider call.
+        The context builder already filters at read time; this second pass
+        closes the read→send window in which a person may revoke
+        ``allow_external_ai``. Each memory is re-checked with the same
+        :meth:`check` rule used for research, so there is one consent rule and
+        one place to audit it. No model call and no network call is made here.
+        """
+        safe: list[dict] = []
+        for memory in memories:
+            memory_id = memory.get("memory_id")
+            if not memory_id:
+                continue
+            decision = await self.check(
+                {"origin": "curiosity", "source_memory_ids": [str(memory_id)]},
+                network_required=True,
+            )
+            if decision.allowed:
+                safe.append(memory)
+            else:
+                self.logger.info(
+                    "idle_external_context_dropped reason=%s",
+                    decision.reason,
+                )
+        return safe
+
     async def _memory_is_external_safe(self, memory_id: str) -> bool:
         view = await self.memory_service.get_view(memory_id, SYSTEM_ADMIN)
         if view is None:
@@ -130,9 +167,37 @@ class ResearchSourceGuard:
         return True
 
 
+async def authorize_external_operation(
+    guard: ResearchSourceGuard,
+    *,
+    source_memory_ids: list[str],
+    origin: str,
+    operation: str,
+) -> SourceDecision:
+    """Unified external-send authorisation for off-task learning.
+
+    Autonomous research calls this immediately before each external send
+    (search and synthesis). Reflection and curiosity apply the same
+    :meth:`ResearchSourceGuard.check` rule through
+    :meth:`ResearchSourceGuard.filter_external_safe` right before their model
+    call, so every path shares one consent rule. This function performs
+    **no** network call and **no** model call; it only reads stored consent
+    and memory state.
+
+    ``operation`` is a label for audit/logging — ``WEB_SEARCH``,
+    ``AI_REFLECTION``, ``AI_CURIOSITY`` or ``AI_SYNTHESIS``. It is never a
+    Router category and never changes routing behaviour.
+    """
+    return await guard.check(
+        {"origin": origin, "source_memory_ids": list(source_memory_ids)},
+        network_required=True,
+    )
+
+
 __all__ = [
     "ResearchSourceGuard",
     "SourceDecision",
     "source_ids_from_task",
+    "authorize_external_operation",
     "SYSTEM_ADMIN",
 ]

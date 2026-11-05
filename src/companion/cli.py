@@ -1390,36 +1390,77 @@ async def _provider_report_line(rt) -> str:
     )
 
 
+async def _idle_provider_status(rt) -> list[str]:
+    """Truthful per-stage provider status, read from the live providers.
+
+    Reflection, curiosity and research synthesis share one idle provider, so
+    all three report the same synthesis mode. Nothing here is hardcoded: an
+    unauthorised real adapter reports ``unauthorised`` rather than claiming to
+    be real.
+    """
+    engine = getattr(rt, "research_engine", None)
+    if engine is None or not hasattr(engine, "provider_report"):
+        return ["Idle Provider: mock (mock)"]
+    try:
+        report = await engine.provider_report()
+    except Exception as exc:  # a config/credential error is surfaced, not hidden
+        return [f"provider_error={type(exc).__name__}: {exc}"]
+    synthesis_mode = report.get("synthesis_mode") or "mock"
+    synthesis_provider = report.get("synthesis_provider") or "mock-deepseek"
+    search_mode = report.get("search_mode") or "mock"
+    search_provider = report.get("search_provider") or "mock-web-search"
+    return [
+        f"Idle Provider: {synthesis_provider} ({synthesis_mode})",
+        f"Reflection: {synthesis_mode}",
+        f"Curiosity: {synthesis_mode}",
+        f"Research Search: {search_provider} ({search_mode})",
+        f"Research Synthesis: {synthesis_provider} ({synthesis_mode})",
+    ]
+
+
 async def cmd_idle_run(args) -> int:
     db = await _connect(args.db)
+    real_provider = bool(getattr(args, "real_provider", False))
     try:
         try:
-            rt = build_runtime(
-                db,
-                real_idle_provider=bool(getattr(args, "real_provider", False)),
-            )
+            rt = build_runtime(db, real_idle_provider=real_provider)
         except Exception as exc:  # missing DEEPSEEK_API_KEY / config
             print(f"error: {exc}")
             return 1
+        if real_provider and not await rt.repos.settings.get_bool(
+            "idle.real_deepseek.enabled", False
+        ):
+            # No silent real->mock downgrade: refuse instead of pretending.
+            print(
+                "error: real idle provider is not authorised"
+                " (set idle.real_deepseek.enabled=true)"
+            )
+            return 1
         try:
             scheduler = await _build_idle_scheduler(rt)
-            print(f"provider: {await _provider_report_line(rt)}")
+            for line in await _idle_provider_status(rt):
+                print(line)
         except Exception as exc:  # missing key / unauthorised real provider
             print(f"error: {exc}")
             return 1
-        result = await scheduler.run_cycle()
-        if result["skipped"]:
-            print("idle learning is disabled (set idle.enabled=true to enable)")
-        else:
-            print(
-                f"reflections={result['reflections']} questions={result['questions']}"
-                f" research={result['research']}"
-            )
-            # Execution stays on the worker path. Draining here makes the CLI
-            # useful end-to-end without introducing a second executor.
-            if rt.worker is not None:
-                processed = await rt.worker.run_until_idle()
-                print(f"worker_processed={processed}")
+        try:
+            result = await scheduler.run_cycle()
+            if result["skipped"]:
+                print("idle learning is disabled (set idle.enabled=true to enable)")
+            else:
+                print(
+                    f"reflections={result['reflections']}"
+                    f" questions={result['questions']}"
+                    f" research={result['research']}"
+                )
+                # Execution stays on the worker path. Draining here makes the
+                # CLI useful end-to-end without introducing a second executor.
+                if rt.worker is not None:
+                    processed = await rt.worker.run_until_idle()
+                    print(f"worker_processed={processed}")
+        except Exception as exc:
+            print(f"error: {exc}")
+            return 1
     finally:
         await db.close()
     return 0

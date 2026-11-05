@@ -40,14 +40,26 @@ def build_idle_scheduler(
     the foreground reflection/curiosity providers used by tests, never the
     executing Worker's global handler. That avoids a second research engine
     (and a second provider) racing the real one.
+
+    V0.9.3: reflection, curiosity and research share **one** idle provider by
+    default — the runtime research engine's ``deepseek`` (the settings-gated
+    DeepSeek adapter). Offline runs therefore stay on the deterministic mock,
+    and an authorised real run uses the same instance for every stage instead
+    of silently pairing real research synthesis with mock reflection/curiosity.
     """
-    reflection_provider = deepseek or DeepSeekProvider()
     settings = settings or runtime.repos.settings
     builder = IdleMemoryContextBuilder(
         runtime.memory_service, runtime.registry, audit=runtime.repos.audit
     )
     task_service = getattr(runtime, "task_service", None)
     research = getattr(runtime, "research_engine", None)
+
+    idle_provider = deepseek
+    if idle_provider is None and research is not None:
+        idle_provider = getattr(research, "deepseek", None)
+    if idle_provider is None:
+        idle_provider = DeepSeekProvider()
+
     if research is None:
         # Only a runtime built without the normal wiring needs a fallback.
         # This is not registered over an existing handler.
@@ -57,27 +69,29 @@ def build_idle_scheduler(
             runtime.memory_service,
             runtime.repos.research,
             web_search or MockWebSearchProvider(),
-            reflection_provider,
+            idle_provider,
             settings=settings,
             state=runtime.repos.research_state,
             source_guard=ResearchSourceGuard(
                 runtime.memory_service, runtime.registry
             ),
         )
+    source_guard = getattr(research, "source_guard", None)
     reflection = ReflectionEngine(
         runtime.memory_service,
-        reflection_provider,
+        idle_provider,
         builder,
         learning=runtime.repos.learning,
+        source_guard=source_guard,
     )
     curiosity = CuriosityEngine(
         runtime.memory_service,
-        reflection_provider,
+        idle_provider,
         runtime.repos.research,
         builder,
         learning=runtime.repos.learning,
         task_service=task_service,
-        source_guard=getattr(research, "source_guard", None),
+        source_guard=source_guard,
         settings=settings,
     )
     return IdleScheduler(
