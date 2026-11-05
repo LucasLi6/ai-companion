@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from companion.domain.enums import (
     AddresseeHint,
@@ -1156,7 +1156,9 @@ class JobRepository:
     _COLUMNS = (
         "job_id, job_key, job_type, payload, status, attempts, max_attempts,"
         " last_error, created_at, started_at, completed_at, owner_id,"
-        " lease_expires_at, heartbeat_at, next_run_at"
+        " lease_expires_at, heartbeat_at, next_run_at, priority, source_kind,"
+        " source_ref, execution_mode, checkpoint_json, cancel_requested,"
+        " result_json"
     )
 
     def __init__(self, db: Database) -> None:
@@ -1169,33 +1171,57 @@ class JobRepository:
         payload: dict,
         max_attempts: int = 3,
         next_run_at: Optional[datetime] = None,
+        *,
+        priority: str = "NORMAL",
+        source_kind: str = "SYSTEM",
+        source_ref: Optional[str] = None,
+        execution_mode: str = "BACKGROUND",
+        checkpoint: Optional[dict] = None,
     ) -> str:
         """Enqueue a job, deduplicating on ``job_key``.
 
         Returns the *existing* job id if ``job_key`` is already present, so
-        re-submitting the same event never creates a second job.
+        re-submitting the same event never creates a second job. Insertion and
+        the dedupe lookup happen in one transaction: two concurrent submissions
+        cannot both insert the same key (the UNIQUE constraint wins), and both
+        callers observe the same durable task id.
         """
-        existing = await self.get_by_key(job_key)
-        if existing is not None:
-            return existing.job_id
         from companion.domain.models import new_id, utcnow
 
+        type_value = job_type.value if isinstance(job_type, JobType) else str(job_type)
         job_id = new_id("job")
-        await self.db.execute(
-            "INSERT INTO processing_jobs(job_id, job_key, job_type, payload, status,"
-            " attempts, max_attempts, created_at, next_run_at)"
-            " VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)",
-            (
-                job_id,
-                job_key,
-                job_type.value,
-                json.dumps(payload),
-                max_attempts,
-                _iso(utcnow()),
-                _iso(next_run_at) if next_run_at is not None else None,
-            ),
-        )
-        return job_id
+        async with self.db.transaction(immediate=True):
+            cur = await self.db.execute(
+                "INSERT OR IGNORE INTO processing_jobs(job_id, job_key, job_type,"
+                " payload, status, attempts, max_attempts, created_at, next_run_at,"
+                " priority, source_kind, source_ref, execution_mode,"
+                " checkpoint_json, cancel_requested)"
+                " VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (
+                    job_id,
+                    job_key,
+                    type_value,
+                    json.dumps(payload),
+                    max_attempts,
+                    _iso(utcnow()),
+                    _iso(next_run_at) if next_run_at is not None else None,
+                    priority,
+                    source_kind,
+                    source_ref,
+                    execution_mode,
+                    json.dumps(checkpoint) if checkpoint else None,
+                ),
+            )
+            if (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1:
+                return job_id
+            cur = await self.db.execute(
+                "SELECT job_id FROM processing_jobs WHERE job_key = ?",
+                (job_key,),
+            )
+            row = await cur.fetchone()
+            if row is None:  # Extremely defensive: a concurrent delete.
+                raise RuntimeError(f"job {job_key!r} vanished during enqueue")
+            return row["job_id"]
 
     async def get(self, job_id: str) -> ProcessingJob | None:
         cur = await self.db.execute(
@@ -1217,25 +1243,80 @@ class JobRepository:
             return None
         return self._to_job(row)
 
-    async def pending(self, limit: int = 100) -> list[ProcessingJob]:
-        """Jobs that are due now, oldest first.
+    async def pending(
+        self,
+        limit: int = 100,
+        *,
+        include_foreground: bool = False,
+        now: datetime | None = None,
+    ) -> list[ProcessingJob]:
+        """Jobs that are due now, ordered by priority then creation time.
 
         ``next_run_at`` delays a job (used by the batched background
-        extraction). A job whose delay has not elapsed is still ``PENDING`` in
-        the database — it is simply not claimable yet, so a restart or a manual
-        ``jobs list`` still sees it.
+        extraction and by a cooperative pause). A delayed job is still
+        ``PENDING`` in the database — it is simply not claimable yet, so a
+        restart or a manual ``jobs list`` still sees it.
+
+        Foreground tasks are executed by ``TaskService.execute_now`` and are
+        excluded by default: the background poller must never race a caller
+        that is already waiting for the result. ``include_foreground=True`` is
+        available for inspection/manual tooling.
         """
         from companion.domain.models import utcnow
 
+        if now is None:
+            now = utcnow()
+        mode_clause = "" if include_foreground else " AND execution_mode = 'BACKGROUND'"
         cur = await self.db.execute(
             f"SELECT {self._COLUMNS} FROM processing_jobs"
             " WHERE status = 'PENDING'"
+            "   AND cancel_requested = 0"
             "   AND (next_run_at IS NULL OR next_run_at <= ?)"
-            " ORDER BY created_at ASC LIMIT ?",
-            (_iso(utcnow()), limit),
+            f"{mode_clause}"
+            " ORDER BY CASE priority"
+            "            WHEN 'HIGH' THEN 0 WHEN 'NORMAL' THEN 1"
+            "            WHEN 'LOW' THEN 2 ELSE 1 END,"
+            "          created_at ASC LIMIT ?",
+            (_iso(now), limit),
         )
         rows = await cur.fetchall()
         return [self._to_job(r) for r in rows]
+
+    async def count_pending(self, *, autonomous_only: bool = False) -> int:
+        sql = "SELECT COUNT(*) AS n FROM processing_jobs WHERE status = 'PENDING'"
+        params: tuple = ()
+        if autonomous_only:
+            sql += " AND source_kind != 'USER'"
+        cur = await self.db.execute(sql, params)
+        row = await cur.fetchone()
+        return int(row["n"]) if row is not None else 0
+
+    async def count_running(self, job_types: tuple[str, ...]) -> int:
+        if not job_types:
+            return 0
+        placeholders = ",".join("?" for _ in job_types)
+        cur = await self.db.execute(
+            f"SELECT COUNT(*) AS n FROM processing_jobs"
+            f" WHERE status = 'RUNNING' AND job_type IN ({placeholders})",
+            tuple(job_types),
+        )
+        row = await cur.fetchone()
+        return int(row["n"]) if row is not None else 0
+
+    async def promote_foreground(self, job_id: str) -> bool:
+        """Turn a queued background job into a foreground execution.
+
+        Only a PENDING job may be promoted. This lets an explicit user request
+        reuse an already-queued background task instead of duplicating it,
+        while never stealing a job another process is running.
+        """
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET execution_mode = 'FOREGROUND',"
+            " priority = 'HIGH', next_run_at = NULL"
+            " WHERE job_id = ? AND status = 'PENDING'",
+            (job_id,),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
 
     async def list_jobs(self, status: JobStatus | None = None) -> list[ProcessingJob]:
         sql = f"SELECT {self._COLUMNS} FROM processing_jobs"
@@ -1269,7 +1350,8 @@ class JobRepository:
             "UPDATE processing_jobs SET status = 'RUNNING', attempts = attempts + 1,"
             " owner_id = ?, lease_expires_at = ?, heartbeat_at = ?,"
             " started_at = COALESCE(started_at, ?), last_error = NULL"
-            " WHERE job_id = ? AND status = 'PENDING' AND attempts < max_attempts",
+            " WHERE job_id = ? AND status = 'PENDING' AND attempts < max_attempts"
+            " AND cancel_requested = 0",
             (
                 owner_id,
                 _iso(lease) if lease is not None else None,
@@ -1299,23 +1381,176 @@ class JobRepository:
         )
         return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
 
-    async def complete(self, job_id: str) -> None:
+    async def complete(self, job_id: str, result: Any = None) -> None:
         from companion.domain.models import utcnow
 
         await self.db.execute(
             "UPDATE processing_jobs SET status = 'COMPLETED', completed_at = ?,"
+            " result_json = COALESCE(?, result_json),"
             " owner_id = NULL, lease_expires_at = NULL WHERE job_id = ?",
+            (
+                _iso(utcnow()),
+                json.dumps(result, ensure_ascii=False, default=str)
+                if result is not None
+                else None,
+                job_id,
+            ),
+        )
+
+    async def complete_owned(
+        self, job_id: str, owner_id: str, result: Any = None
+    ) -> bool:
+        """Commit a result only while this worker still owns the lease.
+
+        A worker that lost its lease (or whose job was cancelled/reclaimed)
+        must not mark the work completed. The caller reports failure rather
+        than claiming success.
+        """
+        from companion.domain.models import utcnow
+
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET status = 'COMPLETED', completed_at = ?,"
+            " result_json = COALESCE(?, result_json),"
+            " owner_id = NULL, lease_expires_at = NULL"
+            " WHERE job_id = ? AND status = 'RUNNING' AND owner_id = ?"
+            " AND cancel_requested = 0",
+            (
+                _iso(utcnow()),
+                json.dumps(result, ensure_ascii=False, default=str)
+                if result is not None
+                else None,
+                job_id,
+                owner_id,
+            ),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+
+    async def cancel(self, job_id: str) -> bool:
+        """Request cancellation, terminal immediately for a PENDING job.
+
+        A RUNNING job cannot be killed inside a database transaction or an
+        in-flight external request; the flag is cooperative. The worker checks
+        it before claiming and after the handler returns. Returns ``True`` when
+        the job is already terminal as CANCELLED or the request was recorded.
+        """
+        from companion.domain.models import utcnow
+
+        now = _iso(utcnow())
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET status = 'CANCELLED', cancel_requested = 1,"
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE job_id = ? AND status = 'PENDING'",
+            (now, job_id),
+        )
+        if (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0:
+            return True
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET cancel_requested = 1"
+            " WHERE job_id = ? AND status = 'RUNNING'",
+            (job_id,),
+        )
+        if (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0:
+            return True
+        job = await self.get(job_id)
+        return job is not None and job.status == JobStatus.CANCELLED
+
+    async def cancel_pending_for_source(
+        self, source_kind: str, source_ref: str
+    ) -> int:
+        """Trusted, queue-independent cancellation for a revoked source."""
+        from companion.domain.models import utcnow
+
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET status = 'CANCELLED', cancel_requested = 1,"
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE status = 'PENDING' AND source_kind = ? AND source_ref = ?",
+            (_iso(utcnow()), source_kind, source_ref),
+        )
+        return cur.rowcount if hasattr(cur, "rowcount") else 0
+
+    async def cancellation_requested(self, job_id: str) -> bool:
+        cur = await self.db.execute(
+            "SELECT cancel_requested FROM processing_jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        row = await cur.fetchone()
+        return bool(row["cancel_requested"]) if row is not None else False
+
+    async def save_checkpoint(self, job_id: str, checkpoint: dict) -> None:
+        """Persist a checkpoint by merging it into the existing document.
+
+        Stage outputs are stored by stable reference; callers must not put
+        unbounded raw text here. The merge means a handler can save one field
+        at a time without losing earlier stages.
+        """
+        job = await self.get(job_id)
+        merged = dict(job.checkpoint) if job is not None else {}
+        merged.update(checkpoint or {})
+        await self.db.execute(
+            "UPDATE processing_jobs SET checkpoint_json = ? WHERE job_id = ?",
+            (json.dumps(merged, ensure_ascii=False, default=str), job_id),
+        )
+
+    async def mark_cancelled(self, job_id: str) -> None:
+        from companion.domain.models import utcnow
+
+        await self.db.execute(
+            "UPDATE processing_jobs SET status = 'CANCELLED', cancel_requested = 1,"
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE job_id = ?",
             (_iso(utcnow()), job_id),
         )
 
-    async def fail(self, job_id: str, error: str) -> None:
+    async def postpone(self, job_id: str, next_run_at: datetime) -> None:
+        """Delay a still-PENDING job without changing its attempt count."""
+        await self.db.execute(
+            "UPDATE processing_jobs SET next_run_at = ?"
+            " WHERE job_id = ? AND status = 'PENDING'",
+            (_iso(next_run_at), job_id),
+        )
+
+    async def yield_for_foreground(
+        self,
+        job_id: str,
+        checkpoint: Optional[dict] = None,
+        *,
+        resume_after: datetime | None = None,
+    ) -> None:
+        """Cooperatively pause a claimed job without consuming a retry.
+
+        The claim incremented ``attempts``; the pause decrements it, clears the
+        lease/owner and returns the job to PENDING. The checkpoint is merged,
+        so the next attempt resumes instead of repeating expensive work. This
+        is deliberately *not* a failure and is not counted as an automatic
+        retry.
+        """
+        if checkpoint:
+            await self.save_checkpoint(job_id, checkpoint)
+        await self.db.execute(
+            "UPDATE processing_jobs SET status = 'PENDING',"
+            " attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,"
+            " started_at = NULL, owner_id = NULL, lease_expires_at = NULL,"
+            " heartbeat_at = NULL, last_error = NULL, next_run_at = ?"
+            " WHERE job_id = ?",
+            (_iso(resume_after) if resume_after is not None else None, job_id),
+        )
+
+    async def fail(self, job_id: str, error: str, result: Any = None) -> None:
         from companion.domain.models import utcnow
 
         await self.db.execute(
             "UPDATE processing_jobs SET status = 'FAILED', last_error = ?,"
+            " result_json = COALESCE(?, result_json),"
             " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
             " WHERE job_id = ?",
-            (error, _iso(utcnow()), job_id),
+            (
+                error,
+                json.dumps(result, ensure_ascii=False, default=str)
+                if result is not None
+                else None,
+                _iso(utcnow()),
+                job_id,
+            ),
         )
 
     async def recover_running(self, now: datetime | None = None) -> int:
@@ -1331,10 +1566,20 @@ class JobRepository:
 
         if now is None:
             now = utcnow()
+        # A cancellation requested while a worker was running is final once the
+        # lease has lapsed: do not resurrect it as PENDING.
+        await self.db.execute(
+            "UPDATE processing_jobs SET status = 'CANCELLED', completed_at = ?,"
+            " owner_id = NULL, lease_expires_at = NULL, heartbeat_at = NULL"
+            " WHERE status = 'RUNNING' AND cancel_requested = 1"
+            " AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
+            (_iso(now), _iso(now)),
+        )
         cur = await self.db.execute(
             "UPDATE processing_jobs SET status = 'PENDING', owner_id = NULL,"
             " lease_expires_at = NULL, heartbeat_at = NULL, started_at = NULL"
             " WHERE status = 'RUNNING'"
+            " AND cancel_requested = 0"
             " AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
             (_iso(now),),
         )
@@ -1366,10 +1611,15 @@ class JobRepository:
         return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
 
     def _to_job(self, row) -> ProcessingJob:
+        raw_type = row["job_type"]
+        try:
+            job_type = JobType(raw_type)
+        except ValueError:  # A registered V0.9 task type not in the enum yet.
+            job_type = raw_type
         return ProcessingJob(
             job_id=row["job_id"],
             job_key=row["job_key"],
-            job_type=JobType(row["job_type"]),
+            job_type=job_type,
             payload=json.loads(row["payload"]),
             status=JobStatus(row["status"]),
             attempts=row["attempts"],
@@ -1382,6 +1632,17 @@ class JobRepository:
             lease_expires_at=_dt(row["lease_expires_at"]),
             heartbeat_at=_dt(row["heartbeat_at"]),
             next_run_at=_dt(row["next_run_at"]),
+            priority=row["priority"] or "NORMAL",
+            source_kind=row["source_kind"] or "SYSTEM",
+            source_ref=row["source_ref"],
+            execution_mode=row["execution_mode"] or "BACKGROUND",
+            checkpoint=json.loads(row["checkpoint_json"])
+            if row["checkpoint_json"]
+            else {},
+            cancel_requested=bool(row["cancel_requested"]),
+            result=json.loads(row["result_json"])
+            if row["result_json"] is not None
+            else None,
         )
 
 

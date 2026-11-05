@@ -157,6 +157,13 @@ class JobType(str, Enum):
     # reply does not wait for it; it is durable, idempotent per event and
     # retryable like any other job.
     TURN_ANALYSIS = "TURN_ANALYSIS"
+    # V0.9: unified off-task execution types. Foreground explicit memory writes
+    # and background research use the same durable job substrate as the older
+    # job types; adding values is backward compatible because the column is
+    # plain text.
+    MEMORY_SAVE = "MEMORY_SAVE"
+    MEMORY_CORRECTION = "MEMORY_CORRECTION"
+    RESEARCH_TASK = "RESEARCH_TASK"
 
 
 class JobStatus(str, Enum):
@@ -164,6 +171,26 @@ class JobStatus(str, Enum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    # Cancellation is terminal. A cooperative pause is *not* represented by a
+    # new status: the job goes back to PENDING so a restart can recover it.
+    CANCELLED = "CANCELLED"
+
+
+class TaskPriority(str, Enum):
+    HIGH = "HIGH"
+    NORMAL = "NORMAL"
+    LOW = "LOW"
+
+
+class TaskSource(str, Enum):
+    USER = "USER"
+    ROUTER = "ROUTER"
+    SYSTEM = "SYSTEM"
+
+
+class TaskMode(str, Enum):
+    FOREGROUND = "FOREGROUND"
+    BACKGROUND = "BACKGROUND"
 
 
 class MemoryKind(str, Enum):

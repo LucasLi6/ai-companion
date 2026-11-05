@@ -64,6 +64,17 @@ def build_idle_scheduler(
         settings=settings,
         state=runtime.repos.research_state,
     )
+    # Register the same engine with the unified off-task worker. This does not
+    # start a second scheduler: it only makes an explicitly enqueued
+    # RESEARCH_TASK job durable and resumable through the existing worker.
+    task_service = getattr(runtime, "task_service", None)
+    if task_service is not None:
+        from companion.domain.enums import JobType
+        from companion.tasks.handlers import build_research_task_handler
+
+        task_service.register_handler(
+            JobType.RESEARCH_TASK, build_research_task_handler(research)
+        )
     return IdleScheduler(
         runtime.repos.settings,
         reflection,

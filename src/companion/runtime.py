@@ -65,6 +65,8 @@ from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
 from companion.runtime_context.timezone import TimeZoneService
 from companion.storage.database import Database
 from companion.storage.repositories import Repositories, make_repositories
+from companion.tasks.handlers import build_explicit_memory_task_handler
+from companion.tasks.service import TaskService
 
 PROVIDERS = ("mock", "deepseek")
 
@@ -104,6 +106,7 @@ class Runtime:
     web_search: object = None
     explicit_memory_operations: object = None
     data_control: object = None
+    task_service: Optional[TaskService] = None
 
 
 def build_runtime(
@@ -352,7 +355,63 @@ def build_runtime(
             )
         if embedding_service is not None:
             handlers["EMBEDDING"] = build_embedding_handler(embedding_service)
+        explicit_task_handler = build_explicit_memory_task_handler(
+            explicit_memory_operations
+        )
+        handlers[JobType.MEMORY_SAVE.value] = explicit_task_handler
+        handlers[JobType.MEMORY_CORRECTION.value] = explicit_task_handler
         worker = JobWorker(repos, handlers, logger=logger)
+
+    # V0.9: one entry point for foreground and background off-task work. The
+    # worker remains the single processor; TaskService owns local checks
+    # (supported type, permission, dedupe, autonomous budget) and the
+    # foreground execution path.
+    permissioned_types = {
+        JobType.TURN_ANALYSIS.value,
+        JobType.MEMORY_SAVE.value,
+        JobType.MEMORY_CORRECTION.value,
+    }
+
+    async def task_permission(request) -> bool:
+        """Re-read live consent at claim/commit time.
+
+        A job approved when it was queued must not keep running after the
+        speaker withdraws processing or persistence consent. Explicit memory
+        tasks also stop when learning consent is withdrawn. The ordinary
+        extraction handler remains a completed no-op in that last case, as
+        before V0.9, so it never writes anything.
+        """
+        if request.type not in permissioned_types:
+            return True
+        event_id = (request.payload or {}).get("event_id")
+        if not event_id:
+            return True
+        event = await repos.utterance.get(event_id)
+        if event is None or event.speaker_person_id is None:
+            # Synthetic/legacy rows keep the pre-V0.9 behaviour; live turns
+            # always carry a registered speaker.
+            return True
+        consent = await registry.get_consent(event.speaker_person_id)
+        if consent is None:
+            return False
+        allowed = bool(consent.allow_processing and consent.allow_persistence)
+        if request.type in {
+            JobType.MEMORY_SAVE.value,
+            JobType.MEMORY_CORRECTION.value,
+        }:
+            # Extraction remains an allowed no-op job when learning is later
+            # withdrawn (the handler re-checks and writes nothing). An explicit
+            # save/correction no longer has a purpose without that grant.
+            allowed = allowed and bool(consent.allow_memory_learning)
+        return allowed
+
+    task_service = TaskService(
+        repos,
+        handlers=worker.handlers if worker is not None else {},
+        worker=worker,
+        logger=logger,
+        permission_checker=task_permission,
+    )
 
     # V0.6 runtime context. Timezone resolution is always on (it needs no
     # consent and no network). GeoIP is strictly opt-in: it requires
@@ -415,6 +474,7 @@ def build_runtime(
         web_search=web_search,
         explicit_memory_operations=explicit_memory_operations,
         data_control=data_control,
+        task_service=task_service,
         turn_analysis_delay_seconds=float(turn_analysis_delay_seconds),
         logger=logger,
     )
@@ -452,4 +512,5 @@ def build_runtime(
         web_search=web_search,
         explicit_memory_operations=explicit_memory_operations,
         data_control=data_control,
+        task_service=task_service,
     )

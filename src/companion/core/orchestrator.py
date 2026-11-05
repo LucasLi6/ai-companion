@@ -68,6 +68,8 @@ from companion.domain.models import (
 )
 from companion.emotion.expression_policy import compile_affect_context
 from companion.emotion.transition import build_conversational_affect
+from companion.memory.explicit_operations import MemoryOperationResult
+from companion.tasks.models import TaskPriority, TaskRejected, TaskRequest, TaskSource
 from companion.memory.candidates import prepare_candidates
 from companion.memory.requests import (
     is_conversation_count_request,
@@ -137,6 +139,7 @@ class Orchestrator:
         web_search=None,
         explicit_memory_operations=None,
         data_control=None,
+        task_service=None,
         turn_analysis_delay_seconds: float = 60.0,
         turn_analysis_batch_size: int = 5,
         logger: Optional[logging.Logger] = None,
@@ -202,6 +205,9 @@ class Orchestrator:
         # intents go through a separate, confirmation-gated trusted service.
         self.explicit_memory_operations = explicit_memory_operations
         self.data_control = data_control
+        # V0.9: task execution is Off-task. The orchestrator only publishes a
+        # foreground activity signal; it never runs background work inline.
+        self.task_service = task_service
         # V0.6.1: a Fast Path turn only queues lightweight extraction. The job
         # waits up to ``delay`` seconds so several turns can share one small
         # request; once ``batch_size`` events are waiting it runs immediately.
@@ -217,6 +223,16 @@ class Orchestrator:
             self._conversation_locks[conversation_id] = lock
         return lock
 
+    def _foreground_scope(self):
+        """Signal that a real foreground turn is active.
+
+        Background jobs observe this only at safe checkpoints. When no task
+        service is wired (legacy tests), this is a no-op context manager.
+        """
+        if self.task_service is None:
+            return contextlib.nullcontext()
+        return self.task_service.foreground.scope()
+
     async def process_utterance(
         self,
         event: UtteranceEvent,
@@ -226,7 +242,8 @@ class Orchestrator:
         # Per-conversation serialization: events in the same conversation run
         # one at a time, in submission order.
         async with self._lock_for(event.conversation_id):
-            return await self._process(event, connection=connection)
+            with self._foreground_scope():
+                return await self._process(event, connection=connection)
 
     async def process_utterance_stream(
         self,
@@ -250,9 +267,10 @@ class Orchestrator:
         async def run() -> ProcessingReport:
             try:
                 async with self._lock_for(event.conversation_id):
-                    return await self._process(
-                        event, connection=connection, stream=sink
-                    )
+                    with self._foreground_scope():
+                        return await self._process(
+                            event, connection=connection, stream=sink
+                        )
             finally:
                 queue.put_nowait(None)
 
@@ -857,10 +875,8 @@ class Orchestrator:
                 ):
                     # WAIT/IGNORE may still perform this authorized internal
                     # write; the action only decides whether a reply follows.
-                    memory_operation = (
-                        await self.explicit_memory_operations.execute(
-                            event, route, consent, routing_view
-                        )
+                    memory_operation = await self._execute_explicit_memory(
+                        event, route, consent, routing_view
                     )
                     memory_outcomes = memory_operation.outcomes
                     steps.append(
@@ -1733,6 +1749,76 @@ class Orchestrator:
             return context
         return context.model_copy(update={"runtime_snapshot": snapshot.as_dict()})
 
+    async def _execute_explicit_memory(
+        self, event, route, consent, routing_view
+    ) -> MemoryOperationResult:
+        """Run an explicit memory intent as a foreground off-task task.
+
+        The router only *proposes* the intent; this trusted local code chooses
+        the task type, foreground mode and ROUTER source. When no full task
+        service is wired (legacy unit wirings), the same service is called
+        directly, preserving behaviour.
+        """
+        intent = None
+        if getattr(route, "processing_intents", None):
+            intents = set(route.processing_intents)
+            if "MEMORY_CORRECTION" in {getattr(i, "value", i) for i in intents}:
+                intent = JobType.MEMORY_CORRECTION.value
+            elif "MEMORY_SAVE" in {getattr(i, "value", i) for i in intents}:
+                intent = JobType.MEMORY_SAVE.value
+        task_service = self.task_service
+        if (
+            task_service is None
+            or intent is None
+            or intent not in task_service.supported_types
+        ):
+            return await self.explicit_memory_operations.execute(
+                event, route, consent, routing_view
+            )
+        payload = {
+            "event": event.model_dump(mode="json"),
+            "route": route.model_dump(mode="json"),
+            "consent": consent.model_dump(mode="json") if consent is not None else None,
+            "routing_context": (
+                routing_view.model_dump(mode="json")
+                if routing_view is not None
+                and hasattr(routing_view, "model_dump")
+                else None
+            ),
+        }
+        try:
+            result = await task_service.execute_now(
+                TaskRequest(
+                    type=intent,
+                    payload=payload,
+                    mode="FOREGROUND",
+                    source=TaskSource.ROUTER,
+                    priority=TaskPriority.HIGH,
+                    source_event_id=event.event_id,
+                    job_key=f"explicit_memory:{event.event_id}:{intent}",
+                )
+            )
+        except TaskRejected as exc:
+            return MemoryOperationResult(
+                event_id=event.event_id,
+                intent=intent,
+                status="DENIED",
+                completed=True,
+                error_code=exc.reason.lower(),
+            )
+        if isinstance(result.result, dict):
+            try:
+                return MemoryOperationResult(**result.result)
+            except TypeError:
+                pass
+        return MemoryOperationResult(
+            event_id=event.event_id,
+            intent=intent,
+            status="FAILED",
+            completed=False,
+            error_code=result.error or "task_failed",
+        )
+
     async def _enqueue_turn_analysis(self, event: UtteranceEvent) -> Optional[str]:
         """Queue the batched extraction job for an already-answered turn.
 
@@ -1754,9 +1840,37 @@ class Orchestrator:
                 next_run_at = utcnow() + timedelta(
                     seconds=self.turn_analysis_delay_seconds
                 )
+        job_key = f"turn_analysis:{event.event_id}"
+        if (
+            self.task_service is not None
+            and JobType.TURN_ANALYSIS.value in self.task_service.supported_types
+        ):
+            # Ordinary extraction is off-task work too: route it through the
+            # same local checks, priority order and durable queue. The legacy
+            # direct enqueue remains for wirings without a task service.
+            try:
+                return await self.task_service.enqueue(
+                    TaskRequest(
+                        type=JobType.TURN_ANALYSIS.value,
+                        payload={"event_id": event.event_id},
+                        source=TaskSource.SYSTEM,
+                        source_ref=event.event_id,
+                        job_key=job_key,
+                        next_run_at=next_run_at,
+                    )
+                )
+            except TaskRejected as exc:
+                # A full autonomous queue may defer learning; it never blocks
+                # or rewrites the user-visible reply.
+                self.logger.info(
+                    "turn_analysis_not_queued event_id=%s reason=%s",
+                    event.event_id,
+                    exc.reason,
+                )
+                return None
         return await self.repos.job.enqueue(
             JobType.TURN_ANALYSIS,
-            f"turn_analysis:{event.event_id}",
+            job_key,
             {"event_id": event.event_id},
             next_run_at=next_run_at,
         )

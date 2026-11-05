@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -948,7 +948,7 @@ class ProcessingJob(DomainModel):
 
     job_id: str = Field(min_length=1, max_length=128)
     job_key: str = Field(min_length=1, max_length=256)
-    job_type: JobType
+    job_type: JobType | str
     payload: dict = Field(default_factory=dict)
     status: JobStatus
     attempts: int = 0
@@ -964,6 +964,17 @@ class ProcessingJob(DomainModel):
     lease_expires_at: Optional[datetime] = None
     heartbeat_at: Optional[datetime] = None
     next_run_at: Optional[datetime] = None
+    # V0.9 off-task metadata. ``priority`` is a scheduling hint (HIGH/NORMAL/
+    # LOW); ``source_kind`` is set by local code, never by a model. A foreground
+    # task is executed through ``TaskService.execute_now`` rather than claimed
+    # by the background poller.
+    priority: str = "NORMAL"
+    source_kind: str = "SYSTEM"
+    source_ref: Optional[str] = None
+    execution_mode: str = "BACKGROUND"
+    checkpoint: dict = Field(default_factory=dict)
+    cancel_requested: bool = False
+    result: Optional[Any] = None
 
 
 class ProcessingReport(DomainModel):

@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1615,6 +1615,44 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE INDEX IF NOT EXISTS idx_data_control_person
             ON data_control_operations(person_id, status);
+        """,
+    ),
+    # Version 23 (V0.9): unified off-task scheduling metadata. All statements
+    # are additive and have defaults, so an existing database keeps every row
+    # and every pre-V0.9 job remains valid (NORMAL/SYSTEM/BACKGROUND).
+    (
+        23,
+        """
+        CREATE TABLE IF NOT EXISTS processing_jobs (
+            job_id       TEXT PRIMARY KEY,
+            job_key      TEXT NOT NULL UNIQUE,
+            job_type     TEXT NOT NULL,
+            payload      TEXT NOT NULL DEFAULT '{}',
+            status       TEXT NOT NULL,
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            last_error   TEXT,
+            created_at   TEXT NOT NULL,
+            started_at   TEXT,
+            completed_at TEXT,
+            owner_id     TEXT,
+            lease_expires_at TEXT,
+            heartbeat_at TEXT,
+            next_run_at  TEXT
+        );
+
+        ALTER TABLE processing_jobs ADD COLUMN priority TEXT NOT NULL DEFAULT 'NORMAL';
+        ALTER TABLE processing_jobs ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'SYSTEM';
+        ALTER TABLE processing_jobs ADD COLUMN source_ref TEXT;
+        ALTER TABLE processing_jobs ADD COLUMN checkpoint_json TEXT;
+        ALTER TABLE processing_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE processing_jobs ADD COLUMN result_json TEXT;
+        ALTER TABLE processing_jobs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'BACKGROUND';
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_schedule
+            ON processing_jobs(status, priority, created_at);
+        CREATE INDEX IF NOT EXISTS idx_jobs_mode
+            ON processing_jobs(execution_mode, status);
         """,
     ),
 ]
