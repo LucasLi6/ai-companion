@@ -11,6 +11,7 @@ from typing import Optional
 
 from pydantic import ValidationError
 
+from companion.domain.enums import ReplyNecessity
 from companion.domain.models import (
     validate_affective_signal,
     validate_pragmatic_analysis,
@@ -19,6 +20,7 @@ from companion.domain.models import (
 from companion.routing.errors import RouterValidationError
 from companion.routing.models import (
     MAX_TOOL_CALLS,
+    InputSemanticStatus,
     RawRouteDecision,
     RoutingContext,
     ToolRequest,
@@ -44,6 +46,8 @@ class RoutingValidator:
             raise RouterValidationError(
                 f"tool request budget exceeded: {len(raw.tool_requests)}"
             )
+
+        self._validate_input_semantics(raw)
 
         requests: list[ToolRequest] = []
         for request in raw.tool_requests:
@@ -101,6 +105,7 @@ class RoutingValidator:
             action=raw.action,
             reply_necessity=raw.reply_necessity,
             addressee_assessment=raw.addressee_assessment,
+            input_semantics=raw.input_semantics,
             turn_state=raw.turn_state,
             processing_intents=list(raw.processing_intents),
             tool_requests=requests,
@@ -134,6 +139,38 @@ class RoutingValidator:
                 "follow-up planning may not change the reply decision"
             )
         return followup
+
+    @staticmethod
+    def _validate_input_semantics(raw: RawRouteDecision) -> None:
+        """Reject structural contradictions, never inspect the user text.
+
+        ``NON_COMMUNICATIVE`` means there is no understandable act to process.
+        A payload that also asks for a durable memory operation, a privacy
+        operation or a concrete tool task contradicts itself; the local layer
+        must not try to guess which half to believe. This reads validated
+        enums only — never ``reason``, ``evidence`` or the raw input text.
+        """
+        if raw.input_semantics != InputSemanticStatus.NON_COMMUNICATIVE:
+            return
+        if raw.processing_intents:
+            raise RouterValidationError(
+                "non-communicative input cannot request internal processing"
+            )
+        if raw.tool_requests:
+            raise RouterValidationError(
+                "non-communicative input cannot request tools"
+            )
+        if raw.data_control_request is not None:
+            raise RouterValidationError(
+                "non-communicative input cannot carry a data control request"
+            )
+        # A reply cannot be *required* by something the model itself says is
+        # not a communicative act. (A RESPOND suggestion is still allowed to
+        # reach local policy, which downgrades it to IGNORE.)
+        if raw.reply_necessity == ReplyNecessity.REQUIRED:
+            raise RouterValidationError(
+                "non-communicative input cannot require a reply"
+            )
 
     @staticmethod
     def _filter_evidence(evidence, context: RoutingContext):

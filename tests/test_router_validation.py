@@ -37,6 +37,7 @@ def raw(**overrides) -> RawRouteDecision:
         "action": "RESPOND",
         "reply_necessity": "USEFUL",
         "addressee_assessment": "AGENT",
+        "input_semantics": "COMMUNICATIVE",
         "reason": "needs a visible reply",
     }
     data.update(overrides)

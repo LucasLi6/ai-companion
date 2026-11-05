@@ -94,7 +94,7 @@ from companion.routing.context_adapter import (
     tool_results_to_memory_context,
 )
 from companion.routing.errors import RouterError, RouterUnavailable
-from companion.routing.models import ProcessingIntent, RouteAction
+from companion.routing.models import InputSemanticStatus, ProcessingIntent, RouteAction
 from companion.tools.models import ToolExecutionContext
 
 
@@ -417,6 +417,7 @@ class Orchestrator:
                     steps,
                     safety_triggered=safety.triggered,
                     persist=persist,
+                    timings=timings,
                 )
                 # Long-term memory reaches this turn only through the
                 # read-only tools the router requested. There is deliberately
@@ -433,10 +434,27 @@ class Orchestrator:
                     route is not None,
                     len(memories),
                 )
+                # 4a-bis. A validated non-communicative turn with no internal
+                # operation is finalized without assembling a speaker context,
+                # compiling persona/scene or calling emotion and response
+                # providers. The analysis, final action, conversation state and
+                # event lifecycle still commit atomically through `_commit_turn`.
+                if self._is_noncommunicative_silent(route):
+                    return await self._finalize_silent_turn(
+                        event=event,
+                        context=context,
+                        route=route,
+                        routing_outcome=routing_outcome,
+                        steps=steps,
+                        timings=timings,
+                        t0=t0,
+                        persist=persist,
+                    )
 
             # 4b. Build the external-AI context (privacy-filtered history,
             # labels, memories) when the real provider is wired in. Mock mode
             # keeps the lightweight ConversationContext exactly as before.
+            t_speaker_context = time.monotonic()
             cognitive_context, provider_memories = await self._prepare_context(
                 event, context, memories, steps, routing_view=routing_view
             )
@@ -575,6 +593,7 @@ class Orchestrator:
                             learn
                             and self.jobs is not None
                             and not safety.triggered
+                            and not self._is_noncommunicative_silent(route)
                             and not (
                                 explicit_memory
                                 and self.explicit_memory_operations is not None
@@ -728,6 +747,9 @@ class Orchestrator:
                     else [],
                     base=cognitive_context,
                 )
+            timings["speaker_context_ms"] = (
+                time.monotonic() - t_speaker_context
+            ) * 1000
             timings["analysis_ms"] = (time.monotonic() - t_analysis) * 1000
 
             # 5b. A retried analysis must be answered by the same trusted
@@ -761,6 +783,7 @@ class Orchestrator:
             # fresh) analysis before any further side effects. Hard local rules
             # (permission, explicit silence, quiet mode, explicit human
             # addressee) outrank the model suggestion.
+            t_policy = time.monotonic()
             await self.policy.refresh(self.repos.settings)
             if semantic_mode and route is not None:
                 decision = self.policy.decide_semantic(
@@ -782,6 +805,7 @@ class Orchestrator:
                     addressee_hint=event.addressee_hint.value,
                     explicit_silence=explicit_silence,
                 )
+            timings["policy_ms"] = (time.monotonic() - t_policy) * 1000
             # 6b. Independent safety floor. An explicit high-risk statement is
             # answered by a fixed local reply, not by persona improvisation and
             # not by a model deferral. Only an explicit human addressee or a
@@ -1035,6 +1059,9 @@ class Orchestrator:
                 timings["generation_ms"] = (time.monotonic() - t_generation) * 1000
                 if stream_meta.get("first_token_ms") is not None:
                     timings["time_to_first_token_ms"] = stream_meta["first_token_ms"]
+                    timings["speaker_first_token_ms"] = stream_meta[
+                        "first_token_ms"
+                    ]
                 action_obj = AgentAction(
                     action_id=new_id("act"),
                     event_id=event.event_id,
@@ -1055,6 +1082,7 @@ class Orchestrator:
             # state and event status in one transaction. The scene has a CAS
             # revision and one receipt per source event, so a retry or a crash
             # boundary cannot double-apply it or overwrite newer state.
+            t_commit = time.monotonic()
             if persist:
                 await self._commit_turn(
                     event=event,
@@ -1074,6 +1102,7 @@ class Orchestrator:
                 # and must not duplicate the record.
                 if existing_action is None:
                     await self._record_stances(event, action_obj, cognitive_context)
+            timings["commit_ms"] = (time.monotonic() - t_commit) * 1000
 
             if job_id is not None:
                 steps.append("[MEMORY_JOB] Queued")
@@ -1095,11 +1124,35 @@ class Orchestrator:
             timings["total_ms"] = (time.monotonic() - t0) * 1000
             self.metrics.record_many(timings)
             self.logger.info(
-                "action_saved event_id=%s action=%s reason_code=%s duration_ms=%.2f status=COMPLETED",
+                "action_saved event_id=%s router_mode=%s route_action=%s"
+                " input_semantics=%s router_provider_calls=%d"
+                " router_followup_calls=%d tool_calls=%d router_llm_ms=%.2f"
+                " tool_execution_ms=%.2f speaker_context_ms=%.2f"
+                " speaker_first_token_ms=%.2f generation_ms=%.2f"
+                " commit_ms=%.2f total_ms=%.2f action=%s reason_code=%s"
+                " status=COMPLETED",
                 event.event_id,
+                self.router_mode,
+                route.action.value
+                if semantic_mode and route is not None
+                else "NONE",
+                route.input_semantics.value
+                if semantic_mode and route is not None
+                else "NONE",
+                routing_outcome.provider_calls if routing_outcome is not None else 0,
+                routing_outcome.planning_steps if routing_outcome is not None else 0,
+                len(routing_outcome.tool_results)
+                if routing_outcome is not None
+                else 0,
+                timings.get("router_llm_ms", 0.0),
+                timings.get("tool_execution_ms", 0.0),
+                timings.get("speaker_context_ms", 0.0),
+                timings.get("speaker_first_token_ms", -1.0),
+                timings.get("generation_ms", 0.0),
+                timings.get("commit_ms", 0.0),
+                timings["total_ms"],
                 final_action.value,
                 final_reason.value,
-                timings["total_ms"],
             )
             return ProcessingReport(
                 event_id=event.event_id,
@@ -1171,6 +1224,7 @@ class Orchestrator:
         *,
         safety_triggered: bool,
         persist: bool,
+        timings: Optional[dict] = None,
     ):
         """Run the LLM router or apply a hard local gate.
 
@@ -1192,7 +1246,10 @@ class Orchestrator:
                 "semantic routing is enabled but no router service is configured"
             )
 
+        t_context = time.monotonic()
         routing_view = await self.routing_context_builder.build(event, conversation)
+        if timings is not None:
+            timings["routing_context_ms"] = (time.monotonic() - t_context) * 1000
         execution_context = ToolExecutionContext(
             event=event,
             person_id=event.speaker_person_id,
@@ -1210,9 +1267,14 @@ class Orchestrator:
         outcome = await self.routing_service.execute(
             event, routing_view, execution_context, persist=persist
         )
+        if timings is not None:
+            timings["router_llm_ms"] = outcome.router_llm_ms
+            timings["router_followup_ms"] = outcome.router_followup_ms
+            timings["tool_execution_ms"] = outcome.tool_execution_ms
         steps.append(
             "[ROUTE] semantic:"
-            f"{outcome.route.action.value}, necessity="
+            f"{outcome.route.action.value}, input="
+            f"{outcome.route.input_semantics.value}, necessity="
             f"{outcome.route.reply_necessity.value},"
             f" intents={[item.value for item in outcome.route.processing_intents]}"
         )
@@ -1225,6 +1287,175 @@ class Orchestrator:
         if outcome.planning_steps:
             steps.append("[ROUTE] follow-up plan applied")
         return routing_view, outcome, outcome.route
+
+    @staticmethod
+    def _is_noncommunicative_silent(route) -> bool:
+        """A validated route that needs no reply and no internal operation.
+
+        This reads only validated enums and lists. It never inspects the input
+        text, so unusual spelling, symbols or language cannot be classified
+        here; that judgment belongs to the semantic router.
+        """
+        return (
+            route is not None
+            and route.input_semantics == InputSemanticStatus.NON_COMMUNICATIVE
+            and not route.processing_intents
+            and not route.tool_requests
+        )
+
+    async def _finalize_silent_turn(
+        self,
+        *,
+        event: UtteranceEvent,
+        context: ConversationContext,
+        route,
+        routing_outcome,
+        steps: list[str],
+        timings: dict[str, float],
+        t0: float,
+        persist: bool,
+    ) -> ProcessingReport:
+        """Commit a non-communicative turn without building a speaker context.
+
+        It is not an early ``return`` that skips persistence: the analysis is
+        stored, the final policy action and non-response trace are recorded,
+        and the conversation/event lifecycle commits through the same atomic
+        `_commit_turn` used by the normal path. Scene transitions and profile
+        observation are deliberately not advanced for this input.
+        """
+        analysis = None
+        analysis_id = None
+        if persist:
+            analysis = await self.repos.analysis.get_analysis(event.event_id)
+            analysis_id = await self.repos.analysis.get_analysis_id(event.event_id)
+
+        if analysis is None:
+            analysis = route_to_cognitive_result(
+                event,
+                route,
+                routing_outcome.tool_results if routing_outcome is not None else [],
+            )
+            steps.append(
+                "[COGNITION] Semantic router: "
+                f"{analysis.action.value}, input=NON_COMMUNICATIVE"
+            )
+            if persist:
+                analysis_id = new_id("ana")
+                await self.repos.persist_cognitive_outcome(
+                    analysis,
+                    analysis_id,
+                    candidates=[],
+                    job_key=None,
+                    job_payload={},
+                    persona=None,
+                )
+        else:
+            steps.append("[COGNITION] Reused existing analysis")
+
+        t_policy = time.monotonic()
+        await self.policy.refresh(self.repos.settings)
+        decision = self.policy.decide_semantic(
+            route,
+            TrustedTurnContext(
+                addressee_hint=event.addressee_hint.value,
+                quiet_mode=bool(context.quiet_mode),
+            ),
+        )
+        timings["policy_ms"] = (time.monotonic() - t_policy) * 1000
+        final_action, final_reason = decision.action, decision.reason_code
+        steps.append(f"[DECISION] {final_action.value}")
+        if decision.overrode_model:
+            steps.append(f"[POLICY] {decision.override_reason}")
+
+        existing_action = (
+            await self.repos.analysis.get_action(event.event_id)
+            if persist
+            else None
+        )
+        if existing_action is not None and existing_action.status not in (
+            "COMPLETED",
+            "TRUNCATED",
+        ):
+            if persist:
+                await self.repos.analysis.delete_action(event.event_id)
+            existing_action = None
+            steps.append("[ACTION] Discarded interrupted partial response")
+
+        if existing_action is not None:
+            final_action = existing_action.action_type
+            final_reason = existing_action.reason_code
+            action_obj = existing_action
+            trace = self._stored_trace(existing_action)
+            steps.append("[ACTION] Reused existing action")
+        else:
+            trace = derive_nonresponse_trace(
+                event=event,
+                analysis=analysis,
+                policy_decision=decision,
+                conversation_context=context,
+            )
+            action_obj = AgentAction(
+                action_id=new_id("act"),
+                event_id=event.event_id,
+                action_type=final_action,
+                response_text=None,
+                reason_code=final_reason,
+                status="COMPLETED",
+                created_at=utcnow(),
+                model_suggested_action=decision.model_action,
+                policy_final_action=decision.action,
+                override_reason=decision.override_reason,
+                nonresponse_trace=(
+                    trace.model_dump() if trace is not None else None
+                ),
+            )
+
+        t_commit = time.monotonic()
+        if persist:
+            # No scene transition and no profile learning: the input was not a
+            # communicative act, so it must not advance either state.
+            await self._commit_turn(
+                event=event,
+                action=action_obj,
+                existing_action=existing_action is not None,
+                trace=trace,
+                scene_enabled=False,
+                previous_scene=None,
+                analysis=analysis,
+                cognitive_context=context,
+                learn_profile=False,
+            )
+        timings["commit_ms"] = (time.monotonic() - t_commit) * 1000
+        timings.setdefault("speaker_context_ms", 0.0)
+        timings["total_ms"] = (time.monotonic() - t0) * 1000
+        self.metrics.record_many(timings)
+        self.logger.info(
+            "silent_turn_committed event_id=%s router_mode=semantic"
+            " route_action=%s input_semantics=%s router_provider_calls=%d"
+            " router_followup_calls=%d tool_calls=%d router_llm_ms=%.2f"
+            " tool_execution_ms=%.2f speaker_context_ms=%.2f total_ms=%.2f",
+            event.event_id,
+            RouteAction(route.action.value).value,
+            route.input_semantics.value,
+            routing_outcome.provider_calls if routing_outcome is not None else 0,
+            routing_outcome.planning_steps if routing_outcome is not None else 0,
+            len(routing_outcome.tool_results) if routing_outcome is not None else 0,
+            timings.get("router_llm_ms", 0.0),
+            timings.get("tool_execution_ms", 0.0),
+            timings.get("speaker_context_ms", 0.0),
+            timings["total_ms"],
+        )
+        steps.append("[STATUS] Completed")
+        return ProcessingReport(
+            event_id=event.event_id,
+            status=ReportStatus.COMPLETED.value,
+            action=final_action,
+            response_text=None,
+            reason_code=final_reason,
+            analysis_id=analysis_id,
+            timings=timings,
+            steps=steps,
+        )
 
     def _local_semantic_analysis(
         self, event: UtteranceEvent, consent, safety_triggered: bool

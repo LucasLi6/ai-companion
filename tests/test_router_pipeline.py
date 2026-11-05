@@ -19,12 +19,13 @@ class FakeRouter:
 
     def __init__(self, *, action="RESPOND", necessity="REQUIRED", addressee="AGENT",
                  tools=None, followup_tools=None, needs_followup=False,
-                 raise_error=None):
+                 raise_error=None, input_semantics="COMMUNICATIVE"):
         self.calls = 0
         self.replans = 0
         self._action = action
         self._necessity = necessity
         self._addressee = addressee
+        self._input_semantics = input_semantics
         self._tools = tools or []
         self._followup_tools = followup_tools or []
         self._needs_followup = needs_followup
@@ -37,6 +38,7 @@ class FakeRouter:
                 "action": self._action,
                 "reply_necessity": self._necessity,
                 "addressee_assessment": self._addressee,
+                "input_semantics": self._input_semantics,
                 "turn_state": "CONTINUING",
                 "tool_requests": tools,
                 "needs_followup_planning": self._needs_followup,

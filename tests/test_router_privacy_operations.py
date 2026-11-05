@@ -67,6 +67,7 @@ class FakeRouter:
                 "action": "RESPOND",
                 "reply_necessity": "REQUIRED",
                 "addressee_assessment": "AGENT",
+                "input_semantics": "COMMUNICATIVE",
                 "turn_state": "CONTINUING",
                 "processing_intents": ["PRIVACY_REQUEST"],
                 "tool_requests": [],

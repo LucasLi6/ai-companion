@@ -34,6 +34,7 @@ def decision_json(**overrides) -> str:
         "action": "RESPOND",
         "reply_necessity": "REQUIRED",
         "addressee_assessment": "AGENT",
+        "input_semantics": "COMMUNICATIVE",
         "reason": "addressed to Ava",
     }
     data.update(overrides)

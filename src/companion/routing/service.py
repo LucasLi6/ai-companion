@@ -12,11 +12,13 @@ The service is deliberately resumable. A retry of the same event:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional, Sequence
 
 from companion.routing.errors import RouterUnavailable
 from companion.routing.models import (
     MAX_TOOL_CALLS,
+    RouteAction,
     RoutePhase,
     RoutingContext,
     RoutingOutcome,
@@ -73,7 +75,7 @@ class RoutingService:
         repo = self.repository if persist else None
         event_id = event.event_id
 
-        route, made = await self._load_or_create_route(
+        route, made, router_llm_ms = await self._load_or_create_route(
             event_id, 0, context, repo
         )
         provider_calls += made
@@ -86,22 +88,27 @@ class RoutingService:
         }
         results: list[ToolResult] = []
         executed0: list[ToolRequest] = []
-        if allow_tool_reads:
+        tool_execution_ms = 0.0
+        requests0 = route.tool_requests[:planned0]
+        if allow_tool_reads and (requests0 or persisted0):
+            t_tools = time.monotonic()
             _, executed0, new_results0 = await self._execute_or_restore(
                 event_id,
                 0,
-                route.tool_requests[:planned0],
+                requests0,
                 persisted0,
                 execution_context,
                 repo,
             )
+            tool_execution_ms += (time.monotonic() - t_tools) * 1000
             results.extend(new_results0)
 
         remaining = max(0, self.max_tool_calls - planned0)
-        followup, made = await self._load_or_create_followup(
+        followup, made, followup_ms = await self._load_or_create_followup(
             event_id,
             context,
             route,
+            executed0,
             results,
             repo,
             provider_calls,
@@ -121,7 +128,8 @@ class RoutingService:
                 for item in followup.tool_requests
                 if request_signature(item) not in seen
             ][:remaining]
-            if allow_tool_reads:
+            if allow_tool_reads and (candidates or persisted1):
+                t_tools = time.monotonic()
                 _, _, new_results1 = await self._execute_or_restore(
                     event_id,
                     1,
@@ -130,6 +138,7 @@ class RoutingService:
                     execution_context,
                     repo,
                 )
+                tool_execution_ms += (time.monotonic() - t_tools) * 1000
                 results.extend(new_results1)
             route = followup
 
@@ -139,6 +148,9 @@ class RoutingService:
             planning_steps=planning_steps,
             provider_calls=provider_calls,
             initial_route=initial_route,
+            router_llm_ms=router_llm_ms,
+            router_followup_ms=followup_ms,
+            tool_execution_ms=tool_execution_ms,
         )
 
     # -- phase loading -----------------------------------------------------
@@ -149,14 +161,17 @@ class RoutingService:
         step_index: int,
         context: RoutingContext,
         repo: Optional[RoutingRepository],
-    ) -> tuple[ValidatedRouteDecision, int]:
+    ) -> tuple[ValidatedRouteDecision, int, float]:
         if repo is not None:
             route = await repo.load_validated(event_id, step_index)
             if route is not None:
-                return route, 0
+                # A restored decision costs zero router model time this turn.
+                return route, 0, 0.0
         if self.provider is None:
             raise RouterUnavailable("semantic routing has no router provider")
+        started = time.monotonic()
         raw = await self.provider.route(context)
+        elapsed_ms = (time.monotonic() - started) * 1000
         route = self.validator.validate(raw, context, self.registry)
         route = self._annotate(route)
         if repo is not None:
@@ -166,33 +181,38 @@ class RoutingService:
                 step_index=step_index,
                 route=route,
             )
-        return route, 1
+        return route, 1, elapsed_ms
 
     async def _load_or_create_followup(
         self,
         event_id: str,
         context: RoutingContext,
         route: ValidatedRouteDecision,
+        executed_requests: Sequence[ToolRequest],
         results: Sequence[ToolResult],
         repo: Optional[RoutingRepository],
         provider_calls: int,
         *,
         remaining: int,
         allow_tool_reads: bool,
-    ) -> tuple[Optional[ValidatedRouteDecision], int]:
+    ) -> tuple[Optional[ValidatedRouteDecision], int, float]:
         if repo is not None:
             saved = await repo.load_validated(event_id, 1)
             if saved is not None:
-                return saved, 0
+                return saved, 0, 0.0
         if not allow_tool_reads or remaining <= 0:
-            return None, 0
+            return None, 0, 0.0
         if provider_calls + 1 > self.max_router_calls:
-            return None, 0
-        if not self._should_replan(route, route.tool_requests, list(results)):
-            return None, 0
+            return None, 0, 0.0
+        if not self._should_replan(
+            route, list(executed_requests), list(results), remaining
+        ):
+            return None, 0, 0.0
         if self.provider is None:
             raise RouterUnavailable("semantic routing has no router provider")
+        started = time.monotonic()
         follow_raw = await self.provider.replan(context, route, list(results))
+        elapsed_ms = (time.monotonic() - started) * 1000
         followup = self.validator.validate_followup(
             follow_raw, context, self.registry, route
         )
@@ -204,7 +224,7 @@ class RoutingService:
                 step_index=1,
                 route=followup,
             )
-        return followup, 1
+        return followup, 1, elapsed_ms
 
     # -- tools -------------------------------------------------------------
 
@@ -334,12 +354,29 @@ class RoutingService:
     @staticmethod
     def _should_replan(
         route: ValidatedRouteDecision,
-        requests,
-        results: list[ToolResult],
+        executed_requests: Sequence[ToolRequest],
+        results: Sequence[ToolResult],
+        remaining_budget: int,
     ) -> bool:
+        """Whether a second plan is justified by *actual* execution state.
+
+        ``needs_followup_planning`` alone is not enough: without an executed
+        request and a result (or an explicit failure) there is nothing new to
+        plan from, and a second call would only re-confirm the first decision.
+        A WAIT/IGNORE with no tool work therefore never pays for a follow-up.
+        """
+        if remaining_budget <= 0:
+            return False
+        if not executed_requests or not results:
+            return False
+        # A WAIT/IGNORE is already final for this turn. A follow-up plan may
+        # only refine tools for a reply that will actually be composed; it may
+        # not spend another model call re-confirming silence.
+        if route.action != RouteAction.RESPOND:
+            return False
         if route.needs_followup_planning:
             return True
-        for request, result in zip(requests, results):
+        for request, result in zip(executed_requests, results):
             if request.required and result.status not in (
                 ToolStatus.SUCCESS,
                 ToolStatus.EMPTY,

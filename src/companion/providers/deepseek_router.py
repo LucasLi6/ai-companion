@@ -116,11 +116,13 @@ class DeepSeekRouterProvider:
 
         self.logger.info(
             "router_decision event_id=%s provider=%s model=%s action=%s"
-            " phase=%s",
+            " input_semantics=%s output_chars=%d phase=%s",
             context.current_event_id,
             self.provider_name,
             self.model or "unknown",
             decision.action.value,
+            decision.input_semantics.value,
+            len(content),
             "FOLLOWUP" if previous is not None else "INITIAL",
         )
         return decision

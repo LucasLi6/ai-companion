@@ -29,7 +29,7 @@ from companion.domain.enums import ReplyNecessity
 from companion.domain.models import AffectiveSignal, PragmaticAnalysis, SceneProposal
 
 ROUTER_SCHEMA_VERSION = 1
-ROUTER_PROMPT_VERSION = "router-v1"
+ROUTER_PROMPT_VERSION = "router-v2"
 
 MAX_TOOL_REQUESTS = 8
 MAX_TOOL_CALLS = 4
@@ -69,6 +69,20 @@ class RouteAddressee(str, Enum):
     AGENT = "AGENT"
     HUMAN = "HUMAN"
     UNKNOWN = "UNKNOWN"
+
+
+class InputSemanticStatus(str, Enum):
+    """Whether this turn is an understandable communicative act *at all*.
+
+    This is independent of whether a reply is wanted: a communicative turn can
+    still be a WAIT. It only records the router's semantic reading of the input
+    as an act in the current conversation, never a claim about text shape,
+    language, symbols or length.
+    """
+
+    COMMUNICATIVE = "COMMUNICATIVE"
+    NON_COMMUNICATIVE = "NON_COMMUNICATIVE"
+    UNCERTAIN = "UNCERTAIN"
 
 
 class TurnState(str, Enum):
@@ -170,6 +184,9 @@ class RawRouteDecision(BaseModel):
     action: RouteAction
     reply_necessity: ReplyNecessity
     addressee_assessment: RouteAddressee
+    # Required: the new protocol must state whether the turn is communicative
+    # at all. An absent field is a schema error, never an implicit IGNORE.
+    input_semantics: InputSemanticStatus
     turn_state: TurnState = TurnState.UNKNOWN
     processing_intents: list[ProcessingIntent] = Field(default_factory=list)
     tool_requests: list[ToolRequest] = Field(default_factory=list)
@@ -233,6 +250,9 @@ class ValidatedRouteDecision(BaseModel):
     action: RouteAction
     reply_necessity: ReplyNecessity
     addressee_assessment: RouteAddressee
+    # V0.8.1 persisted decisions predate this field. Reading one must not turn
+    # it into NON_COMMUNICATIVE, so the compatible default is UNCERTAIN.
+    input_semantics: InputSemanticStatus = InputSemanticStatus.UNCERTAIN
     turn_state: TurnState = TurnState.UNKNOWN
     processing_intents: list[ProcessingIntent] = Field(default_factory=list)
     tool_requests: list[ToolRequest] = Field(default_factory=list)
@@ -276,6 +296,7 @@ class ValidatedRouteDecision(BaseModel):
             self.action,
             self.reply_necessity,
             self.addressee_assessment,
+            self.input_semantics,
             tuple(self.processing_intents),
             self.silence_requested,
             control_key,
@@ -338,6 +359,11 @@ class RoutingOutcome(BaseModel):
     planning_steps: int = 0
     provider_calls: int = 0
     initial_route: Optional[ValidatedRouteDecision] = None
+    # Process-local stage durations (milliseconds). A restored decision reports
+    # zero model time because no model call happened for this attempt.
+    router_llm_ms: float = 0.0
+    router_followup_ms: float = 0.0
+    tool_execution_ms: float = 0.0
 
 
 def finite_json(value: Any) -> bool:

@@ -30,6 +30,7 @@ class CountingRouter:
                 "action": "WAIT",
                 "reply_necessity": "OPTIONAL",
                 "addressee_assessment": "UNKNOWN",
+                "input_semantics": "COMMUNICATIVE",
                 "reason": "no visible reply needed",
             }
         )
@@ -111,6 +112,44 @@ async def test_committed_decision_is_reused_without_a_second_router_call(db):
 
 
 @pytest.mark.asyncio
+async def test_legacy_persisted_decision_reads_as_uncertain(db):
+    """A V0.8.1 row has no input_semantics; it must not become silent."""
+    repo = RoutingRepository(db)
+    router = CountingRouter()
+    service = build_service(repo, router)
+    await _seed_event(db, "evt-legacy")
+    legacy = {
+        "schema_version": 1,
+        "router_version": "router-v1",
+        "action": "WAIT",
+        "reply_necessity": "OPTIONAL",
+        "addressee_assessment": "UNKNOWN",
+        "processing_intents": [],
+        "tool_requests": [],
+        "reason": "saved before the field existed",
+    }
+    await db.execute(
+        "INSERT INTO route_decisions(event_id, phase, step_index,"
+        " schema_version, router_version, provider, model, decision_json,"
+        " validation_status, created_at)"
+        " VALUES (?, 'INITIAL', 0, 1, 'router-v1', 'legacy', 'legacy-model',"
+        " ?, 'VALID', '2026-01-01T00:00:00+00:00')",
+        ("evt-legacy", json.dumps(legacy)),
+    )
+
+    outcome = await service.execute(
+        SimpleNamespace(event_id="evt-legacy"),
+        routing_context(),
+        execution_context(),
+        persist=True,
+    )
+
+    assert router.calls == 0
+    assert outcome.route.input_semantics.value == "UNCERTAIN"
+    assert outcome.route.action.value == "WAIT"
+
+
+@pytest.mark.asyncio
 async def test_no_persistence_writes_no_route_or_tool_rows(db):
     repo = RoutingRepository(db)
     router = CountingRouter()
@@ -147,6 +186,7 @@ class _ToolRouter(CountingRouter):
                 "action": "RESPOND",
                 "reply_necessity": "USEFUL",
                 "addressee_assessment": "AGENT",
+                "input_semantics": "COMMUNICATIVE",
                 "reason": "use memory",
                 "tool_requests": [
                     {"tool_name": "memory.search", "arguments": {"query": "x"}}
@@ -211,6 +251,7 @@ class _MultiToolRouter:
                 "action": "RESPOND",
                 "reply_necessity": "REQUIRED",
                 "addressee_assessment": "AGENT",
+                "input_semantics": "COMMUNICATIVE",
                 "reason": "bounded multi-stage test",
                 "tool_requests": [
                     {"tool_name": "memory.search", "arguments": {"query": q}}

@@ -31,6 +31,7 @@ def raw(**overrides) -> RawRouteDecision:
         "action": "WAIT",
         "reply_necessity": "OPTIONAL",
         "addressee_assessment": "UNKNOWN",
+        "input_semantics": "UNCERTAIN",
     }
     data.update(overrides)
     return RawRouteDecision.model_validate(data)
@@ -58,6 +59,7 @@ def test_unknown_fields_and_schema_versions_are_rejected():
                 "action": "RESPOND",
                 "reply_necessity": "REQUIRED",
                 "addressee_assessment": "AGENT",
+                "input_semantics": "COMMUNICATIVE",
                 "keyword_rule": "ignore this",
             }
         )

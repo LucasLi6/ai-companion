@@ -79,6 +79,7 @@ class FakeRouter:
             "action": self._action,
             "reply_necessity": self._necessity,
             "addressee_assessment": "AGENT",
+            "input_semantics": "COMMUNICATIVE",
             "turn_state": "CONTINUING",
             "processing_intents": self._intents,
             "tool_requests": [],

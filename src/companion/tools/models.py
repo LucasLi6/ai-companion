@@ -75,8 +75,10 @@ class ToolSpec:
 
     def prompt_spec(self) -> dict:
         schema = self.argument_model.model_json_schema()
-        # Local refs make the prompt bigger without adding information.
-        schema.pop("title", None)
+        # The router only needs the argument contract. Local validation already
+        # enforces the pydantic model, so per-field titles and the redundant
+        # ``additionalProperties: false`` are removed to keep the prompt small.
+        schema = _compact_argument_schema(schema)
         schema.pop("$defs", None)
         return {
             "name": self.name,
@@ -85,6 +87,26 @@ class ToolSpec:
             "required_permission": self.permission,
             "read_only": not self.has_side_effects,
         }
+
+
+def _compact_argument_schema(schema: dict) -> dict:
+    """Strip JSON-Schema metadata that does not help the model fill arguments."""
+    if not isinstance(schema, dict):
+        return schema
+    compact: dict = {}
+    for key, value in schema.items():
+        if key in ("title", "additionalProperties"):
+            continue
+        if isinstance(value, dict):
+            compact[key] = _compact_argument_schema(value)
+        elif isinstance(value, list):
+            compact[key] = [
+                _compact_argument_schema(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+        else:
+            compact[key] = value
+    return compact
 
 
 @dataclass

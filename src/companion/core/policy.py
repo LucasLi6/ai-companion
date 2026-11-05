@@ -324,6 +324,25 @@ class Policy:
                 "explicit_silence_request",
             )
 
+        # 3b. A validated NON_COMMUNICATIVE turn with no internal operation is
+        # not a turn to answer. This reads only the router's validated enum and
+        # the (already validated) intent/tool lists; it never inspects the raw
+        # text. The model's own RESPOND suggestion cannot override this, and a
+        # trusted "agent" hint is not evidence of communication either.
+        from companion.routing.models import InputSemanticStatus
+
+        if (
+            route.input_semantics == InputSemanticStatus.NON_COMMUNICATIVE
+            and not route.processing_intents
+            and not route.tool_requests
+        ):
+            return decision(
+                CognitiveAction.IGNORE,
+                ReasonCode.RESPONSE_NOT_NECESSARY,
+                "semantic_noncommunicative",
+                "non_communicative_input",
+            )
+
         # 4. Quiet mode downgrades a visible response, but the turn is still
         # understood and internal operations may proceed.
         if trusted.quiet_mode and model_action == CognitiveAction.RESPOND:
