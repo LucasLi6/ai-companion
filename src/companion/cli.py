@@ -625,6 +625,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_wt.add_argument("--limit", type=int, default=5)
     p_wt.set_defaults(func=cmd_web_test)
+    p_wd = p_web_sub.add_parser(
+        "diagnose",
+        parents=[_common_parser()],
+        help="Show recent web/weather tool calls and likely causes",
+    )
+    p_wd.add_argument("--limit", type=int, default=20)
+    p_wd.set_defaults(func=cmd_web_diagnose)
 
     return parser
 
@@ -834,6 +841,44 @@ async def cmd_inspect(args) -> int:
                 print(f"network_egress_location: {place or '(unknown)'}")
             else:
                 print("network_egress_location: (none)")
+
+        decisions = await rt.repos.routing.list_decisions(args.event_id)
+        print(f"-- routing decisions: {len(decisions)} --")
+        for decision_row in decisions:
+            decision = decision_row.get("decision") or {}
+            print(
+                f"  step={decision_row['step_index']}"
+                f" phase={decision_row['phase']}"
+                f" validation={decision_row['validation_status']}"
+                f" provider={decision_row['provider']}"
+                f" model={decision_row['model']}"
+            )
+            print(
+                f"    action={decision.get('action')}"
+                f" needs_followup_planning="
+                f"{decision.get('needs_followup_planning')}"
+                f" reason={str(decision.get('reason') or '-')[:160]}"
+            )
+            for request in (decision.get("tool_requests") or [])[:8]:
+                print(
+                    "    tool_request: "
+                    f"{request.get('tool_name')}"
+                    f" args={json.dumps(request.get('arguments'), ensure_ascii=False)}"
+                    f" required={request.get('required')}"
+                )
+
+        calls = await rt.repos.routing.list_tool_calls(args.event_id)
+        print(f"-- tool calls: {len(calls)} --")
+        for call in calls:
+            print(
+                f"  {call['tool_call_id']} step={call['route_step_index']}"
+                f" tool={call['tool_name']} status={call['status']}"
+                f" execution={call['execution_status']}"
+                f" error={call['error_code'] or '-'}"
+            )
+            refs = (call.get("result_reference") or {}).get("source_refs") or []
+            for ref in refs[:5]:
+                print(f"    source: {ref}")
 
         candidates = await rt.repos.analysis.get_candidates(args.event_id)
         writes = {
@@ -2027,6 +2072,69 @@ async def cmd_web_test(args) -> int:
             print(f"    url: {result.url}")
             if result.snippet:
                 print(f"    snippet: {result.snippet[:200]}")
+    finally:
+        await db.close()
+    return 0
+
+
+_WEB_DIAGNOSIS_HINTS = {
+    "web_search_disabled": "联网未开启：python -m companion web enable",
+    "permission_denied": "该说话人未开启 allow_external_ai，或联网未开启",
+    "external_ai_permission_revoked": "本轮执行前该人物的外部 AI 权限已被撤回",
+    "duckduckgo_anomaly": "DuckDuckGo 对本机返回反爬挑战；稍后重试、换网络或改用 Brave",
+    "duckduckgo_parse_error": "搜索结果页结构无法识别（不是“没有结果”）",
+    "duckduckgo_empty_response": "搜索端点返回空响应；稍后重试",
+    "duckduckgo_http_error": "搜索端点返回非预期 HTTP 状态",
+    "brave_api_key_missing": "缺少 BRAVE_SEARCH_API_KEY，或改用 duckduckgo",
+    "result_too_large": "工具结果超过大小上限；这是实现问题，不是“没有结果”",
+    "timeout": "工具超时；网络较慢或搜索端点无响应",
+    "web_fetch_url_not_from_search": "web.fetch 只允许读取本轮 web.search 返回的 URL",
+    "web_fetch_turn_limit": "本轮已读取页面数达到上限",
+    "web_fetch_private_address": "目标解析到非公网地址，已按 SSRF 规则拒绝",
+    "weather_location_not_found": "地点未匹配到任何城市；这不是天气服务故障",
+}
+
+
+def _web_hint(error_code: str | None) -> str:
+    if not error_code:
+        return ""
+    for key, hint in _WEB_DIAGNOSIS_HINTS.items():
+        if key in error_code:
+            return hint
+    return ""
+
+
+async def cmd_web_diagnose(args) -> int:
+    """Recent external-tool outcomes from the existing audit table."""
+    db = await _connect(args.db)
+    try:
+        repos = make_repositories(db)
+        calls = await repos.routing.recent_tool_calls(limit=args.limit)
+        calls = [
+            call
+            for call in calls
+            if call["tool_name"] in ("web.search", "web.fetch", "weather.forecast")
+        ]
+        if not calls:
+            print("no recent web.search / weather.forecast / web.fetch calls")
+            return 0
+        print(f"recent external tool calls: {len(calls)}")
+        for call in calls:
+            arguments = json.dumps(call["arguments"], ensure_ascii=False)
+            print(
+                f"- {call['created_at']} {call['tool_name']}"
+                f" status={call['status']} execution={call['execution_status']}"
+            )
+            print(f"    event: {call['event_id']} step={call['route_step_index']}")
+            print(f"    args: {arguments[:160]}")
+            if call["error_code"]:
+                print(f"    error_code: {call['error_code']}")
+                hint = _web_hint(call["error_code"])
+                if hint:
+                    print(f"    hint: {hint}")
+            refs = (call.get("result_reference") or {}).get("source_refs") or []
+            for ref in refs[:3]:
+                print(f"    source: {ref}")
     finally:
         await db.close()
     return 0

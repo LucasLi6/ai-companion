@@ -170,9 +170,23 @@ async def test_duckduckgo_genuine_no_results_is_an_empty_lookup():
     provider = HttpWebSearchProvider(
         enabled=True,
         retries=0,
-        transport=_ddg("<html><body>no results</body></html>"),
+        transport=_ddg(
+            '<html><body><div class="no-results">No results found for that query.</div></body></html>'
+        ),
     )
     assert await provider.search("zzzz-nothing") == []
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_unrecognised_page_is_a_parse_error_not_empty():
+    provider = HttpWebSearchProvider(
+        enabled=True,
+        retries=0,
+        transport=_ddg("<html><body>totally different layout</body></html>"),
+    )
+    with pytest.raises(WebSearchError) as exc:
+        await provider.search("x")
+    assert exc.value.code == "duckduckgo_parse_error"
 
 
 @pytest.mark.asyncio

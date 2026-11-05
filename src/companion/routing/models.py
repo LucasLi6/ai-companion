@@ -29,7 +29,7 @@ from companion.domain.enums import ReplyNecessity
 from companion.domain.models import AffectiveSignal, PragmaticAnalysis, SceneProposal
 
 ROUTER_SCHEMA_VERSION = 1
-ROUTER_PROMPT_VERSION = "router-v2"
+ROUTER_PROMPT_VERSION = "router-v3"
 
 MAX_TOOL_REQUESTS = 8
 MAX_TOOL_CALLS = 4

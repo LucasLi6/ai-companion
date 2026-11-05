@@ -166,7 +166,7 @@ class ToolExecutor:
                 restored=restored,
             )
 
-        return ToolResult(
+        result = ToolResult(
             tool_call_id=tool_call_id,
             tool_name=spec.name,
             status=outcome.status,
@@ -175,7 +175,11 @@ class ToolExecutor:
             source_refs=list(outcome.source_refs)[:20],
             untrusted=outcome.untrusted,
             restored=restored,
+            meta=dict(outcome.meta or {}),
         )
+        if spec.name == "web.search" and result.status == ToolStatus.SUCCESS:
+            _remember_search_urls(context, result.source_refs)
+        return result
 
     @staticmethod
     def _permitted(permission: str, context: ToolExecutionContext) -> bool:
@@ -206,3 +210,28 @@ class ToolExecutor:
 
 
 __all__ = ["ToolExecutor", "MAX_TOOL_CALLS"]
+
+
+def _remember_search_urls(
+    context: ToolExecutionContext, source_refs: list[str]
+) -> None:
+    """Record the URLs a successful search actually returned this turn.
+
+    ``web.fetch`` may only read these. They come from the executed result, not
+    from anything the Router wrote, so a fabricated URL cannot become
+    fetchable.
+    """
+    from companion.providers.webfetch import normalize_web_url
+
+    allowed = context.extras.setdefault("web_search_urls", set())
+    if not isinstance(allowed, set):
+        allowed = set()
+        context.extras["web_search_urls"] = allowed
+    for ref in source_refs:
+        text = str(ref or "").strip()
+        if not text:
+            continue
+        allowed.add(text)
+        normalized = normalize_web_url(text)
+        if normalized:
+            allowed.add(normalized)

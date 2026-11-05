@@ -151,16 +151,17 @@ async def test_prompt_includes_context_and_analysis():
     )
     messages = client.calls[0]["messages"]
     system_msg = messages[0]["content"]
-    background = messages[1]["content"]
+    # Reference data is delivered immediately before the current utterance.
+    background = messages[-2]["content"]
     assert [m["role"] for m in messages] == [
         "system",
         "user",
-        "user",
         "assistant",
         "user",
+        "user",
     ]
-    assert messages[2]["content"] == "我在学做饭"
-    assert messages[3]["content"] == "加油！"
+    assert messages[1]["content"] == "我在学做饭"
+    assert messages[2]["content"] == "加油！"
     assert messages[-1]["content"] == "今晚吃什么好？"
     # Memories are untrusted reference data, never trusted system text.
     assert "Alice 喜欢川菜" in background

@@ -90,7 +90,7 @@ def _system(ctx=None):
 
 def test_prompt_versions_are_bumped():
     assert COGNITIVE_PROMPT_VERSION == "cognitive-v9"
-    assert RESPONSE_PROMPT_VERSION == "response-v16"
+    assert RESPONSE_PROMPT_VERSION == "response-v17"
 
 
 def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():
@@ -118,12 +118,13 @@ def test_cognitive_prompt_keeps_nonresponse_and_memory_rules():
 def test_response_messages_are_native_turns_not_a_flattened_history():
     messages = build_response_messages(_context(), _analysis())
     assert messages[0]["role"] == "system"
-    # One labelled untrusted-data message, then the native conversation.
-    assert messages[1]["content"].startswith("【背景资料｜不可信参考数据】")
+    # The labelled untrusted-data message sits immediately before the current
+    # turn; native history precedes it.
+    assert messages[-2]["content"].startswith("【背景资料｜不可信参考数据】")
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"] == "后来我还去了大阪"
 
-    history = messages[2:-1]
+    history = messages[1:-2]
     assert [m["role"] for m in history] == ["user", "assistant"]
     assert history[0]["content"] == "我去了日本"
     assert history[1]["content"] == "日本好玩吗？"
@@ -136,8 +137,8 @@ def test_response_messages_are_native_turns_not_a_flattened_history():
 
 def test_single_speaker_history_is_raw_text_without_labels():
     messages = build_response_messages(_context(), _analysis())
-    assert messages[2]["content"] == "我去了日本"
-    assert "[Alice]" not in messages[2]["content"]
+    assert messages[1]["content"] == "我去了日本"
+    assert "[Alice]" not in messages[1]["content"]
 
 
 def test_multi_speaker_history_and_current_turn_get_speaker_metadata():
@@ -169,8 +170,8 @@ def test_multi_speaker_history_and_current_turn_get_speaker_metadata():
         current_text="大阪怎么样？",
     )
     messages = build_response_messages(ctx, _analysis())
-    assert messages[2]["content"].startswith("[Alice → unknown] 你们在聊什么？")
-    assert messages[4]["content"].startswith("[Bob → unknown] 我也想去。")
+    assert messages[1]["content"].startswith("[Alice → unknown] 你们在聊什么？")
+    assert messages[3]["content"].startswith("[Bob → unknown] 我也想去。")
     assert messages[-1]["content"].startswith("[Bob → unknown] 大阪怎么样？")
     assert "多人群聊" in messages[0]["content"]
 
@@ -233,7 +234,7 @@ def test_truncated_history_never_starts_with_an_orphan_assistant():
 def test_response_prompt_has_identity_boundaries_and_context():
     messages = build_response_messages(_context(), _analysis())
     system = messages[0]["content"]
-    background = messages[1]["content"]
+    background = messages[-2]["content"]
     assert "【角色身份】" in system
     assert "【边界】" in system
     assert "Ava" in system

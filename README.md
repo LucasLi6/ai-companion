@@ -128,6 +128,13 @@ python -m companion web enable                     # brave if BRAVE_SEARCH_API_K
 python -m companion web enable --provider duckduckgo
 python -m companion web disable
 python -m companion web test "青霉素是什么" --limit 3   # one real search, bypassing the Router
+python -m companion web diagnose --limit 20        # recent web/weather tool calls + likely cause
+
+# With search enabled, the Router can also use two more read-only tools:
+#   weather.forecast  live current weather and today's high/low (Open-Meteo, no key)
+#   web.fetch         read the text of a page returned by this turn's web.search
+# Both obey the same gates: web_search.enabled, the speaker's allow_external_ai,
+# and a live consent re-check immediately before the network call.
 
 # 8. Long-term memory inspection and assignment
 python -m companion memory search "川菜"

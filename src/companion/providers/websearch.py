@@ -73,6 +73,132 @@ class MockWebSearchProvider:
         ]
 
 
+class _DuckDuckGoHTMLParser:
+    """Streaming, container-safe parser for DuckDuckGo's HTML result page.
+
+    A ``result__a`` anchor opens one result; the next ``result__snippet``
+    element in document order supplies its snippet. Titles and snippets are
+    therefore attached per result instead of being paired by list index.
+    Class names are matched as a token set, never as an exact string.
+    """
+
+    _VOID = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+
+    def __init__(self) -> None:
+        self._parser = None
+        self.results: list[dict] = []
+        self.no_results = False
+        self._current: Optional[dict] = None
+        self._capture: Optional[str] = None
+        self._capture_depth = 0
+        self._depth = 0
+        self._buffer: list[str] = []
+
+    def feed(self, body: str) -> None:
+        from html.parser import HTMLParser
+
+        parser = self
+
+        class _Handler(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                parser._start(tag, attrs)
+
+            def handle_startendtag(self, tag, attrs):
+                parser._start(tag, attrs)
+
+            def handle_endtag(self, tag):
+                parser._end(tag)
+
+            def handle_data(self, data):
+                if parser._capture is not None:
+                    parser._buffer.append(data)
+
+        self._parser = _Handler(convert_charrefs=True)
+        self._parser.feed(body)
+
+    def close(self) -> None:
+        if self._parser is not None:
+            self._parser.close()
+        self._finish_current()
+
+    @staticmethod
+    def _attrs(attrs) -> dict[str, str]:
+        return {str(k).lower(): str(v or "") for k, v in attrs}
+
+    @staticmethod
+    def _classes(attrs) -> set[str]:
+        raw = " ".join(
+            str(v or "") for k, v in attrs if str(k).lower() == "class"
+        )
+        return set(raw.split())
+
+    def _start(self, tag: str, attrs) -> None:
+        classes = self._classes(attrs)
+        if self._capture is None:
+            if tag == "a" and "result__a" in classes:
+                values = self._attrs(attrs)
+                self._finish_current()
+                self._current = {
+                    "title": "",
+                    "url": _decode_duckduckgo_url(values.get("href", "")),
+                    "snippet": "",
+                }
+                self._begin_capture("title")
+            elif "result__snippet" in classes and self._current is not None:
+                self._begin_capture("snippet")
+            elif "no-results" in classes or "result--no-result" in classes:
+                self.no_results = True
+        if tag in self._VOID:
+            return
+        self._depth += 1
+
+    def _end(self, tag: str) -> None:
+        if tag in self._VOID:
+            return
+        if self._capture is not None and self._depth == self._capture_depth:
+            self._end_capture()
+        self._depth = max(0, self._depth - 1)
+
+    def _begin_capture(self, field: str) -> None:
+        self._capture = field
+        self._capture_depth = self._depth + 1
+        self._buffer = []
+
+    def _end_capture(self) -> None:
+        text = " ".join("".join(self._buffer).split())
+        if self._current is not None and self._capture is not None:
+            existing = str(self._current.get(self._capture) or "")
+            self._current[self._capture] = (existing + " " + text).strip()
+        self._capture = None
+        self._buffer = []
+
+    def _finish_current(self) -> None:
+        if self._capture is not None:
+            self._end_capture()
+        if self._current is not None:
+            self.results.append(self._current)
+            self._current = None
+
+
+def _decode_duckduckgo_url(href: str) -> str:
+    """Decode a DDG redirect (``//duckduckgo.com/l/?uddg=…``) to its target."""
+    from urllib.parse import parse_qs, urlparse
+
+    href = (href or "").strip()
+    if not href:
+        return ""
+    if "uddg=" in href:
+        target = parse_qs(urlparse(href).query).get("uddg", [""])[0]
+        if target:
+            href = target
+    if href.startswith("//"):
+        href = "https:" + href
+    return href
+
+
 class HttpWebSearchProvider:
     """Real search via DuckDuckGo's HTML endpoint (no API key required).
 
@@ -117,9 +243,7 @@ class HttpWebSearchProvider:
         return "real" if self.enabled else "disabled"
 
     async def search(self, query: str, limit: int = 5) -> list[SearchResult]:
-        import html as html_module
         import httpx
-        import re
 
         if not self.enabled:
             raise WebSearchError(
@@ -196,7 +320,15 @@ class HttpWebSearchProvider:
                     continue
                 raise last_error
 
-            return self._parse(body, html_module, re, limit)
+            if not body.strip():
+                last_error = WebSearchError(
+                    "duckduckgo_empty_response", retryable=True
+                )
+                if attempt + 1 < attempts:
+                    await self._backoff(attempt)
+                    continue
+                raise last_error
+            return self._parse(body, limit)
         raise last_error or WebSearchError("duckduckgo_search_failed")
 
     async def _backoff(self, attempt: int) -> None:
@@ -204,70 +336,55 @@ class HttpWebSearchProvider:
             await asyncio.sleep(min(self.backoff_base * (2**attempt), 2.0))
 
     @staticmethod
-    def _parse(body: str, html_module, re, limit: int) -> list[SearchResult]:
+    def _parse(body: str, limit: int) -> list[SearchResult]:
         """Parse the DuckDuckGo HTML result page.
 
-        Result titles live in ``<a class="result__a">`` and snippets in
-        ``<a class="result__snippet">``; the two lists are paired in document
-        order. DDG result links are redirects (``//duckduckgo.com/l/?uddg=…``)
-        and are decoded to the real target URL before being surfaced.
-        """
-        from urllib.parse import parse_qs, urlparse
+        One streaming parse walks the document in order: a ``result__a`` anchor
+        starts a result and the ``result__snippet`` that follows belongs to that
+        same result. This is more robust than extracting all titles and all
+        snippets separately and pairing them by index, which breaks as soon as
+        one result lacks a snippet or an extra anchor appears.
 
-        titles = HttpWebSearchProvider._anchors(
-            body, "result__a", html_module, re
-        )
-        snippets = HttpWebSearchProvider._anchors(
-            body, "result__snippet", html_module, re
-        )
+        Class matching is by token set, so ``class="result__a js-link"`` and a
+        different attribute order both work. An unrecognised page is reported
+        as a parse error instead of being mistaken for "no results".
+        """
+        parser = _DuckDuckGoHTMLParser()
+        try:
+            parser.feed(body)
+            parser.close()
+        except Exception as exc:  # malformed HTML must not become "no results"
+            raise WebSearchError("duckduckgo_parse_error") from exc
+
         results: list[SearchResult] = []
-        for index, (href, title) in enumerate(titles):
-            if not title:
+        seen: set[str] = set()
+        for item in parser.results:
+            title = " ".join(str(item.get("title") or "").split())
+            url = str(item.get("url") or "").strip()
+            if not title or not url or url in seen:
                 continue
-            snippet = snippets[index][1] if index < len(snippets) else ""
+            if not url.startswith(("http://", "https://")):
+                continue
+            seen.add(url)
             results.append(
                 SearchResult(
                     title=title[:300],
-                    url=HttpWebSearchProvider._decode_url(href, parse_qs, urlparse)[:2000],
-                    snippet=snippet[:2000],
+                    url=url[:2000],
+                    snippet=" ".join(str(item.get("snippet") or "").split())[:2000],
                     provider="duckduckgo",
                 )
             )
             if len(results) >= limit:
                 break
-        return results
 
-    @staticmethod
-    def _anchors(body: str, class_name: str, html_module, re) -> list[tuple[str, str]]:
-        """Return ``(href, text)`` for every anchor with the given class."""
-        pattern = re.compile(
-            r'<a\b([^>]*class="' + re.escape(class_name) + r'"[^>]*)>(.*?)</a>',
-            re.DOTALL,
-        )
-        out: list[tuple[str, str]] = []
-        for m in pattern.finditer(body):
-            attrs = m.group(1)
-            inner = m.group(2)
-            href_match = re.search(r'href="([^"]+)"', attrs)
-            href = html_module.unescape(href_match.group(1)) if href_match else ""
-            text = html_module.unescape(re.sub(r"<[^>]+>", "", inner)).strip()
-            out.append((href, text))
-        return out
-
-    @staticmethod
-    def _decode_url(href: str, parse_qs, urlparse) -> str:
-        href = (href or "").strip()
-        if not href:
-            return ""
-        if "uddg=" in href:
-            target = parse_qs(urlparse(href).query).get("uddg", [""])[0]
-            if target:
-                return target
-        if href.startswith(("http://", "https://")):
-            return href
-        if href.startswith("//"):
-            return "https:" + href
-        return href
+        if results:
+            return results
+        if parser.no_results:
+            return []
+        # A 200 page that neither parsed into results nor says "no results" has
+        # an unknown structure (layout change, interstitial). Reporting that as
+        # an empty success would fabricate "nothing found".
+        raise WebSearchError("duckduckgo_parse_error", retryable=False)
 
 
 class BraveWebSearchProvider:

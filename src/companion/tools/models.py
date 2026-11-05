@@ -39,6 +39,9 @@ class ToolResult(BaseModel):
     # True when this row was produced by re-reading a read-only tool during
     # recovery, not by a newly planned request. It uses the same stable call id.
     restored: bool = False
+    # Bounded, non-content bookkeeping (e.g. returned/truncated counts). Never
+    # carries page text or instructions.
+    meta: dict = Field(default_factory=dict)
 
 
 class ToolHandlerResult(BaseModel):
@@ -51,6 +54,7 @@ class ToolHandlerResult(BaseModel):
     error_code: Optional[str] = None
     source_refs: list[str] = Field(default_factory=list)
     untrusted: bool = False
+    meta: dict = Field(default_factory=dict)
 
 
 class ToolHandler(Protocol):

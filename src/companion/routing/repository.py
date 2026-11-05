@@ -157,25 +157,49 @@ class RoutingRepository:
             (event_id,),
         )
         rows = await cur.fetchall()
-        return [
-            {
-                "tool_call_id": row["tool_call_id"],
-                "event_id": row["event_id"],
-                "route_step_index": row["route_step_index"],
-                "tool_name": row["tool_name"],
-                "arguments": json.loads(row["arguments_json"] or "{}"),
-                "arguments_hash": row["arguments_hash"],
-                "status": row["status"],
-                "execution_status": row["execution_status"],
-                "result_reference": json.loads(
-                    row["result_reference_json"] or "{}"
-                ),
-                "error_code": row["error_code"],
-                "created_at": row["created_at"],
-                "completed_at": row["completed_at"],
-            }
-            for row in rows
-        ]
+        return [self._tool_call_row(row) for row in rows]
+
+    async def recent_tool_calls(
+        self, limit: int = 20, *, tool_prefix: Optional[str] = None
+    ) -> list[dict]:
+        """Most recent tool calls across events, for diagnostics only."""
+        limit = max(1, min(int(limit), 200))
+        columns = (
+            "SELECT tool_call_id, event_id, route_step_index, tool_name,"
+            " arguments_json, arguments_hash, status, execution_status,"
+            " result_reference_json, error_code, created_at, completed_at"
+            " FROM route_tool_calls"
+        )
+        if tool_prefix:
+            cur = await self.db.execute(
+                columns + " WHERE tool_name LIKE ?"
+                " ORDER BY created_at DESC LIMIT ?",
+                (f"{tool_prefix}%", limit),
+            )
+        else:
+            cur = await self.db.execute(
+                columns + " ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+        return [self._tool_call_row(row) for row in await cur.fetchall()]
+
+    @staticmethod
+    def _tool_call_row(row) -> dict:
+        return {
+            "tool_call_id": row["tool_call_id"],
+            "event_id": row["event_id"],
+            "route_step_index": row["route_step_index"],
+            "tool_name": row["tool_name"],
+            "arguments": json.loads(row["arguments_json"] or "{}"),
+            "arguments_hash": row["arguments_hash"],
+            "status": row["status"],
+            "execution_status": row["execution_status"],
+            "result_reference": json.loads(
+                row["result_reference_json"] or "{}"
+            ),
+            "error_code": row["error_code"],
+            "created_at": row["created_at"],
+            "completed_at": row["completed_at"],
+        }
 
     @staticmethod
     def _decision_row(row) -> dict:

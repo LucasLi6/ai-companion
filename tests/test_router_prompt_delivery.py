@@ -174,7 +174,7 @@ def test_budget_overflow_is_an_explicit_marker_not_a_truncated_string():
                 [{"text": "y" * MAX_TOOL_FIELD_CHARS, "speaker": "Alice"}]
                 * MAX_TOOL_ITEMS,
             )
-            for _ in range(10)
+            for _ in range(30)
         ]
     )
     messages = build_response_messages(context, None)

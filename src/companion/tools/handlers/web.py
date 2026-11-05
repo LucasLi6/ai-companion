@@ -8,6 +8,8 @@ the speaker is instructed to treat them as information, never instructions.
 
 from __future__ import annotations
 
+import json
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from companion.providers.websearch import (
@@ -17,6 +19,14 @@ from companion.providers.websearch import (
 )
 from companion.routing.models import ToolStatus
 from companion.tools.models import ToolExecutionContext, ToolHandlerResult
+
+# Bounded result shape. The tool's ``max_result_chars`` (6000) is enforced by
+# the executor as a hard error, so the handler budgets *below* it and drops
+# whole results instead of handing over an object that would be rejected.
+MAX_TITLE_CHARS = 150
+MAX_SNIPPET_CHARS = 400
+MAX_URL_CHARS = 2000
+RESULT_BUDGET_CHARS = 5200
 
 
 class WebSearchArguments(BaseModel):
@@ -88,24 +98,65 @@ class WebSearchHandler:
                 status=ToolStatus.ERROR,
                 error_code=f"web_search_failed:{type(exc).__name__}",
             )
-        data = [
-            {
-                "title": str(getattr(item, "title", ""))[:300],
-                "url": str(getattr(item, "url", ""))[:1000],
-                "snippet": str(getattr(item, "snippet", ""))[:1000],
-            }
-            for item in results[: args.limit]
-        ]
+        data, truncated, dropped_invalid = _fit_results(results, args.limit)
+        meta = {
+            "provider": str(getattr(provider, "name", "") or ""),
+            "requested_limit": args.limit,
+            "returned_count": len(data),
+            "truncated_count": truncated,
+        }
+        if dropped_invalid:
+            meta["invalid_count"] = dropped_invalid
         if not data:
             return ToolHandlerResult(
-                status=ToolStatus.EMPTY, data=[], untrusted=True
+                status=ToolStatus.EMPTY, data=[], untrusted=True, meta=meta
             )
         return ToolHandlerResult(
             status=ToolStatus.SUCCESS,
             data=data,
             source_refs=[item["url"] for item in data if item["url"]],
             untrusted=True,
+            meta=meta,
         )
+
+
+def _fit_results(results, limit: int) -> tuple[list[dict], int, int]:
+    """Convert provider results into the bounded payload the Speaker receives.
+
+    Titles and snippets are clipped, but a URL is never shortened: a truncated
+    link is worse than no link, so an unusable URL drops the whole result.
+    Results are added in order until the byte budget is reached; the rest are
+    counted as truncated.
+    """
+    data: list[dict] = []
+    invalid = 0
+    for item in results[:limit]:
+        title = _clip(getattr(item, "title", ""), MAX_TITLE_CHARS)
+        url = str(getattr(item, "url", "") or "").strip()
+        snippet = _clip(getattr(item, "snippet", ""), MAX_SNIPPET_CHARS)
+        if not title or len(url) > MAX_URL_CHARS or not _is_http_url(url):
+            invalid += 1
+            continue
+        candidate = {"title": title, "url": url, "snippet": snippet}
+        if len(json.dumps(data + [candidate], ensure_ascii=False)) > (
+            RESULT_BUDGET_CHARS
+        ):
+            break
+        data.append(candidate)
+    considered = min(len(results), limit)
+    return data, max(0, considered - len(data) - invalid), invalid
+
+
+def _clip(value, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+
+def _is_http_url(url: str) -> bool:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
 async def _web_search_enabled(context: ToolExecutionContext) -> bool:
