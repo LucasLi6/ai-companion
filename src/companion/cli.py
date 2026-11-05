@@ -1755,6 +1755,8 @@ async def cmd_deepseek_check(args) -> int:
     print(f"max_retries: {config.max_retries}")
     print(f"analysis_max_tokens: {config.analysis_max_tokens}")
     print(f"response_max_tokens: {config.response_max_tokens}")
+    print(f"analysis_thinking: {config.analysis_thinking}")
+    print(f"response_thinking: {config.response_thinking}")
     print(f"analysis_reasoning_effort: {config.analysis_reasoning_effort}")
     print(f"response_reasoning_effort: {config.response_reasoning_effort}")
 
@@ -1768,10 +1770,13 @@ async def cmd_deepseek_check(args) -> int:
 
     try:
         client = build_deepseek_client(config)
+        # Thinking tokens share the output budget, so a tiny cap would produce
+        # an empty visible reply and a false failure.
+        live_tokens = 1024 if config.response_thinking == "enabled" else 8
         response = await client.complete(
             [{"role": "user", "content": "Reply with exactly: OK"}],
             request_type="response",
-            max_tokens=8,
+            max_tokens=live_tokens,
         )
     except DeepSeekError as exc:
         print(f"live check failed: {type(exc).__name__}: {exc}")

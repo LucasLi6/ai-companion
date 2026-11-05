@@ -114,6 +114,8 @@ def test_load_config_defaults():
     assert cfg.max_retries == 2
     assert cfg.analysis_max_tokens == 1024
     assert cfg.response_max_tokens == 2048
+    assert cfg.analysis_thinking == "disabled"
+    assert cfg.response_thinking == "disabled"
     assert cfg.analysis_reasoning_effort == "none"
     assert cfg.response_reasoning_effort == "none"
 
@@ -128,6 +130,7 @@ def test_load_config_reads_env():
             "DEEPSEEK_MAX_RETRIES": "5",
             "DEEPSEEK_ANALYSIS_MAX_TOKENS": "512",
             "DEEPSEEK_RESPONSE_MAX_TOKENS": "4096",
+            "DEEPSEEK_THINKING": "enabled",
             "DEEPSEEK_ANALYSIS_REASONING_EFFORT": "high",
         }
     )
@@ -138,6 +141,8 @@ def test_load_config_reads_env():
     assert cfg.max_retries == 5
     assert cfg.analysis_max_tokens == 512
     assert cfg.response_max_tokens == 4096
+    assert cfg.analysis_thinking == "enabled"
+    assert cfg.response_thinking == "enabled"
     assert cfg.analysis_reasoning_effort == "high"
     assert cfg.response_reasoning_effort == "none"
 
@@ -189,19 +194,49 @@ async def test_thinking_mode_is_off_by_default_on_both_requests():
     client, fake = _make_client(_config(), _ok)
     await client.complete([{"role": "user", "content": "x"}], request_type="analysis")
     await client.complete([{"role": "user", "content": "x"}], request_type="response")
-    assert fake.calls[0]["reasoning_effort"] == "none"
-    assert fake.calls[1]["reasoning_effort"] == "none"
-    # No contradictory thinking switch is ever sent alongside it.
-    assert "thinking" not in fake.calls[0]
-    assert "thinking" not in fake.calls[1]
+    # The V4 API defaults to thinking ON, so off is an explicit wire switch.
+    assert fake.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert fake.calls[1]["extra_body"] == {"thinking": {"type": "disabled"}}
+    # "none" is not an effort value; disabled thinking is expressed by the
+    # switch alone, never by a contradictory effort.
+    assert "reasoning_effort" not in fake.calls[0]
+    assert "reasoning_effort" not in fake.calls[1]
 
 
-async def test_reasoning_effort_passed_when_configured():
+async def test_thinking_enabled_sends_switch_and_effort():
     client, fake = _make_client(
-        _config(analysis_reasoning_effort="high"), _ok
+        _config(
+            analysis_thinking="enabled",
+            response_thinking="enabled",
+            analysis_reasoning_effort="max",
+            response_reasoning_effort="high",
+        ),
+        _ok,
     )
     await client.complete([{"role": "user", "content": "x"}], request_type="analysis")
-    assert fake.calls[0]["reasoning_effort"] == "high"
+    await client.complete([{"role": "user", "content": "x"}], request_type="response")
+    assert fake.calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert fake.calls[0]["reasoning_effort"] == "max"
+    assert fake.calls[1]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert fake.calls[1]["reasoning_effort"] == "high"
+
+
+async def test_thinking_enabled_with_unset_effort_uses_provider_default():
+    client, fake = _make_client(
+        _config(response_thinking="enabled"), _ok
+    )
+    await client.complete([{"role": "user", "content": "x"}], request_type="response")
+    assert fake.calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert "reasoning_effort" not in fake.calls[0]
+
+
+async def test_thinking_can_be_enabled_for_one_request_type_only():
+    cfg = load_deepseek_config({"DEEPSEEK_RESPONSE_THINKING": "enabled"})
+    assert cfg.analysis_thinking == "disabled"
+    assert cfg.response_thinking == "enabled"
+    cfg = load_deepseek_config({"DEEPSEEK_THINKING": "on"})
+    assert cfg.analysis_thinking == "enabled"
+    assert cfg.response_thinking == "enabled"
 
 
 async def test_missing_usage_zeroes_tokens():

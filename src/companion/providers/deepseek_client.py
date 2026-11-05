@@ -60,10 +60,13 @@ class DeepSeekConfig:
     retry_backoff_seconds: float = 1.0
     analysis_max_tokens: int = 1024
     response_max_tokens: int = 2048
-    # V0.4: Thinking Mode is OFF by default for both request types. The
-    # explicit "none" is sent on the wire (not omitted) so the provider cannot
-    # silently apply a reasoning default. An environment override to "high"
-    # remains possible for both request types.
+    # V0.4: Thinking Mode is OFF by default for both request types. V0.6.3
+    # makes that switch explicit on the wire (``thinking.type``), because the
+    # V4 API defaults to thinking ON and ``reasoning_effort`` alone cannot
+    # reliably turn it off. Enable with DEEPSEEK_THINKING=enabled or per type
+    # with DEEPSEEK_ANALYSIS_THINKING / DEEPSEEK_RESPONSE_THINKING.
+    analysis_thinking: str = "disabled"
+    response_thinking: str = "disabled"
     analysis_reasoning_effort: Optional[str] = "none"
     response_reasoning_effort: Optional[str] = "none"
 
@@ -98,6 +101,48 @@ def _env_str(value: str | None, default: str | None) -> str | None:
     return value.strip()
 
 
+_ENABLED_WORDS = ("1", "true", "yes", "on", "enabled", "enable")
+_DISABLED_WORDS = ("0", "false", "no", "off", "disabled", "disable", "none")
+
+
+def _env_thinking(value: str | None, default: str) -> str:
+    """Normalise a thinking-mode env value to ``"enabled"``/``"disabled"``."""
+    if value is None or value.strip() == "":
+        return default
+    word = value.strip().lower()
+    if word in _ENABLED_WORDS:
+        return "enabled"
+    if word in _DISABLED_WORDS:
+        return "disabled"
+    return default
+
+
+def _thinking_wire(request_type: str, config: DeepSeekConfig) -> dict:
+    """The provider's explicit thinking switch, sent in ``extra_body``."""
+    mode = (
+        config.analysis_thinking
+        if request_type == "analysis"
+        else config.response_thinking
+    )
+    return {"thinking": {"type": "enabled" if mode == "enabled" else "disabled"}}
+
+
+def _reasoning_effort_wire(effort: Optional[str], thinking: dict) -> Optional[str]:
+    """Reasoning effort only makes sense while thinking is enabled.
+
+    ``"none"`` is the project's internal "unset" marker; the V4 API expresses
+    off via ``thinking.type``, not via an effort value.
+    """
+    if thinking["thinking"]["type"] != "enabled":
+        return None
+    if effort is None:
+        return None
+    cleaned = effort.strip()
+    if cleaned.lower() in ("", "none", "disabled", "off"):
+        return None
+    return cleaned
+
+
 def load_deepseek_config(environ: dict | None = None) -> DeepSeekConfig:
     """Build :class:`DeepSeekConfig` from ``DEEPSEEK_*`` environment variables.
 
@@ -105,6 +150,8 @@ def load_deepseek_config(environ: dict | None = None) -> DeepSeekConfig:
     developer's real key is never read accidentally.
     """
     env = environ if environ is not None else os.environ
+    # One global switch, with optional per-request-type overrides.
+    thinking = _env_thinking(env.get("DEEPSEEK_THINKING"), "disabled")
     return DeepSeekConfig(
         api_key=env.get("DEEPSEEK_API_KEY", "").strip(),
         base_url=_env_str(env.get("DEEPSEEK_BASE_URL"), DEFAULT_BASE_URL) or DEFAULT_BASE_URL,
@@ -113,6 +160,12 @@ def load_deepseek_config(environ: dict | None = None) -> DeepSeekConfig:
         max_retries=_env_int(env.get("DEEPSEEK_MAX_RETRIES"), 2),
         analysis_max_tokens=_env_int(env.get("DEEPSEEK_ANALYSIS_MAX_TOKENS"), 1024),
         response_max_tokens=_env_int(env.get("DEEPSEEK_RESPONSE_MAX_TOKENS"), 2048),
+        analysis_thinking=_env_thinking(
+            env.get("DEEPSEEK_ANALYSIS_THINKING"), thinking
+        ),
+        response_thinking=_env_thinking(
+            env.get("DEEPSEEK_RESPONSE_THINKING"), thinking
+        ),
         analysis_reasoning_effort=_env_str(
             env.get("DEEPSEEK_ANALYSIS_REASONING_EFFORT"), "none"
         ),
@@ -383,6 +436,8 @@ class DeepSeekClient:
                 if request_type == "analysis"
                 else self.config.response_reasoning_effort
             )
+        thinking = _thinking_wire(request_type, self.config)
+        reasoning_effort = _reasoning_effort_wire(reasoning_effort, thinking)
         request_id = request_id or new_id("dsrq")
 
         last_error: Optional[DeepSeekError] = None
@@ -395,6 +450,7 @@ class DeepSeekClient:
                     json_mode=json_mode,
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
+                    thinking=thinking,
                 )
             except DeepSeekError as exc:
                 last_error = exc
@@ -476,6 +532,8 @@ class DeepSeekClient:
                 if request_type == "analysis"
                 else self.config.response_reasoning_effort
             )
+        thinking = _thinking_wire(request_type, self.config)
+        reasoning_effort = _reasoning_effort_wire(reasoning_effort, thinking)
         request_id = request_id or new_id("dsrq")
 
         attempt = 0
@@ -492,6 +550,7 @@ class DeepSeekClient:
                     json_mode=json_mode,
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
+                    thinking=thinking,
                 )
                 iterator = stream.__aiter__()
                 while True:
@@ -588,6 +647,7 @@ class DeepSeekClient:
         json_mode: bool,
         max_tokens: int,
         reasoning_effort: Optional[str],
+        thinking: dict,
     ):
         if self._client is None:
             raise DeepSeekConfigError("no DeepSeek client configured")
@@ -597,6 +657,7 @@ class DeepSeekClient:
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": max_tokens,
+            "extra_body": thinking,
         }
         if json_mode:
             params["response_format"] = {"type": "json_object"}
@@ -650,6 +711,7 @@ class DeepSeekClient:
         json_mode: bool,
         max_tokens: int,
         reasoning_effort: Optional[str],
+        thinking: dict,
     ) -> ChatResponse:
         if self._client is None:
             raise DeepSeekConfigError("no DeepSeek client configured")
@@ -659,6 +721,7 @@ class DeepSeekClient:
             "messages": messages,
             "stream": False,
             "max_tokens": max_tokens,
+            "extra_body": thinking,
         }
         if json_mode:
             params["response_format"] = {"type": "json_object"}

@@ -284,10 +284,15 @@ uv pip install --python .venv/bin/python -e ".[deepseek]"
 ```bash
 export DEEPSEEK_API_KEY="sk-..."           # read from the environment only
 # optional overrides
-export DEEPSEEK_MODEL="deepseek-flash"
+export DEEPSEEK_MODEL="deepseek-flash"      # or deepseek-v4-pro
 export DEEPSEEK_BASE_URL="https://api.deepseek.com"
 export DEEPSEEK_TIMEOUT="60"
 export DEEPSEEK_MAX_RETRIES="2"
+# Thinking mode is OFF by default; the V4 API defaults it ON, so the client
+# sends an explicit switch. Enable globally or per request type:
+export DEEPSEEK_THINKING="disabled"         # enabled | disabled
+# export DEEPSEEK_RESPONSE_THINKING="enabled"
+# export DEEPSEEK_RESPONSE_REASONING_EFFORT="high"   # high | max
 ```
 
 The key is never accepted as a CLI flag, never written to SQLite, never logged,
