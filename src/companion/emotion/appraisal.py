@@ -90,7 +90,6 @@ EVENT_TO_RULE = {
     "setback": "setback_concern",
     "gratitude": "explicit_gratitude",
     "urgency": "urgent_concern",
-    "question": "curiosity_question",
     "direct_insult": "direct_insult",
     "repeated_hostility": "repeated_hostility",
     "criticism": "agent_criticism",
@@ -170,16 +169,6 @@ DEFAULT_RULES: list[dict] = [
         "arousal_delta": 0.5,
         "intensity": 0.7,
         "priority": 30,
-    },
-    {
-        "name": "curiosity_question",
-        "trigger_type": "utterance",
-        "pattern": {"question": True},
-        "emotion": "CURIOSITY",
-        "valence_delta": 0.1,
-        "arousal_delta": 0.2,
-        "intensity": 0.3,
-        "priority": 5,
     },
     # -- V0.4.1 interpersonal rules (semantic-event only) -------------------
     {

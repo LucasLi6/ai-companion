@@ -357,6 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ui = sub.add_parser("ui", parents=[_common_parser()], help="Start the management web UI (NiceGUI)")
     p_ui.add_argument("--host", default="127.0.0.1")
     p_ui.add_argument("--port", type=int, default=8080)
+    _add_provider_arg(p_ui)
     p_ui.set_defaults(func=cmd_ui)
 
     p_research = sub.add_parser("research", parents=[_common_parser()], help="Manage idle research tasks")
@@ -1349,7 +1350,12 @@ def cmd_ui(args) -> int:
 
     args.db.parent.mkdir(parents=True, exist_ok=True)
     try:
-        serve(args.db, host=args.host, port=args.port)
+        serve(
+            args.db,
+            host=args.host,
+            port=args.port,
+            provider=getattr(args, "provider", "mock"),
+        )
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 1

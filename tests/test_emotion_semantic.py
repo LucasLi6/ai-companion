@@ -52,7 +52,6 @@ SEMANTIC_CASES = [
     ("setback", "项目失败了", "CONCERN", "setback_concern", {}),
     ("gratitude", "谢谢你", "JOY", "explicit_gratitude", {}),
     ("urgency", "紧急情况", "CONCERN", "urgent_concern", {}),
-    ("question", "这是为什么？", "CURIOSITY", "curiosity_question", {}),
 ]
 
 

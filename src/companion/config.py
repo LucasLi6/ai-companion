@@ -11,9 +11,11 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 DEFAULT_DB_NAME = "companion.db"
+DEFAULT_LOG_NAME = "companion.log"
 
 
 @dataclass
@@ -36,14 +38,60 @@ def default_db_path() -> Path:
     return Path("data") / DEFAULT_DB_NAME
 
 
-def configure_logging(debug: bool = False) -> None:
-    """Configure process-wide structured logging.
+def default_log_path() -> Path:
+    """Resolve the default rotating log file.
 
-    Messages carry ``key=value`` fields (``event_id``, ``conversation_id``,
+    Honour ``COMPANION_LOG`` when set, otherwise use ``logs/companion.log``
+    relative to the current working directory.
+    """
+    env = os.environ.get("COMPANION_LOG")
+    if env:
+        return Path(env)
+    return Path("logs") / DEFAULT_LOG_NAME
+
+
+def configure_logging(debug: bool = False, *, log_file: Path | None = None) -> None:
+    """Configure process-wide structured logging without stealing the console.
+
+    Run-time logs go to a rotating file (``logs/companion.log`` by default) so
+    streaming replies and user input are never interleaved with ``INFO``
+    diagnostics. The terminal stays a pure conversation surface: nothing is
+    written to ``stdout``/``stderr`` unless ``debug`` is set, in which case a
+    short ``stderr`` handler is added for local troubleshooting.
+
+    Messages still carry ``key=value`` fields (``event_id``, ``conversation_id``,
     ``speaker_person_id``, ``provider``, ``processing_stage``, ``duration_ms``,
     ``status``, ``reason_code``) so a single event can be traced end-to-end.
-    Raw utterance text is intentionally *not* copied into logs.
+    Raw utterance text, API keys, raw IP addresses and private content are
+    intentionally never written to logs.
+
+    ``httpx``/``httpcore`` request logs are suppressed so provider transport
+    chatter never reaches the conversation surface, even in debug mode.
     """
     level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s %(message)s")
-    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # Clear any handler configured by a previous call (idempotent in tests).
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()
+
+    path = Path(log_file) if log_file is not None else default_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root.addHandler(file_handler)
+
+    if debug:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.DEBUG)
+        stream_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        root.addHandler(stream_handler)
+
+    # Third-party transports are implementation detail, never conversation UI.
+    for noisy in ("httpx", "httpcore", "aiosqlite"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)

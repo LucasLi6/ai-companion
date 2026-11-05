@@ -95,8 +95,33 @@ class EmotionService:
         async with self.repo.db.transaction(immediate=True):
             await self.repo.insert_profile_if_absent(default)
             await self.seed_default_rules(agent_id, now=now)
+            # V0.6.2: "any question raises curiosity" is no longer a default.
+            # New databases never seed it; existing ones disable the unmodified
+            # system default without touching a user's own edits.
+            await self.retire_legacy_question_rule(agent_id)
             profile = await self.repo.get_profile(agent_id)
         return profile or default
+
+    async def retire_legacy_question_rule(self, agent_id: str) -> bool:
+        """Disable the legacy ``curiosity_question`` system default when unmodified.
+
+        Returns True when a row was retired. Audited and reversible through
+        :meth:`set_rule_status`; a rule the user already edited is left intact.
+        """
+        changed = await self.repo.disable_unmodified_system_rule(
+            agent_id, "curiosity_question", {"question": True}
+        )
+        if changed:
+            await self._audit(
+                agent_id,
+                "emotion_rule_retired",
+                "curiosity_question",
+                "reason=V0.6.2 question-does-not-imply-curiosity",
+            )
+            self.logger.info(
+                "emotion_rule_retired agent_id=%s name=curiosity_question", agent_id
+            )
+        return changed
 
     async def seed_default_rules(
         self, agent_id: str, *, now: datetime | None = None

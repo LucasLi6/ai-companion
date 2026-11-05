@@ -213,6 +213,28 @@ class EmotionRepository:
         )
         return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
 
+    async def disable_unmodified_system_rule(
+        self, agent_id: str, name: str, expected_pattern: dict
+    ) -> bool:
+        """Disable a seeded system rule only while it still matches its factory default.
+
+        Returns True when a row changed. A user-edited rule (different pattern,
+        non-system source, or already disabled) is never touched.
+        """
+        cur = await self.db.execute(
+            "UPDATE emotion_appraisal_rules SET status = 'DISABLED', updated_at = ?"
+            " WHERE agent_id = ? AND name = ? AND source = 'system'"
+            " AND status = 'ACTIVE' AND trigger_type = 'utterance'"
+            " AND pattern = ?",
+            (
+                _iso(utcnow()),
+                agent_id,
+                name,
+                json.dumps(expected_pattern, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
+
     async def count_rules(self, agent_id: str) -> int:
         cur = await self.db.execute(
             "SELECT COUNT(*) AS c FROM emotion_appraisal_rules WHERE agent_id = ?",

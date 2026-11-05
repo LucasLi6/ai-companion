@@ -22,8 +22,19 @@ class RegistrationStatus(str, Enum):
 
 
 class EventSource(str, Enum):
+    # ``cli``/``test`` are the historical text inputs. ``text``/``voice`` make
+    # the input modality explicit for the response context (V0.6.2): a voice
+    # event may carry trusted acoustic features; a text event must never claim
+    # to have heard tone.
     CLI = "cli"
     TEST = "test"
+    TEXT = "text"
+    VOICE = "voice"
+
+    @property
+    def modality(self) -> str:
+        """The coarse input modality: ``text`` or ``voice``."""
+        return "voice" if self is EventSource.VOICE else "text"
 
 
 class AddresseeHint(str, Enum):

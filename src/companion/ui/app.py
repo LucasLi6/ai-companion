@@ -10,6 +10,7 @@ visibility, subject-privacy and optimistic-locking rules as the CLI.
 
 from __future__ import annotations
 
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -17,13 +18,15 @@ from typing import AsyncIterator
 from nicegui import app, ui
 
 from companion.domain.enums import (
+    CognitiveAction,
+    EventSource,
     MemoryKind,
     MemoryStatus,
     MemoryVisibility,
     PersonRole,
     RegistrationStatus,
 )
-from companion.domain.models import Consent, utcnow
+from companion.domain.models import Consent, make_utterance_event, utcnow
 from companion.memory.models import AccessContext
 from companion.runtime import Runtime, build_runtime
 from companion.storage.database import Database
@@ -37,9 +40,13 @@ _VISIBILITIES = [v.value for v in MemoryVisibility]
 _ROLES = [r.value for r in PersonRole]
 
 _DB_PATH: Path | None = None
+_PROVIDER = "mock"
+_DEEPSEEK_CLIENT = None
 
 NAV = [
     ("/", "Dashboard"),
+    ("/chat", "Chat"),
+    ("/monitor", "Monitor"),
     ("/memory", "Memory Explorer"),
     ("/people", "People"),
     ("/research", "Research"),
@@ -54,15 +61,78 @@ def _db() -> Path:
     return _DB_PATH
 
 
+def _shared_deepseek_client():
+    """One lazily-built client per server process.
+
+    Per-request runtimes reuse it, so a long chat does not create (and leak) one
+    transport client per message. The client is created on the server's own
+    event loop, the first time a real-provider turn runs.
+    """
+    global _DEEPSEEK_CLIENT
+    if _PROVIDER != "deepseek":
+        return None
+    if _DEEPSEEK_CLIENT is None:
+        from companion.providers.deepseek_client import (
+            build_deepseek_client,
+            load_deepseek_config,
+        )
+
+        _DEEPSEEK_CLIENT = build_deepseek_client(load_deepseek_config())
+    return _DEEPSEEK_CLIENT
+
+
 @asynccontextmanager
 async def open_runtime() -> AsyncIterator[Runtime]:
     """Open a request-scoped database connection and a fully wired runtime."""
     db = await Database(_db()).connect()
     try:
         await db.initialize()
-        yield build_runtime(db, with_worker=False)
+        yield build_runtime(
+            db,
+            with_worker=False,
+            provider=_PROVIDER,
+            deepseek_client=_shared_deepseek_client(),
+        )
     finally:
         await db.close()
+
+
+class _Activity:
+    """Content-free, in-process processing state for the monitor view.
+
+    Only a masked speaker id, the conversation id and a monotonic start time are
+    held. No utterance text, prompt, token count or address ever enters it.
+    """
+
+    def __init__(self) -> None:
+        self.current: dict | None = None
+        self.last_finished: float | None = None
+
+    def begin(self, *, conversation_id: str, person_id: str | None) -> None:
+        self.current = {
+            "conversation": conversation_id,
+            "speaker": person_id,
+            "started": time.monotonic(),
+        }
+
+    def end(self) -> None:
+        self.current = None
+        self.last_finished = time.monotonic()
+
+
+_ACTIVITY = _Activity()
+
+
+def _mask(value: object, keep: int = 4) -> str:
+    """Keep only the last few characters of an identifier; never show content."""
+    text = str(value or "")
+    if not text:
+        return "—"
+    return f"…{text[-keep:]}" if len(text) > keep else "…"
+
+
+def _ava_name(data: dict | None) -> str:
+    return str((data or {}).get("display_name") or "Ava")
 
 
 def _fmt_ts(iso: str | None) -> str:
@@ -631,16 +701,243 @@ async def settings_page() -> None:
                     inp.on_value_change(save_text)
 
 
-def create_app(db_path: Path):
+# -- chat and monitor (two views of one backend) ---------------------------
+#
+# ``/chat`` is the human-facing conversation surface: a speaker name, that
+# person's messages, the companion's name and replies, and an input box. It
+# deliberately never renders event ids, tokens, latency, HTTP status, emotion
+# numbers, jobs or prompts.
+#
+# ``/monitor`` is the operator-facing processing view. It shows status and
+# masked identifiers only (last few characters of an id), never utterance
+# content, prompts or a raw IP. Both pages subscribe to the exact same backend:
+# ``/chat`` consumes ``Orchestrator.process_utterance_stream`` (the same
+# ResponseEvent stream the CLI uses), while ``/monitor`` observes the shared
+# activity/event tables. No second agent or reply generator is created.
+
+
+def _chat_speaker(people, consents: dict):
+    """Prefer the owner, otherwise the first active person who may be processed."""
+    eligible = [
+        person
+        for person in people
+        if person.registration_status == RegistrationStatus.ACTIVE
+        and consents.get(person.person_id) is not None
+        and consents[person.person_id].allow_processing
+    ]
+    for person in eligible:
+        if person.role == PersonRole.OWNER:
+            return person
+    return eligible[0] if eligible else None
+
+
+@ui.page("/chat")
+async def chat_page() -> None:
+    async with open_runtime() as rt:
+        people = await rt.registry.list()
+        consents = {
+            person.person_id: await rt.registry.get_consent(person.person_id)
+            for person in people
+        }
+        agent = await rt.agent_service.show()
+    ava = _ava_name(agent)
+    speaker = _chat_speaker(people, consents)
+
+    with ui.column().classes("w-full max-w-2xl mx-auto p-4 gap-4"):
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label(ava).classes("text-h6")
+            ui.link("Monitor", "/monitor").classes("text-caption")
+        if speaker is None:
+            ui.label(
+                "还没有可用的人。请先在终端运行 `person add` 注册一个允许处理消息的人。"
+            ).classes("text-caption text-gray-500")
+            return
+
+        conversation_id = f"chat:{speaker.person_id}"
+        body = ui.column().classes("w-full gap-3")
+
+        def add_bubble(name: str, text: str, *, mine: bool) -> None:
+            align = "items-end" if mine else "items-start"
+            tint = "bg-blue-50" if mine else "bg-grey-2"
+            with body:
+                with ui.column().classes(f"w-full {align}"):
+                    with ui.card().classes(f"max-w-[85%] {tint} shadow-none"):
+                        ui.label(name).classes("text-caption text-grey-6")
+                        ui.label(text).classes("whitespace-pre-wrap text-body2")
+
+        box = (
+            ui.textarea(placeholder="说点什么…")
+            .props("autogrow outlined")
+            .classes("w-full")
+        )
+        with ui.row().classes("w-full justify-end"):
+            send = ui.button("发送", icon="send")
+
+        async def load_history() -> None:
+            async with open_runtime() as rt:
+                events = await rt.repos.utterance.recent_context(
+                    conversation_id, exclude_event_id=None, limit=20
+                )
+                rows = [
+                    (event, await rt.repos.analysis.get_action(event.event_id))
+                    for event in events
+                ]
+            for event, action in rows:
+                add_bubble(speaker.display_name, event.text, mine=True)
+                if (
+                    action is not None
+                    and action.action_type == CognitiveAction.RESPOND
+                    and action.response_text
+                ):
+                    add_bubble(ava, action.response_text, mine=False)
+
+        async def do_send() -> None:
+            value = (box.value or "").strip()
+            if not value:
+                return
+            box.value = ""
+            add_bubble(speaker.display_name, value, mine=True)
+
+            # A live reply bubble, filled from the same ResponseEvent stream
+            # the CLI consumes. The completed event carries the normalised,
+            # persisted text, so what the screen shows and what history stores
+            # are the same string.
+            with body:
+                with ui.column().classes("w-full items-start") as reply_row:
+                    with ui.card().classes("max-w-[85%] bg-grey-2 shadow-none"):
+                        ui.label(ava).classes("text-caption text-grey-6")
+                        live = ui.label("").classes(
+                            "whitespace-pre-wrap text-body2"
+                        )
+
+            shown = ""
+            finished = False
+            _ACTIVITY.begin(
+                conversation_id=conversation_id, person_id=speaker.person_id
+            )
+            try:
+                async with open_runtime() as rt:
+                    event = make_utterance_event(
+                        conversation_id=conversation_id,
+                        text=value,
+                        addressee_hint="agent",
+                        speaker_person_id=speaker.person_id,
+                        source=EventSource.TEXT,
+                    )
+                    async for item in rt.orchestrator.process_utterance_stream(
+                        event
+                    ):
+                        if item.type == "response_delta":
+                            shown += item.delta or ""
+                            live.text = shown
+                            ui.update()
+                        elif item.type == "response_completed":
+                            finished = True
+                            final = item.text if item.text is not None else shown
+                            if final:
+                                live.text = final
+                                ui.update()
+                            else:
+                                reply_row.delete()
+                        elif item.type == "response_failed":
+                            finished = True
+                            live.text = "（这次没有回应，请稍后重试）"
+                            ui.update()
+                        elif item.type == "response_cancelled":
+                            finished = True
+                            if not shown:
+                                live.text = "（这次没有回应，请稍后重试）"
+                                ui.update()
+            except Exception:  # provider/transport failure: neutral, no internals
+                if not finished:
+                    live.text = "（这次没有回应，请稍后重试）"
+                    ui.update()
+                return
+            finally:
+                _ACTIVITY.end()
+
+            if not finished:
+                # WAIT/IGNORE leaves no reply: silence is a valid response and
+                # no internal action label is ever shown on the chat surface.
+                reply_row.delete()
+
+        send.on_click(do_send)
+        await load_history()
+
+
+@ui.page("/monitor")
+async def monitor_page() -> None:
+    with ui.column().classes("w-full max-w-5xl mx-auto p-4 gap-4"):
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("Monitor").classes("text-h6")
+            ui.link("Chat", "/chat").classes("text-caption")
+        ui.label(
+            "处理状态与脱敏元数据。这里不显示对话正文、完整提示词或原始 IP。"
+        ).classes("text-caption text-grey-6")
+        state_label = ui.label("").classes("text-body2")
+
+        table = ui.table(
+            columns=[
+                {"name": "time", "label": "Time", "field": "time", "align": "left"},
+                {"name": "event", "label": "Event", "field": "event", "align": "left"},
+                {"name": "speaker", "label": "Speaker", "field": "speaker", "align": "left"},
+                {"name": "status", "label": "Status", "field": "status", "align": "left"},
+                {"name": "action", "label": "Action", "field": "action", "align": "left"},
+                {"name": "reason", "label": "Reason", "field": "reason", "align": "left"},
+                {"name": "source", "label": "Source", "field": "source", "align": "left"},
+            ],
+            rows=[],
+        ).classes("w-full")
+
+        async def refresh() -> None:
+            current = _ACTIVITY.current
+            if current is not None:
+                elapsed = time.monotonic() - current["started"]
+                state_label.text = (
+                    f"正在处理…  speaker={_mask(current['speaker'])}"
+                    f"  已用 {elapsed:.1f}s"
+                )
+                state_label.classes(replace="text-body2 text-primary")
+            else:
+                state_label.text = "空闲"
+                state_label.classes(replace="text-body2 text-grey-6")
+
+            async with open_runtime() as rt:
+                events = await rt.repos.utterance.list_events(None, limit=25)
+                rows = []
+                for event in events:
+                    action = await rt.repos.analysis.get_action(event.event_id)
+                    rows.append(
+                        {
+                            "time": _fmt_ts(event.occurred_at.isoformat())[11:],
+                            "event": _mask(event.event_id),
+                            "speaker": _mask(event.speaker_person_id),
+                            "status": event.processing_status.value,
+                            "action": action.action_type.value if action else "—",
+                            "reason": action.reason_code.value if action else "—",
+                            "source": event.source.modality,
+                        }
+                    )
+                table.rows = rows
+                table.update()
+
+        ui.timer(1.0, refresh)
+        await refresh()
+
+
+def create_app(db_path: Path, *, provider: str = "mock"):
     """Register every page against the given database path.
 
     Returns the NiceGUI :class:`~nicegui.app.App` so callers (and tests) can
     inspect the registered routes before the server starts.
     """
-    global _DB_PATH
+    global _DB_PATH, _PROVIDER
     _DB_PATH = Path(db_path)
+    _PROVIDER = (provider or "mock").lower()
 
     ui.page("/")(dashboard)
+    ui.page("/chat")(chat_page)
+    ui.page("/monitor")(monitor_page)
     ui.page("/memory")(memory_explorer)
     ui.page("/memory/{memory_id}")(memory_detail)
     ui.page("/people")(person_manager)
@@ -654,7 +951,13 @@ def create_app(db_path: Path):
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
-def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8080) -> None:
+def serve(
+    db_path: Path,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    *,
+    provider: str = "mock",
+) -> None:
     """Build the app and run the NiceGUI server (blocking).
 
     Binding is loopback-only by default and refused on any non-loopback host,
@@ -662,7 +965,7 @@ def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8080) -> None:
     a network interface would publish every person's private memories. A real
     auth layer (not implemented in V0.0) is the precondition for lifting this.
     """
-    create_app(db_path)
+    create_app(db_path, provider=provider)
     if host not in _LOOPBACK_HOSTS:
         raise RuntimeError(
             f"refusing to bind to non-loopback host {host!r}: the management UI "

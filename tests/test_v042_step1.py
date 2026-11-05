@@ -279,14 +279,16 @@ async def test_agent_target_is_valid_even_when_legacy_subject_is_not_speaker(rt)
     assert result.state.relationship_tension > 0.0
 
 
-async def test_question_may_be_uncertain_without_being_rejected(rt):
+async def test_question_does_not_raise_curiosity(rt):
     text = "这是为什么呢？"
     signal = _signal(
         "question", text, target="AGENT", intent="NEUTRAL", factuality="uncertain"
     )
     result = _appraise(await _rules(rt), signal, text)
-    assert result.diagnostic == APPLIED
-    assert result.reason == "curiosity_question"
+    # V0.6.2: a question is no longer a curiosity event; it leaves affect alone.
+    assert result.emotion == "NEUTRAL"
+    assert result.diagnostic == UNSUPPORTED_EVENT
+    assert result.trigger_rule_id is None
 
 
 @pytest.mark.parametrize(

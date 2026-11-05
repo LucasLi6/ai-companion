@@ -125,6 +125,14 @@ def compile_runtime_context(
         lines.append(f"timezone={detail}")
     if event_time is not None:
         lines.append(f"event_time={_stamp(event_time)}")
+    # What the turn actually arrived as. A text turn carries no acoustic
+    # information, and the model must not invent having heard a tone.
+    modality = _single_line(_value(snapshot, "source"), 16)
+    voice_features = _single_line(_value(snapshot, "voice_features"), 40)
+    if modality:
+        lines.append(f"source={modality}")
+    if voice_features:
+        lines.append(f"voice_features={voice_features}")
     if speaker:
         lines.append(f"speaker={speaker}")
     if last_interaction is not None:

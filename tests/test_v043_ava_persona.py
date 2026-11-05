@@ -141,11 +141,11 @@ def test_structured_core_is_the_fallback_when_no_description_exists():
 def test_response_system_requires_truthful_identity_without_constant_reminders():
     system = build_response_messages(_context(), _analysis())[0]["content"]
 
-    # The fixed V0.6.1 base prompt carries the truthfulness rule; identity is
+    # The fixed V0.6.2 base prompt carries the truthfulness rule; identity is
     # not a separate hard-coded persona reminder.
-    assert "你是人工智能" in system
-    assert "不能亲身感受某件事，不等于不能通过工具了解它" in system
-    assert "没有获得的感官信息、位置、记忆和现实经历，不能假装知道" in system
+    assert "你是人工智能，能够使用系统实际提供的信息和工具。" in system
+    assert "不得编造人类感官体验、现实经历、私人记忆或已执行的操作。" in system
+    assert "没有实际信息时，不能猜测对方刚刚去了哪里、做了什么或有什么职业。" in system
 
 
 def test_response_traits_are_tendencies_not_probabilities():

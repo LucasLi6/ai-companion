@@ -78,6 +78,11 @@ class RuntimeSnapshot(DomainModel):
     reentry: bool = False
     reentry_state: Literal["NEW", "ACTIVE", "CONTINUING", "RETURNING"] = "NEW"
     ava_emotion: Optional[str] = None
+    # V0.6.2: the input modality this turn actually arrived through, and
+    # whether trusted acoustic features exist. Text input has no voice
+    # features, so the reply must not claim to have heard a tone.
+    source: Literal["text", "voice"] = "text"
+    voice_features: str = "not_available"
     location: Optional[GeoLocationModel] = None
 
     def as_dict(self) -> dict:
@@ -143,8 +148,13 @@ class RuntimeSnapshotBuilder:
         )
 
         temporal = await self._temporal(event)
+        modality = getattr(
+            getattr(event, "source", None), "modality", "text"
+        )
         snapshot = RuntimeSnapshot(
             snapshot_id=f"rts_{event.event_id}",
+            source=modality if modality in ("text", "voice") else "text",
+            voice_features="not_available",
             event_id=event.event_id,
             conversation_id=event.conversation_id,
             speaker_person_id=event.speaker_person_id,

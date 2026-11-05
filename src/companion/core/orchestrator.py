@@ -74,6 +74,7 @@ from companion.memory.requests import (
     is_memory_sample_request,
 )
 from companion.people.registry import PersonRegistry
+from companion.prompts.layout import normalize_response_text, response_layout_for
 from companion.runtime_context.connection import ConnectionInfo
 from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
 from companion.storage.repositories import Repositories
@@ -1187,6 +1188,14 @@ class Orchestrator:
             stream.failed(response_id, error=str(exc), partial_text=partial or None)
             raise
         text = "".join(chunks).strip()
+        # Second-layer layout guarantee: for ordinary chat, collapse any stray
+        # paragraph breaks into one natural paragraph so the *persisted* text
+        # matches what the chat surface displays. This operates on the whole
+        # accumulated text (never per-delta) and never runs for structured
+        # requests (code / tutorials / formulas keep their layout verbatim).
+        text = normalize_response_text(
+            text, response_layout_for(event.text)
+        )
         status = "TRUNCATED" if finish_reason == "length" else "COMPLETED"
         return (
             text,

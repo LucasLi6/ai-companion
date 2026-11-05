@@ -34,7 +34,7 @@ SCRIPT = (
 )
 EXPECTED_TRAITS = {
     "humor": 68,
-    "warmth": 48,
+    "warmth": 65,
     "curiosity": 80,
     "formality": 25,
     "verbosity": 43,
@@ -128,6 +128,7 @@ def test_persona_asset_fits_the_description_limit_and_matches_the_spec():
         "好奇心",
         "性格",
         "情绪与关系",
+        "热情与兴趣",
         "自然交流",
     ):
         assert heading in description
@@ -225,13 +226,13 @@ async def test_no_mode_guidance_or_style_reference_in_the_final_request(db):
     _, client, _ = await _deepseek_turn(db)
 
     system = _response_system(client)
-    assert "【交流】" in system
+    assert "【说话方式】" in system
     assert "当前交流模式" not in system
     assert "交流表达参考" not in system
     assert "SOCIAL" not in system
     assert "TASK" not in system
     # Natural self-correction is a stated speaking habit, not a script.
-    assert "自然改口" in system
+    assert "自然承认并纠正" in system
 
 
 async def test_user_text_cannot_overwrite_the_stable_persona(db):

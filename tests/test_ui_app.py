@@ -22,6 +22,8 @@ def test_all_pages_registered(tmp_path):
     paths = {r.path for r in app.routes}
     for expected in (
         "/",
+        "/chat",
+        "/monitor",
         "/memory",
         "/memory/{memory_id}",
         "/people",
@@ -38,6 +40,8 @@ def test_page_handlers_are_async(tmp_path):
 
     for name in (
         "dashboard",
+        "chat_page",
+        "monitor_page",
         "memory_explorer",
         "memory_detail",
         "person_manager",

@@ -13,6 +13,11 @@ venv/
 # Stray nested clone of this repo (own .git/.venv); never commit it
 ai-companion/
 
+# Local runtime logs (never commit conversation diagnostics)
+logs/
+*.log
+*.log.*
+
 # Local database and WAL/SHM sidecar files
 data/*.db
 data/*.db-wal
