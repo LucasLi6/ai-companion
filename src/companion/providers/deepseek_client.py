@@ -60,6 +60,14 @@ class DeepSeekConfig:
     retry_backoff_seconds: float = 1.0
     analysis_max_tokens: int = 1024
     response_max_tokens: int = 2048
+    # Adaptive Router. It has its own model/token/timeout/thinking switches and
+    # never changes the speaker or analysis configuration. An empty
+    # ``router_model`` means "use the currently configured model" — it does not
+    # pretend a smaller model was used.
+    router_model: str = ""
+    router_max_tokens: int = 512
+    router_thinking: str = "disabled"
+    router_timeout_seconds: float = 30.0
     # V0.4: Thinking Mode is OFF by default for both request types. V0.6.3
     # makes that switch explicit on the wire (``thinking.type``), because the
     # V4 API defaults to thinking ON and ``reasoning_effort`` alone cannot
@@ -119,12 +127,19 @@ def _env_thinking(value: str | None, default: str) -> str:
 
 def _thinking_wire(request_type: str, config: DeepSeekConfig) -> dict:
     """The provider's explicit thinking switch, sent in ``extra_body``."""
-    mode = (
-        config.analysis_thinking
-        if request_type == "analysis"
-        else config.response_thinking
-    )
+    if request_type == "router":
+        mode = config.router_thinking
+    elif request_type == "analysis":
+        mode = config.analysis_thinking
+    else:
+        mode = config.response_thinking
     return {"thinking": {"type": "enabled" if mode == "enabled" else "disabled"}}
+
+
+def _model_for(request_type: str, config: DeepSeekConfig) -> str:
+    if request_type == "router" and config.router_model:
+        return config.router_model
+    return config.model
 
 
 def _reasoning_effort_wire(effort: Optional[str], thinking: dict) -> Optional[str]:
@@ -160,6 +175,14 @@ def load_deepseek_config(environ: dict | None = None) -> DeepSeekConfig:
         max_retries=_env_int(env.get("DEEPSEEK_MAX_RETRIES"), 2),
         analysis_max_tokens=_env_int(env.get("DEEPSEEK_ANALYSIS_MAX_TOKENS"), 1024),
         response_max_tokens=_env_int(env.get("DEEPSEEK_RESPONSE_MAX_TOKENS"), 2048),
+        router_model=_env_str(env.get("DEEPSEEK_ROUTER_MODEL"), "") or "",
+        router_max_tokens=_env_int(env.get("DEEPSEEK_ROUTER_MAX_TOKENS"), 512),
+        router_thinking=_env_thinking(
+            env.get("DEEPSEEK_ROUTER_THINKING"), "disabled"
+        ),
+        router_timeout_seconds=_env_float(
+            env.get("DEEPSEEK_ROUTER_TIMEOUT"), 30.0
+        ),
         analysis_thinking=_env_thinking(
             env.get("DEEPSEEK_ANALYSIS_THINKING"), thinking
         ),
@@ -410,32 +433,40 @@ class DeepSeekClient:
         json_mode: Optional[bool] = None,
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> ChatResponse:
         """Run one Chat Completions call with retry + audit logging.
 
-        ``request_type`` is ``"analysis"`` or ``"response"``; it selects the
-        per-type token/effort defaults from the config when those arguments are
-        left ``None``. ``json_mode`` defaults to ``True`` for ``"analysis"``
-        and ``False`` for ``"response"``.
+        ``request_type`` is ``"analysis"``, ``"response"`` or ``"router"``. It
+        selects the per-type model/token/effort defaults from the config when
+        those arguments are left ``None``. ``json_mode`` defaults to ``True``
+        for ``"analysis"`` and ``"router"``.
         """
         if not self.config.api_key and self._client is None:
             raise DeepSeekConfigError(
                 "no DEEPSEEK_API_KEY configured (Real mode requires a key)"
             )
         if json_mode is None:
-            json_mode = request_type == "analysis"
+            json_mode = request_type in ("analysis", "router")
         if max_tokens is None:
-            max_tokens = (
-                self.config.analysis_max_tokens
-                if request_type == "analysis"
-                else self.config.response_max_tokens
-            )
+            if request_type == "router":
+                max_tokens = self.config.router_max_tokens
+            elif request_type == "analysis":
+                max_tokens = self.config.analysis_max_tokens
+            else:
+                max_tokens = self.config.response_max_tokens
         if reasoning_effort is None:
-            reasoning_effort = (
-                self.config.analysis_reasoning_effort
-                if request_type == "analysis"
-                else self.config.response_reasoning_effort
-            )
+            if request_type == "router":
+                reasoning_effort = "none"
+            elif request_type == "analysis":
+                reasoning_effort = self.config.analysis_reasoning_effort
+            else:
+                reasoning_effort = self.config.response_reasoning_effort
+        if model is None:
+            model = _model_for(request_type, self.config)
+        if timeout_seconds is None and request_type == "router":
+            timeout_seconds = self.config.router_timeout_seconds
         thinking = _thinking_wire(request_type, self.config)
         reasoning_effort = _reasoning_effort_wire(reasoning_effort, thinking)
         request_id = request_id or new_id("dsrq")
@@ -445,13 +476,20 @@ class DeepSeekClient:
         while True:
             t0 = time.monotonic()
             try:
-                response = await self._request(
+                call = self._request(
                     messages,
                     json_mode=json_mode,
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
                     thinking=thinking,
+                    model=model,
                 )
+                if timeout_seconds is not None:
+                    response = await asyncio.wait_for(
+                        call, timeout=float(timeout_seconds)
+                    )
+                else:
+                    response = await call
             except DeepSeekError as exc:
                 last_error = exc
             except Exception as exc:  # SDK/transport error -> classify it
@@ -471,6 +509,7 @@ class DeepSeekClient:
                     latency_ms,
                     success=True,
                     error_type=None,
+                    model=getattr(response, "model", None) or model,
                 )
                 return response
 
@@ -486,6 +525,7 @@ class DeepSeekClient:
                 latency_ms,
                 success=False,
                 error_type=last_error.error_type,
+                model=model,
             )
             if not last_error.retryable or attempt >= self.config.max_retries:
                 raise last_error
@@ -712,12 +752,13 @@ class DeepSeekClient:
         max_tokens: int,
         reasoning_effort: Optional[str],
         thinking: dict,
+        model: Optional[str] = None,
     ) -> ChatResponse:
         if self._client is None:
             raise DeepSeekConfigError("no DeepSeek client configured")
 
         params: dict = {
-            "model": self.config.model,
+            "model": model or self.config.model,
             "messages": messages,
             "stream": False,
             "max_tokens": max_tokens,
@@ -782,6 +823,7 @@ class DeepSeekClient:
         *,
         success: bool,
         error_type: Optional[str],
+        model: Optional[str] = None,
     ) -> None:
         """Structured request log — never message content or the API key."""
         self.logger.info(
@@ -790,7 +832,7 @@ class DeepSeekClient:
             " total_tokens=%d success=%s error_type=%s",
             request_id,
             event_id,
-            self.config.model,
+            model or self.config.model,
             request_type,
             latency_ms,
             input_tokens,

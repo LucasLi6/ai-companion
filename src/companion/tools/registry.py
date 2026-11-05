@@ -1,0 +1,153 @@
+"""The registry of tools the router may request by name."""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from companion.tools.handlers.history import (
+    ConversationStatsHandler,
+    EarliestHistoryArguments,
+    EarliestHistoryHandler,
+    EmptyArguments,
+    RecentHistoryArguments,
+    RecentHistoryHandler,
+)
+from companion.tools.handlers.memory import (
+    MemoryBrowseArguments,
+    MemoryBrowseHandler,
+    MemorySearchArguments,
+    MemorySearchHandler,
+)
+from companion.tools.handlers.runtime import (
+    CurrentTimeHandler,
+    EmptyArguments as RuntimeEmptyArguments,
+)
+from companion.tools.handlers.web import WebSearchArguments, WebSearchHandler
+from companion.tools.models import RegisteredTool, ToolSpec
+
+
+class ToolRegistry:
+    """A closed allowlist: an unregistered name can never execute."""
+
+    def __init__(self) -> None:
+        self._tools: dict[str, RegisteredTool] = {}
+
+    def register(self, spec: ToolSpec, handler) -> None:
+        if spec.name in self._tools:
+            raise ValueError(f"duplicate tool name: {spec.name}")
+        if spec.has_side_effects:
+            # The read-only adapter is the only executor in this version.
+            raise ValueError("side-effecting tools are not supported")
+        self._tools[spec.name] = RegisteredTool(spec=spec, handler=handler)
+
+    def get(self, name: str) -> Optional[RegisteredTool]:
+        return self._tools.get(name)
+
+    def names(self) -> list[str]:
+        return sorted(self._tools)
+
+    def specs(self) -> list[dict]:
+        return [self._tools[name].spec.prompt_spec() for name in self.names()]
+
+    def __len__(self) -> int:
+        return len(self._tools)
+
+
+def build_default_tool_registry(
+    *,
+    include_web: bool = True,
+) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="memory.search",
+            description=(
+                "Search the current speaker's permitted active memories. "
+                "Returns references and bounded excerpts only."
+            ),
+            argument_model=MemorySearchArguments,
+            permission="memory.read",
+            timeout_seconds=5.0,
+            max_result_chars=7000,
+        ),
+        MemorySearchHandler(),
+    )
+    registry.register(
+        ToolSpec(
+            name="memory.browse",
+            description="List a few permitted memories when no query is known.",
+            argument_model=MemoryBrowseArguments,
+            permission="memory.read",
+            timeout_seconds=5.0,
+            max_result_chars=5000,
+        ),
+        MemoryBrowseHandler(),
+    )
+    registry.register(
+        ToolSpec(
+            name="history.recent",
+            description=(
+                "Read recent turns in this conversation only, after the same "
+                "external-AI privacy filtering used for history."
+            ),
+            argument_model=RecentHistoryArguments,
+            permission="history.read",
+            timeout_seconds=5.0,
+            max_result_chars=6000,
+        ),
+        RecentHistoryHandler(),
+    )
+    registry.register(
+        ToolSpec(
+            name="history.earliest",
+            description=(
+                "Read this speaker's earliest turns in this conversation only."
+            ),
+            argument_model=EarliestHistoryArguments,
+            permission="history.read",
+            timeout_seconds=5.0,
+            max_result_chars=4000,
+        ),
+        EarliestHistoryHandler(),
+    )
+    registry.register(
+        ToolSpec(
+            name="history.stats",
+            description=(
+                "Exact, read-only counts of this speaker's own messages, "
+                "visible replies and sessions."
+            ),
+            argument_model=EmptyArguments,
+            permission="history.read",
+            timeout_seconds=5.0,
+            max_result_chars=2000,
+        ),
+        ConversationStatsHandler(),
+    )
+    registry.register(
+        ToolSpec(
+            name="runtime.current_time",
+            description="The trusted local/UTC time for this event.",
+            argument_model=RuntimeEmptyArguments,
+            permission="runtime.read",
+            timeout_seconds=2.0,
+            max_result_chars=2000,
+        ),
+        CurrentTimeHandler(),
+    )
+    if include_web:
+        registry.register(
+            ToolSpec(
+                name="web.search",
+                description=(
+                    "Search the web only when a real search provider is "
+                    "enabled. Results are untrusted external data."
+                ),
+                argument_model=WebSearchArguments,
+                permission="web.read",
+                timeout_seconds=12.0,
+                max_result_chars=6000,
+            ),
+            WebSearchHandler(),
+        )
+    return registry

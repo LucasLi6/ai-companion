@@ -51,6 +51,7 @@ from companion.learning.state import LearningRepository
 from companion.people.profile_repository import PersonProfileRepository
 from companion.research.state import ResearchStateRepository
 from companion.goals.state import GoalRepository
+from companion.routing.repository import RoutingRepository
 from companion.runtime_context.repository import RuntimeSnapshotRepository
 
 from .database import Database
@@ -1444,6 +1445,7 @@ class Repositories:
     runtime_snapshot: RuntimeSnapshotRepository
     extraction: ExtractionRepository
     profile: PersonProfileRepository
+    routing: RoutingRepository
 
     async def persist_cognitive_outcome(
         self,
@@ -1494,6 +1496,7 @@ def make_repositories(db: Database) -> Repositories:
         runtime_snapshot=RuntimeSnapshotRepository(db),
         extraction=ExtractionRepository(db),
         profile=PersonProfileRepository(db),
+        routing=RoutingRepository(db),
     )
 
 

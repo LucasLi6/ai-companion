@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1492,6 +1492,44 @@ MIGRATIONS: list[tuple[int, str]] = [
               SELECT 1 FROM person_interaction_profiles ip
               WHERE ip.person_id = ps.person_id
           );
+        """,
+    ),
+    (
+        21,
+        """
+        CREATE TABLE IF NOT EXISTS route_decisions (
+            event_id           TEXT NOT NULL,
+            phase              TEXT NOT NULL,
+            step_index         INTEGER NOT NULL,
+            schema_version     INTEGER NOT NULL,
+            router_version     TEXT NOT NULL,
+            provider           TEXT NOT NULL,
+            model              TEXT NOT NULL,
+            decision_json      TEXT NOT NULL,
+            validation_status  TEXT NOT NULL DEFAULT 'VALID',
+            created_at         TEXT NOT NULL,
+            UNIQUE (event_id, step_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_route_decisions_event
+            ON route_decisions(event_id, step_index);
+
+        CREATE TABLE IF NOT EXISTS route_tool_calls (
+            tool_call_id         TEXT PRIMARY KEY,
+            event_id             TEXT NOT NULL,
+            route_step_index     INTEGER NOT NULL,
+            tool_name            TEXT NOT NULL,
+            arguments_json       TEXT NOT NULL DEFAULT '{}',
+            arguments_hash       TEXT NOT NULL,
+            status               TEXT NOT NULL,
+            result_reference_json TEXT NOT NULL DEFAULT '{}',
+            error_code           TEXT,
+            created_at           TEXT NOT NULL,
+            completed_at         TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_route_tool_calls_event
+            ON route_tool_calls(event_id, route_step_index);
         """,
     ),
 ]

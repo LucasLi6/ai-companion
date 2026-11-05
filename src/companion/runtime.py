@@ -50,7 +50,14 @@ from companion.providers.deepseek_client import (
 )
 from companion.providers.deepseek_cognitive import DeepSeekCognitiveProvider
 from companion.providers.deepseek_response import DeepSeekResponseProvider
+from companion.providers.deepseek_router import DeepSeekRouterProvider
 from companion.providers.mock import MockCognitiveProvider, MockResponseProvider
+from companion.providers.websearch import HttpWebSearchProvider
+from companion.routing.context import RoutingContextBuilder
+from companion.routing.service import RoutingService
+from companion.routing.validator import RoutingValidator
+from companion.tools.executor import ToolExecutor
+from companion.tools.registry import build_default_tool_registry
 from companion.runtime_context.geolocation import GeoLocationService
 from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
 from companion.runtime_context.timezone import TimeZoneService
@@ -87,6 +94,12 @@ class Runtime:
     geo_service: Optional[GeoLocationService] = None
     metrics: Optional[LatencyMetrics] = None
     profile_service: Optional[PersonProfileService] = None
+    router_mode: str = "legacy"
+    router_provider: object = None
+    routing_service: object = None
+    tool_registry: object = None
+    tool_executor: object = None
+    web_search: object = None
 
 
 def build_runtime(
@@ -105,6 +118,10 @@ def build_runtime(
     personality_generation_enabled: Optional[bool] = None,
     cognitive_repair_enabled: Optional[bool] = None,
     fast_path_enabled: Optional[bool] = None,
+    router_mode: Optional[str] = None,
+    router_provider=None,
+    tool_registry=None,
+    web_search_provider=None,
     turn_analysis_delay_seconds: Optional[float] = None,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
@@ -118,6 +135,7 @@ def build_runtime(
     provider = (provider or "mock").lower()
     if provider not in PROVIDERS:
         raise ValueError(f"unknown provider {provider!r}; expected one of {PROVIDERS}")
+    client_injected = deepseek_client is not None
 
     repos = make_repositories(db)
     profile_service = PersonProfileService(
@@ -252,6 +270,63 @@ def build_runtime(
         cognitive = cognitive or MockCognitiveProvider()
         response = response or MockResponseProvider()
 
+    # V0.8 router mode. Real DeepSeek wirings default to semantic routing; the
+    # mock path and tests that inject their own fake DeepSeek client default to
+    # legacy unless they opt in explicitly (an injected client alone is not
+    # proof that semantic routing is wanted). An explicit argument or
+    # AVA_ROUTER_MODE always wins.
+    resolved_mode = (router_mode or os.environ.get("AVA_ROUTER_MODE") or "").strip().lower()
+    if resolved_mode and resolved_mode not in ("semantic", "legacy"):
+        raise ValueError(
+            f"unknown router mode {resolved_mode!r}; expected 'semantic' or 'legacy'"
+        )
+    if not resolved_mode:
+        if provider == "deepseek" and (router_provider is not None or not client_injected):
+            resolved_mode = "semantic"
+        else:
+            resolved_mode = "legacy"
+
+    routing_builder = None
+    routing_service = None
+    tool_executor = None
+    tool_registry = tool_registry
+    web_search = web_search_provider
+    if resolved_mode == "semantic":
+        if router_provider is None:
+            if provider != "deepseek" or deepseek_client is None:
+                raise ValueError(
+                    "semantic router mode requires a real DeepSeek client or an"
+                    " explicit router_provider; refusing to fall back to keyword"
+                    " routing"
+                )
+            router_provider = DeepSeekRouterProvider(deepseek_client, logger=logger)
+        if tool_registry is None:
+            tool_registry = build_default_tool_registry()
+        if web_search is None:
+            # Inert by default: web.search reports DISABLED rather than
+            # presenting mock results as real search results.
+            web_search = HttpWebSearchProvider(enabled=False)
+        if gateway is None:
+            gateway = ForegroundPrivacyGateway(registry, logger=logger)
+        routing_builder = RoutingContextBuilder(
+            repos=repos,
+            registry=registry,
+            privacy_gateway=gateway,
+            profile_service=profile_service,
+            scene_manager=scene_manager,
+            tool_registry=tool_registry,
+            logger=logger,
+        )
+        tool_executor = ToolExecutor(tool_registry, logger=logger)
+        routing_service = RoutingService(
+            provider=router_provider,
+            validator=RoutingValidator(),
+            registry=tool_registry,
+            executor=tool_executor,
+            repository=repos.routing,
+            logger=logger,
+        )
+
     worker = None
     if with_worker:
         handlers = {"MEMORY_CONSOLIDATION": memory_consolidation}
@@ -319,6 +394,11 @@ def build_runtime(
         metrics=metrics,
         profile_learning=profile_learning,
         fast_path_enabled=bool(fast_path_enabled),
+        router_mode=resolved_mode,
+        routing_context_builder=routing_builder,
+        routing_service=routing_service,
+        tool_executor=tool_executor,
+        web_search=web_search,
         turn_analysis_delay_seconds=float(turn_analysis_delay_seconds),
         logger=logger,
     )
@@ -348,4 +428,10 @@ def build_runtime(
         geo_service=geo_service,
         metrics=metrics,
         profile_service=profile_service,
+        router_mode=resolved_mode,
+        router_provider=router_provider,
+        routing_service=routing_service,
+        tool_registry=tool_registry,
+        tool_executor=tool_executor,
+        web_search=web_search,
     )

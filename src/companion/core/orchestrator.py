@@ -83,9 +83,15 @@ from companion.storage.repositories import Repositories
 from .conversation import ConversationManager
 from .fast_path import LOCAL_PROVIDER, TurnAssessment, assess_turn, decide_route
 from .metrics import LatencyMetrics
-from .policy import Policy, PolicyDecision
+from .policy import Policy, PolicyDecision, TrustedTurnContext
 from .response_events import ResponseEventSink
 from .safety import assess_safety, detect_language, safety_response
+
+from companion.routing.adapter import route_to_cognitive_result
+from companion.routing.context import RoutingContextBuilder, build_speaker_context
+from companion.routing.errors import RouterError, RouterUnavailable
+from companion.routing.models import ProcessingIntent, RouteAction
+from companion.tools.models import ToolExecutionContext
 
 
 class PersonaRevisionConflict(Exception):
@@ -120,6 +126,11 @@ class Orchestrator:
         metrics: Optional[LatencyMetrics] = None,
         profile_learning=None,
         fast_path_enabled: bool = True,
+        router_mode: str = "legacy",
+        routing_context_builder: Optional[RoutingContextBuilder] = None,
+        routing_service=None,
+        tool_executor=None,
+        web_search=None,
         turn_analysis_delay_seconds: float = 60.0,
         turn_analysis_batch_size: int = 5,
         logger: Optional[logging.Logger] = None,
@@ -169,6 +180,17 @@ class Orchestrator:
         # deliberation pipeline) can turn it off; routing still never looks at
         # message text.
         self.fast_path_enabled = fast_path_enabled
+        # V0.8: "semantic" routes every eligible turn through the LLM router;
+        # "legacy" keeps the previous local Fast Path / Deliberation pipeline.
+        # In semantic mode the old text classifiers below are never consulted.
+        mode = (router_mode or "legacy").strip().lower()
+        if mode not in ("semantic", "legacy"):
+            raise ValueError(f"unknown router_mode {router_mode!r}")
+        self.router_mode = mode
+        self.routing_context_builder = routing_context_builder
+        self.routing_service = routing_service
+        self.tool_executor = tool_executor
+        self.web_search = web_search
         # V0.6.1: a Fast Path turn only queues lightweight extraction. The job
         # waits up to ``delay`` seconds so several turns can share one small
         # request; once ``batch_size`` events are waiting it runs immediately.
@@ -295,16 +317,26 @@ class Orchestrator:
             else:
                 await self._persist_input(event)
 
-        # 4. Retrieve permitted memories (hand-authored facts only).
-        memories = await self.memory.retrieve(event.text, person_id)
-        # Local, trusted turn signals. The detector distinguishes a direct
-        # request from quoted/reported speech, so neither is delegated to the
-        # model.
-        explicit_silence = detect_explicit_silence(event.text)
-        explicit_remember = detect_explicit_remember(event.text)
+        # 4. Retrieve permitted memories (hand-authored facts only). In
+        # semantic mode retrieval is deferred until after the router has decided
+        # *whether* and *what* this turn needs; the router itself never sees
+        # long-term memories.
+        semantic_mode = self.router_mode == "semantic"
+        memories = [] if semantic_mode else await self.memory.retrieve(
+            event.text, person_id
+        )
+        # Local, trusted turn signals. These are legacy routing helpers: in
+        # semantic mode the router owns the semantic decision and they are not
+        # consulted for routing at all.
+        explicit_silence = (
+            False if semantic_mode else detect_explicit_silence(event.text)
+        )
+        explicit_remember = (
+            False if semantic_mode else detect_explicit_remember(event.text)
+        )
         # Local safety assessment is computed once and reused below: it both
         # selects the independent reply path and keeps crisis content out of
-        # durable memory.
+        # durable memory. This is a fixed local floor, not text-based routing.
         safety = assess_safety(event.text)
         self.logger.info(
             "context_loaded conversation_id=%s quiet_mode=%s memories=%d"
@@ -357,6 +389,33 @@ class Orchestrator:
         stream_emitted = False
 
         try:
+            # 4a. Semantic mode: the LLM router runs *before* any long-term
+            # memory is retrieved and before the full speaker context exists.
+            # Hard local gates (external-AI consent, trusted human addressee,
+            # safety floor) can skip the router entirely; they never fall back
+            # to keyword routing.
+            routing_outcome = None
+            route = None
+            routing_view = None
+            if semantic_mode:
+                routing_view, routing_outcome, route = await self._route_semantic(
+                    event,
+                    context,
+                    consent,
+                    runtime_snapshot,
+                    steps,
+                    safety_triggered=safety.triggered,
+                    persist=persist,
+                )
+                memories = await self.memory.retrieve(event.text, person_id)
+                steps.append(f"[MEMORY] Retrieved {len(memories)} items")
+                self.logger.info(
+                    "semantic_route_ready event_id=%s routed=%s memories=%d",
+                    event.event_id,
+                    route is not None,
+                    len(memories),
+                )
+
             # 4b. Build the external-AI context (privacy-filtered history,
             # labels, memories) when the real provider is wired in. Mock mode
             # keeps the lightweight ConversationContext exactly as before.
@@ -424,12 +483,60 @@ class Orchestrator:
 
             fast_path = False
             assessment: Optional[TurnAssessment] = None
-            local_capable = (
+            job_id: Optional[str] = None
+            if semantic_mode:
+                # The router already produced (or deliberately skipped) the
+                # semantic decision. No old classifier runs here: not
+                # ``assess_turn``, not ``decide_route`` and none of the text
+                # detectors used by the legacy path.
+                if analysis is not None:
+                    steps.append("[COGNITION] Reused existing analysis")
+                    if learn and self.jobs is not None:
+                        job = await self.repos.job.get_by_key(
+                            f"memory:{event.event_id}"
+                        )
+                        if job is not None:
+                            job_id = job.job_id
+                else:
+                    if route is not None:
+                        analysis = route_to_cognitive_result(
+                            event,
+                            route,
+                            routing_outcome.tool_results
+                            if routing_outcome is not None
+                            else [],
+                        )
+                    else:
+                        analysis = self._local_semantic_analysis(
+                            event, consent, safety.triggered
+                        )
+                    steps.append(
+                        "[COGNITION] Semantic router: "
+                        f"{analysis.action.value}, necessity="
+                        f"{analysis.reply_necessity.value}"
+                    )
+                    if persist:
+                        analysis_id = new_id("ana")
+                        job_id = await self.repos.persist_cognitive_outcome(
+                            analysis,
+                            analysis_id,
+                            candidates=[],
+                            job_key=None,
+                            job_payload={},
+                            persona=self._persona_record(cognitive_context),
+                        )
+                        # Background extraction still runs, but never as a
+                        # second full cognitive call on the critical path.
+                        if learn and self.jobs is not None and not safety.triggered:
+                            job_id = await self._enqueue_turn_analysis(event)
+                            steps.append("[MEMORY_JOB] Background analysis queued")
+            else:
+              local_capable = (
                 self.fast_path_enabled
                 and self.context_builder is not None
                 and bool(consent.allow_external_ai)
-            )
-            if analysis is None and local_capable:
+              )
+              if analysis is None and local_capable:
                 # V0.7: addressee and reply necessity are assessed separately.
                 # Explicit silence, a confirmed human addressee, quiet mode and
                 # a wait request are decided locally; an unclear addressee or a
@@ -448,7 +555,7 @@ class Orchestrator:
                 if assessment.is_local:
                     fast_path = True
                     steps.append(f"[ROUTE] local:{assessment.rule}")
-            if analysis is None and not fast_path:
+              if analysis is None and not fast_path:
                 route = decide_route(
                     addressee_hint=event.addressee_hint.value,
                     explicit_remember=explicit_remember,
@@ -460,13 +567,12 @@ class Orchestrator:
                 )
                 fast_path = route.is_fast
                 steps.append(f"[ROUTE] {route.route}:{route.reason}")
-            if analysis is not None and str(
+              if analysis is not None and str(
                 getattr(analysis, "provider", "")
-            ) == LOCAL_PROVIDER:
+              ) == LOCAL_PROVIDER:
                 fast_path = True
 
-            job_id: Optional[str] = None
-            if analysis is None and fast_path:
+              if analysis is None and fast_path:
                 # A local decision record, explicitly marked as local. It is not
                 # a model analysis and is never presented as one. RESPOND,
                 # WAIT and IGNORE all reach here; only the action differs.
@@ -498,7 +604,7 @@ class Orchestrator:
                     if learn and self.jobs is not None and not safety.triggered:
                         job_id = await self._enqueue_turn_analysis(event)
                         steps.append("[MEMORY_JOB] Background analysis queued")
-            elif analysis is None:
+              elif analysis is None:
                 analysis = await self.cognitive.analyze(
                     event, cognitive_context, provider_memories
                 )
@@ -542,7 +648,7 @@ class Orchestrator:
                         job_payload={"event_id": event.event_id},
                         persona=self._persona_record(cognitive_context),
                     )
-            else:
+              else:
                 self.logger.info(
                     "cognitive_analysis_reused event_id=%s provider=%s",
                     event.event_id,
@@ -555,6 +661,21 @@ class Orchestrator:
                         job_id = job.job_id
                     if str(getattr(analysis, "provider", "")) == LOCAL_PROVIDER:
                         job_id = await self._enqueue_turn_analysis(event) or job_id
+            if (
+                semantic_mode
+                and route is not None
+                and routing_view is not None
+                and isinstance(cognitive_context, CognitiveContext)
+            ):
+                cognitive_context = build_speaker_context(
+                    event,
+                    routing_view,
+                    route,
+                    routing_outcome.tool_results
+                    if routing_outcome is not None
+                    else [],
+                    base=cognitive_context,
+                )
             timings["analysis_ms"] = (time.monotonic() - t_analysis) * 1000
 
             # 5b. A retried analysis must be answered by the same trusted
@@ -589,12 +710,26 @@ class Orchestrator:
             # (permission, explicit silence, quiet mode, explicit human
             # addressee) outrank the model suggestion.
             await self.policy.refresh(self.repos.settings)
-            decision = self.policy.decide(
-                analysis,
-                context,
-                addressee_hint=event.addressee_hint.value,
-                explicit_silence=explicit_silence,
-            )
+            if semantic_mode and route is not None:
+                decision = self.policy.decide_semantic(
+                    route,
+                    TrustedTurnContext(
+                        addressee_hint=event.addressee_hint.value,
+                        quiet_mode=bool(context.quiet_mode),
+                        permission_denied=False,
+                        safety_triggered=False,
+                    ),
+                )
+            else:
+                # Legacy path, plus semantic-mode local gates (no external-AI
+                # consent, trusted human addressee, safety floor) which produce
+                # a local analysis without calling the router.
+                decision = self.policy.decide(
+                    analysis,
+                    context,
+                    addressee_hint=event.addressee_hint.value,
+                    explicit_silence=explicit_silence,
+                )
             # 6b. Independent safety floor. An explicit high-risk statement is
             # answered by a fixed local reply, not by persona improvisation and
             # not by a model deferral. Only an explicit human addressee or a
@@ -623,7 +758,39 @@ class Orchestrator:
             # this" request: the durable write must finish *before* the reply
             # that acknowledges it. Ordinary candidates stay with the job.
             memory_outcomes: list[dict] = []
-            if persist and learn and self.memory_writer is not None:
+            if semantic_mode:
+                intents = (
+                    set(route.processing_intents)
+                    if route is not None
+                    else set()
+                )
+                if persist and learn:
+                    if ProcessingIntent.PRIVACY_REQUEST in intents:
+                        # Never delete from model output. Record the request in
+                        # the append-only audit trail; the trusted privacy
+                        # command path performs any destructive change.
+                        await self.repos.audit.record(
+                            event.speaker_person_id or "unknown",
+                            "privacy_request",
+                            "utterance",
+                            event.event_id,
+                            "semantic_router",
+                        )
+                        steps.append(
+                            "[PRIVACY] Request recorded for trusted handling"
+                        )
+                    memory_outcomes = (
+                        await self.repos.analysis.list_candidate_writes(
+                            event.event_id
+                        )
+                    )
+                elif persist:
+                    memory_outcomes = (
+                        await self.repos.analysis.list_candidate_writes(
+                            event.event_id
+                        )
+                    )
+            elif persist and learn and self.memory_writer is not None:
                 if explicit_remember:
                     memory_outcomes = await self.memory_writer.consolidate_event(
                         event.event_id, only_explicit=True
@@ -894,6 +1061,121 @@ class Orchestrator:
             )
 
     # -- helpers -----------------------------------------------------------
+
+    # -- semantic routing --------------------------------------------------
+
+    async def _route_semantic(
+        self,
+        event: UtteranceEvent,
+        conversation: ConversationContext,
+        consent,
+        runtime_snapshot,
+        steps: list[str],
+        *,
+        safety_triggered: bool,
+        persist: bool,
+    ):
+        """Run the LLM router or apply a hard local gate.
+
+        The gates here are *trusted metadata*, not text classification: a
+        withdrawn external-AI grant, an explicit human addressee or the
+        independent safety floor. None of them falls back to keyword routing.
+        """
+        if event.addressee_hint.value == "human":
+            steps.append("[ROUTE] local_gate:trusted_human_addressee")
+            return None, None, None
+        if safety_triggered:
+            steps.append("[ROUTE] local_gate:safety")
+            return None, None, None
+        if not bool(consent.allow_external_ai):
+            steps.append("[ROUTE] local_gate:external_ai_not_allowed")
+            return None, None, None
+        if self.routing_service is None or self.routing_context_builder is None:
+            raise RouterUnavailable(
+                "semantic routing is enabled but no router service is configured"
+            )
+
+        routing_view = await self.routing_context_builder.build(event, conversation)
+        execution_context = ToolExecutionContext(
+            event=event,
+            person_id=event.speaker_person_id,
+            repos=self.repos,
+            memory=self.memory,
+            registry=self.registry,
+            privacy_gateway=getattr(
+                self.routing_context_builder, "privacy_gateway", None
+            ),
+            runtime_snapshot=runtime_snapshot,
+            allow_external_ai=True,
+            web_search=self.web_search,
+            logger=self.logger,
+        )
+        outcome = await self.routing_service.execute(
+            event, routing_view, execution_context, persist=persist
+        )
+        steps.append(
+            "[ROUTE] semantic:"
+            f"{outcome.route.action.value}, necessity="
+            f"{outcome.route.reply_necessity.value},"
+            f" intents={[item.value for item in outcome.route.processing_intents]}"
+        )
+        if outcome.tool_results:
+            statuses = ", ".join(
+                f"{item.tool_name}={item.status.value}"
+                for item in outcome.tool_results
+            )
+            steps.append(f"[TOOLS] {statuses}")
+        if outcome.planning_steps:
+            steps.append("[ROUTE] follow-up plan applied")
+        return routing_view, outcome, outcome.route
+
+    def _local_semantic_analysis(
+        self, event: UtteranceEvent, consent, safety_triggered: bool
+    ) -> CognitiveResult:
+        """A trusted, non-router decision for a gated semantic turn.
+
+        It is explicitly labelled as local policy; it is never presented as a
+        model analysis and it never fabricates an LLM route.
+        """
+        if event.addressee_hint.value == "human":
+            return CognitiveResult(
+                event_id=event.event_id,
+                meaning="trusted_human_addressee",
+                action=CognitiveAction.IGNORE,
+                reason_code=ReasonCode.DIRECT_HUMAN_ADDRESS,
+                response_style="local_policy",
+                provider="local_policy",
+                reply_necessity=ReplyNecessity.UNNECESSARY,
+            )
+        if safety_triggered:
+            return CognitiveResult(
+                event_id=event.event_id,
+                meaning="local_safety_floor",
+                action=CognitiveAction.RESPOND,
+                reason_code=ReasonCode.SAFETY_RESPONSE,
+                response_style="local_policy",
+                provider="local_policy",
+                reply_necessity=ReplyNecessity.REQUIRED,
+            )
+        if not bool(consent.allow_external_ai):
+            return CognitiveResult(
+                event_id=event.event_id,
+                meaning="external_ai_not_allowed",
+                action=CognitiveAction.WAIT,
+                reason_code=ReasonCode.PERMISSION_DENIED,
+                response_style="local_policy",
+                provider="local_policy",
+                reply_necessity=ReplyNecessity.UNNECESSARY,
+            )
+        return CognitiveResult(
+            event_id=event.event_id,
+            meaning="semantic_router_unavailable",
+            action=CognitiveAction.WAIT,
+            reason_code=ReasonCode.UNKNOWN,
+            response_style="local_policy",
+            provider="local_policy",
+            reply_necessity=ReplyNecessity.UNNECESSARY,
+        )
 
     def _scene_preview_for_response(
         self,

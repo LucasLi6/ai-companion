@@ -87,6 +87,22 @@ class PolicyDecision:
         return self.action != self.model_action
 
 
+@dataclass(frozen=True)
+class TrustedTurnContext:
+    """Local facts the semantic policy is allowed to enforce.
+
+    Every field is supplied by trusted program code. Model output can never
+    fill these values; in particular the addressee hint comes from the event
+    metadata, not from the router's ``addressee_assessment``.
+    """
+
+    addressee_hint: Optional[str] = None
+    quiet_mode: bool = False
+    permission_denied: bool = False
+    safety_triggered: bool = False
+    local_silence: bool = False
+
+
 def _one_of(value: str | None, allowed: tuple[str, ...], default: str) -> str:
     if value is None:
         return default
@@ -129,9 +145,10 @@ class Policy:
     ) -> PolicyDecision:
         model_action = analysis.action
         hint = addressee_hint or "unknown"
+        provider_name = str(getattr(analysis, "provider", ""))
         local_source = (
-            "local_fast_path"
-            if str(getattr(analysis, "provider", "")) == "local_fast_path"
+            provider_name
+            if provider_name in ("local_fast_path", "local_policy")
             else "model"
         )
 
@@ -216,7 +233,7 @@ class Policy:
                 model_action,
                 analysis.reason_code,
                 "local_assessment"
-                if local_source == "local_fast_path"
+                if local_source != "model"
                 else "model_suggestion",
             )
 
@@ -240,8 +257,111 @@ class Policy:
         return decision(
             CognitiveAction.RESPOND,
             analysis.reason_code,
-            "fast_path_local_policy" if local_source == "local_fast_path" else "model_suggestion",
+            "fast_path_local_policy"
+            if local_source == "local_fast_path"
+            else ("local_policy" if local_source != "model" else "model_suggestion"),
         )
+
+    def decide_semantic(
+        self,
+        route,
+        trusted: TrustedTurnContext,
+    ) -> PolicyDecision:
+        """Apply local authority on top of a validated semantic route.
+
+        The router owns the semantic reading (reply necessity, addressee
+        assessment, internal intents). This method cannot re-run text
+        classification and does not contain a "direct question" correction:
+        a semantic WAIT/IGNORE is never upgraded from a trusted agent hint.
+
+        Local gates, in order: permission, independent safety, quiet mode,
+        trusted human addressee, then the semantic action itself.
+        """
+        model_action = CognitiveAction(route.action.value)
+        hint = trusted.addressee_hint or "unknown"
+        source = "semantic_router"
+        from companion.routing.adapter import route_reason_code
+
+        reason = route_reason_code(route)
+
+        def decision(
+            action: CognitiveAction,
+            reason: ReasonCode,
+            rule: str,
+            override: str | None = None,
+        ) -> PolicyDecision:
+            return PolicyDecision(
+                action=action,
+                reason_code=reason,
+                model_action=model_action,
+                override_reason=override if action != model_action else None,
+                rule=rule,
+                source=source,
+            )
+
+        # 1. Permission is a hard gate.
+        if trusted.permission_denied:
+            return decision(
+                CognitiveAction.WAIT, ReasonCode.PERMISSION_DENIED, "permission"
+            )
+
+        # 2. Independent safety floor. The local safety reply is generated
+        # outside the model; the semantic router does not get to suppress it.
+        if trusted.safety_triggered:
+            return decision(
+                CognitiveAction.RESPOND,
+                ReasonCode.SAFETY_RESPONSE,
+                "safety_response",
+                "local_safety_floor",
+            )
+
+        # 3. Explicit, current-turn silence supplied by trusted program code.
+        if trusted.local_silence:
+            return decision(
+                CognitiveAction.IGNORE,
+                ReasonCode.EXPLICIT_SILENCE_REQUEST,
+                "explicit_silence",
+                "explicit_silence_request",
+            )
+
+        # 4. Quiet mode downgrades a visible response, but the turn is still
+        # understood and internal operations may proceed.
+        if trusted.quiet_mode and model_action == CognitiveAction.RESPOND:
+            return decision(
+                CognitiveAction.WAIT, ReasonCode.QUIET_MODE, "quiet_mode", "quiet_mode"
+            )
+
+        # 5. Trusted human addressee is a hard constraint on output.
+        if hint == "human" and model_action != CognitiveAction.IGNORE:
+            return decision(
+                CognitiveAction.IGNORE,
+                ReasonCode.CONVERSATION_BETWEEN_HUMANS,
+                "trusted_human_addressee",
+                "trusted_human_addressee",
+            )
+
+        # 6. The semantic decision itself.
+        if model_action != CognitiveAction.RESPOND:
+            return decision(model_action, reason, "semantic_router")
+
+        if route.reply_necessity == ReplyNecessity.UNNECESSARY:
+            return decision(
+                CognitiveAction.WAIT,
+                ReasonCode.RESPONSE_NOT_NECESSARY,
+                "response_not_necessary",
+                "reply_necessity_unnecessary",
+            )
+
+        if hint != "agent":
+            if not self._may_interject(route.reply_necessity):
+                return decision(
+                    CognitiveAction.WAIT,
+                    ReasonCode.CONSERVATIVE_AMBIGUITY,
+                    "conservative_ambiguity",
+                    "unaddressed_response_below_threshold",
+                )
+
+        return decision(CognitiveAction.RESPOND, reason, "semantic_router")
 
     def _may_interject(self, necessity: ReplyNecessity) -> bool:
         """Whether an unaddressed RESPOND suggestion clears the local bar."""

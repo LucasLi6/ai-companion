@@ -118,3 +118,10 @@ class CognitiveContext(BaseModel):
     # understanding profile. It is background data about this person only,
     # never another person's profile and never an instruction.
     person_profile_context: Optional[str] = Field(default=None, max_length=800)
+    # V0.8: the validated semantic route for this turn, rendered for the
+    # speaker as *model judgment* (not a trusted instruction). Never contains
+    # the router's raw output or hidden chain of thought.
+    route_context: Optional[dict] = Field(default=None)
+    # V0.8: truthful, bounded results of read-only tools requested by the
+    # router. External/web content is labelled untrusted by the executor.
+    tool_results: list[dict] = Field(default_factory=list)
