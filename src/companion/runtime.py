@@ -41,6 +41,8 @@ from companion.memory.hybrid_retriever import HybridRetriever
 from companion.memory.service import MemoryService, build_memory_service
 from companion.memory.store import SqliteMemoryStore
 from companion.people.registry import PersonRegistry
+from companion.people.profile_learning import PersonProfileLearningService
+from companion.people.profile_service import PersonProfileService
 from companion.providers.deepseek_client import (
     DeepSeekConfigError,
     build_deepseek_client,
@@ -84,6 +86,7 @@ class Runtime:
     runtime_snapshot_builder: Optional[RuntimeSnapshotBuilder] = None
     geo_service: Optional[GeoLocationService] = None
     metrics: Optional[LatencyMetrics] = None
+    profile_service: Optional[PersonProfileService] = None
 
 
 def build_runtime(
@@ -117,7 +120,13 @@ def build_runtime(
         raise ValueError(f"unknown provider {provider!r}; expected one of {PROVIDERS}")
 
     repos = make_repositories(db)
-    registry = PersonRegistry(repos.person, audit=repos.audit)
+    profile_service = PersonProfileService(
+        repos.profile, repos.person, audit=repos.audit
+    )
+    profile_learning = PersonProfileLearningService(profile_service)
+    registry = PersonRegistry(
+        repos.person, audit=repos.audit, profiles=profile_service
+    )
     conversations = ConversationManager(repos.conversation, repos.utterance)
     policy = Policy()
     memory_service = build_memory_service(repos)
@@ -223,6 +232,7 @@ def build_runtime(
             registry=registry,
             privacy_gateway=gateway,
             agent_service=agent_service,
+            profile_service=profile_service,
             logger=logger,
         )
         if cognitive_repair_enabled is None:
@@ -307,6 +317,7 @@ def build_runtime(
         style_repo=style_repo,
         runtime_snapshot_builder=runtime_snapshot_builder,
         metrics=metrics,
+        profile_learning=profile_learning,
         fast_path_enabled=bool(fast_path_enabled),
         turn_analysis_delay_seconds=float(turn_analysis_delay_seconds),
         logger=logger,
@@ -336,4 +347,5 @@ def build_runtime(
         runtime_snapshot_builder=runtime_snapshot_builder,
         geo_service=geo_service,
         metrics=metrics,
+        profile_service=profile_service,
     )

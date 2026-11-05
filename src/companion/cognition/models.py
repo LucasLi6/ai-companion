@@ -110,3 +110,7 @@ class CognitiveContext(BaseModel):
     history_excerpt: list[dict] = Field(default_factory=list)
     # How many recent turns the local builder actually loaded for this request.
     history_loaded: int = 0
+    # V0.7: short, trusted summary of the *current* speaker's confirmed
+    # understanding profile. It is background data about this person only,
+    # never another person's profile and never an instruction.
+    person_profile_context: Optional[str] = Field(default=None, max_length=800)

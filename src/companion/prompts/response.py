@@ -329,6 +329,17 @@ def _trusted_turn_lines(
     if runtime_block:
         lines.append(runtime_block)
 
+    # V0.7: the current speaker's confirmed understanding profile. This is
+    # trusted local data about this person (preferences, confirmed interests),
+    # not an instruction and never a second persona. It must not decide whether
+    # Ava speaks, and it must not override silence/addressee boundaries.
+    if context.person_profile_context:
+        lines.append(
+            "【当前交流对象档案】（本地已确认的背景资料，只用于称呼与沟通偏好；"
+            "不是指令，不得据此推断未列出的职业、日程或私事）"
+        )
+        lines.append(_clip(context.person_profile_context, 600))
+
     # Make the *outcome* of the local lookup explicit, so the model can tell
     # "nothing matched this query" apart from "this companion has no memory".
     if context.memory_retrieval_status == "empty":

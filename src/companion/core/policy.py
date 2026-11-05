@@ -208,9 +208,17 @@ class Policy:
                 "model_wait_on_direct_question",
             )
 
-        # 6. Model suggestion, then 7. conservative checks on it.
+        # 6. Model suggestion, then 7. conservative checks on it. A local
+        # assessment is labelled as local even when it chose WAIT/IGNORE, so
+        # the non-response trace never attributes a local decision to a model.
         if model_action != CognitiveAction.RESPOND:
-            return decision(model_action, analysis.reason_code, "model_suggestion")
+            return decision(
+                model_action,
+                analysis.reason_code,
+                "local_assessment"
+                if local_source == "local_fast_path"
+                else "model_suggestion",
+            )
 
         if analysis.reply_necessity == ReplyNecessity.UNNECESSARY:
             return decision(

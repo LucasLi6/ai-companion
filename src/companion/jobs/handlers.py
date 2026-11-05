@@ -26,6 +26,8 @@ from companion.domain.enums import JobType
 from companion.memory.candidates import prepare_candidates
 from companion.memory.consolidation import MemoryWriter
 from companion.memory.service import build_memory_service
+from companion.people.profile_learning import PersonProfileLearningService
+from companion.people.profile_service import PersonProfileService
 from companion.providers.deepseek_cognitive import CognitivePermissionDenied
 from companion.storage.repositories import Repositories
 
@@ -70,6 +72,33 @@ async def memory_consolidation(
     service = build_memory_service(repos)
     writer = MemoryWriter(repos, service, logger=logger)
     outcomes = await writer.consolidate_event(event_id)
+
+    # V0.7: link the confirmed memory ids back into the speaker's understanding
+    # profile, so a profile fact references the long-term memory that supports
+    # it instead of duplicating the content. This is provenance only and never
+    # changes whether the memory was written.
+    if event.speaker_person_id is not None:
+        learning = PersonProfileLearningService(
+            PersonProfileService(
+                repos.profile, repos.person, audit=repos.audit
+            )
+        )
+        for memory_id in {
+            outcome.get("memory_id")
+            for outcome in outcomes
+            if outcome.get("memory_id")
+        }:
+            try:
+                await learning.link_output_memory(
+                    event.speaker_person_id, event_id, memory_id
+                )
+            except Exception as exc:  # pragma: no cover - defensive isolation
+                logger.warning(
+                    "profile_memory_link_failed event_id=%s memory_id=%s error=%s",
+                    event_id,
+                    memory_id,
+                    type(exc).__name__,
+                )
 
     logger.info(
         "memory_consolidation_done event_id=%s candidates=%d outcomes=%s",

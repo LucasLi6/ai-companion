@@ -48,6 +48,7 @@ from companion.domain.models import (
 from companion.cognition.nonresponse import NonresponseTrace
 from companion.core.fast_path import LOCAL_PROVIDER
 from companion.learning.state import LearningRepository
+from companion.people.profile_repository import PersonProfileRepository
 from companion.research.state import ResearchStateRepository
 from companion.goals.state import GoalRepository
 from companion.runtime_context.repository import RuntimeSnapshotRepository
@@ -1408,6 +1409,7 @@ class Repositories:
     goals: GoalRepository
     runtime_snapshot: RuntimeSnapshotRepository
     extraction: ExtractionRepository
+    profile: PersonProfileRepository
 
     async def persist_cognitive_outcome(
         self,
@@ -1457,6 +1459,7 @@ def make_repositories(db: Database) -> Repositories:
         goals=GoalRepository(db),
         runtime_snapshot=RuntimeSnapshotRepository(db),
         extraction=ExtractionRepository(db),
+        profile=PersonProfileRepository(db),
     )
 
 

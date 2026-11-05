@@ -158,7 +158,13 @@ async def test_duplicate_delivery_makes_no_further_call(db):
     assert client.calls == calls_after_first
 
 
-async def test_quiet_mode_withholds_response_but_still_analyzes(db):
+async def test_quiet_mode_withholds_response_but_still_learns(db):
+    """V0.7: quiet mode is a local WAIT, not a synchronous model turn.
+
+    No response call is made and no reply text is produced, but the event is
+    recorded, the turn is persisted and its memory learning is queued as a
+    background job so the conversation is not silently lost.
+    """
     client = ScriptedClient()
     rt = build_runtime(db, provider="deepseek", deepseek_client=client)
     person = await _person(rt)
@@ -169,14 +175,19 @@ async def test_quiet_mode_withholds_response_but_still_analyzes(db):
     assert quiet.status == "COMPLETED"
     assert quiet.action == CognitiveAction.WAIT
     assert quiet.response_text is None
-    assert client.calls == ["analysis"]
+    # A local decision makes no provider call at all.
+    assert client.calls == []
+    # The event is still recorded and background learning is queued.
+    assert await rt.repos.utterance.get(event.event_id) is not None
+    job = await rt.repos.job.get_by_key(f"turn_analysis:{event.event_id}")
+    assert job is not None
 
     # A second *different* event after quiet mode is turned off does get a
     # response, using the normal pipeline.
     await rt.conversations.set_quiet_mode("c1", False)
     second = await rt.orchestrator.process_utterance(_event(person.person_id, "再说一次"))
     assert second.action == CognitiveAction.RESPOND
-    assert client.calls == ["analysis", "analysis", "response"]
+    assert client.calls == ["analysis", "response"]
 
 
 async def _dump_all_text(db) -> str:

@@ -132,9 +132,26 @@ def derive_nonresponse_trace(
         return _trace(action, "HUMAN_ADDRESSEE", "LOCAL_POLICY", override=override)
 
     # 5. Other local policy restrictions (including a RESPOND suggestion
-    # downgraded to WAIT). The model's motive is not reused here: it did not
-    # decide this outcome.
-    if policy_decision.overrode_model or policy_decision.rule != "model_suggestion":
+    # downgraded to WAIT, and any local assessment). The model's motive is not
+    # reused here: it did not decide this outcome.
+    local_provider = str(getattr(analysis, "provider", "")) == "local_fast_path"
+    if (
+        local_provider
+        and getattr(analysis, "conversation_state", "") == "local_wait_request"
+    ):
+        return _trace(
+            action,
+            "AWAITING_CONTINUATION",
+            "LOCAL_POLICY",
+            override=override,
+            pending=True,
+            reentry="NEXT_TOPIC_CONTINUATION",
+        )
+    if (
+        policy_decision.overrode_model
+        or policy_decision.rule != "model_suggestion"
+        or local_provider
+    ):
         cause = _REASON_TO_CAUSE.get(reason, "UNKNOWN")
         return _trace(action, cause, "LOCAL_POLICY", override=override)
 
@@ -171,6 +188,8 @@ def _trace(
     source: str,
     *,
     override: Optional[str],
+    pending: bool = False,
+    reentry: str = "NONE",
 ) -> NonresponseTrace:
     return NonresponseTrace(
         final_action=action.value,
@@ -179,8 +198,8 @@ def _trace(
         model_motive=None,
         policy_override=override,
         evidence_span=None,
-        pending_followup=False,
-        reentry_condition="NONE",
+        pending_followup=pending,
+        reentry_condition=reentry,
         spoken=False,
     )
 

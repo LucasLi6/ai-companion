@@ -14,15 +14,21 @@ from companion.domain.models import Consent, Person, new_id, utcnow
 from companion.storage.repositories import PersonRepository
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from companion.people.profile_service import PersonProfileService
     from companion.storage.repositories import AuditRepository
 
 
 class PersonRegistry:
     def __init__(
-        self, repo: PersonRepository, *, audit: Optional["AuditRepository"] = None
+        self,
+        repo: PersonRepository,
+        *,
+        audit: Optional["AuditRepository"] = None,
+        profiles: Optional["PersonProfileService"] = None,
     ) -> None:
         self.repo = repo
         self.audit = audit
+        self.profiles = profiles
 
     async def register(
         self,
@@ -53,7 +59,19 @@ class PersonRegistry:
             allow_external_ai=allow_external_ai,
             updated_at=now,
         )
-        await self.repo.register(person, consent)
+        async with self.repo.db.transaction():
+            await self.repo.register(person, consent)
+            # The empty understanding profile is created in the *same*
+            # transaction as registration, and only when local persistence was
+            # granted. It grants no consent of its own: passing
+            # allow_persistence above is the sole authorisation for the profile
+            # to exist.
+            if self.profiles is not None and allow_persistence:
+                await self.profiles.ensure_profile(
+                    pid,
+                    actor="registration",
+                    enforce_authorization=False,
+                )
         if self.audit is not None:
             await self.audit.record(
                 actor="app",
@@ -75,6 +93,8 @@ class PersonRegistry:
 
     async def set_consent(self, consent: Consent) -> None:
         await self.repo.set_consent(consent)
+        if self.profiles is not None:
+            await self.profiles.on_consent_changed(consent.person_id)
         if self.audit is not None:
             await self.audit.record(
                 actor="app",
@@ -94,6 +114,8 @@ class PersonRegistry:
     ) -> None:
         """Suspend or revoke a person; this never deletes existing data."""
         await self.repo.set_registration_status(person_id, status)
+        if self.profiles is not None:
+            await self.profiles.on_status_changed(person_id)
         if self.audit is not None:
             await self.audit.record(
                 actor="app",

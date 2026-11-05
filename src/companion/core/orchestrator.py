@@ -80,7 +80,7 @@ from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
 from companion.storage.repositories import Repositories
 
 from .conversation import ConversationManager
-from .fast_path import LOCAL_PROVIDER, decide_route
+from .fast_path import LOCAL_PROVIDER, TurnAssessment, assess_turn, decide_route
 from .metrics import LatencyMetrics
 from .policy import Policy, PolicyDecision
 from .response_events import ResponseEventSink
@@ -117,6 +117,7 @@ class Orchestrator:
         style_repo=None,
         runtime_snapshot_builder: Optional[RuntimeSnapshotBuilder] = None,
         metrics: Optional[LatencyMetrics] = None,
+        profile_learning=None,
         fast_path_enabled: bool = True,
         turn_analysis_delay_seconds: float = 60.0,
         turn_analysis_batch_size: int = 5,
@@ -152,6 +153,11 @@ class Orchestrator:
         # cognitive and response providers. In mock mode it stays None and the
         # providers receive the lightweight ConversationContext as before.
         self.context_builder = context_builder
+        # V0.7: deterministic, local-only person-profile learning. It never
+        # makes a model call and never decides whether Ava replies; it only
+        # records explicit preferences and unconfirmed candidate facts within
+        # the speaker's standing consent.
+        self.profile_learning = profile_learning
         # V0.6: one immutable runtime snapshot per event (time, zone, gaps,
         # optional consented location). Missing builder keeps older wirings
         # working unchanged.
@@ -416,34 +422,64 @@ class Orchestrator:
                 analysis_id = await self.repos.analysis.get_analysis_id(event.event_id)
 
             fast_path = False
-            if analysis is None:
+            assessment: Optional[TurnAssessment] = None
+            local_capable = (
+                self.fast_path_enabled
+                and self.context_builder is not None
+                and bool(consent.allow_external_ai)
+            )
+            if analysis is None and local_capable:
+                # V0.7: addressee and reply necessity are assessed separately.
+                # Explicit silence, a confirmed human addressee, quiet mode and
+                # a wait request are decided locally; an unclear addressee or a
+                # memory request still uses the existing Deliberation Path.
+                # Legacy/mock wirings keep their original Deliberation Path, so
+                # no old behaviour is silently rewritten.
+                assessment = assess_turn(
+                    addressee_hint=event.addressee_hint.value,
+                    text=event.text,
+                    explicit_silence=explicit_silence,
+                    quiet_mode=bool(context.quiet_mode),
+                    explicit_remember=explicit_remember,
+                    fast_path_enabled=local_capable,
+                    model_available=local_capable,
+                )
+                if assessment.is_local:
+                    fast_path = True
+                    steps.append(f"[ROUTE] local:{assessment.rule}")
+            if analysis is None and not fast_path:
                 route = decide_route(
                     addressee_hint=event.addressee_hint.value,
                     explicit_remember=explicit_remember,
-                    # Fast Path still obeys the external-AI gate: without an
-                    # explicit grant the turn goes through the standard path,
-                    # where the privacy gateway returns a local denial without
-                    # any network call.
-                    fast_path_enabled=(
-                        self.fast_path_enabled
-                        and self.context_builder is not None
-                        and bool(consent.allow_external_ai)
-                    ),
+                    # Fast Path still obeys the external-AI gate: without
+                    # an explicit grant the turn goes through the standard
+                    # path, where the privacy gateway returns a local
+                    # denial without any network call.
+                    fast_path_enabled=local_capable,
                 )
                 fast_path = route.is_fast
                 steps.append(f"[ROUTE] {route.route}:{route.reason}")
-            elif str(getattr(analysis, "provider", "")) == LOCAL_PROVIDER:
+            if analysis is not None and str(
+                getattr(analysis, "provider", "")
+            ) == LOCAL_PROVIDER:
                 fast_path = True
 
             job_id: Optional[str] = None
             if analysis is None and fast_path:
                 # A local decision record, explicitly marked as local. It is not
-                # a model analysis and is never presented as one.
-                analysis = self._local_fast_path_analysis(event)
-                steps.append("[COGNITION] Skipped (fast path, no model analysis)")
+                # a model analysis and is never presented as one. RESPOND,
+                # WAIT and IGNORE all reach here; only the action differs.
+                analysis = self._local_turn_analysis(event, assessment)
+                steps.append(
+                    "[COGNITION] Skipped (local decision: "
+                    f"{analysis.action.value}, necessity="
+                    f"{analysis.reply_necessity.value})"
+                )
                 self.logger.info(
-                    "fast_path_selected event_id=%s",
+                    "local_assessment_selected event_id=%s action=%s rule=%s",
                     event.event_id,
+                    analysis.action.value,
+                    assessment.rule if assessment is not None else "reused",
                 )
                 if persist:
                     analysis_id = new_id("ana")
@@ -764,6 +800,7 @@ class Orchestrator:
                     previous_scene=scene_record,
                     analysis=analysis,
                     cognitive_context=cognitive_context,
+                    learn_profile=bool(persist and learn and not safety.triggered),
                 )
                 if scene_enabled and action_obj is not None:
                     steps.append("[SCENE] Transition committed")
@@ -1069,25 +1106,40 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _local_fast_path_analysis(event) -> CognitiveResult:
-        """A local decision record for a clearly direct turn.
+    def _local_turn_analysis(
+        event, assessment: Optional[TurnAssessment]
+    ) -> CognitiveResult:
+        """A local decision record for a turn settled by trusted metadata.
 
         This is deliberately *not* presented as a model analysis: ``provider``
-        is ``local_fast_path`` and the meaning string says so. The policy still
-        applies every local rule (quiet mode, explicit silence, permissions)
-        on top of it, and background learning runs as a durable job.
+        is ``local_fast_path`` and the meaning string says so. The recorded
+        action and reply necessity come from the local assessment, so a WAIT
+        or IGNORE is stored as such instead of being disguised as a RESPOND.
+        The policy still applies every local rule on top of it.
         """
+        if assessment is None:
+            # Reused local analysis (retry of a Fast Path turn).
+            assessment = TurnAssessment(
+                action=CognitiveAction.RESPOND,
+                reason=ReasonCode.DIRECT_AGENT_ADDRESS,
+                reply_necessity=ReplyNecessity.USEFUL,
+                rule="local_direct_address",
+                addressee="agent",
+            )
         return CognitiveResult(
             event_id=event.event_id,
-            meaning="direct address; fast path (no model analysis)",
-            action=CognitiveAction.RESPOND,
-            reason_code=ReasonCode.DIRECT_AGENT_ADDRESS,
+            meaning=(
+                f"local selective response ({assessment.rule}); "
+                "no model analysis"
+            ),
+            action=assessment.action,
+            reason_code=assessment.reason,
             response_style="fast_path",
             provider=LOCAL_PROVIDER,
-            intent="direct_chat",
-            addressed_to="agent",
-            reply_necessity=ReplyNecessity.REQUIRED,
-            conversation_state="direct",
+            intent="local_assessment",
+            addressed_to=assessment.addressee,
+            reply_necessity=assessment.reply_necessity,
+            conversation_state=assessment.rule,
         )
 
     async def _update_runtime_emotion(self, event, snapshot, cognitive_context):
@@ -1814,6 +1866,7 @@ class Orchestrator:
         previous_scene,
         analysis,
         cognitive_context,
+        learn_profile: bool = False,
     ) -> None:
         """Atomic finalization of action + scene + conversation + event.
 
@@ -1828,6 +1881,7 @@ class Orchestrator:
             async with self.repos.db.transaction(immediate=True):
                 if not existing_action:
                     await self.repos.analysis.save_action(action)
+                await self._observe_profile(event, learn_profile)
                 await self.conversations.record_last_action(
                     event.conversation_id, action.action_type.value
                 )
@@ -1931,6 +1985,7 @@ class Orchestrator:
                                 "revision": candidate.revision,
                             },
                         )
+                    await self._observe_profile(event, learn_profile)
                     await self.conversations.record_last_action(
                         event.conversation_id, action.action_type.value
                     )
@@ -1973,6 +2028,38 @@ class Orchestrator:
                             event.event_id, ProcessingStatus.COMPLETED
                         )
                     return
+
+    async def _observe_profile(self, event, enabled: bool) -> None:
+        """Local-only profile learning; never affects the reply or commit.
+
+        It runs inside the turn's commit transaction so a rolled-back turn
+        cannot leave profile changes behind. A failure here is logged and
+        ignored: learning is never allowed to break a conversation.
+        """
+        if not enabled or self.profile_learning is None:
+            return
+        person_id = event.speaker_person_id
+        if person_id is None:
+            return
+        try:
+            result = await self.profile_learning.observe(
+                person_id, event.text, event_id=event.event_id
+            )
+            if result.preferences or result.candidates or result.corrections:
+                self.logger.info(
+                    "profile_learning event_id=%s preferences=%d candidates=%d"
+                    " corrections=%d",
+                    event.event_id,
+                    len(result.preferences),
+                    len(result.candidates),
+                    len(result.corrections),
+                )
+        except Exception as exc:  # pragma: no cover - defensive isolation
+            self.logger.warning(
+                "profile_learning_failed event_id=%s error=%s",
+                event.event_id,
+                type(exc).__name__,
+            )
 
     async def _persist_input(self, event: UtteranceEvent) -> None:
         to_save = event.model_copy(update={"processing_status": ProcessingStatus.PROCESSING})

@@ -24,6 +24,7 @@ from typing import Optional
 from companion.core.policy import load_policy_config
 from companion.domain.enums import CognitiveAction
 from companion.domain.models import UtteranceEvent
+from companion.people.profile_compiler import compile_profile_context
 from companion.people.registry import PersonRegistry
 from companion.storage.repositories import Repositories
 
@@ -48,6 +49,7 @@ class ContextBuilder:
         registry: PersonRegistry,
         privacy_gateway=None,
         agent_service=None,
+        profile_service=None,
         history_limit: int = DEFAULT_HISTORY_LIMIT,
         max_turns: Optional[int] = DEFAULT_MAX_TURNS,
         max_chars: Optional[int] = DEFAULT_MAX_CHARS,
@@ -57,6 +59,7 @@ class ContextBuilder:
         self.registry = registry
         self.privacy_gateway = privacy_gateway
         self.agent_service = agent_service
+        self.profile_service = profile_service
         self.history_limit = history_limit
         self.max_turns = max_turns
         self.max_chars = max_chars
@@ -99,6 +102,9 @@ class ContextBuilder:
         current_label = labels.get(
             event.speaker_person_id, event.speaker_label or "unknown"
         )
+        person_profile_context = await self._profile_context(
+            event.speaker_person_id
+        )
         agent_context = None
         if self.agent_service is not None:
             policy_config = await load_policy_config(self.repos.settings)
@@ -118,6 +124,7 @@ class ContextBuilder:
             action_history=action_history,
             memories=memories,
             agent_context=agent_context,
+            person_profile_context=person_profile_context,
         )
 
     # -- internals ----------------------------------------------------------
@@ -257,6 +264,27 @@ class ContextBuilder:
         if person_id not in self._people:
             self._people[person_id] = await self.registry.get(person_id)
         return self._people[person_id]
+
+    async def _profile_context(self, person_id: Optional[str]) -> Optional[str]:
+        """Build the *current speaker's* profile block, if they consented.
+
+        The profile may reach an external model only when that person granted
+        both local persistence and external AI use. A different person's
+        private profile is never loaded here.
+        """
+        if self.profile_service is None or person_id is None:
+            return None
+        if not await self.registry.is_authorized(person_id):
+            return None
+        consent = await self.repos.person.get_consent(person_id)
+        if (
+            consent is None
+            or not consent.allow_persistence
+            or not consent.allow_external_ai
+        ):
+            return None
+        profile = await self.profile_service.get(person_id)
+        return compile_profile_context(profile)
 
     async def _subject_ids_of(self, memory: dict) -> list[str]:
         """PERSON subject ids of a retrieved memory, for the privacy gateway."""

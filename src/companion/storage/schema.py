@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1374,6 +1374,124 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE INDEX IF NOT EXISTS idx_turn_extractions_status
             ON turn_extractions(status, created_at);
+        """,
+    ),
+    # Version 20 (V0.7): person understanding profile.
+    #
+    # Extends the existing ``person_interaction_profiles`` row (one per person)
+    # rather than introducing a second profile store. Fields hold only the
+    # *effective* value plus its provenance; speculative updates live in
+    # ``person_profile_candidates`` until there is enough evidence. Every
+    # accepted change leaves a ``person_profile_revisions`` row, and evidence
+    # references point back at memory items / events instead of duplicating
+    # them. ``created_at`` is added nullable because SQLite cannot ADD COLUMN
+    # with a non-constant default; it is backfilled from ``updated_at``.
+    (
+        20,
+        """
+        ALTER TABLE person_interaction_profiles
+            ADD COLUMN compact_summary TEXT NOT NULL DEFAULT '';
+        ALTER TABLE person_interaction_profiles
+            ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE person_interaction_profiles
+            ADD COLUMN created_at TEXT;
+        ALTER TABLE person_interaction_profiles
+            ADD COLUMN last_reviewed_at TEXT;
+        ALTER TABLE person_interaction_profiles
+            ADD COLUMN updated_by TEXT NOT NULL DEFAULT 'system';
+
+        UPDATE person_interaction_profiles
+            SET created_at = updated_at WHERE created_at IS NULL;
+
+        CREATE TABLE IF NOT EXISTS person_profile_fields (
+            person_id                TEXT NOT NULL
+                                     REFERENCES persons(person_id) ON DELETE CASCADE,
+            field_key                TEXT NOT NULL,
+            value_json               TEXT NOT NULL,
+            source                   TEXT NOT NULL,
+            confidence               REAL NOT NULL DEFAULT 0,
+            status                   TEXT NOT NULL DEFAULT 'ACTIVE',
+            evidence_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+            evidence_event_ids_json  TEXT NOT NULL DEFAULT '[]',
+            evidence_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+            revision                 INTEGER NOT NULL DEFAULT 1,
+            created_at               TEXT NOT NULL,
+            updated_at               TEXT NOT NULL,
+            PRIMARY KEY (person_id, field_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_fields_person
+            ON person_profile_fields(person_id, status);
+
+        CREATE TABLE IF NOT EXISTS person_profile_candidates (
+            candidate_id             TEXT PRIMARY KEY,
+            person_id                TEXT NOT NULL
+                                     REFERENCES persons(person_id) ON DELETE CASCADE,
+            field_key                TEXT NOT NULL,
+            candidate_value_json     TEXT NOT NULL,
+            source                   TEXT NOT NULL,
+            confidence               REAL NOT NULL DEFAULT 0,
+            status                   TEXT NOT NULL DEFAULT 'PENDING',
+            evidence_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+            evidence_event_ids_json  TEXT NOT NULL DEFAULT '[]',
+            evidence_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+            reason                   TEXT,
+            created_at               TEXT NOT NULL,
+            updated_at               TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_candidates_person
+            ON person_profile_candidates(person_id, status, field_key);
+
+        CREATE TABLE IF NOT EXISTS person_profile_revisions (
+            revision_id     TEXT PRIMARY KEY,
+            person_id       TEXT NOT NULL
+                            REFERENCES persons(person_id) ON DELETE CASCADE,
+            revision        INTEGER NOT NULL,
+            changes_json    TEXT NOT NULL DEFAULT '{}',
+            changed_by      TEXT NOT NULL,
+            source_event_id TEXT,
+            reason          TEXT,
+            created_at      TEXT NOT NULL,
+            UNIQUE (person_id, revision)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_revisions_person
+            ON person_profile_revisions(person_id, revision);
+
+        CREATE TABLE IF NOT EXISTS person_profile_evidence (
+            evidence_id     TEXT PRIMARY KEY,
+            person_id       TEXT NOT NULL
+                            REFERENCES persons(person_id) ON DELETE CASCADE,
+            field_key       TEXT NOT NULL,
+            memory_id       TEXT
+                            REFERENCES memory_items(memory_id) ON DELETE SET NULL,
+            source_event_id TEXT,
+            candidate_id    TEXT
+                            REFERENCES person_profile_candidates(candidate_id)
+                            ON DELETE CASCADE,
+            evidence_type   TEXT NOT NULL DEFAULT 'EVENT',
+            created_at      TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_evidence_person
+            ON person_profile_evidence(person_id, field_key);
+        CREATE INDEX IF NOT EXISTS idx_profile_evidence_memory
+            ON person_profile_evidence(memory_id);
+
+        INSERT INTO person_interaction_profiles(
+            person_id, relationship_tier, style_overrides, updated_at,
+            compact_summary, revision, created_at, updated_by)
+        SELECT ps.person_id, 'STRANGER', '{}', ps.updated_at,
+               '', 1, ps.updated_at, 'migration_v20'
+        FROM persons ps
+        JOIN consents c ON c.person_id = ps.person_id
+        WHERE ps.registration_status = 'active'
+          AND c.allow_persistence = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM person_interaction_profiles ip
+              WHERE ip.person_id = ps.person_id
+          );
         """,
     ),
 ]
