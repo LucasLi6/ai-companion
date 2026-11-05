@@ -40,12 +40,29 @@ def build_idle_scheduler(
     :class:`IdleMemoryContextBuilder`, and research is gated by the
     ``research.enabled`` / ``web_search.enabled`` settings.
     """
+    custom_providers = deepseek is not None or web_search is not None
     deepseek = deepseek or DeepSeekProvider()
     web_search = web_search or MockWebSearchProvider()
     settings = settings or runtime.repos.settings
     builder = IdleMemoryContextBuilder(
         runtime.memory_service, runtime.registry, audit=runtime.repos.audit
     )
+    task_service = getattr(runtime, "task_service", None)
+    # The normal runtime already owns a research engine and has registered its
+    # handler. Reuse it so scheduling, execution and ownership all refer to
+    # the same engine. A caller that injects explicit providers (the CLI's
+    # settings-aware wiring) still gets its own engine, which is then
+    # registered in place of the default one.
+    research = None if custom_providers else getattr(runtime, "research_engine", None)
+    if research is None:
+        research = ResearchEngine(
+            runtime.memory_service,
+            runtime.repos.research,
+            web_search,
+            deepseek,
+            settings=settings,
+            state=runtime.repos.research_state,
+        )
     reflection = ReflectionEngine(
         runtime.memory_service, deepseek, builder, learning=runtime.repos.learning
     )
@@ -55,19 +72,11 @@ def build_idle_scheduler(
         runtime.repos.research,
         builder,
         learning=runtime.repos.learning,
-    )
-    research = ResearchEngine(
-        runtime.memory_service,
-        runtime.repos.research,
-        web_search,
-        deepseek,
-        settings=settings,
-        state=runtime.repos.research_state,
+        task_service=task_service,
     )
     # Register the same engine with the unified off-task worker. This does not
-    # start a second scheduler: it only makes an explicitly enqueued
-    # RESEARCH_TASK job durable and resumable through the existing worker.
-    task_service = getattr(runtime, "task_service", None)
+    # start a second scheduler: it only makes an enqueued RESEARCH_TASK job
+    # durable and resumable through the existing worker.
     if task_service is not None:
         from companion.domain.enums import JobType
         from companion.tasks.handlers import build_research_task_handler
@@ -81,6 +90,7 @@ def build_idle_scheduler(
         curiosity,
         research,
         learning=runtime.repos.learning,
+        task_service=task_service,
     )
 
 

@@ -28,7 +28,11 @@ from companion.domain.enums import (
 from companion.memory.models import MemoryEvidence, MemorySource
 from companion.memory.service import MemoryService
 from companion.research.state import ResearchStateRepository
-from companion.tasks.models import TaskPaused
+from companion.tasks.models import (
+    TaskCommitRejected,
+    TaskLeaseLost,
+    TaskPaused,
+)
 
 from . import SYSTEM_ADMIN
 
@@ -275,6 +279,9 @@ class ResearchEngine:
                 done.append(result)
         return done
 
+    def _owner_token(self, task_id: str, owner_id: str | None) -> str:
+        return owner_id or f"{self.owner_id}:{task_id}"
+
     async def run_resumable(
         self,
         task_id: str,
@@ -283,28 +290,55 @@ class ResearchEngine:
         pause_check=None,
         save_checkpoint=None,
         owner_id: str | None = None,
+        authorize=None,
+        commit=None,
     ) -> dict:
         """Execute one research task with durable stages.
 
         Stages are ``SEARCH -> ANALYZE -> SAVE -> DONE``. A checkpoint stores
         search results by value (bounded snippets) and the durable run/source
         references needed to resume, never a claim that permission or a lease
-        is still valid. A pause is observed only *between* stages: an in-flight
-        HTTP request is never claimed to be cancelled instantly.
+        is still valid.
+
+        When invoked through ``TaskService`` the caller supplies
+
+        - ``owner_id``: a stable token such as ``job:<job_id>`` so the research
+          detail row and the job name the same execution;
+        - ``authorize``: an async predicate over the *job* lease/cancel/
+          permission state, checked before each stage;
+        - ``commit``: an atomic-commit callback that runs the memory write,
+          the research detail update and the job completion in one SQLite
+          transaction.
+
+        A task is never run merely because its detail row says RUNNING: a live
+        lease owned by a different execution rejects this one, and an expired
+        lease is reclaimed through the normal claim path.
         """
         import inspect
 
         state = dict(checkpoint or {})
         if not await self._enabled():
             return {"status": "CANCELLED", "reason": "research_disabled"}
+        if authorize is not None and not await authorize():
+            return {"status": "CANCELLED", "reason": "authorization_lost"}
         task = await self.research_repo.get(task_id)
         if task is None:
             return {"status": "FAILED", "error": "research task not found"}
+        owner = self._owner_token(task_id, owner_id)
+
         if task["status"] == "RUNNING":
-            await self.research_repo.recover_running()
+            same_owner = task.get("owner_id") == owner
+            live = await self.research_repo.lease_live(task_id)
+            if not same_owner and live:
+                # A different execution still holds a valid lease. Do not
+                # race it, and do not treat its RUNNING row as our own.
+                return {"status": "PENDING", "reason": "claimed_elsewhere"}
+            if not live:
+                await self.research_repo.recover_task(task_id)
             task = await self.research_repo.get(task_id)
             if task is None:
                 return {"status": "FAILED", "error": "research task not found"}
+
         if task["status"] == "COMPLETED":
             await self._repair_completed_run(task)
             return self._completed_payload(task)
@@ -315,7 +349,6 @@ class ResearchEngine:
                 "memory_id": task.get("memory_id"),
             }
 
-        owner = owner_id or f"{self.owner_id}:{task_id}"
         if task["status"] == "PENDING":
             if not await self.research_repo.claim(
                 task_id, owner, self.lease_seconds
@@ -329,11 +362,30 @@ class ResearchEngine:
                         "error": current.get("error") or "research task failed",
                     }
                 return {"status": "PENDING", "reason": "claim_failed"}
-        task = await self.research_repo.get(task_id)
-        if task is None:
-            return {"status": "FAILED", "error": "research task not found"}
+            task = await self.research_repo.get(task_id)
+        if task is None or task["status"] != "RUNNING":
+            return {"status": "PENDING", "reason": "not_owned"}
+        if task.get("owner_id") != owner:
+            # Lost a claim race after recovery; never run another's task.
+            return {"status": "PENDING", "reason": "claimed_elsewhere"}
 
-        async def save(update: dict) -> None:
+        async def guard() -> None:
+            """Abort without writes when this execution has no right to run."""
+            if authorize is not None and not await authorize():
+                raise TaskCommitRejected("CANCELLED")
+            if not await self.research_repo.renew(
+                task_id, owner, self.lease_seconds
+            ):
+                raise TaskLeaseLost("research_lease_lost")
+
+        async def save(update: dict, *, final: bool = False) -> None:
+            # ``final`` is used only by the legacy direct-engine path after a
+            # successful consolidation: the detail row is already COMPLETED,
+            # so a lease renewal there would fail even though the work ended
+            # correctly. With an atomic commit the job is COMPLETED and no
+            # final checkpoint is written at all.
+            if not final:
+                await guard()
             state.update(update)
             if save_checkpoint is not None:
                 result = save_checkpoint(dict(state))
@@ -341,6 +393,7 @@ class ResearchEngine:
                     await result
 
         async def pause_if_needed() -> None:
+            await guard()
             if pause_check is None:
                 return
             paused = pause_check()
@@ -350,10 +403,20 @@ class ResearchEngine:
                 await save({"stage": state.get("stage", "START")})
                 raise TaskPaused(dict(state))
 
-        # A prior attempt may have consolidated the memory. Reuse it rather
-        # than creating a duplicate.
+        # A prior attempt may have consolidated the memory. Finalize the
+        # detail row through the same atomic commit path so cancellation can
+        # never leave a job COMPLETED with an abandoned research row.
         if task.get("memory_id"):
-            await self._repair_completed_run(task)
+            try:
+                await self._finalize_existing(task, owner, commit)
+            except TaskCommitRejected as rejected:
+                await self.research_repo.cancel_owned(task_id, owner)
+                return {"status": "CANCELLED", "reason": rejected.reason}
+            except TaskLeaseLost as lost:
+                current = await self.research_repo.get(task_id)
+                if current is not None and current["status"] == "COMPLETED":
+                    return self._completed_payload(current)
+                return {"status": "PENDING", "reason": lost.reason}
             return self._completed_payload(task)
 
         try:
@@ -362,28 +425,94 @@ class ResearchEngine:
                 state,
                 save=save,
                 pause_if_needed=pause_if_needed,
+                owner_id=owner,
+                commit=commit,
             )
         except TaskPaused:
             raise
+        except TaskCommitRejected as rejected:
+            await self.research_repo.cancel_owned(task_id, owner)
+            return {"status": "CANCELLED", "reason": rejected.reason}
+        except TaskLeaseLost as lost:
+            current = await self.research_repo.get(task_id)
+            if current is not None and current["status"] == "COMPLETED":
+                return self._completed_payload(current)
+            return {"status": "PENDING", "reason": lost.reason}
         except Exception as exc:  # noqa: BLE001 — retried by the job worker.
             current = await self.research_repo.get(task_id)
             if current is not None and current["status"] == "RUNNING":
-                if current["attempts"] >= current["max_attempts"]:
-                    await self.research_repo.fail(task_id, str(exc))
-                else:
-                    await self.research_repo.requeue(task_id, str(exc))
+                if current.get("owner_id") == owner:
+                    if current["attempts"] >= current["max_attempts"]:
+                        await self.research_repo.fail_owned(
+                            task_id, owner, str(exc)
+                        )
+                    else:
+                        await self.research_repo.requeue_owned(
+                            task_id, owner, str(exc)
+                        )
             raise
         task = await self.research_repo.get(task_id)
         if task is None:
             return {"status": "FAILED", "error": "research task not found"}
         if task["status"] == "COMPLETED":
-            await save({"stage": "DONE"})
             return self._completed_payload(task)
         if task["status"] == "CANCELLED":
             return {"status": "CANCELLED"}
         return {"status": "PENDING", "reason": "not finished"}
 
-    async def _resume_stages(self, task: dict, state: dict, *, save, pause_if_needed) -> None:
+    async def cancel_detail(self, task_id: str, owner_id: str | None = None) -> bool:
+        """Cancel a research detail row on behalf of its cancelled job.
+
+        The owner token, when supplied, confines the RUNNING branch to this
+        execution; a PENDING row is cancelled because the job that would have
+        claimed it is already terminal.
+        """
+        if owner_id is not None and await self.research_repo.cancel_owned(
+            task_id, owner_id
+        ):
+            return True
+        return await self.research_repo.cancel_for_job(task_id, owner_id or "")
+
+    async def _finalize_existing(self, task: dict, owner: str, commit) -> None:
+        """Complete a task whose memory was already written by a prior attempt."""
+        task_id = task["task_id"]
+        memory_id = task.get("memory_id")
+        summary = task.get("result") or ""
+        payload = {
+            "status": "COMPLETED",
+            "research_task_id": task_id,
+            "memory_id": memory_id,
+            "result": summary,
+        }
+
+        async def action() -> None:
+            if commit is not None:
+                ok = await self.research_repo.complete_owned(
+                    task_id, owner, summary, memory_id=memory_id
+                )
+                if not ok:
+                    raise TaskLeaseLost("research_owner_lost")
+            else:
+                await self.research_repo.complete(
+                    task_id, summary, memory_id=memory_id
+                )
+
+        if commit is not None:
+            await commit(action, result=payload)
+        else:
+            await action()
+        await self._repair_completed_run(task)
+
+    async def _resume_stages(
+        self,
+        task: dict,
+        state: dict,
+        *,
+        save,
+        pause_if_needed,
+        owner_id: str | None = None,
+        commit=None,
+    ) -> None:
         started_from_checkpoint = bool(state.get("stage"))
         if getattr(self.web_search, "name", "") == "http-web-search":
             if self.settings is None or not await self.settings.get_bool(
@@ -512,19 +641,37 @@ class ResearchEngine:
             sources = self._sources_from_state(task, state)
             state["stage"] = "SAVING"
             await save(dict(state))
-            await self._consolidate(task, summary, [], sources=sources)
-            await self.state.finish_run(
-                run_id,
-                "COMPLETED",
-                budget_used={
-                    "search_limit": search_limit,
-                    "results": len(state.get("search_results") or []),
-                    "sources": len(sources),
-                    "resumed": started_from_checkpoint,
-                },
+            await self._consolidate(
+                task,
+                summary,
+                [],
+                sources=sources,
+                owner_id=owner_id,
+                commit=commit,
             )
+            try:
+                await self.state.finish_run(
+                    run_id,
+                    "COMPLETED",
+                    budget_used={
+                        "search_limit": search_limit,
+                        "results": len(state.get("search_results") or []),
+                        "sources": len(sources),
+                        "resumed": started_from_checkpoint,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - repair can finish it later.
+                self.logger.warning(
+                    "research_run_finish_failed research_id=%s error=%s",
+                    task["task_id"],
+                    type(exc).__name__,
+                )
             state["stage"] = "DONE"
-            await save({"stage": "DONE"})
+            if commit is None:
+                # With an atomic commit the job is already COMPLETED; writing
+                # a checkpoint afterwards would be rejected (correctly) and
+                # must not turn a committed result into an error.
+                await save({"stage": "DONE"}, final=True)
 
     @staticmethod
     def _sources_from_state(task: dict, state: dict) -> list[MemorySource]:
@@ -574,7 +721,14 @@ class ResearchEngine:
 
 
     async def _consolidate(
-        self, task: dict, summary: str, results, *, sources: list[MemorySource] | None = None
+        self,
+        task: dict,
+        summary: str,
+        results,
+        *,
+        sources: list[MemorySource] | None = None,
+        owner_id: str | None = None,
+        commit=None,
     ) -> None:
         memory_id = f"mem:{task['task_id']}"
         provider_name = getattr(self.web_search, "name", None)
@@ -597,13 +751,11 @@ class ResearchEngine:
             )
             for s in sources
         ]
-        # One transaction: the memory and the task's COMPLETED state commit
-        # together, so a crash cannot leave a memory without a completed task
-        # (and vice versa).
-        async with self.memory_service.repo.db.transaction():
+
+        async def write() -> None:
             existing = await self.memory_service.get_item(memory_id, SYSTEM_ADMIN)
             if existing is None:
-                item = await self.memory_service.create(
+                await self.memory_service.create(
                     kind=MemoryKind.WORLD_KNOWLEDGE,
                     content=summary,
                     access=SYSTEM_ADMIN,
@@ -615,11 +767,41 @@ class ResearchEngine:
                     evidence=evidence,
                     memory_id=memory_id,
                 )
+            if commit is not None:
+                # Detail-row update is conditional on this exact execution
+                # still owning the task. If the token changed, raising rolls
+                # the memory write back in the same transaction.
+                if owner_id is None:
+                    raise TaskLeaseLost("no_research_owner")
+                completed = await self.research_repo.complete_owned(
+                    task["task_id"], owner_id, summary, memory_id=memory_id
+                )
+                if not completed:
+                    raise TaskLeaseLost("research_owner_lost")
             else:
-                item = existing
-            await self.research_repo.complete(task["task_id"], summary, memory_id=memory_id)
+                await self.research_repo.complete(
+                    task["task_id"], summary, memory_id=memory_id
+                )
+
+        if commit is not None:
+            # The outer task transaction runs the memory write, the detail-row
+            # COMPLETED update and the job COMPLETED update together. A
+            # cancellation before this point writes nothing; one after it
+            # cannot undo the committed result.
+            payload = {
+                "status": "COMPLETED",
+                "research_task_id": task["task_id"],
+                "memory_id": memory_id,
+                "result": summary,
+            }
+            await commit(write, result=payload)
+        else:
+            # Legacy direct-engine path: the memory and the task's COMPLETED
+            # state still commit together.
+            async with self.memory_service.repo.db.transaction():
+                await write()
         self.logger.info(
             "research_consolidated memory_id=%s provider=%s",
-            item.memory_id,
+            memory_id,
             provider_name or "unknown",
         )

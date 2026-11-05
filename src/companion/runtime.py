@@ -65,7 +65,10 @@ from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
 from companion.runtime_context.timezone import TimeZoneService
 from companion.storage.database import Database
 from companion.storage.repositories import Repositories, make_repositories
-from companion.tasks.handlers import build_explicit_memory_task_handler
+from companion.tasks.handlers import (
+    build_explicit_memory_task_handler,
+    build_research_task_handler,
+)
 from companion.tasks.service import TaskService
 
 PROVIDERS = ("mock", "deepseek")
@@ -107,6 +110,7 @@ class Runtime:
     explicit_memory_operations: object = None
     data_control: object = None
     task_service: Optional[TaskService] = None
+    research_engine: object = None
 
 
 def build_runtime(
@@ -344,6 +348,26 @@ def build_runtime(
         logger=logger,
     )
 
+    # V0.9.1: one research engine belongs to the runtime itself, and its
+    # RESEARCH_TASK handler is registered with the normal worker. Curiosity
+    # and the idle scheduler enqueue through TaskService; they never start a
+    # second research scheduler. The engine is offline by default (mock search
+    # and mock synthesis); a real search provider is only used when the
+    # operator has wired one and enabled it by setting.
+    from companion.idle.research import ResearchEngine
+    from companion.providers.deepseek import DeepSeekProvider
+    from companion.providers.websearch import MockWebSearchProvider
+
+    research_engine = ResearchEngine(
+        memory_service,
+        repos.research,
+        web_search or MockWebSearchProvider(),
+        DeepSeekProvider(),
+        settings=repos.settings,
+        state=repos.research_state,
+        logger=logger,
+    )
+
     worker = None
     if with_worker:
         handlers = {"MEMORY_CONSOLIDATION": memory_consolidation}
@@ -360,6 +384,9 @@ def build_runtime(
         )
         handlers[JobType.MEMORY_SAVE.value] = explicit_task_handler
         handlers[JobType.MEMORY_CORRECTION.value] = explicit_task_handler
+        handlers[JobType.RESEARCH_TASK.value] = build_research_task_handler(
+            research_engine
+        )
         worker = JobWorker(repos, handlers, logger=logger)
 
     # V0.9: one entry point for foreground and background off-task work. The
@@ -372,36 +399,57 @@ def build_runtime(
         JobType.MEMORY_CORRECTION.value,
     }
 
+    def _task_event_id(request) -> Optional[str]:
+        """Resolve the source event from trusted task metadata only.
+
+        Explicit-memory payloads carry ``{"event": ..., "route": ...}`` rather
+        than a top-level ``event_id``. ``source_event_id``/``source_ref`` are
+        written by local code and are authoritative; the payload snapshot is
+        only a fallback for rows queued by older builds. A consent snapshot in
+        the payload is deliberately ignored.
+        """
+        event_id = getattr(request, "source_event_id", None) or getattr(
+            request, "source_ref", None
+        )
+        if event_id:
+            return str(event_id)
+        payload = request.payload or {}
+        event_id = payload.get("event_id")
+        if not event_id and isinstance(payload.get("event"), dict):
+            event_id = payload["event"].get("event_id")
+        return str(event_id) if event_id else None
+
     async def task_permission(request) -> bool:
-        """Re-read live consent at claim/commit time.
+        """Re-read live consent at enqueue, claim and commit time.
 
         A job approved when it was queued must not keep running after the
         speaker withdraws processing or persistence consent. Explicit memory
-        tasks also stop when learning consent is withdrawn. The ordinary
-        extraction handler remains a completed no-op in that last case, as
-        before V0.9, so it never writes anything.
+        tasks also require the current learning grant, a real source event and
+        a registered speaker: an unverifiable source is rejected rather than
+        default-allowed. The ordinary extraction handler remains a completed
+        no-op when only learning is withdrawn (nothing it writes depends on
+        that grant).
         """
         if request.type not in permissioned_types:
             return True
-        event_id = (request.payload or {}).get("event_id")
+        explicit = request.type in {
+            JobType.MEMORY_SAVE.value,
+            JobType.MEMORY_CORRECTION.value,
+        }
+        event_id = _task_event_id(request)
         if not event_id:
-            return True
+            # An explicit memory write always names its source event. A missing
+            # reference is unverifiable, not a default grant.
+            return not explicit
         event = await repos.utterance.get(event_id)
         if event is None or event.speaker_person_id is None:
-            # Synthetic/legacy rows keep the pre-V0.9 behaviour; live turns
-            # always carry a registered speaker.
-            return True
-        consent = await registry.get_consent(event.speaker_person_id)
+            # Extraction of synthetic/legacy rows keeps the pre-V0.9 behaviour.
+            return not explicit
+        consent = await repos.person.get_consent(event.speaker_person_id)
         if consent is None:
             return False
         allowed = bool(consent.allow_processing and consent.allow_persistence)
-        if request.type in {
-            JobType.MEMORY_SAVE.value,
-            JobType.MEMORY_CORRECTION.value,
-        }:
-            # Extraction remains an allowed no-op job when learning is later
-            # withdrawn (the handler re-checks and writes nothing). An explicit
-            # save/correction no longer has a purpose without that grant.
+        if explicit:
             allowed = allowed and bool(consent.allow_memory_learning)
         return allowed
 
@@ -513,4 +561,5 @@ def build_runtime(
         explicit_memory_operations=explicit_memory_operations,
         data_control=data_control,
         task_service=task_service,
+        research_engine=research_engine,
     )

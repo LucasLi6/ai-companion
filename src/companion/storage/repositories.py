@@ -67,6 +67,19 @@ def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
+class JobCapacityError(RuntimeError):
+    """An autonomous-research capacity check rejected an enqueue.
+
+    Raised *inside* the enqueue transaction so a concurrent submitter can
+    never slip past the same capacity check.
+    """
+
+    def __init__(self, pending: int, limit: int) -> None:
+        super().__init__(f"autonomous research queue is full ({pending}/{limit})")
+        self.pending = pending
+        self.limit = limit
+
+
 class PersonRepository:
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -1177,20 +1190,53 @@ class JobRepository:
         source_ref: Optional[str] = None,
         execution_mode: str = "BACKGROUND",
         checkpoint: Optional[dict] = None,
+        autonomous_limit: Optional[int] = None,
+        autonomous_types: tuple[str, ...] = (),
     ) -> str:
         """Enqueue a job, deduplicating on ``job_key``.
 
         Returns the *existing* job id if ``job_key`` is already present, so
-        re-submitting the same event never creates a second job. Insertion and
-        the dedupe lookup happen in one transaction: two concurrent submissions
-        cannot both insert the same key (the UNIQUE constraint wins), and both
-        callers observe the same durable task id.
+        re-submitting the same event never creates a second job. Dedupe, the
+        optional autonomous-research capacity check and insertion all happen
+        under one ``BEGIN IMMEDIATE`` transaction: two concurrent submissions
+        cannot both insert the same key, and they cannot both pass a capacity
+        check that only one slot can satisfy. ``autonomous_limit`` applies only
+        to ``autonomous_types`` from a non-USER source; maintenance work such
+        as TURN_ANALYSIS, MEMORY_CONSOLIDATION and EMBEDDING is never counted
+        or rejected here.
         """
         from companion.domain.models import new_id, utcnow
 
         type_value = job_type.value if isinstance(job_type, JobType) else str(job_type)
         job_id = new_id("job")
+        is_autonomous = bool(
+            autonomous_limit is not None
+            and type_value in autonomous_types
+            and str(source_kind).upper() != "USER"
+        )
         async with self.db.transaction(immediate=True):
+            cur = await self.db.execute(
+                "SELECT job_id FROM processing_jobs WHERE job_key = ?",
+                (job_key,),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                return row["job_id"]
+
+            if is_autonomous:
+                placeholders = ",".join("?" for _ in autonomous_types)
+                cur = await self.db.execute(
+                    "SELECT COUNT(*) AS n FROM processing_jobs"
+                    " WHERE status = 'PENDING'"
+                    f" AND job_type IN ({placeholders})"
+                    " AND source_kind != 'USER'",
+                    tuple(autonomous_types),
+                )
+                count_row = await cur.fetchone()
+                pending = int(count_row["n"]) if count_row is not None else 0
+                if pending >= int(autonomous_limit):
+                    raise JobCapacityError(pending, int(autonomous_limit))
+
             cur = await self.db.execute(
                 "INSERT OR IGNORE INTO processing_jobs(job_id, job_key, job_type,"
                 " payload, status, attempts, max_attempts, created_at, next_run_at,"
@@ -1400,30 +1446,65 @@ class JobRepository:
     async def complete_owned(
         self, job_id: str, owner_id: str, result: Any = None
     ) -> bool:
-        """Commit a result only while this worker still owns the lease.
+        """Commit a result only while this worker still owns a live lease.
 
-        A worker that lost its lease (or whose job was cancelled/reclaimed)
-        must not mark the work completed. The caller reports failure rather
-        than claiming success.
+        A worker that lost its lease, whose lease lapsed, or whose job was
+        cancelled/reclaimed must not mark the work completed. The caller
+        reports failure rather than claiming success.
         """
         from companion.domain.models import utcnow
 
+        now = utcnow()
         cur = await self.db.execute(
             "UPDATE processing_jobs SET status = 'COMPLETED', completed_at = ?,"
             " result_json = COALESCE(?, result_json),"
             " owner_id = NULL, lease_expires_at = NULL"
             " WHERE job_id = ? AND status = 'RUNNING' AND owner_id = ?"
-            " AND cancel_requested = 0",
+            " AND cancel_requested = 0"
+            " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
             (
-                _iso(utcnow()),
+                _iso(now),
                 json.dumps(result, ensure_ascii=False, default=str)
                 if result is not None
                 else None,
                 job_id,
                 owner_id,
+                _iso(now),
             ),
         )
         return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+
+    async def lease_owned(
+        self,
+        job_id: str,
+        owner_id: str,
+        *,
+        lease_seconds: Optional[int] = None,
+    ) -> bool:
+        """Return whether this owner still holds a live, uncancelled lease.
+
+        With ``lease_seconds`` the lease is renewed first (a heartbeat), so a
+        long multi-stage task can prove liveness at safe boundaries without a
+        separate timer.
+        """
+        from companion.domain.models import utcnow
+
+        if lease_seconds is not None:
+            return await self.heartbeat(job_id, owner_id, lease_seconds)
+        cur = await self.db.execute(
+            "SELECT status, owner_id, cancel_requested, lease_expires_at"
+            " FROM processing_jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return False
+        if row["status"] != "RUNNING" or row["owner_id"] != owner_id:
+            return False
+        if bool(row["cancel_requested"]):
+            return False
+        expires = _dt(row["lease_expires_at"])
+        return expires is not None and expires > utcnow()
 
     async def cancel(self, job_id: str) -> bool:
         """Request cancellation, terminal immediately for a PENDING job.
@@ -1476,20 +1557,48 @@ class JobRepository:
         row = await cur.fetchone()
         return bool(row["cancel_requested"]) if row is not None else False
 
-    async def save_checkpoint(self, job_id: str, checkpoint: dict) -> None:
+    async def save_checkpoint(
+        self, job_id: str, checkpoint: dict, *, owner_id: Optional[str] = None
+    ) -> bool:
         """Persist a checkpoint by merging it into the existing document.
 
         Stage outputs are stored by stable reference; callers must not put
         unbounded raw text here. The merge means a handler can save one field
         at a time without losing earlier stages.
+
+        With ``owner_id`` the write is conditional on this worker still owning
+        a live ``RUNNING`` lease: a stale worker can neither overwrite a newer
+        worker's checkpoint nor revive a cancelled/completed job.
         """
+        from companion.domain.models import utcnow
+
         job = await self.get(job_id)
-        merged = dict(job.checkpoint) if job is not None else {}
+        if job is None or job.status != JobStatus.RUNNING:
+            return False
+        now = utcnow()
+        if owner_id is not None:
+            if job.owner_id != owner_id or job.cancel_requested:
+                return False
+            if job.lease_expires_at is None or job.lease_expires_at <= now:
+                return False
+        merged = dict(job.checkpoint or {})
         merged.update(checkpoint or {})
-        await self.db.execute(
-            "UPDATE processing_jobs SET checkpoint_json = ? WHERE job_id = ?",
-            (json.dumps(merged, ensure_ascii=False, default=str), job_id),
+        sql = (
+            "UPDATE processing_jobs SET checkpoint_json = ?"
+            " WHERE job_id = ? AND status = 'RUNNING' AND cancel_requested = 0"
         )
+        params: tuple = (
+            json.dumps(merged, ensure_ascii=False, default=str),
+            job_id,
+        )
+        if owner_id is not None:
+            sql += (
+                " AND owner_id = ? AND lease_expires_at IS NOT NULL"
+                " AND lease_expires_at > ?"
+            )
+            params = (*params, owner_id, _iso(now))
+        cur = await self.db.execute(sql, params)
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
 
     async def mark_cancelled(self, job_id: str) -> None:
         from companion.domain.models import utcnow
@@ -1500,6 +1609,30 @@ class JobRepository:
             " WHERE job_id = ?",
             (_iso(utcnow()), job_id),
         )
+
+    async def mark_cancelled_pending(self, job_id: str) -> bool:
+        """Cancel a still-PENDING row without touching a claimed execution."""
+        from companion.domain.models import utcnow
+
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET status = 'CANCELLED', cancel_requested = 1,"
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE job_id = ? AND status = 'PENDING'",
+            (_iso(utcnow()), job_id),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+
+    async def mark_cancelled_owned(self, job_id: str, owner_id: str) -> bool:
+        """Cancel only the RUNNING job this caller still owns."""
+        from companion.domain.models import utcnow
+
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET status = 'CANCELLED', cancel_requested = 1,"
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE job_id = ? AND status = 'RUNNING' AND owner_id = ?",
+            (_iso(utcnow()), job_id, owner_id),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
 
     async def postpone(self, job_id: str, next_run_at: datetime) -> None:
         """Delay a still-PENDING job without changing its attempt count."""
@@ -1515,7 +1648,8 @@ class JobRepository:
         checkpoint: Optional[dict] = None,
         *,
         resume_after: datetime | None = None,
-    ) -> None:
+        owner_id: Optional[str] = None,
+    ) -> bool:
         """Cooperatively pause a claimed job without consuming a retry.
 
         The claim incremented ``attempts``; the pause decrements it, clears the
@@ -1523,17 +1657,40 @@ class JobRepository:
         so the next attempt resumes instead of repeating expensive work. This
         is deliberately *not* a failure and is not counted as an automatic
         retry.
+
+        With ``owner_id`` both the checkpoint and the state transition are
+        conditional on a live lease held by this worker. A stale worker cannot
+        turn a cancelled, completed, or newly-reclaimed job back into PENDING.
         """
-        if checkpoint:
-            await self.save_checkpoint(job_id, checkpoint)
-        await self.db.execute(
-            "UPDATE processing_jobs SET status = 'PENDING',"
-            " attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,"
-            " started_at = NULL, owner_id = NULL, lease_expires_at = NULL,"
-            " heartbeat_at = NULL, last_error = NULL, next_run_at = ?"
-            " WHERE job_id = ?",
-            (_iso(resume_after) if resume_after is not None else None, job_id),
-        )
+        from companion.domain.models import utcnow
+
+        now = utcnow()
+        async with self.db.transaction(immediate=True):
+            if checkpoint:
+                saved = await self.save_checkpoint(
+                    job_id, checkpoint, owner_id=owner_id
+                )
+                if not saved:
+                    return False
+            sql = (
+                "UPDATE processing_jobs SET status = 'PENDING',"
+                " attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,"
+                " started_at = NULL, owner_id = NULL, lease_expires_at = NULL,"
+                " heartbeat_at = NULL, last_error = NULL, next_run_at = ?"
+                " WHERE job_id = ? AND status = 'RUNNING' AND cancel_requested = 0"
+            )
+            params: tuple = (
+                _iso(resume_after) if resume_after is not None else None,
+                job_id,
+            )
+            if owner_id is not None:
+                sql += (
+                    " AND owner_id = ? AND lease_expires_at IS NOT NULL"
+                    " AND lease_expires_at > ?"
+                )
+                params = (*params, owner_id, _iso(now))
+            cur = await self.db.execute(sql, params)
+            return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
 
     async def fail(self, job_id: str, error: str, result: Any = None) -> None:
         from companion.domain.models import utcnow
@@ -1552,6 +1709,32 @@ class JobRepository:
                 job_id,
             ),
         )
+
+    async def fail_owned(
+        self, job_id: str, owner_id: str, error: str, result: Any = None
+    ) -> bool:
+        """Record a failure only for a RUNNING job we still own."""
+        from companion.domain.models import utcnow
+
+        now = utcnow()
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET status = 'FAILED', last_error = ?,"
+            " result_json = COALESCE(?, result_json),"
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE job_id = ? AND status = 'RUNNING' AND owner_id = ?"
+            " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+            (
+                error,
+                json.dumps(result, ensure_ascii=False, default=str)
+                if result is not None
+                else None,
+                _iso(now),
+                job_id,
+                owner_id,
+                _iso(now),
+            ),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
 
     async def recover_running(self, now: datetime | None = None) -> int:
         """Reset *expired* ``RUNNING`` jobs to ``PENDING``.
@@ -1593,6 +1776,21 @@ class JobRepository:
             " heartbeat_at = NULL WHERE job_id = ?",
             (error, job_id),
         )
+
+    async def requeue_owned(self, job_id: str, owner_id: str, error: str) -> bool:
+        """Requeue only a RUNNING job still owned under a live lease."""
+        from companion.domain.models import utcnow
+
+        now = utcnow()
+        cur = await self.db.execute(
+            "UPDATE processing_jobs SET status = 'PENDING', last_error = ?,"
+            " started_at = NULL, owner_id = NULL, lease_expires_at = NULL,"
+            " heartbeat_at = NULL WHERE job_id = ? AND status = 'RUNNING'"
+            " AND owner_id = ? AND cancel_requested = 0"
+            " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+            (error, job_id, owner_id, _iso(now)),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
 
     async def retry(self, job_id: str) -> bool:
         """Requeue a *failed* job for a clean manual retry.
@@ -1992,12 +2190,69 @@ class ResearchRepository:
         )
         return cur.rowcount if hasattr(cur, "rowcount") else 0
 
+    async def recover_task(
+        self, task_id: str, now: datetime | None = None
+    ) -> bool:
+        """Reclaim one expired ``RUNNING`` task without touching its peers."""
+        from companion.domain.models import utcnow
+
+        if now is None:
+            now = utcnow()
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET status = 'PENDING', owner_id = NULL,"
+            " lease_expires_at = NULL, started_at = NULL"
+            " WHERE task_id = ? AND status = 'RUNNING'"
+            " AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
+            (task_id, _iso(now)),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+
+    async def lease_live(self, task_id: str, now: datetime | None = None) -> bool:
+        """Whether a ``RUNNING`` task is protected by an unexpired lease."""
+        from companion.domain.models import utcnow
+
+        if now is None:
+            now = utcnow()
+        cur = await self.db.execute(
+            "SELECT 1 FROM research_tasks WHERE task_id = ? AND status = 'RUNNING'"
+            " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+            (task_id, _iso(now)),
+        )
+        return (await cur.fetchone()) is not None
+
+    async def renew(
+        self, task_id: str, owner_id: str, lease_seconds: int = 300
+    ) -> bool:
+        """Extend the research detail lease only for its current owner."""
+        from companion.domain.models import utcnow
+
+        now = utcnow()
+        lease = now + timedelta(seconds=lease_seconds) if lease_seconds else None
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET lease_expires_at = ?"
+            " WHERE task_id = ? AND status = 'RUNNING' AND owner_id = ?",
+            (_iso(lease) if lease is not None else None, task_id, owner_id),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+
     async def fail(self, task_id: str, error: str) -> None:
         await self.db.execute(
             "UPDATE research_tasks SET status = 'FAILED', error = ?, completed_at = ?,"
             " owner_id = NULL, lease_expires_at = NULL WHERE task_id = ?",
             (error, _iso(utcnow()), task_id),
         )
+
+    async def fail_owned(
+        self, task_id: str, owner_id: str, error: str
+    ) -> bool:
+        """Mark FAILED only for the RUNNING task this execution still owns."""
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET status = 'FAILED', error = ?,"
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE task_id = ? AND status = 'RUNNING' AND owner_id = ?",
+            (error, _iso(utcnow()), task_id, owner_id),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
 
     async def requeue(self, task_id: str, error: str) -> None:
         """Requeue a task for automatic retry, keeping its attempt count."""
@@ -2006,6 +2261,18 @@ class ResearchRepository:
             " owner_id = NULL, lease_expires_at = NULL WHERE task_id = ?",
             (error, task_id),
         )
+
+    async def requeue_owned(
+        self, task_id: str, owner_id: str, error: str
+    ) -> bool:
+        """Requeue only the RUNNING task this execution still owns."""
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET status = 'PENDING', error = ?,"
+            " started_at = NULL, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE task_id = ? AND status = 'RUNNING' AND owner_id = ?",
+            (error, task_id, owner_id),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
 
     async def retry(self, task_id: str) -> bool:
         """Reset a *failed* task for a clean manual retry."""
@@ -2030,3 +2297,51 @@ class ResearchRepository:
             " memory_id = COALESCE(?, memory_id), completed_at = ? WHERE task_id = ?",
             (result, memory_id, _iso(utcnow()), task_id),
         )
+
+    async def complete_owned(
+        self,
+        task_id: str,
+        owner_id: str,
+        result: str,
+        memory_id: str | None = None,
+    ) -> bool:
+        """Mark COMPLETED only while this execution still owns the task.
+
+        This is the detail-row half of an atomic research commit: if the token
+        changed, the caller's memory write is rolled back with its transaction.
+        """
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET status = 'COMPLETED', result = ?,"
+            " memory_id = COALESCE(?, memory_id), completed_at = ?,"
+            " owner_id = NULL, lease_expires_at = NULL"
+            " WHERE task_id = ? AND status = 'RUNNING' AND owner_id = ?",
+            (result, memory_id, _iso(utcnow()), task_id, owner_id),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+
+    async def cancel_owned(self, task_id: str, owner_id: str) -> bool:
+        """Mark a task CANCELLED only for its current execution owner."""
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET status = 'CANCELLED', error = ?,"
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE task_id = ? AND status = 'RUNNING' AND owner_id = ?",
+            ("cancelled", _iso(utcnow()), task_id, owner_id),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+
+    async def cancel_for_job(self, task_id: str, owner_id: str) -> bool:
+        """Cancel a research detail row owned by (or not yet claimed by) a job.
+
+        A job may be cancelled before its handler ever claims the research
+        task, so PENDING is included. A RUNNING row owned by a *different*
+        live executor is left alone: that executor decides its own fate.
+        """
+        cur = await self.db.execute(
+            "UPDATE research_tasks SET status = 'CANCELLED', error = ?,"
+            " completed_at = ?, owner_id = NULL, lease_expires_at = NULL"
+            " WHERE task_id = ?"
+            " AND (status = 'PENDING' OR (status = 'RUNNING' AND owner_id = ?))",
+            ("cancelled", _iso(utcnow()), task_id, owner_id),
+        )
+        return (cur.rowcount if hasattr(cur, "rowcount") else 0) > 0
+

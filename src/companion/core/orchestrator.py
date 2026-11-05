@@ -1776,6 +1776,9 @@ class Orchestrator:
                 event, route, consent, routing_view
             )
         payload = {
+            # Trusted reference for permission re-reads. The event snapshot is
+            # historical proposal data and is never used as a grant.
+            "event_id": event.event_id,
             "event": event.model_dump(mode="json"),
             "route": route.model_dump(mode="json"),
             "consent": consent.model_dump(mode="json") if consent is not None else None,

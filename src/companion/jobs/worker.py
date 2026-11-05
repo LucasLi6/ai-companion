@@ -95,7 +95,8 @@ class JobWorker:
             allowed, reason = await self.task_service.can_claim(job)
             if not allowed:
                 if reason in ("CANCELLED", "PERMISSION_REVOKED"):
-                    await self.job_repo.mark_cancelled(job.job_id)
+                    await self.job_repo.mark_cancelled_pending(job.job_id)
+                    await self._cancel_research_detail(job)
                     self.logger.info(
                         "job_cancelled job_id=%s reason=%s", job.job_id, reason
                     )
@@ -134,6 +135,7 @@ class JobWorker:
             source=TaskSource(claimed_job.source_kind),
             checkpoint=dict(claimed_job.checkpoint or {}),
             service=self.task_service,
+            owner_id=claimed_job.owner_id,
         )
         token = set_task_context(context)
         try:
@@ -156,13 +158,27 @@ class JobWorker:
         context: TaskContext,
         t0: float,
     ) -> None:
+        # A handler may commit its side effect and the job result atomically
+        # (research does). In that case the row is already COMPLETED and this
+        # pass must not apply a second result or downgrade it.
+        latest = await self.job_repo.get(job.job_id)
+        if latest is not None and latest.status == JobStatus.COMPLETED:
+            self.logger.info("job_already_committed job_id=%s", job.job_id)
+            return
+        if latest is not None and latest.status == JobStatus.CANCELLED:
+            await self._cancel_research_detail(job)
+            return
+
         if isinstance(outcome, TaskOutcome):
             status = str(outcome.status)
             if status == TaskStatus.PENDING:
-                await self._pause(job.job_id, outcome.checkpoint or context.checkpoint)
+                await self._pause(
+                    job.job_id, outcome.checkpoint or context.checkpoint
+                )
                 return
             if status == TaskStatus.CANCELLED:
-                await self.job_repo.mark_cancelled(job.job_id)
+                await self.job_repo.mark_cancelled_owned(job.job_id, self.owner_id)
+                await self._cancel_research_detail(job)
                 return
             if status == TaskStatus.FAILED:
                 await self._handle_failure(
@@ -170,7 +186,15 @@ class JobWorker:
                 )
                 return
             if outcome.checkpoint:
-                await self.job_repo.save_checkpoint(job.job_id, outcome.checkpoint)
+                saved = await self.job_repo.save_checkpoint(
+                    job.job_id, outcome.checkpoint, owner_id=self.owner_id
+                )
+                if not saved:
+                    self.logger.error(
+                        "job_checkpoint_rejected job_id=%s reason=lease_or_cancel",
+                        job.job_id,
+                    )
+                    return
             result = outcome.result
         else:
             result = outcome
@@ -180,7 +204,8 @@ class JobWorker:
         if self.task_service is not None:
             allowed, reason = await self.task_service.can_commit(job)
             if not allowed:
-                await self.job_repo.mark_cancelled(job.job_id)
+                await self.job_repo.mark_cancelled_owned(job.job_id, self.owner_id)
+                await self._cancel_research_detail(job)
                 self.logger.info(
                     "job_cancelled job_id=%s phase=pre_commit reason=%s",
                     job.job_id,
@@ -188,13 +213,22 @@ class JobWorker:
                 )
                 return
         elif await self.job_repo.cancellation_requested(job.job_id):
-            await self.job_repo.mark_cancelled(job.job_id)
+            await self.job_repo.mark_cancelled_owned(job.job_id, self.owner_id)
+            await self._cancel_research_detail(job)
             self.logger.info("job_cancelled job_id=%s phase=pre_commit", job.job_id)
             return
         committed = await self.job_repo.complete_owned(
             job.job_id, self.owner_id, result
         )
         if not committed:
+            latest = await self.job_repo.get(job.job_id)
+            if latest is not None and latest.status == JobStatus.COMPLETED:
+                self.logger.info(
+                    "job_already_committed job_id=%s", job.job_id
+                )
+                return
+            if latest is not None and latest.status == JobStatus.CANCELLED:
+                await self._cancel_research_detail(job)
             self.logger.error(
                 "job_commit_rejected job_id=%s reason=lease_or_cancel",
                 job.job_id,
@@ -220,7 +254,7 @@ class JobWorker:
             )
         )
         await self.job_repo.yield_for_foreground(
-            job_id, checkpoint, resume_after=resume_at
+            job_id, checkpoint, resume_after=resume_at, owner_id=self.owner_id
         )
         self.logger.info(
             "job_paused job_id=%s reason=foreground attempts_not_consumed=true",
@@ -233,12 +267,20 @@ class JobWorker:
         # Cancellation is terminal. A handler that raises after the user
         # cancelled must not be retried or reported as a plain failure.
         if await self.job_repo.cancellation_requested(job.job_id):
-            await self.job_repo.mark_cancelled(job.job_id)
+            await self.job_repo.mark_cancelled_owned(job.job_id, self.owner_id)
+            await self._cancel_research_detail(job)
             self.logger.info("job_cancelled job_id=%s phase=failure", job.job_id)
             return
         attempts = job.attempts + 1
         if attempts >= job.max_attempts:
-            await self.job_repo.fail(job.job_id, str(exc))
+            if not await self.job_repo.fail_owned(
+                job.job_id, self.owner_id, str(exc)
+            ):
+                self.logger.error(
+                    "job_failure_rejected job_id=%s reason=lease_or_cancel",
+                    job.job_id,
+                )
+                return
             self.logger.error(
                 "job_failed job_id=%s job_type=%s attempts=%d error=%s",
                 job.job_id,
@@ -249,7 +291,14 @@ class JobWorker:
                 exc,
             )
         else:
-            await self.job_repo.requeue(job.job_id, str(exc))
+            if not await self.job_repo.requeue_owned(
+                job.job_id, self.owner_id, str(exc)
+            ):
+                self.logger.error(
+                    "job_requeue_rejected job_id=%s reason=lease_or_cancel",
+                    job.job_id,
+                )
+                return
             self.logger.warning(
                 "job_requeued job_id=%s job_type=%s attempts=%d error=%s",
                 job.job_id,
@@ -259,6 +308,27 @@ class JobWorker:
                 attempts,
                 exc,
             )
+
+    async def _cancel_research_detail(self, job: ProcessingJob) -> None:
+        """Cancel the linked research detail row when this job is cancelled."""
+        job_type = (
+            job.job_type.value
+            if isinstance(job.job_type, JobType)
+            else str(job.job_type)
+        )
+        if job_type != JobType.RESEARCH_TASK.value:
+            return
+        payload = job.payload or {}
+        research_id = (
+            payload.get("research_task_id")
+            or payload.get("task_id")
+            or job.source_ref
+        )
+        if not research_id:
+            return
+        await self.repos.research.cancel_for_job(
+            str(research_id), f"job:{job.job_id}"
+        )
 
     async def start(self) -> None:
         """Start a background loop (used by long-running sessions/demo)."""

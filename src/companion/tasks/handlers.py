@@ -30,22 +30,53 @@ def build_explicit_memory_task_handler(explicit_service) -> Handler:
     checked event/route/consent into the payload keeps a retry local and
     permission-revalidating; the handler never trusts a model-declared grant.
     """
-    from companion.domain.models import Consent, UtteranceEvent
     from companion.routing.models import RoutingContext, ValidatedRouteDecision
 
     async def handle(payload: dict, repos: Repositories, logger: logging.Logger):
-        event = UtteranceEvent.model_validate(payload["event"])
         route = ValidatedRouteDecision.model_validate(payload["route"])
-        consent = (
-            Consent.model_validate(payload["consent"])
-            if payload.get("consent") is not None
-            else None
-        )
         routing_context = (
             RoutingContext.model_validate(payload["routing_context"])
             if payload.get("routing_context") is not None
             else None
         )
+        # Resolve the source event from a trusted reference, then re-read the
+        # real row. The event/consent snapshots in the payload are only a
+        # historical record of what was proposed; they can never grant
+        # permission or substitute a different event.
+        snapshot_event = payload.get("event") or {}
+        event_id = payload.get("event_id") or snapshot_event.get("event_id")
+        if not event_id and routing_context is not None:
+            event_id = routing_context.current_event_id
+        if not event_id:
+            return TaskOutcome(
+                status=TaskStatus.FAILED, error="missing_source_event"
+            )
+        if (
+            snapshot_event.get("event_id")
+            and snapshot_event.get("event_id") != event_id
+        ):
+            return TaskOutcome(
+                status=TaskStatus.FAILED, error="event_identity_mismatch"
+            )
+        event = await repos.utterance.get(str(event_id))
+        if event is None:
+            return TaskOutcome(
+                status=TaskStatus.FAILED, error="source_event_unavailable"
+            )
+        speaker = event.speaker_person_id
+        if not speaker:
+            return TaskOutcome(
+                status=TaskStatus.FAILED, error="no_registered_speaker"
+            )
+        consent = await repos.person.get_consent(speaker)
+        if consent is None or not (
+            consent.allow_processing
+            and consent.allow_persistence
+            and consent.allow_memory_learning
+        ):
+            return TaskOutcome(
+                status=TaskStatus.FAILED, error="permission_denied"
+            )
         result = await explicit_service.execute(
             event, route, consent, routing_context
         )
@@ -76,14 +107,29 @@ def build_research_task_handler(research_engine) -> Handler:
             return TaskOutcome(
                 status=TaskStatus.FAILED, error="missing research_task_id"
             )
+        task_id = str(task_id)
         context = current_task_context()
         checkpoint = dict(context.checkpoint) if context is not None else {}
+        # The job row is the sole execution authority. Its stable id names the
+        # research detail owner, and its lease/owner is re-checked at every
+        # stage and at the atomic commit.
+        owner = f"job:{context.task_id}" if context is not None else None
+
+        async def authorize() -> bool:
+            return await context.can_continue()
+
+        async def commit(action, *, result=None):
+            return await context.commit_atomic(action, result=result)
+
         try:
             result = await research_engine.run_resumable(
-                str(task_id),
+                task_id,
                 checkpoint=checkpoint,
                 pause_check=context.should_pause if context is not None else None,
                 save_checkpoint=context.save_checkpoint if context is not None else None,
+                owner_id=owner,
+                authorize=authorize if context is not None else None,
+                commit=commit if context is not None else None,
             )
         except TaskPaused:
             raise
@@ -101,6 +147,9 @@ def build_research_task_handler(research_engine) -> Handler:
                 checkpoint={"stage": "DONE"},
             )
         if status == "CANCELLED":
+            cancel = getattr(research_engine, "cancel_detail", None)
+            if cancel is not None:
+                await cancel(task_id, owner)
             return TaskOutcome(status=TaskStatus.CANCELLED)
         if status == "PENDING":
             return TaskOutcome(

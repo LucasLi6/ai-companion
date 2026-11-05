@@ -317,14 +317,35 @@ async def test_autonomous_queue_limit_never_drops_user_work(db):
         return None
 
     repos, worker, service = make_service(
-        db, {"NOOP": handler}, autonomous_pending_limit=1
+        db,
+        {
+            JobType.RESEARCH_TASK.value: handler,
+            JobType.TURN_ANALYSIS.value: handler,
+        },
+        autonomous_pending_limit=1,
     )
-    await service.enqueue(TaskRequest(type="NOOP", job_key="a1"))
+    # Only autonomous research consumes the bounded queue.
+    await service.enqueue(
+        TaskRequest(type=JobType.RESEARCH_TASK.value, job_key="a1")
+    )
     with pytest.raises(TaskRejected) as exc:
-        await service.enqueue(TaskRequest(type="NOOP", job_key="a2"))
+        await service.enqueue(
+            TaskRequest(type=JobType.RESEARCH_TASK.value, job_key="a2")
+        )
     assert exc.value.reason == "AUTONOMOUS_QUEUE_FULL"
+    # Ordinary SYSTEM maintenance is never counted or dropped because the
+    # research queue is full.
+    analysis_id = await service.enqueue(
+        TaskRequest(type=JobType.TURN_ANALYSIS.value, job_key="t1")
+    )
+    assert (await repos.job.get(analysis_id)).status == JobStatus.PENDING
+    # A user-requested research task is authoritative too.
     user_id = await service.enqueue(
-        TaskRequest(type="NOOP", job_key="u1", source=TaskSource.USER)
+        TaskRequest(
+            type=JobType.RESEARCH_TASK.value,
+            job_key="u1",
+            source=TaskSource.USER,
+        )
     )
     assert (await repos.job.get(user_id)).status == JobStatus.PENDING
 

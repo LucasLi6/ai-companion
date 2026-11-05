@@ -39,6 +39,8 @@ __all__ = [
     "TaskOutcome",
     "TaskPaused",
     "TaskRejected",
+    "TaskLeaseLost",
+    "TaskCommitRejected",
     "TaskStatus",
 ]
 
@@ -237,6 +239,27 @@ class TaskRejected(Exception):
 
     def __init__(self, reason: str, *, detail: Optional[str] = None) -> None:
         super().__init__(detail or reason)
+        self.reason = reason
+
+
+class TaskLeaseLost(Exception):
+    """This execution no longer owns a live lease, so it must not write.
+
+    Raised at a commit boundary when the durable row was reclaimed, completed
+    or cancelled by someone else. The caller reports the loss; it never
+    converts it into a retryable failure or a success.
+    """
+
+    def __init__(self, reason: str = "lease_lost") -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class TaskCommitRejected(Exception):
+    """A pre-commit local check (cancel/permission) refused the write."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
         self.reason = reason
         self.detail = detail
 
