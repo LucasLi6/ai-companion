@@ -15,6 +15,10 @@ from companion.people.profile_refinement import (
     ProfileReviewContextSource,
     ProfileReviewDecision,
 )
+from companion.people.profile_service import (
+    ProfileProposalStale,
+    TRUSTED_CONFIRMATION,
+)
 from companion.providers.deepseek_profile import (
     DeepSeekProfileRefinementProvider,
     ScriptedProfileRefinementProvider,
@@ -278,7 +282,9 @@ async def test_confirmed_name_requires_explicit_confirmation(rt):
     assert pending and pending[0]["requires_confirmation"]
 
     revision = await rt.profile_service.confirm_profile_proposal(
-        pending[0]["candidate_id"], actor="user"
+        pending[0]["candidate_id"],
+        actor="user",
+        authority=TRUSTED_CONFIRMATION,
     )
     assert revision == 2
     assert (await rt.repos.profile.get_entry(entry_id))["content"] == "阿明"
@@ -652,10 +658,44 @@ async def test_sixty_turn_conversation_stays_concise_sourced_and_complete(rt):
     assert pending[0]["requires_confirmation"]
     assert not any(item["field_key"] == "identity.name" for item in active)
 
+    # The identity proposal was made at turn 45 on the then-current revision;
+    # four later changes have moved the profile. It must not overwrite that
+    # newer state: confirmation is explicitly stale, nothing is bumped, and the
+    # candidate is kept for re-review.
+    with pytest.raises(ProfileProposalStale):
+        await rt.profile_service.confirm_profile_proposal(
+            pending[0]["candidate_id"],
+            actor="user",
+            authority=TRUSTED_CONFIRMATION,
+        )
+    assert (await rt.profile_service.get(person.person_id)).metadata.revision == 8
+    stale = await rt.repos.profile.get_candidate(pending[0]["candidate_id"])
+    assert stale["status"] == "NEEDS_REVIEW"
+    assert not any(
+        item["field_key"] == "identity.name" for item in active
+    )
+
+    # Re-reviewing the same turn against the *current* profile produces a
+    # fresh proposal bound to revision 8; only that may be confirmed.
+    re_review_engine, _ = _engine(rt, decisions[45])
+    review = await re_review_engine.review(person.person_id, events[45].event_id)
+    reapplied = await re_review_engine.apply_proposals(review)
+    assert reapplied.status == "PENDING_CONFIRMATION"
+    fresh = [
+        item
+        for item in await rt.repos.profile.find_pending(
+            person.person_id, "identity.name"
+        )
+        if item["status"] == "PENDING" and item["expected_revision"] == 8
+    ]
+    assert len(fresh) == 1
+
     # The strict identity change only happens through the explicit path.
     assert (
         await rt.profile_service.confirm_profile_proposal(
-            pending[0]["candidate_id"], actor="user"
+            fresh[0]["candidate_id"],
+            actor="user",
+            authority=TRUSTED_CONFIRMATION,
         )
         == 9
     )

@@ -13,6 +13,7 @@ from companion.people.profile_refinement import (
     ProfileReviewContextSource,
     ProfileReviewDecision,
 )
+from companion.people.profile_service import TRUSTED_CONFIRMATION
 from companion.providers.deepseek_profile import ScriptedProfileRefinementProvider
 
 
@@ -196,7 +197,7 @@ async def test_pending_only_review_does_not_bump_until_confirmed(rt):
     assert len(pending) == 1
 
     revision = await rt.profile_service.confirm_profile_proposal(
-        pending[0]["candidate_id"]
+        pending[0]["candidate_id"], authority=TRUSTED_CONFIRMATION
     )
     assert revision == 2
     entries = await rt.repos.profile.list_entries(

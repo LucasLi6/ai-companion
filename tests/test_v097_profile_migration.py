@@ -123,9 +123,9 @@ async def _seed_v24(path):
         await db.close()
 
 
-async def test_fresh_database_has_schema_25_structures(db):
+async def test_fresh_database_has_current_schema_structures(db):
     cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 25
+    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 26
 
     names = {
         row["name"]
@@ -133,7 +133,11 @@ async def test_fresh_database_has_schema_25_structures(db):
             await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
         ).fetchall()
     }
-    assert {"person_profile_entries", "profile_review_receipts"} <= names
+    assert {
+        "person_profile_entries",
+        "profile_review_receipts",
+        "profile_review_leases",
+    } <= names
     indexes = {
         row["name"]
         for row in await (
@@ -145,6 +149,7 @@ async def test_fresh_database_has_schema_25_structures(db):
         "idx_profile_entries_effective",
         "idx_profile_receipts_person",
         "idx_profile_receipts_event",
+        "idx_profile_review_leases_expiry",
     } <= indexes
 
 
@@ -158,7 +163,7 @@ async def test_migration_24_adds_columns_without_changing_old_rows(tmp_path):
         await db.initialize()
 
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 25
+        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 26
 
         cur = await db.execute(
             "SELECT * FROM person_interaction_profiles WHERE person_id='person_old'"
@@ -289,7 +294,7 @@ async def test_migration_25_is_additive_from_23(tmp_path):
     try:
         await db.initialize()
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == 25
+        assert (await cur.fetchone())["v"] == 26
         cur = await db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
             " AND name='person_profile_entries'"

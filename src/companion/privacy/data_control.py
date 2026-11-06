@@ -317,7 +317,17 @@ class DataControlService:
 
     async def _delete_memory(self, person_id: str, memory_id: str) -> dict:
         access = AccessContext(actor_id=person_id, is_admin=True, role="data_control")
-        await self.memory_service.delete(memory_id, access=access)
+        # The raw delete and the profile invalidation share one transaction:
+        # a failure in either leaves the memory and its derived understanding
+        # exactly as they were.
+        async with self.repos.db.transaction(immediate=True):
+            await self.memory_service.delete(memory_id, access=access)
+            if self.profile_service is not None:
+                await self.profile_service.invalidate_profile_source(
+                    person_id,
+                    memory_id=memory_id,
+                    deletion_mode="PRIVACY_DELETE",
+                )
         return {"deleted": {"memory": 1}, "memory_id": memory_id}
 
     async def _delete_profile(self, person_id: str) -> dict:
@@ -330,25 +340,32 @@ class DataControlService:
         event = await self.repos.utterance.get(event_id)
         if event is None or event.speaker_person_id != person_id:
             raise MemoryPermissionDeniedError(event_id)
-        # Memories learned from this event are deleted first: the utterance
-        # delete cascades the candidate/provenance bookkeeping, so this is the
-        # last moment the provenance lookup can find them.
-        derived = await self.memory_service.repo.list_memory_ids_for_source_event(
-            event_id
-        )
         access = AccessContext(actor_id=person_id, is_admin=True, role="data_control")
-        deleted_memories = 0
-        for memory_id in derived:
-            try:
-                await self.memory_service.delete(memory_id, access=access)
-            except MemoryNotFoundError:
-                continue
-            deleted_memories += 1
-        deleted = await self.repos.utterance.delete_owned_event(
-            event_id, speaker_person_id=person_id
-        )
-        if not deleted:
-            raise MemoryPermissionDeniedError(event_id)
+        async with self.repos.db.transaction(immediate=True):
+            # Memories learned from this event are deleted first: the utterance
+            # delete cascades the candidate/provenance bookkeeping, so this is
+            # the last moment the provenance lookup can find them.
+            derived = await self.memory_service.repo.list_memory_ids_for_source_event(
+                event_id
+            )
+            deleted_memories = 0
+            for memory_id in derived:
+                try:
+                    await self.memory_service.delete(memory_id, access=access)
+                except MemoryNotFoundError:
+                    continue
+                deleted_memories += 1
+            deleted = await self.repos.utterance.delete_owned_event(
+                event_id, speaker_person_id=person_id
+            )
+            if not deleted:
+                raise MemoryPermissionDeniedError(event_id)
+            if self.profile_service is not None:
+                await self.profile_service.invalidate_profile_source(
+                    person_id,
+                    event_id=event_id,
+                    deletion_mode="PRIVACY_DELETE",
+                )
         return {
             "deleted": {"event": 1, "memory": deleted_memories},
             "event_id": event_id,

@@ -6,26 +6,37 @@ transaction as the turn. The worker later loads the complete profile, the
 authorized evidence and the model proposal, then applies only what local rules
 accept.
 
-Ordering per person is enforced by processing the oldest pending receipt
-first. Receipt ``(person_id, source_event_id)`` is unique, so a retried turn
-cannot queue the same event twice, and ``apply_refinement`` refuses to apply
-the same event to a second revision.
+V0.9.7.1 hardens execution:
+
+- a *person-level* lease, not just the per-event receipt, means at most one
+  review can run for a person at a time — across workers and processes;
+- the lease is renewed around the model call and re-checked immediately before
+  any profile write, so a worker that lost its slot can never commit;
+- receipts follow the persisted conversation order (oldest first);
+- a job that exhausts its retries leaves an explainable ``FAILED`` receipt
+  instead of an endlessly ``PENDING`` one;
+- ``reconcile_profile_review_jobs`` repairs orphaned receipts without
+  replaying changes that already committed.
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import timedelta
 from typing import Optional
 
-from companion.domain.enums import JobType
+from companion.domain.enums import JobStatus, JobType
 from companion.domain.models import utcnow
 from companion.people.profile_service import ProfileUnauthorized
+from companion.tasks.context import current_task_context
+from companion.tasks.models import TaskPaused
 
 TERMINAL_RECEIPT_STATUSES = frozenset(
     {"COMPLETED", "SKIPPED", "FAILED", "CANCELLED"}
 )
 MAX_RECEIPTS_PER_JOB = 20
+DEFAULT_REVIEW_LEASE_SECONDS = 900
 
 
 class JobError(Exception):
@@ -92,12 +103,64 @@ class ProfileReviewScheduler:
         )
         return review_id
 
+    async def retry(self, person_id: str, source_event_id: str) -> Optional[str]:
+        """Manually retry a failed or orphaned review.
+
+        A retry gets a *new* durable execution record (fresh job key and a
+        reset receipt), so it can never be silently deduplicated against the
+        exhausted job row and its recovery state is visibly cleared.
+        """
+        if not person_id or not source_event_id:
+            return None
+        receipt = await self.repository.get_review_receipt(
+            person_id, source_event_id
+        )
+        if receipt is None:
+            return None
+        if receipt["status"] == "COMPLETED":
+            # A completed review already applied its changes; a manual retry
+            # must not replay them. Requeueing the same event is a new review
+            # only if the caller explicitly deletes the receipt first.
+            return None
+        new_key = (
+            f"{profile_review_job_key(person_id, source_event_id)}"
+            f":retry:{uuid.uuid4().hex[:8]}"
+        )
+        await self.repository.prepare_review_receipt_retry(
+            receipt["review_id"], job_key=new_key
+        )
+        await self.jobs.enqueue(
+            JobType.PROFILE_REVIEW,
+            new_key,
+            {"person_id": person_id, "source_event_id": source_event_id},
+        )
+        self.logger.info(
+            "profile_review_manual_retry person_id=%s event_id=%s review_id=%s",
+            person_id,
+            source_event_id,
+            receipt["review_id"],
+        )
+        return receipt["review_id"]
+
+
+def _execution_owner() -> str:
+    """A lease owner token unique to this execution.
+
+    Including the job id means a stale execution can never release a newer
+    execution's lease, even if the worker owner id is reused.
+    """
+    context = current_task_context()
+    if context is not None and context.task_id:
+        return f"{context.task_id}:{context.owner_id or 'direct'}"
+    return f"direct:{uuid.uuid4().hex[:12]}"
+
 
 def build_profile_review_handler(
     engine,
     *,
     logger: Optional[logging.Logger] = None,
     max_receipts: int = MAX_RECEIPTS_PER_JOB,
+    lease_seconds: int = DEFAULT_REVIEW_LEASE_SECONDS,
 ):
     """Build the worker handler around a ProfileRefinementEngine."""
 
@@ -108,7 +171,9 @@ def build_profile_review_handler(
             raise JobError("profile_review payload missing person_id/source_event_id")
 
         repository = repos.profile
-        await repository.recover_stale_review_receipts(person_id)
+        # Verify the receipt exists before touching the lease: a bogus payload
+        # must not create a lease row for an unknown person (FK) and must not
+        # produce partial bookkeeping.
         receipt = await repository.get_review_receipt(person_id, source_event_id)
         if receipt is None:
             raise JobError(
@@ -117,40 +182,93 @@ def build_profile_review_handler(
         if receipt["status"] in TERMINAL_RECEIPT_STATUSES:
             return
 
-        pending = await repository.list_review_receipts(
-            person_id, status="PENDING", limit=max(1, int(max_receipts))
+        owner = _execution_owner()
+        acquired = await repository.acquire_review_lease(
+            person_id, owner, lease_seconds=lease_seconds
         )
-        # Oldest first: a later turn may never commit before an earlier one.
-        # Receipts are created in event order by the turn transaction.
-        processed = 0
-        for item in pending:
-            if item["status"] != "PENDING":
-                continue
-            if not await repository.claim_review_receipt(item["review_id"]):
-                continue
-            outcome = await _review_one(engine, repository, item, log)
-            processed += 1
-            if outcome == "retry":
-                break
-        if processed == 0:
-            current = await repository.get_review_receipt_by_id(
-                receipt["review_id"]
+        if not acquired:
+            # Another worker is reviewing this person. Return the job to
+            # PENDING without consuming a retry; the next pass tries again.
+            raise TaskPaused({})
+        try:
+            await reconcile_profile_review_jobs(repos, person_id=person_id, log=log)
+            await repository.recover_stale_review_receipts(person_id)
+            receipt = await repository.get_review_receipt(
+                person_id, source_event_id
             )
-            if current is not None and current["status"] == "PENDING":
-                # Nothing claimed (another worker owns it); leave the job
-                # pending rather than falsely reporting completion.
-                raise JobError("profile review receipt is being processed")
-        log.info(
-            "profile_review_done event_id=%s person_id=%s receipts=%d",
-            source_event_id,
-            person_id,
-            processed,
-        )
+            if receipt is None:
+                raise JobError(
+                    f"profile review receipt missing for {person_id}/{source_event_id}"
+                )
+            if receipt["status"] in TERMINAL_RECEIPT_STATUSES:
+                return
+
+            pending = await repository.list_review_receipts(
+                person_id, status="PENDING", limit=max(1, int(max_receipts))
+            )
+            # Oldest first: a later turn may never commit before an earlier one.
+            # Receipts are created in event order by the turn transaction.
+            processed = 0
+            for item in pending:
+                if item["status"] != "PENDING":
+                    continue
+                if not await repository.claim_review_receipt(item["review_id"]):
+                    continue
+                outcome = await _review_one(
+                    engine,
+                    repository,
+                    item,
+                    log,
+                    repos=repos,
+                    owner=owner,
+                    lease_seconds=lease_seconds,
+                )
+                processed += 1
+                if outcome == "retry":
+                    break
+            if processed == 0:
+                current = await repository.get_review_receipt_by_id(
+                    receipt["review_id"]
+                )
+                if current is not None and current["status"] == "PENDING":
+                    # Nothing claimed (another worker owns it); leave the job
+                    # pending rather than falsely reporting completion.
+                    raise JobError("profile review receipt is being processed")
+            log.info(
+                "profile_review_done event_id=%s person_id=%s receipts=%d",
+                source_event_id,
+                person_id,
+                processed,
+            )
+        finally:
+            # Only the owner can release; a stale execution's release is a
+            # no-op.
+            await repository.release_review_lease(person_id, owner)
 
     return profile_review
 
 
-async def _review_one(engine, repository, receipt: dict, log: logging.Logger) -> str:
+async def _renew_or_abort(
+    repository, person_id: str, owner: str, lease_seconds: int
+) -> None:
+    if not await repository.renew_review_lease(
+        person_id, owner, lease_seconds=lease_seconds
+    ):
+        # We lost the slot (expired or taken over). Never write profile data
+        # or a receipt result from a stale execution.
+        raise JobError("profile_review_lease_lost")
+
+
+async def _review_one(
+    engine,
+    repository,
+    receipt: dict,
+    log: logging.Logger,
+    *,
+    repos=None,
+    owner: Optional[str] = None,
+    lease_seconds: int = DEFAULT_REVIEW_LEASE_SECONDS,
+) -> str:
     person_id = receipt["person_id"]
     source_event_id = receipt["source_event_id"]
     try:
@@ -159,13 +277,17 @@ async def _review_one(engine, repository, receipt: dict, log: logging.Logger) ->
         await _complete(repository, receipt, "SKIPPED", "unauthorized")
         return "done"
     except Exception as exc:
-        await repository.update_review_receipt(
-            receipt["review_id"],
-            status="PENDING",
-            last_error=f"{type(exc).__name__}: {exc}"[:500],
-            increment_attempt=True,
-        )
+        await _fail_or_retry(repository, receipt, repos, exc)
         raise JobError(f"profile review failed: {exc}") from exc
+
+    if owner is not None:
+        try:
+            await _renew_or_abort(repository, person_id, owner, lease_seconds)
+        except JobError:
+            await repository.release_review_receipt(
+                receipt["review_id"], reason="review_lease_lost"
+            )
+            raise
 
     if result.status in ("NO_PROFILE", "UNAUTHORIZED"):
         await _complete(repository, receipt, "SKIPPED", result.reason or result.status)
@@ -182,14 +304,18 @@ async def _review_one(engine, repository, receipt: dict, log: logging.Logger) ->
                 source_event_id,
             )
             result = await engine.review(person_id, source_event_id)
+            if owner is not None:
+                await _renew_or_abort(
+                    repository, person_id, owner, lease_seconds
+                )
             applied = await engine.apply_proposals(result)
-    except Exception as exc:
-        await repository.update_review_receipt(
-            receipt["review_id"],
-            status="PENDING",
-            last_error=f"{type(exc).__name__}: {exc}"[:500],
-            increment_attempt=True,
+    except JobError:
+        await repository.release_review_receipt(
+            receipt["review_id"], reason="review_lease_lost"
         )
+        raise
+    except Exception as exc:
+        await _fail_or_retry(repository, receipt, repos, exc)
         raise JobError(f"profile review apply failed: {exc}") from exc
 
     changes = (
@@ -244,6 +370,35 @@ async def _review_one(engine, repository, receipt: dict, log: logging.Logger) ->
     return "done"
 
 
+async def _fail_or_retry(repository, receipt: dict, repos, exc: Exception) -> None:
+    """Record the failure, or fail the receipt when the job is out of retries.
+
+    The worker only retries a finite number of times. Without this, the last
+    failed attempt would leave the receipt ``PENDING`` forever and block every
+    later review of the same person.
+    """
+    error = f"{type(exc).__name__}: {exc}"[:500]
+    status = "PENDING"
+    exhausted = False
+    if repos is not None:
+        context = current_task_context()
+        if context is not None and context.task_id:
+            job = await repos.job.get(context.task_id)
+            if job is not None and int(job.attempts) >= int(job.max_attempts):
+                exhausted = True
+    if exhausted:
+        status = "FAILED"
+    await repository.update_review_receipt(
+        receipt["review_id"],
+        status=status,
+        decision=status if status == "FAILED" else None,
+        reason="retry_exhausted" if exhausted else None,
+        last_error=error,
+        increment_attempt=True,
+        completed=exhausted,
+    )
+
+
 async def _complete(
     repository, receipt: dict, status: str, reason: str
 ) -> None:
@@ -256,10 +411,106 @@ async def _complete(
     )
 
 
+async def reconcile_profile_review_jobs(
+    repos,
+    *,
+    person_id: Optional[str] = None,
+    limit: int = 200,
+    log: Optional[logging.Logger] = None,
+) -> dict:
+    """Repair review jobs whose receipt and job rows disagree.
+
+    This never replays an applied change: a receipt belongs to one event, and
+    ``apply_refinement`` refuses to apply an event twice. Orphaned receipts are
+    re-enqueued, jobs that already failed mark their receipt ``FAILED``, and a
+    receipt left ``RUNNING`` by a dead worker returns to ``PENDING``.
+    """
+    logger = log or logging.getLogger("companion.profile_review")
+    repository = repos.profile
+    receipts = await repository.list_unfinished_review_receipts(
+        person_id=person_id, limit=limit
+    )
+    fixed = {
+        "checked": len(receipts),
+        "enqueued": 0,
+        "reset_running": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
+    for receipt in receipts:
+        job_key = receipt.get("job_key") or profile_review_job_key(
+            receipt["person_id"], receipt["source_event_id"]
+        )
+        job = await repos.job.get_by_key(job_key) if job_key else None
+        if receipt["status"] == "RUNNING":
+            if job is None or job.status != JobStatus.RUNNING:
+                await repository.update_review_receipt(
+                    receipt["review_id"],
+                    status="PENDING",
+                    last_error="reconciled_orphaned_runner",
+                )
+                receipt = dict(receipt, status="PENDING")
+                fixed["reset_running"] += 1
+            else:
+                # A live execution owns this receipt; leave it alone.
+                continue
+        if job is not None and job.status == JobStatus.FAILED:
+            await repository.update_review_receipt(
+                receipt["review_id"],
+                status="FAILED",
+                decision="FAILED",
+                reason="job_failed",
+                last_error=(job.last_error or "job_failed")[:500],
+                completed=True,
+            )
+            fixed["failed"] += 1
+            continue
+        if job is not None and job.status == JobStatus.CANCELLED:
+            await repository.update_review_receipt(
+                receipt["review_id"],
+                status="CANCELLED",
+                decision="CANCELLED",
+                reason="job_cancelled",
+                completed=True,
+            )
+            fixed["cancelled"] += 1
+            continue
+        if job is not None and job.status == JobStatus.COMPLETED:
+            # The handler normally writes a terminal receipt before the job
+            # completes. Reaching this state means the receipt was reset out
+            # of band; do not replay a possibly-applied change silently.
+            await repository.update_review_receipt(
+                receipt["review_id"],
+                status="FAILED",
+                decision="FAILED",
+                reason="job_completed_without_receipt",
+                last_error="job_completed_without_receipt",
+                completed=True,
+            )
+            fixed["failed"] += 1
+            continue
+        if job is None:
+            await repos.job.enqueue(
+                JobType.PROFILE_REVIEW,
+                job_key,
+                {
+                    "person_id": receipt["person_id"],
+                    "source_event_id": receipt["source_event_id"],
+                },
+            )
+            fixed["enqueued"] += 1
+    if any(
+        fixed[key] for key in ("enqueued", "reset_running", "failed", "cancelled")
+    ):
+        logger.info("profile_review_reconciled %s", fixed)
+    return fixed
+
+
 __all__ = [
     "JobError",
     "MAX_RECEIPTS_PER_JOB",
     "ProfileReviewScheduler",
     "build_profile_review_handler",
     "profile_review_job_key",
+    "reconcile_profile_review_jobs",
 ]

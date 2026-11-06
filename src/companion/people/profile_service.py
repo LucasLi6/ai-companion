@@ -22,6 +22,7 @@ Rules enforced here (V0.7):
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Optional
 
@@ -51,6 +52,8 @@ from companion.people.profile_refinement import (
     ProfileReviewResult,
     SnapshotEntry,
     ValidatedChange,
+    is_strict_field,
+    validate_change_targets,
 )
 from companion.people.profile_repository import PersonProfileRepository
 from companion.storage.repositories import AuditRepository, PersonRepository
@@ -73,6 +76,69 @@ _SENTINEL = object()
 
 class ProfileUnauthorized(Exception):
     """Raised when a profile write is not covered by the person's consent."""
+
+
+class _TrustedConfirmationToken:
+    """Opaque marker for the explicit, user-initiated confirmation path.
+
+    A confirmation is not authorised by a caller-supplied string such as
+    ``actor="user"``. The trusted CLI (or an administrator) must present this
+    token, or an explicit admin identity. The background refinement path never
+    has it, so it can never confirm its own pending proposal.
+    """
+
+    __slots__ = ()
+
+
+TRUSTED_CONFIRMATION = _TrustedConfirmationToken()
+
+
+class ProfileProposalStale(ValueError):
+    """A pending proposal no longer matches the profile it was based on.
+
+    The candidate is left for re-review; no entry, revision or candidate is
+    silently overwritten. Callers see an explicit ``STALE_PROPOSAL`` status.
+    """
+
+    status = "STALE_PROPOSAL"
+
+    def __init__(
+        self,
+        candidate_id: str,
+        expected_revision: Optional[int],
+        current_revision: Optional[int],
+        *,
+        reason: str = "profile_revision_changed",
+    ) -> None:
+        super().__init__(reason)
+        self.candidate_id = candidate_id
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
+        self.reason = reason
+
+
+@dataclass
+class ProfileInvalidationResult:
+    person_id: str
+    event_id: Optional[str] = None
+    memory_id: Optional[str] = None
+    deletion_mode: str = "RETRACTION"
+    revision: Optional[int] = None
+    entries_updated: int = 0
+    entries_archived: int = 0
+    entries_deleted: int = 0
+    candidates_cleaned: int = 0
+    receipts_cleaned: int = 0
+
+    @property
+    def changed(self) -> bool:
+        return bool(
+            self.entries_updated
+            or self.entries_archived
+            or self.entries_deleted
+            or self.candidates_cleaned
+            or self.receipts_cleaned
+        )
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:
@@ -185,7 +251,7 @@ class PersonProfileService:
                     ),
                 )
             )
-            candidates = await self.repo.list_candidates(person_id)
+            candidates = await self.repo.list_candidates(person_id, status=None)
             pending = [
                 {
                     "candidate_id": item["candidate_id"],
@@ -196,6 +262,7 @@ class PersonProfileService:
                     "status": item["status"],
                     "review_status": item.get("review_status") or "PENDING",
                     "confidence": item["confidence"],
+                    "expected_revision": item.get("expected_revision"),
                     "requires_confirmation": bool(
                         item.get("requires_confirmation")
                     ),
@@ -900,13 +967,21 @@ class PersonProfileService:
         *,
         actor: str = "user",
         reason: Optional[str] = None,
+        authority: Any = None,
+        actor_person_id: Optional[str] = None,
+        is_admin: bool = False,
     ) -> int:
         """Apply a pending refinement proposal after explicit confirmation.
 
         This is the trusted path for strict identity (and other pending)
-        changes. The candidate's content is treated as confirmed, but the
-        person's permission and the profile's current revision are still
-        checked; a stale candidate cannot be applied over a newer revision.
+        changes. It requires either the opaque trusted-confirmation token held
+        by the local CLI or an explicit administrator/person identity — a bare
+        ``actor="user"`` string is not authorisation.
+
+        The candidate is bound to the revision it was proposed against. If the
+        profile has moved, or a target/evidence it cites is no longer valid,
+        the result is an explicit ``STALE_PROPOSAL``: the candidate is left for
+        re-review and nothing is overwritten, bumped or confirmed.
         """
         candidate = await self.repo.get_candidate(candidate_id)
         if candidate is None:
@@ -920,8 +995,32 @@ class PersonProfileService:
         if spec is None or spec.storage is not ProfileFieldStorage.ENTRY:
             raise ValueError("candidate is not an understanding entry proposal")
         person_id = candidate["person_id"]
+        if authority is not TRUSTED_CONFIRMATION:
+            if not is_admin and (
+                not actor_person_id or actor_person_id != person_id
+            ):
+                raise ProfileUnauthorized(
+                    f"{person_id}: confirmation requires a trusted actor"
+                )
         if not await self.can_learn(person_id):
             raise ProfileUnauthorized(person_id)
+
+        expected_revision = candidate.get("expected_revision")
+        row = await self.repo.get(person_id)
+        if row is None:
+            raise ProfileUnauthorized(person_id)
+        current_revision = int(row["revision"] or 1)
+        if (
+            expected_revision is not None
+            and int(expected_revision) != current_revision
+        ):
+            await self._mark_proposal_needs_review(
+                candidate_id, "stale_expected_revision"
+            )
+            raise ProfileProposalStale(
+                candidate_id, int(expected_revision), current_revision
+            )
+
         proposal = ProfileChangeProposal(
             operation=candidate.get("operation") or "ADD",
             field_key=candidate["field_key"],
@@ -932,44 +1031,99 @@ class PersonProfileService:
             requires_confirmation=True,
         )
         change = ValidatedChange(proposal=proposal, auto_apply=False)
-        async with self.repo.db.transaction():
-            row = await self.repo.get(person_id)
-            if row is None:
-                raise ProfileUnauthorized(person_id)
-            revision = await self.repo.bump_revision(
-                person_id,
-                expected_revision=int(row["revision"] or 1),
-                updated_by=actor,
-                mark_reviewed=True,
+
+        try:
+            async with self.repo.db.transaction():
+                fresh = await self.repo.get(person_id)
+                if fresh is None:
+                    raise ProfileUnauthorized(person_id)
+                fresh_revision = int(fresh["revision"] or 1)
+                if fresh_revision != current_revision:
+                    raise ProfileProposalStale(
+                        candidate_id, expected_revision, fresh_revision
+                    )
+                # Re-check the entries this proposal points at *now*: the old
+                # target may be archived, merged or replaced.
+                targets = []
+                for entry_id in dict.fromkeys(proposal.target_entry_ids):
+                    entry = await self.repo.get_entry(entry_id)
+                    if (
+                        entry is None
+                        or entry["person_id"] != person_id
+                        or entry["status"]
+                        not in (
+                            ProfileEntryStatus.ACTIVE.value,
+                            ProfileEntryStatus.TENTATIVE.value,
+                        )
+                    ):
+                        raise ProfileProposalStale(
+                            candidate_id,
+                            expected_revision,
+                            fresh_revision,
+                            reason="target_entries_changed",
+                        )
+                    targets.append(entry)
+                validate_change_targets(
+                    proposal.operation, proposal.field_key, targets
+                )
+                await self._assert_evidence_locked(
+                    person_id,
+                    list(proposal.evidence_event_ids),
+                    list(proposal.evidence_quotes),
+                )
+                revision = await self.repo.bump_revision(
+                    person_id,
+                    expected_revision=fresh_revision,
+                    updated_by=actor,
+                    mark_reviewed=True,
+                )
+                if not revision:
+                    raise ProfileProposalStale(
+                        candidate_id, expected_revision, fresh_revision
+                    )
+                applied = await self._apply_change_locked(
+                    person_id,
+                    change,
+                    revision=revision,
+                    source_event_id=None,
+                    confirmed=True,
+                    actor=actor,
+                )
+                await self.repo.set_candidate_status(
+                    candidate_id,
+                    CandidateStatus.CONFIRMED.value,
+                    reason=reason or "confirmed_by_person",
+                )
+                await self.repo.insert_revision(
+                    person_id=person_id,
+                    revision=revision,
+                    changes={
+                        "changes": [applied],
+                        "candidate_id": candidate_id,
+                        "confirmed": True,
+                    },
+                    changed_by=actor,
+                    source_event_id=None,
+                    reason=reason or "profile_proposal_confirmed",
+                )
+                await self._refresh_summary(person_id)
+        except ProfileProposalStale as stale:
+            await self._mark_proposal_needs_review(
+                candidate_id, stale.reason
             )
-            if not revision:
-                raise ValueError("profile revision changed; confirm again")
-            applied = await self._apply_change_locked(
-                person_id,
-                change,
-                revision=revision,
-                source_event_id=None,
-                confirmed=True,
-                actor=actor,
-            )
-            await self.repo.set_candidate_status(
+            raise
+        except ValueError as exc:
+            # Validation is part of the same all-or-nothing boundary: the
+            # transaction rolled back, so mark the proposal for re-review in
+            # a separate, committed statement.
+            await self._mark_proposal_needs_review(candidate_id, str(exc))
+            raise ProfileProposalStale(
                 candidate_id,
-                CandidateStatus.CONFIRMED.value,
-                reason=reason or "confirmed_by_person",
-            )
-            await self.repo.insert_revision(
-                person_id=person_id,
-                revision=revision,
-                changes={
-                    "changes": [applied],
-                    "candidate_id": candidate_id,
-                    "confirmed": True,
-                },
-                changed_by=actor,
-                source_event_id=None,
-                reason=reason or "profile_proposal_confirmed",
-            )
-            await self._refresh_summary(person_id)
+                expected_revision,
+                current_revision,
+                reason=str(exc) or "invalid_proposal",
+            ) from exc
+
         await self._audit_field(
             actor,
             "profile_proposal_confirmed",
@@ -978,6 +1132,21 @@ class PersonProfileService:
             candidate["source"],
         )
         return revision
+
+    async def _mark_proposal_needs_review(
+        self, candidate_id: str, reason: str
+    ) -> None:
+        candidate = await self.repo.get_candidate(candidate_id)
+        if candidate is None:
+            return
+        if candidate["status"] == CandidateStatus.CONFIRMED.value:
+            return
+        async with self.repo.db.transaction():
+            await self.repo.set_candidate_status(
+                candidate_id,
+                CandidateStatus.NEEDS_REVIEW.value,
+                reason=(reason or "stale_proposal")[:200],
+            )
 
     async def reject_profile_proposal(
         self, candidate_id: str, *, reason: str = "rejected_by_person"
@@ -1071,52 +1240,40 @@ class PersonProfileService:
                 )
                 continue
             targets = list(dict.fromkeys(proposal.target_entry_ids))
-            if proposal.operation == "ADD" and targets:
+            if proposal.operation != "ADD" and not targets:
                 rejected.append(
                     {
                         "operation": proposal.operation,
                         "field_key": proposal.field_key,
-                        "reason": "add_must_not_target_entries",
+                        "reason": "missing_target_entry_ids",
                     }
                 )
                 continue
-            if proposal.operation in (
-                "UPDATE",
-                "CORRECT",
-                "MERGE",
-                "REFINE",
-                "ARCHIVE",
-            ):
-                if not targets:
-                    rejected.append(
-                        {
-                            "operation": proposal.operation,
-                            "field_key": proposal.field_key,
-                            "reason": "missing_target_entry_ids",
-                        }
-                    )
-                    continue
-                found = [entries.get(entry_id) for entry_id in targets]
-                if any(item is None for item in found):
-                    rejected.append(
-                        {
-                            "operation": proposal.operation,
-                            "field_key": proposal.field_key,
-                            "reason": "target_entry_not_in_this_profile",
-                        }
-                    )
-                    continue
-                if any(
-                    item["field_key"] != proposal.field_key for item in found
-                ) and proposal.operation in ("MERGE", "REFINE"):
-                    rejected.append(
-                        {
-                            "operation": proposal.operation,
-                            "field_key": proposal.field_key,
-                            "reason": "merge_targets_differ_in_field",
-                        }
-                    )
-                    continue
+            found = [entries.get(entry_id) for entry_id in targets]
+            if any(item is None for item in found):
+                rejected.append(
+                    {
+                        "operation": proposal.operation,
+                        "field_key": proposal.field_key,
+                        "reason": "target_entry_not_in_this_profile",
+                    }
+                )
+                continue
+            try:
+                validate_change_targets(
+                    proposal.operation,
+                    proposal.field_key,
+                    [item for item in found if item is not None],
+                )
+            except ValueError as exc:
+                rejected.append(
+                    {
+                        "operation": proposal.operation,
+                        "field_key": proposal.field_key,
+                        "reason": str(exc) or "invalid_change_target",
+                    }
+                )
+                continue
             if spec.max_entries and proposal.operation == "ADD":
                 effective = await self.repo.list_entries(
                     person_id,
@@ -1135,16 +1292,17 @@ class PersonProfileService:
                     )
                     continue
             evidence = list(dict.fromkeys(proposal.evidence_event_ids))
+            user_texts: dict[str, str] = {}
             if evidence:
                 placeholders = ",".join("?" for _ in evidence)
                 cur = await self.persons.db.execute(
-                    "SELECT event_id FROM utterances WHERE event_id IN"
+                    "SELECT event_id, text FROM utterances WHERE event_id IN"
                     f" ({placeholders}) AND speaker_person_id = ?",
                     tuple(evidence) + (person_id,),
                 )
                 rows = await cur.fetchall()
-                valid = {row["event_id"] for row in rows}
-                if not set(evidence) <= valid:
+                user_texts = {row["event_id"]: row["text"] for row in rows}
+                if not set(evidence) <= set(user_texts):
                     pending.append(
                         change.model_copy(
                             update={"auto_apply": False,
@@ -1152,7 +1310,44 @@ class PersonProfileService:
                         )
                     )
                     continue
-                event_ids.update(valid)
+                event_ids.update(user_texts)
+            if proposal.evidence_quotes:
+                if not evidence:
+                    pending.append(
+                        change.model_copy(
+                            update={"auto_apply": False,
+                                    "pending_reason": "evidence_quote_without_event"}
+                        )
+                    )
+                    continue
+                normalised_texts = [
+                    " ".join(str(text or "").split())
+                    for text in user_texts.values()
+                ]
+                missing = any(
+                    not any(
+                        " ".join(str(quote or "").split())
+                        and " ".join(str(quote or "").split()) in text
+                        for text in normalised_texts
+                    )
+                    for quote in proposal.evidence_quotes
+                )
+                if missing:
+                    rejected.append(
+                        {
+                            "operation": proposal.operation,
+                            "field_key": proposal.field_key,
+                            "reason": "evidence_quote_not_found",
+                        }
+                    )
+                    continue
+            if not evidence and not proposal.evidence_quotes:
+                pending.append(
+                    change.model_copy(
+                        update={"auto_apply": False, "pending_reason": "no_evidence"}
+                    )
+                )
+                continue
             if proposal.confidence < 0.7:
                 pending.append(
                     change.model_copy(
@@ -1186,6 +1381,12 @@ class PersonProfileService:
         content = self._normalise_entry_content(proposal.proposed_content, spec)
         if not content and proposal.operation != "ARCHIVE":
             raise ValueError("missing_proposed_content")
+        # Final write-boundary checks. Even a caller that constructs
+        # ``ValidatedChange(auto_apply=True)`` by hand cannot bypass these.
+        if not confirmed and (spec.strict_identity or not spec.model_writable):
+            raise ValueError("confirmed_identity_requires_confirmation")
+        if not confirmed and _SENSITIVE_CONTENT.search(content):
+            raise ValueError("sensitive_field_requires_review")
         targets: list[dict] = []
         for entry_id in dict.fromkeys(proposal.target_entry_ids):
             entry = await self.repo.get_entry(entry_id)
@@ -1200,12 +1401,29 @@ class PersonProfileService:
             ):
                 raise ValueError("target_entry_not_effective")
             targets.append(entry)
+        validate_change_targets(proposal.operation, proposal.field_key, targets)
+        if proposal.operation == "ADD" and spec.max_entries:
+            existing = await self.repo.list_entries(
+                person_id,
+                statuses=(
+                    ProfileEntryStatus.ACTIVE.value,
+                    ProfileEntryStatus.TENTATIVE.value,
+                ),
+                field_key=proposal.field_key,
+            )
+            if len(existing) >= spec.max_entries:
+                raise ValueError("field_capacity_reached")
 
         evidence_events = list(
             dict.fromkeys(
                 list(proposal.evidence_event_ids)
                 + ([source_event_id] if source_event_id else [])
             )
+        )
+        if not confirmed and not evidence_events and not proposal.evidence_quotes:
+            raise ValueError("no_evidence")
+        await self._assert_evidence_locked(
+            person_id, evidence_events, proposal.evidence_quotes
         )
         source = (
             ProfileSource.USER_CORRECTION.value
@@ -1358,15 +1576,35 @@ class PersonProfileService:
     ) -> str:
         proposal = change.proposal
         content = self._normalise_entry_content(proposal.proposed_content)
+        targets = sorted(set(proposal.target_entry_ids))
         for item in await self.repo.find_pending(person_id, proposal.field_key):
-            if item["candidate_value"] == content:
-                await self.repo.add_candidate_evidence(
+            # ADD("a new fact") and UPDATE("an old fact") may carry identical
+            # text and target different entries. Only a genuinely identical
+            # proposal may merge its evidence.
+            same_proposal = (
+                item["candidate_value"] == content
+                and (item.get("operation") or "ADD") == proposal.operation
+                and sorted(set(item.get("target_entry_ids") or [])) == targets
+            )
+            if not same_proposal:
+                continue
+            if item.get("expected_revision") not in (None, base_revision):
+                # The old proposal was based on a profile that has since
+                # moved. Keep it visible for re-review instead of piling new
+                # evidence onto a stale base.
+                await self.repo.set_candidate_status(
                     item["candidate_id"],
-                    memory_ids=[],
-                    event_ids=list(proposal.evidence_event_ids),
-                    candidate_ids=[],
+                    CandidateStatus.NEEDS_REVIEW.value,
+                    reason="stale_base_revision",
                 )
-                return item["candidate_id"]
+                continue
+            await self.repo.add_candidate_evidence(
+                item["candidate_id"],
+                memory_ids=[],
+                event_ids=list(proposal.evidence_event_ids),
+                candidate_ids=[],
+            )
+            return item["candidate_id"]
         return await self.repo.insert_candidate(
             person_id=person_id,
             field_key=proposal.field_key,
@@ -1511,107 +1749,284 @@ class PersonProfileService:
 
     # -- evidence / memory linkage ----------------------------------------
 
-    async def propagate_memory_retraction(self, memory_id: str) -> int:
-        """Stop referencing a memory that was revoked or deleted.
+    async def invalidate_profile_source(
+        self,
+        person_id: str,
+        *,
+        event_id: Optional[str] = None,
+        memory_id: Optional[str] = None,
+        deletion_mode: str = "RETRACTION",
+    ) -> ProfileInvalidationResult:
+        """Remove one event/memory as support for this person's understanding.
 
-        Returns the number of fields that changed. Scalar fields whose only
-        remaining support was that memory are retired; list entries that point
-        at it are removed.
+        ``RETRACTION`` withdraws a source: entries that still have another
+        independent source keep their content (a merged entry whose remaining
+        sources cannot be proven to support the whole text becomes
+        ``PENDING_REVIEW``); entries with no support left stop being effective.
+
+        ``PRIVACY_DELETE`` is the explicit "remove my data" path: affected
+        entries and candidates are deleted, and derived copies in revisions and
+        review receipts are redacted rather than merely archived. The method
+        runs in one SQLite transaction, so raw deletion and profile
+        invalidation either both happen or neither does.
         """
-        references = await self.repo.fields_referencing_memory(memory_id)
-        changed = 0
-        seen: set[tuple[str, str]] = set()
-        for reference in references:
-            key = (reference["person_id"], reference["field_key"])
-            if key in seen:
-                continue
-            seen.add(key)
-            person_id, field_key = key
-            async with self.repo.db.transaction():
-                row = await self.repo.get(person_id)
-                if row is None:
+        mode = str(deletion_mode or "RETRACTION").upper()
+        if mode not in ("RETRACTION", "PRIVACY_DELETE"):
+            raise ValueError("unsupported_deletion_mode")
+        if not event_id and not memory_id:
+            raise ValueError("event_id_or_memory_id_required")
+        privacy = mode == "PRIVACY_DELETE"
+        result = ProfileInvalidationResult(
+            person_id=person_id,
+            event_id=event_id,
+            memory_id=memory_id,
+            deletion_mode=mode,
+        )
+
+        def touched(evidence_events: list[str], evidence_memories: list[str]) -> bool:
+            return bool(
+                (event_id and event_id in evidence_events)
+                or (memory_id and memory_id in evidence_memories)
+            )
+
+        async with self.repo.db.transaction():
+            row = await self.repo.get(person_id)
+            if row is None:
+                return result
+            current_revision = int(row["revision"] or 1)
+            entries = [
+                entry
+                for entry in await self.repo.list_entries(person_id)
+                if touched(
+                    entry["evidence_event_ids"], entry["evidence_memory_ids"]
+                )
+            ]
+            candidates = await self.repo.list_candidates_referencing_source(
+                person_id, event_id=event_id, memory_id=memory_id
+            )
+            fields = [
+                field
+                for field in await self.repo.list_fields(person_id)
+                if touched(
+                    field["evidence_event_ids"], field["evidence_memory_ids"]
+                )
+            ]
+            affected_ids = [entry["entry_id"] for entry in entries]
+
+            new_revision: Optional[int] = None
+            if entries or fields:
+                new_revision = await self.repo.bump_revision(
+                    person_id,
+                    expected_revision=current_revision,
+                    updated_by=(
+                        "privacy_delete" if privacy else "source_invalidation"
+                    ),
+                    mark_reviewed=False,
+                )
+                if not new_revision:
+                    return result
+
+            for entry in entries:
+                if privacy:
+                    await self.repo.delete_entry(entry["entry_id"])
+                    result.entries_deleted += 1
                     continue
-                field = await self.repo.get_field(person_id, field_key)
-                if field is None or field["status"] != "ACTIVE":
+                remaining_events = [
+                    item
+                    for item in entry["evidence_event_ids"]
+                    if item != event_id
+                ]
+                remaining_memories = [
+                    item
+                    for item in entry["evidence_memory_ids"]
+                    if item != memory_id
+                ]
+                effective = entry["status"] in (
+                    ProfileEntryStatus.ACTIVE.value,
+                    ProfileEntryStatus.TENTATIVE.value,
+                )
+                if not remaining_events and not remaining_memories:
+                    if effective:
+                        await self.repo.update_entry(
+                            entry["entry_id"],
+                            status=ProfileEntryStatus.ARCHIVED.value,
+                            valid_until=utcnow(),
+                        )
+                        result.entries_archived += 1
+                    # The retracted source may no longer be cited as support.
+                    await self.repo.replace_entry_evidence(
+                        entry["entry_id"],
+                        evidence_event_ids=remaining_events,
+                        evidence_memory_ids=remaining_memories,
+                    )
+                elif entry["merged_from"]:
+                    # A merged text combines several sources. Removing one does
+                    # not prove the survivors still support every detail, so
+                    # stop presenting it until it is reviewed.
+                    if effective:
+                        await self.repo.update_entry(
+                            entry["entry_id"],
+                            status=ProfileEntryStatus.PENDING_REVIEW.value,
+                            valid_until=utcnow(),
+                        )
+                        result.entries_archived += 1
+                    await self.repo.replace_entry_evidence(
+                        entry["entry_id"],
+                        evidence_event_ids=remaining_events,
+                        evidence_memory_ids=remaining_memories,
+                    )
+                else:
+                    await self.repo.replace_entry_evidence(
+                        entry["entry_id"],
+                        evidence_event_ids=remaining_events,
+                        evidence_memory_ids=remaining_memories,
+                    )
+                    result.entries_updated += 1
+
+            for field in fields:
+                revision = new_revision or current_revision
+                field_key = field["field_key"]
+                if privacy:
+                    await self.repo.redact_field(
+                        person_id, field_key, revision=revision
+                    )
+                    result.entries_archived += 1
                     continue
-                old_value = field["value"]
-                memory_ids = [
+                remaining_events = [
+                    item
+                    for item in field["evidence_event_ids"]
+                    if item != event_id
+                ]
+                remaining_memories = [
                     item
                     for item in field["evidence_memory_ids"]
                     if item != memory_id
                 ]
+                value = field["value"]
                 if field_key in LIST_FIELDS:
+                    old_items = list(value or [])
                     value = [
-                        entry
-                        for entry in (old_value or [])
-                        if entry.get("memory_id") != memory_id
+                        item
+                        for item in old_items
+                        if not (memory_id and item.get("memory_id") == memory_id)
                     ]
-                    if len(value) == len(old_value or []):
-                        continue
-                    if not value:
-                        revision = int(row["revision"] or 1) + 1
-                        await self.repo.retire_field(
-                            person_id, field_key, revision=revision
-                        )
-                        change = {"retired": True}
-                    else:
-                        revision = int(row["revision"] or 1) + 1
-                        await self.repo.upsert_field(
-                            person_id,
-                            field_key,
-                            value=validate_field_value(field_key, value),
-                            source=field["source"],
-                            confidence=field["confidence"],
-                            evidence_memory_ids=memory_ids,
-                            evidence_event_ids=field["evidence_event_ids"],
-                            evidence_candidate_ids=field[
-                                "evidence_candidate_ids"
-                            ],
-                            revision=revision,
-                        )
-                        change = {"old": old_value, "new": value}
+                    removed_item = len(value) != len(old_items)
                 else:
-                    if memory_id not in field["evidence_memory_ids"]:
-                        continue
-                    remaining_events = field["evidence_event_ids"]
-                    remaining_candidates = field["evidence_candidate_ids"]
-                    if (
-                        not memory_ids
-                        and not remaining_events
-                        and not remaining_candidates
-                    ):
-                        revision = int(row["revision"] or 1) + 1
-                        await self.repo.retire_field(
-                            person_id, field_key, revision=revision
+                    removed_item = False
+                if not remaining_events and not remaining_memories:
+                    await self.repo.retire_field(
+                        person_id, field_key, revision=revision
+                    )
+                    result.entries_archived += 1
+                elif removed_item or remaining_events != field["evidence_event_ids"]:
+                    await self.repo.upsert_field(
+                        person_id,
+                        field_key,
+                        value=value,
+                        source=field["source"],
+                        confidence=field["confidence"],
+                        evidence_memory_ids=remaining_memories,
+                        evidence_event_ids=remaining_events,
+                        evidence_candidate_ids=field["evidence_candidate_ids"],
+                        revision=revision,
+                    )
+                    result.entries_updated += 1
+
+            for candidate in candidates:
+                if privacy:
+                    await self.repo.delete_candidate(candidate["candidate_id"])
+                    result.candidates_cleaned += 1
+                    continue
+                remaining_events = [
+                    item
+                    for item in candidate["evidence_event_ids"]
+                    if item != event_id
+                ]
+                remaining_memories = [
+                    item
+                    for item in candidate["evidence_memory_ids"]
+                    if item != memory_id
+                ]
+                if not remaining_events and not remaining_memories:
+                    await self.repo.set_candidate_status(
+                        candidate["candidate_id"],
+                        CandidateStatus.NEEDS_REVIEW.value,
+                        reason="evidence_source_retracted",
+                    )
+                else:
+                    await self.repo.replace_candidate_evidence(
+                        candidate["candidate_id"],
+                        evidence_event_ids=remaining_events,
+                        evidence_memory_ids=remaining_memories,
+                    )
+                result.candidates_cleaned += 1
+
+            if privacy:
+                await self.repo.delete_evidence_for_source(
+                    person_id, event_id=event_id, memory_id=memory_id
+                )
+                if event_id:
+                    result.receipts_cleaned += (
+                        await self.repo.cancel_review_receipts_for_source(
+                            person_id, event_id
                         )
-                        change = {"retired": True}
-                    else:
-                        if not memory_ids:
-                            continue
-                        revision = int(row["revision"] or 1) + 1
-                        await self.repo.upsert_field(
-                            person_id,
-                            field_key,
-                            value=old_value,
-                            source=field["source"],
-                            confidence=field["confidence"],
-                            evidence_memory_ids=memory_ids,
-                            evidence_event_ids=remaining_events,
-                            evidence_candidate_ids=remaining_candidates,
-                            revision=revision,
-                        )
-                        change = {"evidence_memory_removed": memory_id}
-                await self.repo.touch(person_id, updated_by="memory_retraction")
+                    )
+                    await self.repo.scrub_revisions_for_source(
+                        person_id, event_id
+                    )
+                    await self.repo.scrub_receipts_for_source(
+                        person_id, event_id
+                    )
+                if affected_ids:
+                    await self.repo.scrub_revisions_for_entries(
+                        person_id, affected_ids
+                    )
+                    await self.repo.scrub_receipts_for_entries(
+                        person_id, affected_ids
+                    )
+
+            if new_revision is not None:
                 await self.repo.insert_revision(
                     person_id=person_id,
-                    revision=revision,
-                    changes={"field_key": field_key, **change},
-                    changed_by="memory_retraction",
+                    revision=new_revision,
+                    changes={
+                        "source_invalidated": {
+                            "event_deleted": bool(event_id),
+                            "memory_deleted": bool(memory_id),
+                            "mode": mode,
+                            "entries": len(entries),
+                            "candidates": len(candidates),
+                            "legacy_fields": len(fields),
+                        }
+                    },
+                    changed_by=(
+                        "privacy_delete" if privacy else "source_invalidation"
+                    ),
                     source_event_id=None,
-                    reason=f"memory deleted: {memory_id}",
+                    reason=(
+                        "privacy_delete"
+                        if privacy
+                        else "evidence_source_retracted"
+                    ),
                 )
-                changed += 1
-        return changed
+                await self._refresh_summary(person_id)
+                result.revision = new_revision
+        return result
+
+    async def propagate_memory_retraction(self, memory_id: str) -> int:
+        """Stop referencing a revoked/deleted memory in every person profile.
+
+        V0.9.7 entries and the pre-V0.9.7 field table are handled by
+        :meth:`invalidate_profile_source`, one person at a time.
+        """
+        changed_people = 0
+        for person_id in await self.repo.list_all_person_ids():
+            result = await self.invalidate_profile_source(
+                person_id, memory_id=memory_id, deletion_mode="RETRACTION"
+            )
+            if result.changed:
+                changed_people += 1
+        return changed_people
 
     # -- helpers -----------------------------------------------------------
 
@@ -1625,6 +2040,39 @@ class PersonProfileService:
             await self.repo.set_summary(
                 person_id, block, updated_by="profile_service"
             )
+
+    async def _assert_evidence_locked(
+        self,
+        person_id: str,
+        event_ids: list[str],
+        quotes: list[str],
+    ) -> None:
+        """Re-check evidence inside the final write transaction.
+
+        Evidence must still be a real message written by this person. A quote,
+        when supplied, must occur in the cited message's own text — never in
+        Ava's reply or another person's turn.
+        """
+        ids = [str(item) for item in dict.fromkeys(event_ids) if item]
+        if not ids:
+            if quotes:
+                raise ValueError("evidence_quote_without_event")
+            return
+        placeholders = ",".join("?" for _ in ids)
+        cur = await self.persons.db.execute(
+            "SELECT event_id, text FROM utterances WHERE event_id IN"
+            f" ({placeholders}) AND speaker_person_id = ?",
+            tuple(ids) + (person_id,),
+        )
+        rows = await cur.fetchall()
+        texts = {row["event_id"]: row["text"] for row in rows}
+        if not set(ids) <= set(texts):
+            raise ValueError("evidence_event_not_accessible")
+        normalised_texts = [" ".join(str(text or "").split()) for text in texts.values()]
+        for quote in quotes:
+            normalised = " ".join(str(quote or "").split())
+            if not any(normalised and normalised in text for text in normalised_texts):
+                raise ValueError("evidence_quote_not_found")
 
     async def _record_evidence(
         self,

@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1868,6 +1868,30 @@ MIGRATIONS: list[tuple[int, str]] = [
                         WHEN 'interaction.familiarity_notes' THEN 'interaction.familiarity_notes'
                     END
           );
+        """,
+    ),
+    # Version 26 (V0.9.7.1): one Profile Review execution slot per person.
+    #
+    # The review receipt row is unique per (person_id, source_event_id), which
+    # serialises one *turn* but not a person: two workers could still review
+    # two different turns of the same person concurrently and interleave their
+    # writes. This table is a short-lived lease, not a data record: at most one
+    # owner per person, with an expiry so a crashed worker's slot can be
+    # safely recovered. Nothing is deleted from profile data by this migration.
+    (
+        26,
+        """
+        CREATE TABLE IF NOT EXISTS profile_review_leases (
+            person_id   TEXT PRIMARY KEY
+                        REFERENCES persons(person_id) ON DELETE CASCADE,
+            owner_id    TEXT NOT NULL,
+            acquired_at TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_review_leases_expiry
+            ON profile_review_leases(expires_at);
         """,
     ),
 ]

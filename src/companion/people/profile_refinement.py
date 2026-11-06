@@ -36,8 +36,95 @@ MAX_QUOTE_CHARS = 500
 DEFAULT_AUTO_APPLY_CONFIDENCE = 0.7
 DEFAULT_RECENT_TURNS = 8
 DEFAULT_RECENT_CHARS = 2000
+MAX_SNAPSHOT_PENDING = 20
+MAX_SNAPSHOT_LEGACY_FIELDS = 40
+MAX_SNAPSHOT_TEXT_CHARS = 4000
 
 _OPERATIONS = ("ADD", "UPDATE", "CORRECT", "MERGE", "REFINE", "ARCHIVE")
+
+# Cross-field movement is not a general capability. Only an explicit project
+# state transition may target an entry that lives under a different field key,
+# and only through UPDATE. Any other cross-field write is a target-safety bug.
+ALLOWED_FIELD_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("projects.active", "projects.paused"),
+        ("projects.paused", "projects.active"),
+        ("projects.active", "projects.completed"),
+        ("projects.paused", "projects.completed"),
+    }
+)
+_STRICT_FIELD_PREFIXES = ("identity.", "relationship.")
+
+
+def is_strict_field(field_key: str) -> bool:
+    """Whether a field is confirmed identity/relationship or registry-marked."""
+    if str(field_key or "").startswith(_STRICT_FIELD_PREFIXES):
+        return True
+    spec = profile_field_spec(field_key)
+    return bool(spec and spec.strict_identity)
+
+
+def validate_change_targets(
+    operation: str,
+    target_field_key: str,
+    target_entries: list,
+) -> None:
+    """Enforce that an operation only touches entries it is allowed to touch.
+
+    ``target_entries`` are the *actual* stored rows (dicts with ``entry_id``
+    and ``field_key``), never the model's claim about them. The function raises
+    ``ValueError`` with a stable reason code; both the engine's pre-validation
+    and the final write transaction call it, so a caller that constructs
+    ``ValidatedChange(auto_apply=True)`` directly cannot bypass it.
+    """
+    operation = str(operation or "").upper()
+    entries = list(target_entries or [])
+    fields = [str(item.get("field_key") or "") for item in entries]
+
+    if operation == "ADD":
+        if entries:
+            raise ValueError("add_must_not_target_entries")
+        return
+    if operation not in ("UPDATE", "CORRECT", "MERGE", "REFINE", "ARCHIVE"):
+        raise ValueError("unsupported_operation")
+
+    if not entries:
+        raise ValueError("missing_target_entry_ids")
+
+    if operation in ("MERGE", "REFINE"):
+        if any(field != target_field_key for field in fields):
+            raise ValueError(
+                "merge_targets_differ_in_field"
+                if operation == "MERGE"
+                else "refine_target_field_mismatch"
+            )
+        if operation == "MERGE":
+            ids = {item.get("entry_id") for item in entries}
+            if len(entries) < 2 or len(ids) < 2:
+                raise ValueError("merge_needs_two_targets")
+        elif len(entries) != 1:
+            raise ValueError("refine_needs_one_target")
+        return
+
+    if operation in ("UPDATE", "CORRECT"):
+        if len(entries) != 1:
+            raise ValueError("update_needs_one_target")
+        source_field = fields[0]
+        if source_field != target_field_key:
+            if operation != "UPDATE":
+                raise ValueError("cross_field_change_not_allowed")
+            if (source_field, target_field_key) not in ALLOWED_FIELD_TRANSITIONS:
+                raise ValueError("field_transition_not_allowed")
+            if is_strict_field(source_field) or is_strict_field(target_field_key):
+                raise ValueError("strict_field_transition_not_allowed")
+        return
+
+    # ARCHIVE
+    if any(field != target_field_key for field in fields):
+        raise ValueError("archive_target_field_mismatch")
+    for field in set(fields) | {target_field_key}:
+        if is_strict_field(field):
+            raise ValueError("strict_field_cannot_be_archived")
 
 
 class ProfileRefinementError(Exception):
@@ -53,23 +140,40 @@ class ProfileRefinementProviderError(ProfileRefinementError):
 
 
 class ProfileEvidenceBundle(BaseModel):
-    """Authorized evidence for exactly one person and one turn."""
+    """Authorized evidence for exactly one person and one turn.
+
+    ``recent_context`` is the conversational context the model may read: it
+    contains the person's own turns and Ava's visible replies. Only
+    ``eligible_user_evidence`` is *evidence* about the person. Ava's reply is
+    context, never a direct self-report, so a proposal may not cite or quote it
+    as proof of a personal fact.
+    """
 
     person_id: str
     source_event_id: str
     current_turn: str = ""
     recent_context: list[dict] = Field(default_factory=list)
+    eligible_user_evidence: list[dict] = Field(default_factory=list)
     allowed_event_ids: list[str] = Field(default_factory=list)
     allowed_memory_ids: list[str] = Field(default_factory=list)
     authorized: bool = True
     reason: str = ""
 
+    def user_event_texts(self) -> dict[str, str]:
+        """``event_id -> text`` for this person's own messages only."""
+        texts: dict[str, str] = {}
+        for item in self.eligible_user_evidence:
+            event_id = str(item.get("event_id") or "")
+            text = str(item.get("text") or "")
+            if event_id and text:
+                texts[event_id] = text
+        if self.current_turn:
+            texts.setdefault(self.source_event_id, self.current_turn)
+        return texts
+
     def quote_texts(self) -> list[str]:
-        texts = [self.current_turn]
-        texts.extend(
-            str(item.get("text") or "") for item in self.recent_context
-        )
-        return [text for text in texts if text]
+        """Texts a quote may be located in: the person's own words only."""
+        return [text for text in self.user_event_texts().values() if text]
 
 
 class SnapshotEntry(BaseModel):
@@ -146,6 +250,23 @@ class FullProfileSnapshot(BaseModel):
                 ("interaction", self.interaction),
             )
         }
+        pending = [
+            {
+                "candidate_id": item.get("candidate_id"),
+                "field_key": item.get("field_key"),
+                "operation": item.get("operation", "ADD"),
+                "target_entry_ids": list(item.get("target_entry_ids") or []),
+                "proposed_content": str(item.get("proposed_content") or "")[:240],
+                "status": item.get("status") or "PENDING",
+                "review_status": item.get("review_status") or "PENDING",
+            }
+            for item in self.pending_candidates[:MAX_SNAPSHOT_PENDING]
+        ]
+        legacy_names = sorted(self.legacy_fields)
+        legacy = {
+            key: self.legacy_fields[key]
+            for key in legacy_names[:MAX_SNAPSHOT_LEGACY_FIELDS]
+        }
         return {
             "person_id": self.person_id,
             "profile_revision": self.revision,
@@ -158,6 +279,21 @@ class FullProfileSnapshot(BaseModel):
             "entry_ids": {
                 key: [entry.entry_id for entry in items]
                 for key, items in self.entries.items()
+            },
+            # A pending proposal is explicitly NOT confirmed understanding.
+            "pending_proposals": pending,
+            "legacy_unconverted": legacy,
+            "compact_summary": self.compact_summary[:MAX_SNAPSHOT_TEXT_CHARS],
+            "snapshot_limits": {
+                "pending_total": len(self.pending_candidates),
+                "pending_included": len(pending),
+                "legacy_total": len(legacy_names),
+                "legacy_included": len(legacy),
+                "truncated": (
+                    len(self.pending_candidates) > len(pending)
+                    or len(legacy_names) > len(legacy)
+                    or len(self.compact_summary) > MAX_SNAPSHOT_TEXT_CHARS
+                ),
             },
         }
 
@@ -299,6 +435,12 @@ def _coverage(targets: list[str], proposed: str) -> float:
 
 
 _FILLER = re.compile(r"^(喜欢|爱好|兴趣|擅长|正在|在|做|搞|研究|开发)+$")
+# A joke, hypothetical or reported speech is not a stable self-report. This is
+# only a conservative textual flag: it sends the proposal to pending review,
+# it does not claim to understand the sentence.
+_HYPOTHETICAL = re.compile(
+    r"(如果|假如|假设|要是|开玩笑|说着玩|玩笑|据说|听说|别人说|他说|她说)"
+)
 _SENSITIVE = re.compile(
     r"(健康|疾病|病历|诊断|医院|用药|药物|抑郁|焦虑症|"
     r"银行|信用卡|贷款|工资|收入|存款|密码|"
@@ -314,6 +456,18 @@ def _effective_content(snapshot: FullProfileSnapshot, entry_ids: list[str]) -> l
         for entry in items
         if entry.entry_id in wanted
     ]
+
+
+def _entries_by_id(snapshot: FullProfileSnapshot) -> dict[str, SnapshotEntry]:
+    return {
+        entry.entry_id: entry
+        for items in snapshot.entries.values()
+        for entry in items
+    }
+
+
+def _normalise_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
 
 
 class ProfileFieldRegistry:
@@ -392,15 +546,21 @@ class ProfileRefinementEngine:
         # (3)/(4)/(5) The provider decides whether the whole understanding
         # should change and proposes minimal edits. It never sees a different
         # revision than the one above.
+        snapshot = existing.model_input()
         payload = {
             "person_id": person_id,
             "profile_revision": existing.revision,
-            "existing_profile": existing.model_input()["existing_profile"],
-            "entry_ids": existing.model_input()["entry_ids"],
+            "existing_profile": snapshot["existing_profile"],
+            "entry_ids": snapshot["entry_ids"],
+            "pending_proposals": snapshot["pending_proposals"],
+            "legacy_unconverted": snapshot["legacy_unconverted"],
+            "compact_summary": snapshot["compact_summary"],
+            "snapshot_limits": snapshot["snapshot_limits"],
             "new_evidence": {
                 "source_event_id": source_event_id,
                 "current_turn": evidence.current_turn,
                 "recent_context": evidence.recent_context,
+                "eligible_user_evidence": evidence.eligible_user_evidence,
                 "allowed_event_ids": evidence.allowed_event_ids,
             },
         }
@@ -457,14 +617,13 @@ class ProfileRefinementEngine:
             result.status = "NO_CHANGE"
             return result
 
-        allowed_entry_ids = existing.entry_ids()
-        allowed_event_ids = set(evidence.allowed_event_ids)
-        quote_texts = evidence.quote_texts()
+        entries_by_id = _entries_by_id(existing)
+        user_texts = evidence.user_event_texts()
         validated: list[ValidatedChange] = []
 
         for index, proposal in enumerate(decision.changes):
             issue, pending_reason = self._check_proposal(
-                proposal, existing, allowed_entry_ids, allowed_event_ids, quote_texts
+                proposal, existing, entries_by_id, user_texts
             )
             if issue is None and index >= self.registry.max_changes:
                 issue = "change_limit_exceeded"
@@ -494,14 +653,14 @@ class ProfileRefinementEngine:
         self,
         proposal: ProfileChangeProposal,
         existing: FullProfileSnapshot,
-        allowed_entry_ids: set[str],
-        allowed_event_ids: set[str],
-        quote_texts: list[str],
+        entries_by_id: dict[str, SnapshotEntry],
+        user_texts: dict[str, str],
     ) -> tuple[Optional[str], Optional[str]]:
         """Return ``(issue, pending_reason)``.
 
         ``issue`` rejects the proposal entirely. ``pending_reason`` keeps it as
-        a durable pending candidate that a person can confirm later.
+        a durable pending candidate that a person can confirm later. Target
+        checks use the *stored* entry rows, never the model's label for them.
         """
         spec = self.registry.spec(proposal.field_key)
         if spec is None:
@@ -510,23 +669,31 @@ class ProfileRefinementEngine:
             return "field_not_an_understanding_entry", None
         if not proposal.proposed_content and proposal.operation != "ARCHIVE":
             return "missing_proposed_content", None
-        if proposal.operation in ("UPDATE", "CORRECT", "MERGE", "REFINE", "ARCHIVE"):
-            if not proposal.target_entry_ids:
-                return "missing_target_entry_ids", None
-            if not set(proposal.target_entry_ids) <= allowed_entry_ids:
-                return "target_entry_not_in_this_profile", None
-            targets = _effective_content(existing, proposal.target_entry_ids)
-            if len(targets) != len(set(proposal.target_entry_ids)):
-                return "target_entry_not_effective", None
-            if proposal.operation == "MERGE" and len(set(proposal.target_entry_ids)) < 2:
-                return "merge_needs_two_targets", None
+
         if proposal.operation == "ADD":
-            if set(proposal.target_entry_ids):
+            if proposal.target_entry_ids:
                 return "add_must_not_target_entries", None
             if not self._add_is_new(existing, proposal):
                 return "already_present", None
+            target_entries: list[dict] = []
+        else:
+            if not proposal.target_entry_ids:
+                return "missing_target_entry_ids", None
+            unique_ids = list(dict.fromkeys(proposal.target_entry_ids))
+            if any(entry_id not in entries_by_id for entry_id in unique_ids):
+                return "target_entry_not_in_this_profile", None
+            target_entries = [
+                entries_by_id[entry_id].model_dump() for entry_id in unique_ids
+            ]
+            try:
+                validate_change_targets(
+                    proposal.operation, proposal.field_key, target_entries
+                )
+            except ValueError as exc:
+                return str(exc) or "invalid_change_target", None
+
         if proposal.operation in ("MERGE", "REFINE"):
-            targets = _effective_content(existing, proposal.target_entry_ids)
+            targets = [item["content"] for item in target_entries]
             content = proposal.proposed_content or ""
             # Only merging/condensing is checked for lost specifics. A genuine
             # CORRECT may replace a fact (university -> high school); an UPDATE
@@ -536,23 +703,38 @@ class ProfileRefinementEngine:
             # A merge/refine may shorten wording, not delete every specific.
             if content and _FILLER.match(content.strip()):
                 return "lossy_change_rejects_existing_facts", None
-        if proposal.operation == "ARCHIVE" and (
-            proposal.field_key.startswith("identity.")
-            or proposal.field_key.startswith("relationship.")
-        ):
-            return "strict_field_cannot_be_archived", None
+
+        allowed_event_ids = set(user_texts)
         if proposal.evidence_event_ids and not set(
             proposal.evidence_event_ids
         ) <= allowed_event_ids:
             return "evidence_event_not_authorized", None
         if proposal.evidence_quotes:
+            cited = list(dict.fromkeys(proposal.evidence_event_ids))
+            if not cited:
+                # A quote that is not tied to a specific user message cannot be
+                # verified; it may not silently auto-apply.
+                return None, "evidence_quote_without_event"
+            cited_texts = [
+                _normalise_text(user_texts[event_id])
+                for event_id in cited
+                if event_id in user_texts
+            ]
             for quote in proposal.evidence_quotes:
-                if not any(quote and quote in text for text in quote_texts):
+                normalised = _normalise_text(quote)
+                if not any(
+                    normalised and normalised in text for text in cited_texts
+                ):
                     return "evidence_quote_not_found", None
         if not proposal.evidence_event_ids and not proposal.evidence_quotes:
             # New stable understanding needs some evidence. A no-evidence
             # proposal is kept for a person to confirm rather than applied.
             return None, "no_evidence"
+        quoted = " ".join(proposal.evidence_quotes)
+        if _HYPOTHETICAL.search(f"{proposal.proposed_content or ''} {quoted}"):
+            # Jokes, hypotheticals and third-party claims are not stable
+            # self-report; a person can still confirm them explicitly.
+            return None, "uncertain_evidence_requires_review"
         if _SENSITIVE.search(proposal.proposed_content or ""):
             return None, "sensitive_field_requires_review"
         if self.registry.is_strict(proposal.field_key):
@@ -632,9 +814,13 @@ class ProfileReviewContextSource:
                 reason="source_event_not_owned_by_person",
             )
 
-        history = await self.repos.utterance.recent_context(
+        # A background review may run minutes later. Only messages persisted
+        # *before* this event, in this conversation, are context — a later turn
+        # can never leak backwards into an earlier review. ``exclude_event_id``
+        # alone would not provide that boundary.
+        history = await self.repos.utterance.context_before_event(
             event.conversation_id,
-            exclude_event_id=event.event_id,
+            event.event_id,
             limit=self.recent_turns * 2,
         )
         history = [
@@ -648,10 +834,24 @@ class ProfileReviewContextSource:
             [item.event_id for item in history]
         )
         recent: list[dict] = []
-        allowed_events = [event.event_id]
+        eligible_user_evidence: list[dict] = [
+            {
+                "event_id": event.event_id,
+                "speaker_person_id": person_id,
+                "text": event.text,
+                "role": "user",
+            }
+        ]
         for item in history:
             recent.append({"role": "human", "text": item.text})
-            allowed_events.append(item.event_id)
+            eligible_user_evidence.append(
+                {
+                    "event_id": item.event_id,
+                    "speaker_person_id": person_id,
+                    "text": item.text,
+                    "role": "user",
+                }
+            )
             action = actions.get(item.event_id)
             if (
                 action is not None
@@ -677,14 +877,20 @@ class ProfileReviewContextSource:
             source_event_id=source_event_id,
             current_turn=event.text,
             recent_context=recent,
-            allowed_event_ids=allowed_events,
+            eligible_user_evidence=eligible_user_evidence,
+            allowed_event_ids=[
+                item["event_id"] for item in eligible_user_evidence
+            ],
             allowed_memory_ids=[],
         )
 
 
 __all__ = [
+    "ALLOWED_FIELD_TRANSITIONS",
     "DEFAULT_AUTO_APPLY_CONFIDENCE",
     "FullProfileSnapshot",
+    "MAX_SNAPSHOT_LEGACY_FIELDS",
+    "MAX_SNAPSHOT_PENDING",
     "MAX_CHANGES_PER_REVIEW",
     "ProfileApplyResult",
     "ProfileChangeProposal",
@@ -699,4 +905,6 @@ __all__ = [
     "ProfileReviewResult",
     "SnapshotEntry",
     "ValidatedChange",
+    "is_strict_field",
+    "validate_change_targets",
 ]

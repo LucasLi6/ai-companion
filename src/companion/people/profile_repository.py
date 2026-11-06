@@ -264,6 +264,30 @@ class PersonProfileRepository:
         )
         return entry_id
 
+    async def replace_entry_evidence(
+        self,
+        entry_id: str,
+        *,
+        evidence_event_ids: list[str],
+        evidence_memory_ids: list[str],
+    ) -> None:
+        """Set the entry's evidence lists exactly (used by source invalidation)."""
+        await self.db.execute(
+            "UPDATE person_profile_entries SET evidence_event_ids_json = ?,"
+            " evidence_memory_ids_json = ?, updated_at = ? WHERE entry_id = ?",
+            (
+                _json(sorted(set(evidence_event_ids))),
+                _json(sorted(set(evidence_memory_ids))),
+                _iso(utcnow()),
+                entry_id,
+            ),
+        )
+
+    async def delete_entry(self, entry_id: str) -> None:
+        await self.db.execute(
+            "DELETE FROM person_profile_entries WHERE entry_id = ?", (entry_id,)
+        )
+
     async def update_entry(
         self,
         entry_id: str,
@@ -452,6 +476,100 @@ class PersonProfileRepository:
         row = await cur.fetchone()
         return self._receipt_row(row) if row is not None else None
 
+    async def list_unfinished_review_receipts(
+        self, person_id: Optional[str] = None, *, limit: int = 200
+    ) -> list[dict]:
+        """Receipts whose outcome is still unknown (PENDING or RUNNING)."""
+        sql = (
+            "SELECT * FROM profile_review_receipts"
+            " WHERE status IN ('PENDING', 'RUNNING')"
+        )
+        params: list[Any] = []
+        if person_id is not None:
+            sql += " AND person_id = ?"
+            params.append(person_id)
+        sql += " ORDER BY created_at ASC, rowid ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        cur = await self.db.execute(sql, tuple(params))
+        rows = await cur.fetchall()
+        return [self._receipt_row(row) for row in rows]
+
+    async def release_review_receipt(self, review_id: str, *, reason: str) -> bool:
+        """Return a claimed receipt to PENDING after a lost execution lease.
+
+        Conditional on the receipt still being ``RUNNING``: a terminal or
+        newly claimed receipt is never reopened.
+        """
+        cur = await self.db.execute(
+            "UPDATE profile_review_receipts SET status = 'PENDING',"
+            " last_error = ?, updated_at = ?"
+            " WHERE review_id = ? AND status = 'RUNNING'",
+            (reason[:500], _iso(utcnow()), review_id),
+        )
+        return int(cur.rowcount or 0) == 1
+
+    async def prepare_review_receipt_retry(
+        self, review_id: str, *, job_key: str
+    ) -> bool:
+        """Clear recovery state for a manual retry with a fresh job key."""
+        now = _iso(utcnow())
+        cur = await self.db.execute(
+            "UPDATE profile_review_receipts SET status = 'PENDING',"
+            " job_key = ?, base_revision = NULL, result_revision = NULL,"
+            " decision = NULL, reason = NULL, changes_json = '[]',"
+            " attempt_count = 0, last_error = NULL, completed_at = NULL,"
+            " updated_at = ?"
+            " WHERE review_id = ? AND status != 'COMPLETED'",
+            (job_key, now, review_id),
+        )
+        return int(cur.rowcount or 0) == 1
+
+    async def cancel_review_receipts_for_source(
+        self, person_id: str, source_event_id: str
+    ) -> int:
+        """Cancel any review of an event that is being privacy-deleted."""
+        cur = await self.db.execute(
+            "UPDATE profile_review_receipts SET status = 'CANCELLED',"
+            " decision = 'CANCELLED', reason = 'source_event_deleted',"
+            " completed_at = ?, updated_at = ?"
+            " WHERE person_id = ? AND source_event_id = ?"
+            " AND status IN ('PENDING', 'RUNNING')",
+            (
+                _iso(utcnow()),
+                _iso(utcnow()),
+                person_id,
+                source_event_id,
+            ),
+        )
+        return int(cur.rowcount or 0)
+
+    async def scrub_receipts_for_source(
+        self, person_id: str, source_event_id: str
+    ) -> int:
+        """Redact receipt bodies derived from a permanently deleted event."""
+        cur = await self.db.execute(
+            "UPDATE profile_review_receipts SET changes_json = '[]',"
+            " reason = COALESCE(reason, 'source_event_deleted'), updated_at = ?"
+            " WHERE person_id = ? AND source_event_id = ?"
+            " AND changes_json NOT IN ('[]', '')",
+            (_iso(utcnow()), person_id, source_event_id),
+        )
+        return int(cur.rowcount or 0)
+
+    async def scrub_receipts_for_entries(
+        self, person_id: str, entry_ids: list[str]
+    ) -> int:
+        affected = 0
+        for entry_id in dict.fromkeys(entry_ids or []):
+            cur = await self.db.execute(
+                "UPDATE profile_review_receipts SET changes_json = '[]',"
+                " updated_at = ? WHERE person_id = ?"
+                " AND changes_json LIKE ?",
+                (_iso(utcnow()), person_id, f"%{entry_id}%"),
+            )
+            affected += int(cur.rowcount or 0)
+        return affected
+
     async def update_review_receipt(
         self,
         review_id: str,
@@ -595,6 +713,25 @@ class PersonProfileRepository:
             (int(revision), _iso(utcnow()), person_id, field_key),
         )
 
+    async def redact_field(
+        self, person_id: str, field_key: str, *, revision: int
+    ) -> None:
+        """Permanently remove a legacy field's value after a privacy delete.
+
+        Retiring alone keeps ``value_json`` in the file, which would leave the
+        private text recoverable. The row stays (history is continuous) but its
+        value, source and evidence are cleared.
+        """
+        await self.db.execute(
+            "UPDATE person_profile_fields SET status = 'RETIRED',"
+            " value_json = '{\"redacted\": \"privacy_delete\"}',"
+            " source = 'PRIVACY_DELETE', confidence = 0,"
+            " evidence_memory_ids_json = '[]', evidence_event_ids_json = '[]',"
+            " evidence_candidate_ids_json = '[]', revision = ?, updated_at = ?"
+            " WHERE person_id = ? AND field_key = ?",
+            (int(revision), _iso(utcnow()), person_id, field_key),
+        )
+
     @staticmethod
     def _field_row(row) -> dict:
         return {
@@ -686,13 +823,25 @@ class PersonProfileRepository:
         return self._candidate_row(row) if row is not None else None
 
     async def list_candidates(
-        self, person_id: str, *, status: str = "PENDING"
+        self, person_id: str, *, status: Optional[str] = "PENDING"
     ) -> list[dict]:
-        cur = await self.db.execute(
-            "SELECT * FROM person_profile_candidates"
-            " WHERE person_id = ? AND status = ? ORDER BY created_at ASC",
-            (person_id, status),
-        )
+        """Candidate rows, newest last.
+
+        ``status=None`` returns every status; the review snapshot needs the
+        parked ``NEEDS_REVIEW`` proposals too, not only fresh ``PENDING`` ones.
+        """
+        if status is None:
+            cur = await self.db.execute(
+                "SELECT * FROM person_profile_candidates"
+                " WHERE person_id = ? ORDER BY created_at ASC",
+                (person_id,),
+            )
+        else:
+            cur = await self.db.execute(
+                "SELECT * FROM person_profile_candidates"
+                " WHERE person_id = ? AND status = ? ORDER BY created_at ASC",
+                (person_id, status),
+            )
         rows = await cur.fetchall()
         return [self._candidate_row(row) for row in rows]
 
@@ -748,6 +897,51 @@ class PersonProfileRepository:
                 _iso(utcnow()),
                 candidate_id,
             ),
+        )
+
+    async def list_candidates_referencing_source(
+        self,
+        person_id: str,
+        *,
+        event_id: Optional[str] = None,
+        memory_id: Optional[str] = None,
+    ) -> list[dict]:
+        """All candidate rows (any status) that cite this event or memory."""
+        cur = await self.db.execute(
+            "SELECT * FROM person_profile_candidates WHERE person_id = ?",
+            (person_id,),
+        )
+        rows = await cur.fetchall()
+        candidates = [self._candidate_row(row) for row in rows]
+        return [
+            candidate
+            for candidate in candidates
+            if (event_id and event_id in candidate["evidence_event_ids"])
+            or (memory_id and memory_id in candidate["evidence_memory_ids"])
+        ]
+
+    async def replace_candidate_evidence(
+        self,
+        candidate_id: str,
+        *,
+        evidence_event_ids: list[str],
+        evidence_memory_ids: list[str],
+    ) -> None:
+        await self.db.execute(
+            "UPDATE person_profile_candidates SET evidence_event_ids_json = ?,"
+            " evidence_memory_ids_json = ?, updated_at = ? WHERE candidate_id = ?",
+            (
+                _json(sorted(set(evidence_event_ids))),
+                _json(sorted(set(evidence_memory_ids))),
+                _iso(utcnow()),
+                candidate_id,
+            ),
+        )
+
+    async def delete_candidate(self, candidate_id: str) -> None:
+        await self.db.execute(
+            "DELETE FROM person_profile_candidates WHERE candidate_id = ?",
+            (candidate_id,),
         )
 
     async def reject_pending(self, person_id: str, reason: str) -> int:
@@ -854,6 +1048,61 @@ class PersonProfileRepository:
             for row in rows
         ]
 
+    async def scrub_revisions_for_source(
+        self, person_id: str, source_event_id: str
+    ) -> int:
+        """Redact revision bodies that were derived from a deleted event.
+
+        The row keeps its revision number so history stays continuous; its
+        ``changes_json`` no longer retains the private before/after text.
+        """
+        cur = await self.db.execute(
+            "UPDATE person_profile_revisions"
+            " SET changes_json = '{\"redacted\": \"privacy_delete\"}'"
+            " WHERE person_id = ? AND source_event_id = ?"
+            " AND changes_json NOT LIKE '%\"redacted\"%'",
+            (person_id, source_event_id),
+        )
+        return int(cur.rowcount or 0)
+
+    async def scrub_revisions_for_entries(
+        self, person_id: str, entry_ids: list[str]
+    ) -> int:
+        affected = 0
+        for entry_id in dict.fromkeys(entry_ids or []):
+            cur = await self.db.execute(
+                "UPDATE person_profile_revisions"
+                " SET changes_json = '{\"redacted\": \"privacy_delete\"}'"
+                " WHERE person_id = ? AND changes_json LIKE ?"
+                " AND changes_json NOT LIKE '%\"redacted\"%'",
+                (person_id, f"%{entry_id}%"),
+            )
+            affected += int(cur.rowcount or 0)
+        return affected
+
+    async def delete_evidence_for_source(
+        self,
+        person_id: str,
+        *,
+        event_id: Optional[str] = None,
+        memory_id: Optional[str] = None,
+    ) -> int:
+        if event_id:
+            cur = await self.db.execute(
+                "DELETE FROM person_profile_evidence"
+                " WHERE person_id = ? AND source_event_id = ?",
+                (person_id, event_id),
+            )
+        elif memory_id:
+            cur = await self.db.execute(
+                "DELETE FROM person_profile_evidence"
+                " WHERE person_id = ? AND memory_id = ?",
+                (person_id, memory_id),
+            )
+        else:
+            return 0
+        return int(cur.rowcount or 0)
+
     async def insert_evidence(
         self,
         *,
@@ -951,6 +1200,94 @@ class PersonProfileRepository:
         )
         rows = await cur.fetchall()
         return [dict(row) for row in rows]
+
+    # -- per-person review lease (V0.9.7.1) --------------------------------
+
+    async def acquire_review_lease(
+        self,
+        person_id: str,
+        owner_id: str,
+        *,
+        lease_seconds: int = 900,
+    ) -> bool:
+        """Atomically take the one review slot for ``person_id``.
+
+        A row whose lease has expired (a crashed worker) may be taken over; a
+        live lease held by a different owner never can. SQLite serialises the
+        conditional upsert, so this works across worker processes — not just
+        within one event loop.
+        """
+        from datetime import timedelta
+
+        now = utcnow()
+        expires = now + timedelta(seconds=max(30, int(lease_seconds)))
+        cur = await self.db.execute(
+            "INSERT INTO profile_review_leases("
+            " person_id, owner_id, acquired_at, expires_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(person_id) DO UPDATE SET"
+            " owner_id = excluded.owner_id,"
+            " acquired_at = excluded.acquired_at,"
+            " expires_at = excluded.expires_at,"
+            " updated_at = excluded.updated_at"
+            " WHERE profile_review_leases.expires_at < ?"
+            " OR profile_review_leases.owner_id = ?",
+            (
+                person_id,
+                owner_id,
+                _iso(now),
+                _iso(expires),
+                _iso(now),
+                _iso(now),
+                owner_id,
+            ),
+        )
+        return int(cur.rowcount or 0) == 1
+
+    async def renew_review_lease(
+        self,
+        person_id: str,
+        owner_id: str,
+        *,
+        lease_seconds: int = 900,
+    ) -> bool:
+        """Extend a lease this owner still holds; fail after it expired."""
+        from datetime import timedelta
+
+        now = utcnow()
+        expires = now + timedelta(seconds=max(30, int(lease_seconds)))
+        cur = await self.db.execute(
+            "UPDATE profile_review_leases SET expires_at = ?, updated_at = ?"
+            " WHERE person_id = ? AND owner_id = ? AND expires_at >= ?",
+            (_iso(expires), _iso(now), person_id, owner_id, _iso(now)),
+        )
+        return int(cur.rowcount or 0) == 1
+
+    async def release_review_lease(self, person_id: str, owner_id: str) -> bool:
+        """Release only the lease this owner still holds."""
+        cur = await self.db.execute(
+            "DELETE FROM profile_review_leases"
+            " WHERE person_id = ? AND owner_id = ?",
+            (person_id, owner_id),
+        )
+        return int(cur.rowcount or 0) == 1
+
+    async def get_review_lease(self, person_id: str) -> Optional[dict]:
+        cur = await self.db.execute(
+            "SELECT person_id, owner_id, acquired_at, expires_at, updated_at"
+            " FROM profile_review_leases WHERE person_id = ?",
+            (person_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "person_id": row["person_id"],
+            "owner_id": row["owner_id"],
+            "acquired_at": _dt(row["acquired_at"]),
+            "expires_at": _dt(row["expires_at"]),
+            "updated_at": _dt(row["updated_at"]),
+        }
 
     async def list_all_person_ids(self) -> list[str]:
         cur = await self.db.execute(

@@ -56,7 +56,11 @@ from companion.people.profile_models import (
     ProfileFieldStorage,
     profile_field_spec,
 )
-from companion.people.profile_service import ProfileUnauthorized
+from companion.people.profile_service import (
+    ProfileProposalStale,
+    ProfileUnauthorized,
+    TRUSTED_CONFIRMATION,
+)
 from companion.jobs.profile_review import ProfileReviewScheduler
 from companion.memory.models import (
     AccessContext,
@@ -981,12 +985,17 @@ async def cmd_profile_confirm(args) -> int:
         try:
             if spec is not None and spec.storage is ProfileFieldStorage.ENTRY:
                 revision = await rt.profile_service.confirm_profile_proposal(
-                    args.candidate_id, actor="user"
+                    args.candidate_id,
+                    actor="user",
+                    authority=TRUSTED_CONFIRMATION,
                 )
             else:
                 revision = await rt.profile_service.confirm_candidate(
                     args.candidate_id, actor="user"
                 )
+        except ProfileProposalStale as exc:
+            print(f"STALE_PROPOSAL {exc}")
+            return 2
         except (ValueError, ProfileUnauthorized) as exc:
             print(f"cannot confirm: {exc}")
             return 1

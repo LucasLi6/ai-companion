@@ -498,6 +498,71 @@ class UtteranceRepository:
             for r in rows
         ]
 
+    async def context_before_event(
+        self,
+        conversation_id: str,
+        event_id: str,
+        limit: int = 20,
+    ) -> list[UtteranceEvent]:
+        """Messages persisted *before* one target event, oldest first.
+
+        A background job may process an old event long after later turns were
+        stored. ``recent_context(exclude_event_id=...)`` only removes the
+        target row; it can still return messages that arrived after the turn
+        being reviewed. This method resolves the target's persisted position
+        and reads only rows strictly before it.
+
+        Ordering is ``(occurred_at, rowid)``: ``occurred_at`` is the claimed
+        turn time, and ``rowid`` is SQLite's insertion order — a stable,
+        persisted tie-break that does not depend on the lexical ordering of
+        random event ids. A missing target, or one from another conversation,
+        returns no context rather than guessing.
+        """
+        cur = await self.db.execute(
+            "SELECT rowid AS seq, conversation_id, occurred_at"
+            " FROM utterances WHERE event_id = ?",
+            (event_id,),
+        )
+        target = await cur.fetchone()
+        if target is None or target["conversation_id"] != conversation_id:
+            return []
+        sql = (
+            "SELECT * FROM ("
+            "  SELECT rowid AS seq, event_id, conversation_id,"
+            "         speaker_person_id, speaker_label, text, source,"
+            "         addressee_hint, occurred_at, processing_status"
+            "  FROM utterances"
+            "  WHERE conversation_id = ?"
+            "    AND (occurred_at < ? OR (occurred_at = ? AND rowid < ?))"
+            "  ORDER BY occurred_at DESC, rowid DESC LIMIT ?"
+            ") ORDER BY occurred_at ASC, seq ASC"
+        )
+        cur = await self.db.execute(
+            sql,
+            (
+                conversation_id,
+                target["occurred_at"],
+                target["occurred_at"],
+                target["seq"],
+                max(1, int(limit)),
+            ),
+        )
+        rows = await cur.fetchall()
+        return [
+            UtteranceEvent(
+                event_id=r["event_id"],
+                conversation_id=r["conversation_id"],
+                speaker_person_id=r["speaker_person_id"],
+                speaker_label=r["speaker_label"],
+                text=r["text"],
+                source=EventSource(r["source"]),
+                addressee_hint=AddresseeHint(r["addressee_hint"]),
+                occurred_at=_dt(r["occurred_at"]),
+                processing_status=ProcessingStatus(r["processing_status"]),
+            )
+            for r in rows
+        ]
+
     async def last_before_speaker(
         self,
         person_id: str,

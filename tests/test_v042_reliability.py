@@ -36,7 +36,7 @@ from companion.storage.schema import SCHEMA_VERSION
 
 
 async def test_schema_16_carries_pragmatic_and_stance_storage(db):
-    assert SCHEMA_VERSION == 25
+    assert SCHEMA_VERSION == 26
 
     cur = await db.execute("PRAGMA table_info(cognitive_analyses)")
     columns = {row["name"] for row in await cur.fetchall()}
