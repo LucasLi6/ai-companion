@@ -131,6 +131,7 @@ class Orchestrator:
         runtime_snapshot_builder: Optional[RuntimeSnapshotBuilder] = None,
         metrics: Optional[LatencyMetrics] = None,
         profile_learning=None,
+        profile_review=None,
         fast_path_enabled: bool = True,
         router_mode: str = "legacy",
         routing_context_builder: Optional[RoutingContextBuilder] = None,
@@ -179,6 +180,11 @@ class Orchestrator:
         # records explicit preferences and unconfirmed candidate facts within
         # the speaker's standing consent.
         self.profile_learning = profile_learning
+        # V0.9.7: background profile review request. Called inside the turn
+        # commit transaction (receipt + job), so the conversation and its
+        # review request commit or roll back together. It is never awaited for
+        # the reply.
+        self.profile_review = profile_review
         # V0.6: one immutable runtime snapshot per event (time, zone, gaps,
         # optional consented location). Missing builder keeps older wirings
         # working unchanged.
@@ -2803,36 +2809,44 @@ class Orchestrator:
                     return
 
     async def _observe_profile(self, event, enabled: bool) -> None:
-        """Local-only profile learning; never affects the reply or commit.
+        """Record local learning and request a background review.
 
-        It runs inside the turn's commit transaction so a rolled-back turn
-        cannot leave profile changes behind. A failure here is logged and
-        ignored: learning is never allowed to break a conversation.
+        Both run inside the turn's commit transaction. Local learning never
+        makes a model call and a local failure is logged and ignored. The
+        review *request* is different: its receipt and job must commit with
+        the turn, otherwise a committed conversation could silently lose its
+        review. It is only a small same-DB insert — the actual model review
+        runs later in the worker.
         """
-        if not enabled or self.profile_learning is None:
+        if not enabled:
             return
         person_id = event.speaker_person_id
         if person_id is None:
             return
-        try:
-            result = await self.profile_learning.observe(
-                person_id, event.text, event_id=event.event_id
-            )
-            if result.preferences or result.candidates or result.corrections:
-                self.logger.info(
-                    "profile_learning event_id=%s preferences=%d candidates=%d"
-                    " corrections=%d",
-                    event.event_id,
-                    len(result.preferences),
-                    len(result.candidates),
-                    len(result.corrections),
+        if self.profile_learning is not None:
+            try:
+                result = await self.profile_learning.observe(
+                    person_id, event.text, event_id=event.event_id
                 )
-        except Exception as exc:  # pragma: no cover - defensive isolation
-            self.logger.warning(
-                "profile_learning_failed event_id=%s error=%s",
-                event.event_id,
-                type(exc).__name__,
-            )
+                if result.preferences or result.candidates or result.corrections:
+                    self.logger.info(
+                        "profile_learning event_id=%s preferences=%d candidates=%d"
+                        " corrections=%d",
+                        event.event_id,
+                        len(result.preferences),
+                        len(result.candidates),
+                        len(result.corrections),
+                    )
+            except Exception as exc:  # pragma: no cover - defensive isolation
+                self.logger.warning(
+                    "profile_learning_failed event_id=%s error=%s",
+                    event.event_id,
+                    type(exc).__name__,
+                )
+        if self.profile_review is not None:
+            # Deliberately not swallowed: losing this insert would leave a
+            # committed turn with no recoverable review request.
+            await self.profile_review.request(person_id, event.event_id)
 
     async def _persist_input(self, event: UtteranceEvent) -> None:
         to_save = event.model_copy(update={"processing_status": ProcessingStatus.PROCESSING})

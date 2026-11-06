@@ -118,6 +118,10 @@ class CognitiveContext(BaseModel):
     # understanding profile. It is background data about this person only,
     # never another person's profile and never an instruction.
     person_profile_context: Optional[str] = Field(default=None, max_length=800)
+    # The committed profile revision the block above was compiled from. Shared
+    # by the router and speaker so one turn cannot mix two revisions; it is
+    # metadata for the program, not a value sent to the model.
+    person_profile_revision: Optional[int] = Field(default=None)
     # V0.8: the validated semantic route for this turn, rendered for the
     # speaker as *model judgment* (not a trusted instruction). Never contains
     # the router's raw output or hidden chain of thought.

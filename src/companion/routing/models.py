@@ -321,6 +321,10 @@ class RoutingContext(BaseModel):
     conversation_state: dict = Field(default_factory=dict)
     compact_scene: Optional[dict] = None
     compact_person_profile: Optional[str] = None
+    # The exact profile revision the compact block was compiled from. The
+    # speaker reuses that block instead of reading a second, possibly newer
+    # revision for the same turn.
+    compact_person_profile_revision: Optional[int] = None
     available_tool_specs: list[dict] = Field(default_factory=list)
     # Trusted metadata for the validator (never rendered as instructions).
     visible_event_ids: list[str] = Field(default_factory=list)

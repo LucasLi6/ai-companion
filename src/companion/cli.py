@@ -52,6 +52,12 @@ from companion.domain.enums import (
     MemoryVisibility,
 )
 from companion.domain.models import make_utterance_event
+from companion.people.profile_models import (
+    ProfileFieldStorage,
+    profile_field_spec,
+)
+from companion.people.profile_service import ProfileUnauthorized
+from companion.jobs.profile_review import ProfileReviewScheduler
 from companion.memory.models import (
     AccessContext,
     MemoryNotFoundError,
@@ -190,6 +196,51 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = p_person_sub.add_parser("show", parents=[_common_parser()], help="Show one person")
     p_show.add_argument("person_id")
     p_show.set_defaults(func=cmd_person_show)
+
+    p_profile = sub.add_parser(
+        "profile", parents=[_common_parser()],
+        help="Inspect and review one person's understanding profile",
+    )
+    p_profile_sub = p_profile.add_subparsers(dest="profile_command")
+    pp_show = p_profile_sub.add_parser(
+        "show", parents=[_common_parser()], help="Show the confirmed profile"
+    )
+    pp_show.add_argument("--person", required=True)
+    pp_show.set_defaults(func=cmd_profile_show)
+    pp_history = p_profile_sub.add_parser(
+        "history", parents=[_common_parser()], help="Show profile revisions"
+    )
+    pp_history.add_argument("--person", required=True)
+    pp_history.set_defaults(func=cmd_profile_history)
+    pp_candidates = p_profile_sub.add_parser(
+        "candidates", parents=[_common_parser()],
+        help="Show pending change proposals",
+    )
+    pp_candidates.add_argument("--person", required=True)
+    pp_candidates.set_defaults(func=cmd_profile_candidates)
+    pp_review = p_profile_sub.add_parser(
+        "review", parents=[_common_parser()],
+        help="Run or check a formal profile review for one turn",
+    )
+    pp_review.add_argument("--person", required=True)
+    pp_review.add_argument(
+        "--event", default=None,
+        help="Source event id (default: this person's latest turn)",
+    )
+    _add_provider_arg(pp_review)
+    pp_review.set_defaults(func=cmd_profile_review)
+    pp_confirm = p_profile_sub.add_parser(
+        "confirm", parents=[_common_parser()],
+        help="Confirm one pending proposal (explicit trusted write)",
+    )
+    pp_confirm.add_argument("candidate_id")
+    pp_confirm.set_defaults(func=cmd_profile_confirm)
+    pp_reject = p_profile_sub.add_parser(
+        "reject", parents=[_common_parser()],
+        help="Reject one pending proposal",
+    )
+    pp_reject.add_argument("candidate_id")
+    pp_reject.set_defaults(func=cmd_profile_reject)
 
     p_say = sub.add_parser("say", parents=[_common_parser()], help="Submit one utterance")
     p_say.add_argument("--person", required=True, help="Registered person id of the speaker")
@@ -731,6 +782,238 @@ async def cmd_person_show(args) -> int:
             print(f"allow_persistence: {c.allow_persistence}")
             print(f"allow_memory_learning: {c.allow_memory_learning}")
             print(f"allow_external_ai: {c.allow_external_ai}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_profile_show(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        snapshot = await rt.profile_service.get_full_snapshot(args.person)
+        if snapshot is None:
+            print(
+                "profile not available: unknown person or persistence consent"
+                " is not granted"
+            )
+            return 1
+        print(f"person_id: {snapshot.person_id}")
+        print(f"registration_label: {snapshot.display_name}")
+        print(f"revision: {snapshot.revision}")
+        print(
+            "identity_confirmed: name={name} preferred_name={preferred_name}"
+            " pronouns={pronouns}".format(
+                name=snapshot.identity.get("name", "UNKNOWN"),
+                preferred_name=snapshot.identity.get("preferred_name", "UNKNOWN"),
+                pronouns=snapshot.identity.get("pronouns", "UNKNOWN"),
+            )
+        )
+        print(
+            f"relationship: familiarity={snapshot.relationship.get('familiarity')}"
+            f" label={snapshot.relationship.get('label') or []}"
+        )
+        entry_count = sum(len(items) for items in snapshot.entries.values())
+        print(f"understanding_entries: {entry_count}")
+        for field_key, items in snapshot.entries.items():
+            for entry in items:
+                print(
+                    f"  [{field_key}] {entry.content}"
+                    f" ({entry.status}, source={entry.source},"
+                    f" confidence={entry.confidence:.2f})"
+                )
+        print(f"pending_proposals: {len(snapshot.pending_candidates)}")
+        receipt = await rt.repos.profile.latest_review_receipt(args.person)
+        if receipt is not None:
+            print(
+                "last_review: status={status} decision={decision}"
+                " revision={base}->{result} source_event={event}".format(
+                    status=receipt["status"],
+                    decision=receipt["decision"] or "-",
+                    base=receipt["base_revision"] or "-",
+                    result=receipt["result_revision"] or "-",
+                    event=receipt["source_event_id"],
+                )
+            )
+    finally:
+        await db.close()
+    return 0
+
+
+def _print_revision(revision: dict) -> None:
+    print(
+        f"revision {revision['revision']}  by={revision['changed_by']}"
+        f"  event={revision['source_event_id'] or '-'}"
+        f"  reason={revision['reason'] or '-'}"
+    )
+    changes = revision["changes"] or {}
+    rows = changes.get("changes") if isinstance(changes, dict) else None
+    if not rows and isinstance(changes, dict):
+        rows = [changes] if changes.get("field_key") else []
+    for change in rows or []:
+        if not isinstance(change, dict):
+            continue
+        operation = change.get("operation") or "-"
+        field_key = change.get("field_key") or "-"
+        before = change.get("before")
+        after = change.get("after")
+        targets = change.get("target_entry_ids") or []
+        print(
+            f"  {operation} {field_key} targets={targets}"
+            f" before={before!r} after={after!r}"
+            f" status={change.get('status', '-')}"
+        )
+
+
+async def cmd_profile_history(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        if not await rt.profile_service.can_persist(args.person):
+            print("profile history unavailable: no persistence consent")
+            return 1
+        revisions = await rt.repos.profile.list_revisions(args.person)
+        if not revisions:
+            print("no profile revisions")
+            return 0
+        for revision in revisions:
+            _print_revision(revision)
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_profile_candidates(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        if not await rt.profile_service.can_persist(args.person):
+            print("profile candidates unavailable: no persistence consent")
+            return 1
+        candidates = []
+        for status in ("PENDING", "NEEDS_REVIEW"):
+            candidates.extend(
+                await rt.repos.profile.list_candidates(args.person, status=status)
+            )
+        if not candidates:
+            print("no pending profile proposals")
+            return 0
+        for item in candidates:
+            print(
+                f"{item['candidate_id']}  {item.get('operation') or 'ADD'}"
+                f"  {item['field_key']}  status={item['status']}"
+                f"  confirm={bool(item.get('requires_confirmation'))}"
+                f"  confidence={item['confidence']:.2f}"
+            )
+            print(f"  proposed: {item['candidate_value']}")
+            print(f"  reason: {item['reason'] or '-'}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_profile_review(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = await _get_foreground_runtime(db, getattr(args, "provider", "mock"))
+        if rt is None:
+            return 1
+        if not await rt.profile_service.can_use_external_ai(args.person):
+            print(
+                "profile review unavailable: persistence and external-AI"
+                " consent are required"
+            )
+            return 1
+        event_id = args.event
+        if not event_id:
+            events = await rt.repos.utterance.list_events(args.person, limit=1)
+            if not events:
+                print("profile review unavailable: this person has no turns")
+                return 1
+            event_id = events[0].event_id
+        scheduler = ProfileReviewScheduler(
+            rt.repos.profile, rt.repos.job, persons=rt.repos.person
+        )
+        async with db.transaction():
+            review_id = await scheduler.request(args.person, event_id)
+        if review_id is None:
+            print("profile review skipped: consent is not granted")
+            return 0
+        if rt.worker is not None:
+            await rt.worker.run_once()
+        receipt = await rt.repos.profile.get_review_receipt(args.person, event_id)
+        if receipt is None:
+            print("profile review receipt missing")
+            return 1
+        print(
+            "review: status={status} decision={decision}"
+            " revision={base}->{result} event={event}".format(
+                status=receipt["status"],
+                decision=receipt["decision"] or "-",
+                base=receipt["base_revision"] or "-",
+                result=receipt["result_revision"] or "-",
+                event=event_id,
+            )
+        )
+        if receipt["reason"]:
+            print(f"reason: {receipt['reason']}")
+        for change in receipt["changes"] or []:
+            print(
+                f"  {change.get('operation', '-')} {change.get('field_key', '-')}"
+                f" status={change.get('status', '-')}"
+                f" before={change.get('before')!r}"
+                f" after={change.get('after')!r}"
+            )
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_profile_confirm(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        candidate = await rt.repos.profile.get_candidate(args.candidate_id)
+        if candidate is None:
+            print(f"candidate not found: {args.candidate_id}")
+            return 1
+        spec = profile_field_spec(candidate["field_key"])
+        try:
+            if spec is not None and spec.storage is ProfileFieldStorage.ENTRY:
+                revision = await rt.profile_service.confirm_profile_proposal(
+                    args.candidate_id, actor="user"
+                )
+            else:
+                revision = await rt.profile_service.confirm_candidate(
+                    args.candidate_id, actor="user"
+                )
+        except (ValueError, ProfileUnauthorized) as exc:
+            print(f"cannot confirm: {exc}")
+            return 1
+        print(f"confirmed {args.candidate_id} at revision {revision}")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_profile_reject(args) -> int:
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        candidate = await rt.repos.profile.get_candidate(args.candidate_id)
+        if candidate is None:
+            print(f"candidate not found: {args.candidate_id}")
+            return 1
+        spec = profile_field_spec(candidate["field_key"])
+        if spec is not None and spec.storage is ProfileFieldStorage.ENTRY:
+            await rt.profile_service.reject_profile_proposal(
+                args.candidate_id, reason="rejected_by_user"
+            )
+        else:
+            await rt.profile_service.reject_candidate(
+                args.candidate_id, reason="rejected_by_user", actor="user"
+            )
+        print(f"rejected {args.candidate_id}")
     finally:
         await db.close()
     return 0

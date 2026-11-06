@@ -164,6 +164,9 @@ class JobType(str, Enum):
     MEMORY_SAVE = "MEMORY_SAVE"
     MEMORY_CORRECTION = "MEMORY_CORRECTION"
     RESEARCH_TASK = "RESEARCH_TASK"
+    # V0.9.7: one person's turn is reviewed against their complete existing
+    # profile in the background. Never awaited by the reply path.
+    PROFILE_REVIEW = "PROFILE_REVIEW"
 
 
 class JobStatus(str, Enum):

@@ -128,6 +128,392 @@ class PersonProfileRepository:
             (_iso(utcnow()), person_id),
         )
 
+    async def bump_revision(
+        self,
+        person_id: str,
+        *,
+        expected_revision: int,
+        updated_by: str,
+        summary: Optional[str] = None,
+        mark_reviewed: bool = True,
+    ) -> int:
+        """Optimistic-concurrency revision bump.
+
+        Returns the new revision, or ``0`` when the row no longer matches
+        ``expected_revision``. The conditional ``WHERE revision = ?`` is the
+        only place a stale review may lose: it cannot overwrite a newer commit.
+        """
+        now = _iso(utcnow())
+        new_revision = int(expected_revision) + 1
+        if summary is None:
+            cur = await self.db.execute(
+                "UPDATE person_interaction_profiles SET revision = ?,"
+                " updated_at = ?, updated_by = ?,"
+                " last_reviewed_at = CASE WHEN ? THEN ? ELSE last_reviewed_at END"
+                " WHERE person_id = ? AND revision = ?",
+                (
+                    new_revision,
+                    now,
+                    updated_by,
+                    1 if mark_reviewed else 0,
+                    now,
+                    person_id,
+                    int(expected_revision),
+                ),
+            )
+        else:
+            cur = await self.db.execute(
+                "UPDATE person_interaction_profiles SET revision = ?,"
+                " updated_at = ?, updated_by = ?, compact_summary = ?,"
+                " last_reviewed_at = CASE WHEN ? THEN ? ELSE last_reviewed_at END"
+                " WHERE person_id = ? AND revision = ?",
+                (
+                    new_revision,
+                    now,
+                    updated_by,
+                    summary[:2000],
+                    1 if mark_reviewed else 0,
+                    now,
+                    person_id,
+                    int(expected_revision),
+                ),
+            )
+        return new_revision if (cur.rowcount or 0) == 1 else 0
+
+    # -- independent understanding entries (V0.9.7) ------------------------
+
+    _ENTRY_COLUMNS = (
+        "entry_id, person_id, field_key, content, status, source, confidence,"
+        " evidence_event_ids_json, evidence_memory_ids_json, merged_from_json,"
+        " superseded_by, valid_from, valid_until, created_at, updated_at"
+    )
+
+    async def get_entry(self, entry_id: str) -> Optional[dict]:
+        cur = await self.db.execute(
+            f"SELECT {self._ENTRY_COLUMNS} FROM person_profile_entries"
+            " WHERE entry_id = ?",
+            (entry_id,),
+        )
+        row = await cur.fetchone()
+        return self._entry_row(row) if row is not None else None
+
+    async def list_entries(
+        self,
+        person_id: str,
+        *,
+        statuses: Optional[tuple[str, ...]] = None,
+        field_key: Optional[str] = None,
+    ) -> list[dict]:
+        sql = (
+            f"SELECT {self._ENTRY_COLUMNS} FROM person_profile_entries"
+            " WHERE person_id = ?"
+        )
+        params: list[Any] = [person_id]
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            sql += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        if field_key is not None:
+            sql += " AND field_key = ?"
+            params.append(field_key)
+        sql += " ORDER BY created_at ASC, entry_id ASC"
+        cur = await self.db.execute(sql, tuple(params))
+        rows = await cur.fetchall()
+        return [self._entry_row(row) for row in rows]
+
+    async def insert_entry(
+        self,
+        *,
+        person_id: str,
+        field_key: str,
+        content: str,
+        status: str,
+        source: str,
+        confidence: float,
+        evidence_event_ids: list[str],
+        evidence_memory_ids: list[str],
+        merged_from: Optional[list[str]] = None,
+        valid_from: Optional[datetime] = None,
+        valid_until: Optional[datetime] = None,
+    ) -> str:
+        entry_id = new_id("pfe")
+        now = _iso(utcnow())
+        await self.db.execute(
+            "INSERT INTO person_profile_entries("
+            " entry_id, person_id, field_key, content, status, source,"
+            " confidence, evidence_event_ids_json, evidence_memory_ids_json,"
+            " merged_from_json, superseded_by, valid_from, valid_until,"
+            " created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            (
+                entry_id,
+                person_id,
+                field_key,
+                content,
+                status,
+                source,
+                float(confidence),
+                _json(sorted(set(evidence_event_ids))),
+                _json(sorted(set(evidence_memory_ids))),
+                _json(sorted(set(merged_from or []))),
+                _iso(valid_from) if valid_from is not None else None,
+                _iso(valid_until) if valid_until is not None else None,
+                now,
+                now,
+            ),
+        )
+        return entry_id
+
+    async def update_entry(
+        self,
+        entry_id: str,
+        *,
+        content: Optional[str] = None,
+        status: Optional[str] = None,
+        source: Optional[str] = None,
+        confidence: Optional[float] = None,
+        evidence_event_ids: Optional[list[str]] = None,
+        evidence_memory_ids: Optional[list[str]] = None,
+        merged_from: Optional[list[str]] = None,
+        superseded_by: Optional[str] = None,
+        valid_until: Optional[datetime] = None,
+    ) -> None:
+        entry = await self.get_entry(entry_id)
+        if entry is None:
+            return
+        await self.db.execute(
+            "UPDATE person_profile_entries SET content = ?, status = ?,"
+            " source = ?, confidence = ?, evidence_event_ids_json = ?,"
+            " evidence_memory_ids_json = ?, merged_from_json = ?,"
+            " superseded_by = ?, valid_until = ?, updated_at = ?"
+            " WHERE entry_id = ?",
+            (
+                content if content is not None else entry["content"],
+                status if status is not None else entry["status"],
+                source if source is not None else entry["source"],
+                float(confidence)
+                if confidence is not None
+                else entry["confidence"],
+                _json(
+                    sorted(
+                        set(entry["evidence_event_ids"])
+                        | set(evidence_event_ids or [])
+                    )
+                ),
+                _json(
+                    sorted(
+                        set(entry["evidence_memory_ids"])
+                        | set(evidence_memory_ids or [])
+                    )
+                ),
+                _json(
+                    sorted(set(entry["merged_from"]) | set(merged_from or []))
+                ),
+                superseded_by
+                if superseded_by is not None
+                else entry["superseded_by"],
+                _iso(valid_until)
+                if valid_until is not None
+                else (
+                    _iso(entry["valid_until"])
+                    if entry["valid_until"] is not None
+                    else None
+                ),
+                _iso(utcnow()),
+                entry_id,
+            ),
+        )
+
+    @staticmethod
+    def _entry_row(row) -> dict:
+        return {
+            "entry_id": row["entry_id"],
+            "person_id": row["person_id"],
+            "field_key": row["field_key"],
+            "content": row["content"],
+            "status": row["status"],
+            "source": row["source"],
+            "confidence": float(row["confidence"]),
+            "evidence_event_ids": _loads(row["evidence_event_ids_json"], []),
+            "evidence_memory_ids": _loads(row["evidence_memory_ids_json"], []),
+            "merged_from": _loads(row["merged_from_json"], []),
+            "superseded_by": row["superseded_by"],
+            "valid_from": _dt(row["valid_from"]),
+            "valid_until": _dt(row["valid_until"]),
+            "created_at": _dt(row["created_at"]),
+            "updated_at": _dt(row["updated_at"]),
+        }
+
+    # -- review receipts (V0.9.7) ------------------------------------------
+
+    async def ensure_review_receipt(
+        self,
+        *,
+        person_id: str,
+        source_event_id: str,
+        job_key: str,
+    ) -> str:
+        """Create (or return) the one receipt for a person's event.
+
+        The unique ``(person_id, source_event_id)`` constraint makes a retried
+        turn commit idempotent: it can never queue a second review of the same
+        event.
+        """
+        review_id = new_id("pfrv")
+        now = _iso(utcnow())
+        await self.db.execute(
+            "INSERT OR IGNORE INTO profile_review_receipts("
+            " review_id, person_id, source_event_id, job_key, status,"
+            " created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, 'PENDING', ?, ?)",
+            (review_id, person_id, source_event_id, job_key, now, now),
+        )
+        cur = await self.db.execute(
+            "SELECT review_id FROM profile_review_receipts"
+            " WHERE person_id = ? AND source_event_id = ?",
+            (person_id, source_event_id),
+        )
+        row = await cur.fetchone()
+        return row["review_id"] if row is not None else review_id
+
+    async def get_review_receipt(
+        self, person_id: str, source_event_id: str
+    ) -> Optional[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM profile_review_receipts"
+            " WHERE person_id = ? AND source_event_id = ?",
+            (person_id, source_event_id),
+        )
+        row = await cur.fetchone()
+        return self._receipt_row(row) if row is not None else None
+
+    async def get_review_receipt_by_id(self, review_id: str) -> Optional[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM profile_review_receipts WHERE review_id = ?",
+            (review_id,),
+        )
+        row = await cur.fetchone()
+        return self._receipt_row(row) if row is not None else None
+
+    async def list_review_receipts(
+        self,
+        person_id: str,
+        *,
+        status: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        sql = (
+            "SELECT * FROM profile_review_receipts WHERE person_id = ?"
+        )
+        params: list[Any] = [person_id]
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at ASC, rowid ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        cur = await self.db.execute(sql, tuple(params))
+        rows = await cur.fetchall()
+        return [self._receipt_row(row) for row in rows]
+
+    async def claim_review_receipt(self, review_id: str) -> bool:
+        """Atomically take ownership of one pending review.
+
+        Two workers may see the same pending list; only one conditional
+        ``UPDATE`` can move a row out of ``PENDING``.
+        """
+        cur = await self.db.execute(
+            "UPDATE profile_review_receipts SET status = 'RUNNING',"
+            " updated_at = ? WHERE review_id = ? AND status = 'PENDING'",
+            (_iso(utcnow()), review_id),
+        )
+        return (cur.rowcount or 0) == 1
+
+    async def recover_stale_review_receipts(
+        self, person_id: str, *, older_than_seconds: int = 900
+    ) -> int:
+        """Return a crashed worker's claimed receipt to the pending queue."""
+        from datetime import timedelta
+
+        cutoff = _iso(utcnow() - timedelta(seconds=max(60, older_than_seconds)))
+        cur = await self.db.execute(
+            "UPDATE profile_review_receipts SET status = 'PENDING',"
+            " last_error = 'stale_runner_recovered', updated_at = ?"
+            " WHERE person_id = ? AND status = 'RUNNING' AND updated_at < ?",
+            (_iso(utcnow()), person_id, cutoff),
+        )
+        return int(cur.rowcount or 0)
+
+    async def latest_review_receipt(self, person_id: str) -> Optional[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM profile_review_receipts WHERE person_id = ?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (person_id,),
+        )
+        row = await cur.fetchone()
+        return self._receipt_row(row) if row is not None else None
+
+    async def update_review_receipt(
+        self,
+        review_id: str,
+        *,
+        status: Optional[str] = None,
+        base_revision: Optional[int] = None,
+        result_revision: Optional[int] = None,
+        decision: Optional[str] = None,
+        reason: Optional[str] = None,
+        changes: Optional[list[dict]] = None,
+        increment_attempt: bool = False,
+        last_error: Optional[str] = None,
+        completed: bool = False,
+    ) -> None:
+        receipt = await self.get_review_receipt_by_id(review_id)
+        if receipt is None:
+            return
+        now = _iso(utcnow())
+        await self.db.execute(
+            "UPDATE profile_review_receipts SET status = ?, base_revision = ?,"
+            " result_revision = ?, decision = ?, reason = ?, changes_json = ?,"
+            " attempt_count = ?, last_error = ?, updated_at = ?,"
+            " completed_at = ? WHERE review_id = ?",
+            (
+                status if status is not None else receipt["status"],
+                base_revision
+                if base_revision is not None
+                else receipt["base_revision"],
+                result_revision
+                if result_revision is not None
+                else receipt["result_revision"],
+                decision if decision is not None else receipt["decision"],
+                reason if reason is not None else receipt["reason"],
+                _json(changes) if changes is not None else _json(receipt["changes"]),
+                receipt["attempt_count"] + (1 if increment_attempt else 0),
+                last_error if last_error is not None else receipt["last_error"],
+                now,
+                now if completed else receipt["completed_at"],
+                review_id,
+            ),
+        )
+
+    @staticmethod
+    def _receipt_row(row) -> dict:
+        return {
+            "review_id": row["review_id"],
+            "person_id": row["person_id"],
+            "source_event_id": row["source_event_id"],
+            "job_key": row["job_key"],
+            "status": row["status"],
+            "base_revision": row["base_revision"],
+            "result_revision": row["result_revision"],
+            "decision": row["decision"],
+            "reason": row["reason"],
+            "changes": _loads(row["changes_json"], []),
+            "attempt_count": int(row["attempt_count"] or 0),
+            "last_error": row["last_error"],
+            "created_at": _dt(row["created_at"]),
+            "updated_at": _dt(row["updated_at"]),
+            "completed_at": _dt(row["completed_at"]),
+        }
+
     # -- effective fields --------------------------------------------------
 
     async def get_field(self, person_id: str, field_key: str) -> Optional[dict]:
@@ -244,6 +630,11 @@ class PersonProfileRepository:
         evidence_event_ids: list[str],
         evidence_candidate_ids: list[str],
         reason: Optional[str] = None,
+        operation: str = "ADD",
+        target_entry_ids: Optional[list[str]] = None,
+        expected_revision: Optional[int] = None,
+        requires_confirmation: bool = False,
+        review_status: str = "PENDING",
     ) -> str:
         candidate_id = new_id("pfc")
         now = _iso(utcnow())
@@ -252,8 +643,9 @@ class PersonProfileRepository:
             " candidate_id, person_id, field_key, candidate_value_json, source,"
             " confidence, status, evidence_memory_ids_json,"
             " evidence_event_ids_json, evidence_candidate_ids_json, reason,"
-            " created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)",
+            " created_at, updated_at, operation, target_entry_ids_json,"
+            " expected_revision, requires_confirmation, review_status)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 candidate_id,
                 person_id,
@@ -267,9 +659,23 @@ class PersonProfileRepository:
                 reason,
                 now,
                 now,
+                operation,
+                _json(sorted(set(target_entry_ids or []))),
+                int(expected_revision) if expected_revision is not None else None,
+                1 if requires_confirmation else 0,
+                review_status,
             ),
         )
         return candidate_id
+
+    async def set_candidate_review_status(
+        self, candidate_id: str, review_status: str, *, reason: Optional[str] = None
+    ) -> None:
+        await self.db.execute(
+            "UPDATE person_profile_candidates SET review_status = ?,"
+            " reason = COALESCE(?, reason), updated_at = ? WHERE candidate_id = ?",
+            (review_status, reason, _iso(utcnow()), candidate_id),
+        )
 
     async def get_candidate(self, candidate_id: str) -> Optional[dict]:
         cur = await self.db.execute(
@@ -354,6 +760,27 @@ class PersonProfileRepository:
 
     @staticmethod
     def _candidate_row(row) -> dict:
+        keys = row.keys() if hasattr(row, "keys") else ()
+        extra = {
+            "operation": row["operation"] if "operation" in keys else "ADD",
+            "target_entry_ids": _loads(
+                row["target_entry_ids_json"]
+                if "target_entry_ids_json" in keys
+                else None,
+                [],
+            ),
+            "expected_revision": (
+                row["expected_revision"] if "expected_revision" in keys else None
+            ),
+            "requires_confirmation": bool(
+                row["requires_confirmation"]
+                if "requires_confirmation" in keys
+                else 0
+            ),
+            "review_status": (
+                row["review_status"] if "review_status" in keys else "PENDING"
+            ),
+        }
         return {
             "candidate_id": row["candidate_id"],
             "person_id": row["person_id"],
@@ -372,6 +799,7 @@ class PersonProfileRepository:
             "reason": row["reason"],
             "created_at": _dt(row["created_at"]),
             "updated_at": _dt(row["updated_at"]),
+            **extra,
         }
 
     # -- revisions / evidence ---------------------------------------------
@@ -544,6 +972,8 @@ class PersonProfileRepository:
             "person_profile_candidates",
             "person_profile_revisions",
             "person_profile_fields",
+            "person_profile_entries",
+            "profile_review_receipts",
             "person_interaction_profiles",
         ):
             await self.db.execute(

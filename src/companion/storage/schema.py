@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1701,6 +1701,173 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON research_tasks(status);
         CREATE INDEX IF NOT EXISTS idx_research_origin_status
             ON research_tasks(origin, status);
+        """,
+    ),
+    # Version 25 (V0.9.7): profile-aware continuous refinement.
+    #
+    # The pre-V0.9.7 profile stores one effective value per field, which makes
+    # an independent interest or project impossible to update without rewriting
+    # the whole value. ``person_profile_entries`` adds independent, traceable
+    # rows while the existing field table, candidates and revisions stay
+    # intact. Old multi-value fields are converted once, with their original
+    # source/confidence/evidence preserved. Nothing is deleted: an old field
+    # row remains readable and a review receipt records each processed turn.
+    (
+        25,
+        """
+        CREATE TABLE IF NOT EXISTS person_profile_entries (
+            entry_id                  TEXT PRIMARY KEY,
+            person_id                 TEXT NOT NULL
+                                      REFERENCES persons(person_id) ON DELETE CASCADE,
+            field_key                 TEXT NOT NULL,
+            content                   TEXT NOT NULL,
+            status                    TEXT NOT NULL DEFAULT 'ACTIVE',
+            source                    TEXT NOT NULL DEFAULT 'INTERACTION_INFERENCE',
+            confidence                REAL NOT NULL DEFAULT 0.5,
+            evidence_event_ids_json   TEXT NOT NULL DEFAULT '[]',
+            evidence_memory_ids_json  TEXT NOT NULL DEFAULT '[]',
+            merged_from_json          TEXT NOT NULL DEFAULT '[]',
+            superseded_by             TEXT,
+            valid_from                TEXT,
+            valid_until               TEXT,
+            created_at                TEXT NOT NULL,
+            updated_at                TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_entries_person
+            ON person_profile_entries(person_id, field_key, status);
+        CREATE INDEX IF NOT EXISTS idx_profile_entries_effective
+            ON person_profile_entries(person_id, status, updated_at);
+
+        -- A synthetic/legacy database may declare a high version without the
+        -- V0.7 profile tables having been materialised. Ensure the base table
+        -- exists before the additive ALTERs; a normal database keeps its rows.
+        CREATE TABLE IF NOT EXISTS person_profile_candidates (
+            candidate_id             TEXT PRIMARY KEY,
+            person_id                TEXT NOT NULL
+                                     REFERENCES persons(person_id) ON DELETE CASCADE,
+            field_key                TEXT NOT NULL,
+            candidate_value_json     TEXT NOT NULL,
+            source                   TEXT NOT NULL,
+            confidence               REAL NOT NULL DEFAULT 0,
+            status                   TEXT NOT NULL DEFAULT 'PENDING',
+            evidence_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+            evidence_event_ids_json  TEXT NOT NULL DEFAULT '[]',
+            evidence_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+            reason                   TEXT,
+            created_at               TEXT NOT NULL,
+            updated_at               TEXT NOT NULL
+        );
+
+        ALTER TABLE person_profile_candidates
+            ADD COLUMN operation TEXT NOT NULL DEFAULT 'ADD';
+        ALTER TABLE person_profile_candidates
+            ADD COLUMN target_entry_ids_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE person_profile_candidates
+            ADD COLUMN expected_revision INTEGER;
+        ALTER TABLE person_profile_candidates
+            ADD COLUMN requires_confirmation INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE person_profile_candidates
+            ADD COLUMN review_status TEXT NOT NULL DEFAULT 'PENDING';
+
+        CREATE TABLE IF NOT EXISTS profile_review_receipts (
+            review_id       TEXT PRIMARY KEY,
+            person_id       TEXT NOT NULL
+                            REFERENCES persons(person_id) ON DELETE CASCADE,
+            source_event_id TEXT NOT NULL,
+            job_key         TEXT NOT NULL DEFAULT '',
+            status          TEXT NOT NULL DEFAULT 'PENDING',
+            base_revision   INTEGER,
+            result_revision INTEGER,
+            decision        TEXT,
+            reason          TEXT,
+            changes_json    TEXT NOT NULL DEFAULT '[]',
+            attempt_count   INTEGER NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            completed_at    TEXT,
+            UNIQUE (person_id, source_event_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_receipts_person
+            ON profile_review_receipts(person_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_profile_receipts_event
+            ON profile_review_receipts(source_event_id);
+
+        INSERT INTO person_profile_entries(
+            entry_id, person_id, field_key, content, status, source,
+            confidence, evidence_event_ids_json, evidence_memory_ids_json,
+            merged_from_json, created_at, updated_at)
+        SELECT 'pfe_mig_' || lower(hex(randomblob(8))), person_id, field_key,
+               label, 'ACTIVE', source, confidence, event_ids, memory_ids,
+               '[]', created_at, updated_at
+        FROM (
+            SELECT f.person_id AS person_id,
+                   CASE f.field_key
+                       WHEN 'understanding.interests' THEN 'interests.topics'
+                       WHEN 'understanding.ongoing_projects' THEN 'projects.active'
+                       WHEN 'understanding.usual_activities' THEN 'habits.stable_habits'
+                       WHEN 'understanding.personal_goals' THEN 'goals.general'
+                       WHEN 'interaction.recurring_topics' THEN 'interaction.recurring_patterns'
+                       WHEN 'interaction.communication_feedback' THEN 'interaction.communication_feedback'
+                   END AS field_key,
+                   trim(json_extract(j.value, '$.label')) AS label,
+                   f.source AS source,
+                   f.confidence AS confidence,
+                   f.evidence_event_ids_json AS event_ids,
+                   f.evidence_memory_ids_json AS memory_ids,
+                   f.created_at AS created_at,
+                   f.updated_at AS updated_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY f.person_id, f.field_key,
+                                    lower(trim(json_extract(j.value, '$.label')))
+                       ORDER BY f.updated_at ASC
+                   ) AS rn
+            FROM person_profile_fields f, json_each(f.value_json) j
+            WHERE f.field_key IN (
+                    'understanding.interests',
+                    'understanding.ongoing_projects',
+                    'understanding.usual_activities',
+                    'understanding.personal_goals',
+                    'interaction.recurring_topics',
+                    'interaction.communication_feedback'
+                  )
+              AND f.status = 'ACTIVE'
+              AND trim(json_extract(j.value, '$.label')) IS NOT NULL
+              AND trim(json_extract(j.value, '$.label')) <> ''
+        ) converted
+        WHERE rn = 1;
+
+        INSERT INTO person_profile_entries(
+            entry_id, person_id, field_key, content, status, source,
+            confidence, evidence_event_ids_json, evidence_memory_ids_json,
+            merged_from_json, created_at, updated_at)
+        SELECT 'pfe_mig_' || lower(hex(randomblob(8))), person_id,
+               CASE field_key
+                   WHEN 'understanding.occupation' THEN 'background.occupation'
+                   WHEN 'interaction.familiarity_notes' THEN 'interaction.familiarity_notes'
+               END,
+               trim(json_extract(value_json, '$')), 'ACTIVE', source,
+               confidence, evidence_event_ids_json, evidence_memory_ids_json,
+               '[]', created_at, updated_at
+        FROM person_profile_fields
+        WHERE field_key IN (
+                'understanding.occupation',
+                'interaction.familiarity_notes'
+              )
+          AND status = 'ACTIVE'
+          AND trim(json_extract(value_json, '$')) IS NOT NULL
+          AND trim(json_extract(value_json, '$')) <> ''
+          AND lower(trim(json_extract(value_json, '$'))) <> 'unknown'
+          AND NOT EXISTS (
+              SELECT 1 FROM person_profile_entries e
+              WHERE e.person_id = person_profile_fields.person_id
+                AND e.field_key = CASE person_profile_fields.field_key
+                        WHEN 'understanding.occupation' THEN 'background.occupation'
+                        WHEN 'interaction.familiarity_notes' THEN 'interaction.familiarity_notes'
+                    END
+          );
         """,
     ),
 ]

@@ -126,7 +126,9 @@ class RoutingContextBuilder:
                     type(exc).__name__,
                 )
 
-        profile_context = await self._profile_context(event.speaker_person_id)
+        profile_context, profile_revision = await self._profile_context(
+            event.speaker_person_id, query=event.text
+        )
         visible_ids = [turn["event_id"] for turn in turns]
         # One text per visible turn, index-aligned for evidence validation.
         authorized_texts = [str(turn.get("text") or "") for turn in turns]
@@ -151,6 +153,7 @@ class RoutingContextBuilder:
             },
             compact_scene=scene,
             compact_person_profile=profile_context,
+            compact_person_profile_revision=profile_revision,
             available_tool_specs=specs,
             visible_event_ids=visible_ids,
             authorized_history_texts=authorized_texts,
@@ -230,20 +233,29 @@ class RoutingContextBuilder:
                 records.append(record.model_dump())
         return records[-8:]
 
-    async def _profile_context(self, person_id) -> Optional[str]:
+    async def _profile_context(
+        self, person_id, *, query: str = ""
+    ) -> tuple[Optional[str], Optional[int]]:
         if self.profile_service is None or person_id is None:
-            return None
+            return None, None
         if not await self.registry.is_authorized(person_id):
-            return None
+            return None, None
         consent = await self.repos.person.get_consent(person_id)
         if (
             consent is None
             or not consent.allow_persistence
             or not consent.allow_external_ai
         ):
-            return None
+            return None, None
         profile = await self.profile_service.get(person_id)
-        return compile_profile_context(profile)
+        if profile is None:
+            return None, None
+        # One read per turn: the speaker reuses this same block, so the router
+        # and the reply cannot silently see two different profile revisions.
+        return (
+            compile_profile_context(profile, query=query),
+            int(profile.metadata.revision),
+        )
 
     @staticmethod
     def speaker_context(

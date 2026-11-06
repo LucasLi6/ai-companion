@@ -33,6 +33,10 @@ from companion.emotion.repository import EmotionRepository
 from companion.emotion.service import EmotionService
 from companion.jobs.embedding_handler import build_embedding_handler
 from companion.jobs.handlers import build_turn_analysis_handler, memory_consolidation
+from companion.jobs.profile_review import (
+    ProfileReviewScheduler,
+    build_profile_review_handler,
+)
 from companion.jobs.worker import JobWorker
 from companion.memory.consolidation import MemoryWriter
 from companion.memory.embedding_repository import EmbeddingRepository
@@ -43,6 +47,10 @@ from companion.memory.service import MemoryService, build_memory_service
 from companion.memory.store import SqliteMemoryStore
 from companion.people.registry import PersonRegistry
 from companion.people.profile_learning import PersonProfileLearningService
+from companion.people.profile_refinement import (
+    ProfileRefinementEngine,
+    ProfileReviewContextSource,
+)
 from companion.people.profile_service import PersonProfileService
 from companion.privacy.data_control import DataControlService
 from companion.providers.deepseek_client import (
@@ -51,6 +59,10 @@ from companion.providers.deepseek_client import (
     load_deepseek_config,
 )
 from companion.providers.deepseek_cognitive import DeepSeekCognitiveProvider
+from companion.providers.deepseek_profile import (
+    DeepSeekProfileRefinementProvider,
+    MockProfileRefinementProvider,
+)
 from companion.providers.deepseek_response import DeepSeekResponseProvider
 from companion.providers.deepseek_router import DeepSeekRouterProvider
 from companion.providers.mock import MockCognitiveProvider, MockResponseProvider
@@ -111,6 +123,7 @@ class Runtime:
     data_control: object = None
     task_service: Optional[TaskService] = None
     research_engine: object = None
+    profile_refinement_engine: object = None
 
 
 def build_runtime(
@@ -135,6 +148,8 @@ def build_runtime(
     web_search_provider=None,
     turn_analysis_delay_seconds: Optional[float] = None,
     real_idle_provider: Optional[bool] = None,
+    profile_refinement_provider=None,
+    profile_review_delay_seconds: float = 30.0,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
 
@@ -397,6 +412,40 @@ def build_runtime(
         logger=logger,
     )
 
+    # V0.9.7: background profile refinement. The engine is only wired when a
+    # worker can process its durable jobs. It reuses the same DeepSeek client
+    # and the same privacy gateway as the foreground path; it never runs
+    # inside the reply path and never writes the database itself.
+    profile_refinement_engine = None
+    profile_review_scheduler = None
+    if with_worker:
+        if profile_refinement_provider is None:
+            if provider == "deepseek" and deepseek_client is not None:
+                profile_refinement_provider = DeepSeekProfileRefinementProvider(
+                    deepseek_client, logger=logger
+                )
+            else:
+                profile_refinement_provider = MockProfileRefinementProvider()
+        review_gateway = gateway or ForegroundPrivacyGateway(
+            registry, logger=logger
+        )
+        profile_refinement_engine = ProfileRefinementEngine(
+            profile_service,
+            repos.profile,
+            profile_refinement_provider,
+            ProfileReviewContextSource(
+                repos, privacy_gateway=review_gateway, logger=logger
+            ),
+            logger=logger,
+        )
+        profile_review_scheduler = ProfileReviewScheduler(
+            repos.profile,
+            repos.job,
+            persons=repos.person,
+            delay_seconds=profile_review_delay_seconds,
+            logger=logger,
+        )
+
     worker = None
     if with_worker:
         handlers = {"MEMORY_CONSOLIDATION": memory_consolidation}
@@ -416,6 +465,10 @@ def build_runtime(
         handlers[JobType.RESEARCH_TASK.value] = build_research_task_handler(
             research_engine
         )
+        if profile_refinement_engine is not None:
+            handlers[JobType.PROFILE_REVIEW.value] = build_profile_review_handler(
+                profile_refinement_engine, logger=logger
+            )
         worker = JobWorker(repos, handlers, logger=logger)
 
     # V0.9: one entry point for foreground and background off-task work. The
@@ -426,6 +479,7 @@ def build_runtime(
         JobType.TURN_ANALYSIS.value,
         JobType.MEMORY_SAVE.value,
         JobType.MEMORY_CORRECTION.value,
+        JobType.PROFILE_REVIEW.value,
     }
 
     def _task_event_id(request) -> Optional[str]:
@@ -443,7 +497,7 @@ def build_runtime(
         if event_id:
             return str(event_id)
         payload = request.payload or {}
-        event_id = payload.get("event_id")
+        event_id = payload.get("event_id") or payload.get("source_event_id")
         if not event_id and isinstance(payload.get("event"), dict):
             event_id = payload["event"].get("event_id")
         return str(event_id) if event_id else None
@@ -465,21 +519,31 @@ def build_runtime(
             JobType.MEMORY_SAVE.value,
             JobType.MEMORY_CORRECTION.value,
         }
+        profile_review = request.type == JobType.PROFILE_REVIEW.value
         event_id = _task_event_id(request)
         if not event_id:
             # An explicit memory write always names its source event. A missing
             # reference is unverifiable, not a default grant.
-            return not explicit
+            return not explicit and not profile_review
         event = await repos.utterance.get(event_id)
         if event is None or event.speaker_person_id is None:
             # Extraction of synthetic/legacy rows keeps the pre-V0.9 behaviour.
-            return not explicit
+            return not explicit and not profile_review
         consent = await repos.person.get_consent(event.speaker_person_id)
         if consent is None:
             return False
         allowed = bool(consent.allow_processing and consent.allow_persistence)
         if explicit:
             allowed = allowed and bool(consent.allow_memory_learning)
+        if profile_review:
+            # A profile review uploads the person's context and existing
+            # understanding to an external model, so it needs both the
+            # learning grant and the external-AI grant, re-read live.
+            allowed = (
+                allowed
+                and bool(consent.allow_memory_learning)
+                and bool(consent.allow_external_ai)
+            )
         return allowed
 
     async def task_claim_gate(request):
@@ -556,6 +620,7 @@ def build_runtime(
         runtime_snapshot_builder=runtime_snapshot_builder,
         metrics=metrics,
         profile_learning=profile_learning,
+        profile_review=profile_review_scheduler,
         fast_path_enabled=bool(fast_path_enabled),
         router_mode=resolved_mode,
         routing_context_builder=routing_builder,
@@ -604,4 +669,5 @@ def build_runtime(
         data_control=data_control,
         task_service=task_service,
         research_engine=research_engine,
+        profile_refinement_engine=profile_refinement_engine,
     )

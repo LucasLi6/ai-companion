@@ -21,9 +21,12 @@ Rules enforced here (V0.7):
 
 from __future__ import annotations
 
+import re
+from datetime import datetime
 from typing import Any, Iterable, Optional
 
 from companion.domain.enums import RegistrationStatus
+from companion.domain.models import utcnow
 from companion.people.profile_compiler import compile_profile_context
 from companion.people.profile_models import (
     CandidateStatus,
@@ -31,14 +34,39 @@ from companion.people.profile_models import (
     MAX_LIST_ITEMS,
     PersonInteractionProfile,
     ProfileCandidate,
+    ProfileEntry,
+    ProfileEntryStatus,
     ProfileField,
     ProfileFieldStatus,
+    ProfileFieldStorage,
     ProfileMetadata,
     ProfileSource,
+    profile_field_spec,
     validate_field_value,
+)
+from companion.people.profile_refinement import (
+    FullProfileSnapshot,
+    ProfileApplyResult,
+    ProfileChangeProposal,
+    ProfileReviewResult,
+    SnapshotEntry,
+    ValidatedChange,
 )
 from companion.people.profile_repository import PersonProfileRepository
 from companion.storage.repositories import AuditRepository, PersonRepository
+
+MAX_REFINEMENT_CHANGES = 5
+_IDENTITY_LABELS = {
+    "identity.name": "name",
+    "identity.preferred_name": "preferred_name",
+    "identity.gender_identity": "gender_identity",
+    "identity.pronouns": "pronouns",
+}
+_SENSITIVE_CONTENT = re.compile(
+    r"(健康|疾病|病历|诊断|医院|用药|药物|抑郁|焦虑症|"
+    r"银行|信用卡|贷款|工资|收入|存款|密码|"
+    r"住址|家庭地址|身份证|护照号)"
+)
 
 _SENTINEL = object()
 
@@ -78,6 +106,18 @@ class PersonProfileService:
         consent = await self.persons.get_consent(person_id)
         return bool(consent and consent.allow_memory_learning)
 
+    async def can_use_external_ai(self, person_id: str) -> bool:
+        """Whether this person's profile may be sent to an external model.
+
+        Local learning is not permission to upload private context: the
+        external-AI grant is checked independently and re-checked at apply
+        time, after the model has already run.
+        """
+        if not await self.can_persist(person_id):
+            return False
+        consent = await self.persons.get_consent(person_id)
+        return bool(consent and consent.allow_external_ai)
+
     # -- reads -------------------------------------------------------------
 
     async def get(self, person_id: str) -> Optional[PersonInteractionProfile]:
@@ -89,6 +129,7 @@ class PersonProfileService:
             item["field_key"]: self._field_model(item)
             for item in await self.repo.list_fields(person_id)
         }
+        entries = self._group_entries(await self.repo.list_entries(person_id))
         candidates = [
             self._candidate_model(item)
             for item in await self.repo.list_candidates(person_id)
@@ -98,6 +139,11 @@ class PersonProfileService:
             display_name=person.display_name if person is not None else "unknown",
             relationship_tier=row["relationship_tier"] or "STRANGER",
             fields=fields,
+            entries=entries,
+            identity=self._identity_view(entries),
+            relationship=self._relationship_view(
+                entries, row["relationship_tier"] or "STRANGER"
+            ),
             candidates=candidates,
             compact_summary=row["compact_summary"] or "",
             metadata=ProfileMetadata(
@@ -109,6 +155,88 @@ class PersonProfileService:
                 updated_by=row["updated_by"] or "system",
             ),
         )
+
+    async def get_full_snapshot(
+        self, person_id: str
+    ) -> Optional[FullProfileSnapshot]:
+        """Read everything one review needs, from one consistent DB view.
+
+        The whole profile is read at the program layer — the model is not given
+        the Speaker's 600-character budget. The read transaction keeps the row,
+        revision, entries, fields and pending candidates from the same instant.
+        """
+        if not await self.can_persist(person_id):
+            return None
+        async with self.repo.db.transaction():
+            row = await self.repo.get(person_id)
+            if row is None:
+                return None
+            person = await self.persons.get(person_id)
+            fields = {
+                item["field_key"]: item
+                for item in await self.repo.list_fields(person_id)
+            }
+            entries = self._group_entries(
+                await self.repo.list_entries(
+                    person_id,
+                    statuses=(
+                        ProfileEntryStatus.ACTIVE.value,
+                        ProfileEntryStatus.TENTATIVE.value,
+                    ),
+                )
+            )
+            candidates = await self.repo.list_candidates(person_id)
+            pending = [
+                {
+                    "candidate_id": item["candidate_id"],
+                    "field_key": item["field_key"],
+                    "operation": item.get("operation") or "ADD",
+                    "proposed_content": item["candidate_value"],
+                    "target_entry_ids": item.get("target_entry_ids") or [],
+                    "status": item["status"],
+                    "review_status": item.get("review_status") or "PENDING",
+                    "confidence": item["confidence"],
+                    "requires_confirmation": bool(
+                        item.get("requires_confirmation")
+                    ),
+                }
+                for item in candidates
+                if item["status"] in (
+                    CandidateStatus.PENDING.value,
+                    CandidateStatus.NEEDS_REVIEW.value,
+                )
+            ]
+            tier = row["relationship_tier"] or "STRANGER"
+            return FullProfileSnapshot(
+                person_id=person_id,
+                revision=int(row["revision"] or 1),
+                display_name=(
+                    person.display_name if person is not None else "unknown"
+                ),
+                identity=self._identity_view(entries),
+                relationship=self._relationship_view(entries, tier),
+                communication=self._category_view(entries, fields, "communication"),
+                personality=self._category_view(entries, fields, "personality"),
+                interests=self._category_view(entries, fields, "interests"),
+                knowledge=self._category_view(entries, fields, "knowledge"),
+                background=self._category_view(entries, fields, "background"),
+                projects=self._category_view(entries, fields, "projects"),
+                goals=self._category_view(entries, fields, "goals"),
+                habits=self._category_view(entries, fields, "habits"),
+                values=self._category_view(entries, fields, "values"),
+                interaction=self._category_view(entries, fields, "interaction"),
+                entries={
+                    key: [self._snapshot_entry(entry) for entry in items]
+                    for key, items in entries.items()
+                },
+                legacy_fields={
+                    key: value["value"] for key, value in fields.items()
+                },
+                pending_candidates=pending,
+                compact_summary=row["compact_summary"] or "",
+                updated_at=row["updated_at"],
+                last_reviewed_at=row["last_reviewed_at"],
+            )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -434,12 +562,32 @@ class PersonProfileService:
                 )
                 return same["candidate_id"]
 
+            explicit = ProfileSource(source).value in (
+                ProfileSource.DIRECT_SELF_REPORT.value,
+                ProfileSource.USER_CORRECTION.value,
+                ProfileSource.ADMIN.value,
+            )
             for item in pending:
-                await self.repo.set_candidate_status(
-                    item["candidate_id"],
-                    CandidateStatus.SUPERSEDED.value,
-                    reason="superseded_by_new_evidence",
-                )
+                if explicit:
+                    # A new explicit statement genuinely replaces an earlier
+                    # *pending inference*. This is the only superseding case.
+                    await self.repo.set_candidate_status(
+                        item["candidate_id"],
+                        CandidateStatus.SUPERSEDED.value,
+                        reason="superseded_by_explicit_report",
+                    )
+                elif field_key in LIST_FIELDS:
+                    # Multi-value understanding coexists: "robot dog" and
+                    # "jazz" are both true and neither replaces the other.
+                    continue
+                else:
+                    # Two incompatible inferred values for one scalar field are
+                    # a conflict for a person to review, not a silent winner.
+                    await self.repo.set_candidate_status(
+                        item["candidate_id"],
+                        CandidateStatus.NEEDS_REVIEW.value,
+                        reason="conflicts_with_pending_candidate",
+                    )
             candidate_id = await self.repo.insert_candidate(
                 person_id=person_id,
                 field_key=field_key,
@@ -552,6 +700,814 @@ class PersonProfileService:
         await self.repo.set_candidate_status(
             candidate_id, CandidateStatus.REJECTED.value, reason=reason
         )
+
+    # -- V0.9.7 refinement -------------------------------------------------
+
+    async def apply_refinement(
+        self,
+        person_id: str,
+        decision: Any,
+        *,
+        source_event_id: Optional[str] = None,
+        actor: str = "profile_refinement",
+    ) -> ProfileApplyResult:
+        """Validate and apply one review's proposals atomically.
+
+        The model never reaches this method directly. ``decision`` carries
+        proposals that the engine already checked against the *existing*
+        snapshot; this method re-checks authorization, revision, ownership,
+        evidence and limits, then commits everything in one SQLite
+        transaction. A stale ``base_revision`` is reported, never overwritten.
+        """
+        status = str(getattr(decision, "status", "") or "")
+        base_revision = int(getattr(decision, "base_revision", 0) or 0)
+        source_event_id = source_event_id or getattr(
+            decision, "source_event_id", None
+        )
+        reason = str(getattr(decision, "reason", "") or "")
+        if status == "NO_PROFILE":
+            return ProfileApplyResult(
+                person_id=person_id,
+                source_event_id=source_event_id,
+                status="NO_PROFILE",
+                base_revision=base_revision,
+                reason=reason,
+            )
+        if not await self.can_learn(person_id):
+            return ProfileApplyResult(
+                person_id=person_id,
+                source_event_id=source_event_id,
+                status="UNAUTHORIZED",
+                base_revision=base_revision,
+                reason="learning_or_persistence_not_authorized",
+            )
+        if not await self.can_use_external_ai(person_id):
+            return ProfileApplyResult(
+                person_id=person_id,
+                source_event_id=source_event_id,
+                status="UNAUTHORIZED",
+                base_revision=base_revision,
+                reason="external_ai_not_authorized",
+            )
+
+        # Idempotency: a retried job whose first attempt committed but whose
+        # receipt update failed must not add a second revision or duplicate an
+        # ADD/MERGE.
+        if source_event_id:
+            for revision in await self.repo.list_revisions(person_id):
+                if (
+                    revision["source_event_id"] == source_event_id
+                    and revision["changed_by"] == "profile_refinement"
+                ):
+                    return ProfileApplyResult(
+                        person_id=person_id,
+                        source_event_id=source_event_id,
+                        status="ALREADY_APPLIED",
+                        base_revision=base_revision,
+                        new_revision=revision["revision"],
+                        reason="same_event_already_applied",
+                    )
+
+        accepted, pending, rejected = self._classify_changes(decision)
+        accepted, late_pending, late_rejected = await self._precheck_changes(
+            person_id, accepted
+        )
+        pending.extend(late_pending)
+        rejected.extend(late_rejected)
+
+        if not accepted:
+            async with self.repo.db.transaction():
+                row = await self.repo.get(person_id)
+                if row is None:
+                    return ProfileApplyResult(
+                        person_id=person_id,
+                        source_event_id=source_event_id,
+                        status="UNAUTHORIZED",
+                        base_revision=base_revision,
+                        reason="no_profile",
+                    )
+                if int(row["revision"] or 1) != base_revision:
+                    return ProfileApplyResult(
+                        person_id=person_id,
+                        source_event_id=source_event_id,
+                        status="REVISION_CONFLICT",
+                        base_revision=base_revision,
+                        reason="profile_revision_changed",
+                    )
+                for change in pending:
+                    await self._store_pending_candidate(
+                        person_id, change, base_revision
+                    )
+                await self.repo.set_reviewed(person_id)
+            return ProfileApplyResult(
+                person_id=person_id,
+                source_event_id=source_event_id,
+                status="PENDING_CONFIRMATION" if pending else "NO_CHANGE",
+                base_revision=base_revision,
+                pending=[self._pending_summary(change) for change in pending],
+                rejected=rejected,
+                reason=reason,
+            )
+
+        async with self.repo.db.transaction():
+            row = await self.repo.get(person_id)
+            if row is None:
+                return ProfileApplyResult(
+                    person_id=person_id,
+                    source_event_id=source_event_id,
+                    status="UNAUTHORIZED",
+                    base_revision=base_revision,
+                    reason="no_profile",
+                )
+            if int(row["revision"] or 1) != base_revision:
+                # Do not just swap in the latest revision: the caller reloads
+                # and re-evaluates whether the old proposals still hold.
+                return ProfileApplyResult(
+                    person_id=person_id,
+                    source_event_id=source_event_id,
+                    status="REVISION_CONFLICT",
+                    base_revision=base_revision,
+                    reason="profile_revision_changed",
+                )
+            new_revision = await self.repo.bump_revision(
+                person_id,
+                expected_revision=base_revision,
+                updated_by="profile_refinement",
+                mark_reviewed=True,
+            )
+            if not new_revision:
+                return ProfileApplyResult(
+                    person_id=person_id,
+                    source_event_id=source_event_id,
+                    status="REVISION_CONFLICT",
+                    base_revision=base_revision,
+                    reason="profile_revision_changed",
+                )
+            applied: list[dict] = []
+            for change in accepted:
+                applied.append(
+                    await self._apply_change_locked(
+                        person_id,
+                        change,
+                        revision=new_revision,
+                        source_event_id=source_event_id,
+                        confirmed=False,
+                        actor=actor,
+                    )
+                )
+            stored_pending = []
+            for change in pending:
+                await self._store_pending_candidate(
+                    person_id, change, base_revision
+                )
+                stored_pending.append(self._pending_summary(change))
+            await self.repo.insert_revision(
+                person_id=person_id,
+                revision=new_revision,
+                changes={
+                    "changes": applied,
+                    "pending": stored_pending,
+                    "rejected": rejected,
+                },
+                changed_by=actor,
+                source_event_id=source_event_id,
+                reason=reason or "profile_refinement",
+            )
+            await self._refresh_summary(person_id)
+
+        await self._audit_field(
+            actor,
+            "profile_refinement_applied",
+            person_id,
+            ",".join(sorted({item["field_key"] for item in applied}))[:200],
+            ProfileSource.INTERACTION_INFERENCE.value,
+        )
+        return ProfileApplyResult(
+            person_id=person_id,
+            source_event_id=source_event_id,
+            status="APPLIED" if not stored_pending else "APPLIED_WITH_PENDING",
+            base_revision=base_revision,
+            new_revision=new_revision,
+            applied=applied,
+            pending=stored_pending,
+            rejected=rejected,
+            reason=reason,
+        )
+
+    async def confirm_profile_proposal(
+        self,
+        candidate_id: str,
+        *,
+        actor: str = "user",
+        reason: Optional[str] = None,
+    ) -> int:
+        """Apply a pending refinement proposal after explicit confirmation.
+
+        This is the trusted path for strict identity (and other pending)
+        changes. The candidate's content is treated as confirmed, but the
+        person's permission and the profile's current revision are still
+        checked; a stale candidate cannot be applied over a newer revision.
+        """
+        candidate = await self.repo.get_candidate(candidate_id)
+        if candidate is None:
+            raise ValueError(f"unknown candidate {candidate_id!r}")
+        if candidate["status"] not in (
+            CandidateStatus.PENDING.value,
+            CandidateStatus.NEEDS_REVIEW.value,
+        ):
+            raise ValueError(f"candidate {candidate_id!r} is {candidate['status']}")
+        spec = profile_field_spec(candidate["field_key"])
+        if spec is None or spec.storage is not ProfileFieldStorage.ENTRY:
+            raise ValueError("candidate is not an understanding entry proposal")
+        person_id = candidate["person_id"]
+        if not await self.can_learn(person_id):
+            raise ProfileUnauthorized(person_id)
+        proposal = ProfileChangeProposal(
+            operation=candidate.get("operation") or "ADD",
+            field_key=candidate["field_key"],
+            target_entry_ids=list(candidate.get("target_entry_ids") or []),
+            proposed_content=str(candidate["candidate_value"] or ""),
+            evidence_event_ids=list(candidate["evidence_event_ids"]),
+            confidence=float(candidate["confidence"] or 0.0),
+            requires_confirmation=True,
+        )
+        change = ValidatedChange(proposal=proposal, auto_apply=False)
+        async with self.repo.db.transaction():
+            row = await self.repo.get(person_id)
+            if row is None:
+                raise ProfileUnauthorized(person_id)
+            revision = await self.repo.bump_revision(
+                person_id,
+                expected_revision=int(row["revision"] or 1),
+                updated_by=actor,
+                mark_reviewed=True,
+            )
+            if not revision:
+                raise ValueError("profile revision changed; confirm again")
+            applied = await self._apply_change_locked(
+                person_id,
+                change,
+                revision=revision,
+                source_event_id=None,
+                confirmed=True,
+                actor=actor,
+            )
+            await self.repo.set_candidate_status(
+                candidate_id,
+                CandidateStatus.CONFIRMED.value,
+                reason=reason or "confirmed_by_person",
+            )
+            await self.repo.insert_revision(
+                person_id=person_id,
+                revision=revision,
+                changes={
+                    "changes": [applied],
+                    "candidate_id": candidate_id,
+                    "confirmed": True,
+                },
+                changed_by=actor,
+                source_event_id=None,
+                reason=reason or "profile_proposal_confirmed",
+            )
+            await self._refresh_summary(person_id)
+        await self._audit_field(
+            actor,
+            "profile_proposal_confirmed",
+            person_id,
+            candidate["field_key"],
+            candidate["source"],
+        )
+        return revision
+
+    async def reject_profile_proposal(
+        self, candidate_id: str, *, reason: str = "rejected_by_person"
+    ) -> None:
+        candidate = await self.repo.get_candidate(candidate_id)
+        if candidate is None:
+            return
+        if candidate["status"] not in (
+            CandidateStatus.PENDING.value,
+            CandidateStatus.NEEDS_REVIEW.value,
+        ):
+            return
+        await self.repo.set_candidate_status(
+            candidate_id, CandidateStatus.REJECTED.value, reason=reason
+        )
+
+    # -- refinement internals ---------------------------------------------
+
+    @staticmethod
+    def _classify_changes(decision: Any):
+        accepted: list[ValidatedChange] = []
+        pending: list[ValidatedChange] = []
+        rejected: list[dict] = []
+        if isinstance(decision, ProfileReviewResult):
+            for change in decision.changes:
+                if not change.accepted:
+                    continue
+                if change.auto_apply:
+                    accepted.append(change)
+                else:
+                    pending.append(change)
+            rejected.extend(decision.rejected)
+            return accepted, pending, rejected
+        for item in getattr(decision, "changes", []) or []:
+            if isinstance(item, ValidatedChange):
+                (accepted if item.auto_apply else pending).append(item)
+            elif isinstance(item, ProfileChangeProposal):
+                pending.append(ValidatedChange(proposal=item, auto_apply=False))
+            else:
+                rejected.append({"reason": "unsupported_change"})
+        return accepted, pending, rejected
+
+    async def _precheck_changes(
+        self, person_id: str, changes: list[ValidatedChange]
+    ):
+        """Defence in depth around the engine's validation.
+
+        These checks are deliberately conservative: anything that cannot be
+        proven safe becomes a pending proposal instead of an automatic write.
+        """
+        accepted: list[ValidatedChange] = []
+        pending: list[ValidatedChange] = []
+        rejected: list[dict] = []
+        entries = {
+            item["entry_id"]: item
+            for item in await self.repo.list_entries(
+                person_id,
+                statuses=(
+                    ProfileEntryStatus.ACTIVE.value,
+                    ProfileEntryStatus.TENTATIVE.value,
+                ),
+            )
+        }
+        event_ids: set[str] = set()
+        for change in changes[:MAX_REFINEMENT_CHANGES]:
+            proposal = change.proposal
+            spec = profile_field_spec(proposal.field_key)
+            if spec is None or spec.storage is not ProfileFieldStorage.ENTRY:
+                rejected.append(
+                    {
+                        "operation": proposal.operation,
+                        "field_key": proposal.field_key,
+                        "reason": "field_not_refinable",
+                    }
+                )
+                continue
+            if spec.strict_identity or not spec.model_writable:
+                pending.append(
+                    change.model_copy(
+                        update={"auto_apply": False,
+                                "pending_reason": "confirmed_identity_requires_confirmation"}
+                    )
+                )
+                continue
+            if _SENSITIVE_CONTENT.search(proposal.proposed_content or ""):
+                pending.append(
+                    change.model_copy(
+                        update={"auto_apply": False,
+                                "pending_reason": "sensitive_field_requires_review"}
+                    )
+                )
+                continue
+            targets = list(dict.fromkeys(proposal.target_entry_ids))
+            if proposal.operation == "ADD" and targets:
+                rejected.append(
+                    {
+                        "operation": proposal.operation,
+                        "field_key": proposal.field_key,
+                        "reason": "add_must_not_target_entries",
+                    }
+                )
+                continue
+            if proposal.operation in (
+                "UPDATE",
+                "CORRECT",
+                "MERGE",
+                "REFINE",
+                "ARCHIVE",
+            ):
+                if not targets:
+                    rejected.append(
+                        {
+                            "operation": proposal.operation,
+                            "field_key": proposal.field_key,
+                            "reason": "missing_target_entry_ids",
+                        }
+                    )
+                    continue
+                found = [entries.get(entry_id) for entry_id in targets]
+                if any(item is None for item in found):
+                    rejected.append(
+                        {
+                            "operation": proposal.operation,
+                            "field_key": proposal.field_key,
+                            "reason": "target_entry_not_in_this_profile",
+                        }
+                    )
+                    continue
+                if any(
+                    item["field_key"] != proposal.field_key for item in found
+                ) and proposal.operation in ("MERGE", "REFINE"):
+                    rejected.append(
+                        {
+                            "operation": proposal.operation,
+                            "field_key": proposal.field_key,
+                            "reason": "merge_targets_differ_in_field",
+                        }
+                    )
+                    continue
+            if spec.max_entries and proposal.operation == "ADD":
+                effective = await self.repo.list_entries(
+                    person_id,
+                    statuses=(
+                        ProfileEntryStatus.ACTIVE.value,
+                        ProfileEntryStatus.TENTATIVE.value,
+                    ),
+                    field_key=proposal.field_key,
+                )
+                if len(effective) >= spec.max_entries:
+                    pending.append(
+                        change.model_copy(
+                            update={"auto_apply": False,
+                                    "pending_reason": "field_capacity_reached"}
+                        )
+                    )
+                    continue
+            evidence = list(dict.fromkeys(proposal.evidence_event_ids))
+            if evidence:
+                placeholders = ",".join("?" for _ in evidence)
+                cur = await self.persons.db.execute(
+                    "SELECT event_id FROM utterances WHERE event_id IN"
+                    f" ({placeholders}) AND speaker_person_id = ?",
+                    tuple(evidence) + (person_id,),
+                )
+                rows = await cur.fetchall()
+                valid = {row["event_id"] for row in rows}
+                if not set(evidence) <= valid:
+                    pending.append(
+                        change.model_copy(
+                            update={"auto_apply": False,
+                                    "pending_reason": "evidence_event_not_accessible"}
+                        )
+                    )
+                    continue
+                event_ids.update(valid)
+            if proposal.confidence < 0.7:
+                pending.append(
+                    change.model_copy(
+                        update={"auto_apply": False, "pending_reason": "low_confidence"}
+                    )
+                )
+                continue
+            accepted.append(change)
+        for change in changes[MAX_REFINEMENT_CHANGES:]:
+            pending.append(
+                change.model_copy(
+                    update={"auto_apply": False, "pending_reason": "change_limit_exceeded"}
+                )
+            )
+        return accepted, pending, rejected
+
+    async def _apply_change_locked(
+        self,
+        person_id: str,
+        change: ValidatedChange,
+        *,
+        revision: int,
+        source_event_id: Optional[str],
+        confirmed: bool,
+        actor: str,
+    ) -> dict:
+        proposal = change.proposal
+        spec = profile_field_spec(proposal.field_key)
+        if spec is None or spec.storage is not ProfileFieldStorage.ENTRY:
+            raise ValueError("field_not_refinable")
+        content = self._normalise_entry_content(proposal.proposed_content, spec)
+        if not content and proposal.operation != "ARCHIVE":
+            raise ValueError("missing_proposed_content")
+        targets: list[dict] = []
+        for entry_id in dict.fromkeys(proposal.target_entry_ids):
+            entry = await self.repo.get_entry(entry_id)
+            if (
+                entry is None
+                or entry["person_id"] != person_id
+                or entry["status"]
+                not in (
+                    ProfileEntryStatus.ACTIVE.value,
+                    ProfileEntryStatus.TENTATIVE.value,
+                )
+            ):
+                raise ValueError("target_entry_not_effective")
+            targets.append(entry)
+
+        evidence_events = list(
+            dict.fromkeys(
+                list(proposal.evidence_event_ids)
+                + ([source_event_id] if source_event_id else [])
+            )
+        )
+        source = (
+            ProfileSource.USER_CORRECTION.value
+            if confirmed
+            else ProfileSource.INTERACTION_INFERENCE.value
+        )
+        operation = proposal.operation
+        before = [item["content"] for item in targets]
+        now = utcnow()
+
+        if operation == "ADD":
+            if spec.single_value:
+                for existing in await self.repo.list_entries(
+                    person_id,
+                    statuses=(
+                        ProfileEntryStatus.ACTIVE.value,
+                        ProfileEntryStatus.TENTATIVE.value,
+                    ),
+                    field_key=proposal.field_key,
+                ):
+                    await self.repo.update_entry(
+                        existing["entry_id"],
+                        status=ProfileEntryStatus.ARCHIVED.value,
+                        valid_until=now,
+                    )
+            entry_id = await self.repo.insert_entry(
+                person_id=person_id,
+                field_key=proposal.field_key,
+                content=content,
+                status=ProfileEntryStatus.ACTIVE.value,
+                source=source,
+                confidence=proposal.confidence,
+                evidence_event_ids=evidence_events,
+                evidence_memory_ids=[],
+            )
+        elif operation in ("UPDATE", "CORRECT"):
+            if len(targets) != 1:
+                raise ValueError("update_needs_one_target")
+            target = targets[0]
+            if target["field_key"] != proposal.field_key:
+                # A project moving from active to completed keeps the old row
+                # (archived, pointing at its successor) and adds a new one.
+                entry_id = await self.repo.insert_entry(
+                    person_id=person_id,
+                    field_key=proposal.field_key,
+                    content=content,
+                    status=ProfileEntryStatus.ACTIVE.value,
+                    source=source,
+                    confidence=proposal.confidence,
+                    evidence_event_ids=evidence_events,
+                    evidence_memory_ids=target["evidence_memory_ids"],
+                    merged_from=[target["entry_id"]],
+                )
+                await self.repo.update_entry(
+                    target["entry_id"],
+                    status=ProfileEntryStatus.ARCHIVED.value,
+                    superseded_by=entry_id,
+                    valid_until=now,
+                )
+            else:
+                entry_id = target["entry_id"]
+                await self.repo.update_entry(
+                    entry_id,
+                    content=content,
+                    status=ProfileEntryStatus.ACTIVE.value,
+                    confidence=proposal.confidence,
+                    evidence_event_ids=evidence_events,
+                )
+        elif operation == "MERGE":
+            if len(targets) < 2:
+                raise ValueError("merge_needs_two_targets")
+            if any(item["field_key"] != proposal.field_key for item in targets):
+                raise ValueError("merge_targets_differ_in_field")
+            memory_ids = sorted(
+                {
+                    memory_id
+                    for item in targets
+                    for memory_id in item["evidence_memory_ids"]
+                }
+            )
+            entry_id = await self.repo.insert_entry(
+                person_id=person_id,
+                field_key=proposal.field_key,
+                content=content,
+                status=ProfileEntryStatus.ACTIVE.value,
+                source=source,
+                confidence=proposal.confidence,
+                evidence_event_ids=evidence_events,
+                evidence_memory_ids=memory_ids,
+                merged_from=[item["entry_id"] for item in targets],
+            )
+            for item in targets:
+                await self.repo.update_entry(
+                    item["entry_id"],
+                    status=ProfileEntryStatus.MERGED.value,
+                    superseded_by=entry_id,
+                    valid_until=now,
+                )
+        elif operation == "REFINE":
+            if len(targets) != 1:
+                raise ValueError("refine_needs_one_target")
+            target = targets[0]
+            if target["field_key"] != proposal.field_key:
+                raise ValueError("refine_target_field_mismatch")
+            entry_id = target["entry_id"]
+            await self.repo.update_entry(
+                entry_id,
+                content=content,
+                status=ProfileEntryStatus.ACTIVE.value,
+                confidence=proposal.confidence,
+                evidence_event_ids=evidence_events,
+            )
+        elif operation == "ARCHIVE":
+            if not targets:
+                raise ValueError("archive_needs_targets")
+            for item in targets:
+                if item["field_key"].startswith(
+                    ("identity.", "relationship.")
+                ):
+                    raise ValueError("strict_field_cannot_be_archived")
+                await self.repo.update_entry(
+                    item["entry_id"],
+                    status=ProfileEntryStatus.ARCHIVED.value,
+                    valid_until=now,
+                )
+            entry_id = None
+        else:
+            raise ValueError(f"unsupported_operation:{operation}")
+
+        for event_id in evidence_events:
+            await self._record_evidence(
+                person_id,
+                proposal.field_key,
+                memory_ids=[],
+                event_ids=[event_id],
+            )
+        return {
+            "operation": operation,
+            "field_key": proposal.field_key,
+            "target_entry_ids": [item["entry_id"] for item in targets],
+            "before": before,
+            "after": content if operation != "ARCHIVE" else None,
+            "entry_id": entry_id,
+            "status": "APPLIED",
+            "reason": proposal.reason,
+        }
+
+    async def _store_pending_candidate(
+        self, person_id: str, change: ValidatedChange, base_revision: int
+    ) -> str:
+        proposal = change.proposal
+        content = self._normalise_entry_content(proposal.proposed_content)
+        for item in await self.repo.find_pending(person_id, proposal.field_key):
+            if item["candidate_value"] == content:
+                await self.repo.add_candidate_evidence(
+                    item["candidate_id"],
+                    memory_ids=[],
+                    event_ids=list(proposal.evidence_event_ids),
+                    candidate_ids=[],
+                )
+                return item["candidate_id"]
+        return await self.repo.insert_candidate(
+            person_id=person_id,
+            field_key=proposal.field_key,
+            value=content,
+            source=ProfileSource.INTERACTION_INFERENCE.value,
+            confidence=proposal.confidence,
+            evidence_memory_ids=[],
+            evidence_event_ids=list(proposal.evidence_event_ids),
+            evidence_candidate_ids=[],
+            reason=change.pending_reason or proposal.reason or "pending_review",
+            operation=proposal.operation,
+            target_entry_ids=proposal.target_entry_ids,
+            expected_revision=base_revision,
+            requires_confirmation=True,
+            review_status="PENDING",
+        )
+
+    @staticmethod
+    def _normalise_entry_content(
+        content: Any, spec: Any = None
+    ) -> str:
+        text = " ".join(str(content or "").split())
+        limit = getattr(spec, "max_chars", 240) if spec is not None else 240
+        return text[:limit]
+
+    @staticmethod
+    def _pending_summary(change: ValidatedChange) -> dict:
+        return {
+            "operation": change.proposal.operation,
+            "field_key": change.proposal.field_key,
+            "target_entry_ids": change.proposal.target_entry_ids,
+            "proposed_content": change.proposal.proposed_content,
+            "reason": change.pending_reason or "pending_review",
+            "requires_confirmation": True,
+        }
+
+    # -- snapshot helpers --------------------------------------------------
+
+    @staticmethod
+    def _group_entries(items: list[dict]) -> dict[str, list[ProfileEntry]]:
+        grouped: dict[str, list[ProfileEntry]] = {}
+        for item in items:
+            entry = ProfileEntry(
+                entry_id=item["entry_id"],
+                person_id=item["person_id"],
+                field_key=item["field_key"],
+                content=item["content"],
+                status=item["status"],
+                source=item["source"],
+                confidence=item["confidence"],
+                evidence_event_ids=item["evidence_event_ids"],
+                evidence_memory_ids=item["evidence_memory_ids"],
+                merged_from=item["merged_from"],
+                valid_from=item["valid_from"],
+                valid_until=item["valid_until"],
+                created_at=item["created_at"],
+                updated_at=item["updated_at"],
+                superseded_by=item["superseded_by"],
+            )
+            grouped.setdefault(entry.field_key, []).append(entry)
+        return grouped
+
+    @staticmethod
+    def _snapshot_entry(entry: ProfileEntry) -> SnapshotEntry:
+        return SnapshotEntry(
+            entry_id=entry.entry_id,
+            field_key=entry.field_key,
+            content=entry.content,
+            status=entry.status,
+            source=entry.source,
+            confidence=entry.confidence,
+            evidence_event_ids=entry.evidence_event_ids,
+            evidence_memory_ids=entry.evidence_memory_ids,
+            updated_at=entry.updated_at.isoformat() if entry.updated_at else None,
+        )
+
+    @staticmethod
+    def _identity_view(entries: dict[str, list[ProfileEntry]]) -> dict[str, Any]:
+        view: dict[str, Any] = {}
+        for field_key, label in _IDENTITY_LABELS.items():
+            texts = [
+                entry.content
+                for entry in entries.get(field_key, [])
+                if entry.is_effective()
+            ]
+            view[label] = texts[0] if texts else "UNKNOWN"
+        view["nicknames"] = [
+            entry.content
+            for entry in entries.get("identity.nicknames", [])
+            if entry.is_effective()
+        ]
+        return view
+
+    @staticmethod
+    def _relationship_view(
+        entries: dict[str, list[ProfileEntry]], tier: str
+    ) -> dict[str, Any]:
+        return {
+            # The tier remains the single authoritative familiarity source.
+            "familiarity": tier,
+            "label": [
+                entry.content
+                for entry in entries.get("relationship.label", [])
+                if entry.is_effective()
+            ],
+            "boundaries": [
+                entry.content
+                for entry in entries.get("relationship.boundaries", [])
+                if entry.is_effective()
+            ],
+        }
+
+    @staticmethod
+    def _category_view(
+        entries: dict[str, list[ProfileEntry]],
+        fields: dict[str, dict],
+        category: str,
+    ) -> dict[str, Any]:
+        view: dict[str, list[dict]] = {}
+        for field_key, items in entries.items():
+            spec = profile_field_spec(field_key)
+            if spec is None or spec.category != category:
+                continue
+            effective = [
+                {
+                    "entry_id": entry.entry_id,
+                    "content": entry.content,
+                    "status": entry.status,
+                    "source": entry.source,
+                    "confidence": entry.confidence,
+                }
+                for entry in items
+                if entry.is_effective()
+            ]
+            if effective:
+                view[spec.label] = effective
+        if category == "communication":
+            view["settings"] = {
+                key: value["value"] for key, value in fields.items()
+            }
+        return view
 
     # -- evidence / memory linkage ----------------------------------------
 

@@ -22,6 +22,7 @@ Design rules:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, Optional
@@ -99,6 +100,251 @@ class CandidateStatus(str, Enum):
     CONFIRMED = "CONFIRMED"
     REJECTED = "REJECTED"
     SUPERSEDED = "SUPERSEDED"
+    # V0.9.7: two pending values that genuinely conflict stay visible instead
+    # of one silently replacing the other. Neither is treated as effective.
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+
+
+class ProfileEntryStatus(str, Enum):
+    """Lifecycle of one independent understanding entry.
+
+    ``ACTIVE`` is the only status the Speaker context uses. ``TENTATIVE`` is
+    still visible to a review but not presented as settled understanding.
+    ``MERGED``/``ARCHIVED``/``RETIRED`` keep the row for traceability; entry
+    content is never destroyed by a refinement.
+    """
+
+    ACTIVE = "ACTIVE"
+    TENTATIVE = "TENTATIVE"
+    PENDING_REVIEW = "PENDING_REVIEW"
+    MERGED = "MERGED"
+    ARCHIVED = "ARCHIVED"
+    RETIRED = "RETIRED"
+
+
+class ProfileFieldStorage(str, Enum):
+    """Where a registry field physically lives.
+
+    ``ENTRY`` fields use independent ``person_profile_entries`` rows, so one
+    item can be added, corrected, merged or archived without rewriting the
+    others. ``SINGLE`` is the pre-V0.9.7 enum-validated field table.
+    ``DERIVED`` is read from the authoritative source (relationship tier) and
+    can never be written by the refinement model.
+    """
+
+    ENTRY = "ENTRY"
+    SINGLE = "SINGLE"
+    DERIVED = "DERIVED"
+
+
+@dataclass(frozen=True)
+class ProfileFieldSpec:
+    key: str
+    category: str
+    storage: ProfileFieldStorage
+    label: str
+    # Confirmed identity fields: a model may only ever propose a pending
+    # confirmation. Local code writes them after explicit confirmation.
+    strict_identity: bool = False
+    # False for derived/authoritative values. A proposal is rejected, not
+    # silently ignored.
+    model_writable: bool = True
+    single_value: bool = False
+    max_entries: int = 40
+    max_chars: int = 240
+
+
+# V0.9.7 evolving-understanding registry. Keys are stable storage identifiers;
+# a category groups related entries for the prompt but never merges them.
+_PROFILE_FIELD_SPECS: tuple[ProfileFieldSpec, ...] = (
+    # -- confirmed identity (never auto-written) -------------------------
+    ProfileFieldSpec("identity.name", "identity", ProfileFieldStorage.ENTRY,
+                     "name", strict_identity=True, model_writable=False,
+                     single_value=True, max_entries=1, max_chars=80),
+    ProfileFieldSpec("identity.preferred_name", "identity", ProfileFieldStorage.ENTRY,
+                     "preferred_name", strict_identity=True, model_writable=False,
+                     single_value=True, max_entries=1, max_chars=80),
+    ProfileFieldSpec("identity.nicknames", "identity", ProfileFieldStorage.ENTRY,
+                     "nicknames", strict_identity=True, model_writable=False,
+                     max_entries=8, max_chars=80),
+    ProfileFieldSpec("identity.gender_identity", "identity", ProfileFieldStorage.ENTRY,
+                     "gender_identity", strict_identity=True, model_writable=False,
+                     single_value=True, max_entries=1, max_chars=80),
+    ProfileFieldSpec("identity.pronouns", "identity", ProfileFieldStorage.ENTRY,
+                     "pronouns", strict_identity=True, model_writable=False,
+                     single_value=True, max_entries=1, max_chars=80),
+    # The relationship tier is the single authoritative source. The derived
+    # value exists for snapshot readability only.
+    ProfileFieldSpec("relationship.familiarity", "relationship",
+                     ProfileFieldStorage.DERIVED, "familiarity",
+                     strict_identity=True, model_writable=False),
+    ProfileFieldSpec("relationship.label", "relationship", ProfileFieldStorage.ENTRY,
+                     "label", strict_identity=True, model_writable=False,
+                     max_entries=8, max_chars=120),
+    ProfileFieldSpec("relationship.boundaries", "relationship",
+                     ProfileFieldStorage.ENTRY, "boundaries",
+                     strict_identity=True, model_writable=False,
+                     max_entries=20, max_chars=240),
+    # -- communication ---------------------------------------------------
+    ProfileFieldSpec("communication.language", "communication",
+                     ProfileFieldStorage.ENTRY, "language", max_entries=4),
+    ProfileFieldSpec("communication.preferred_tone", "communication",
+                     ProfileFieldStorage.ENTRY, "preferred_tone", max_entries=8),
+    ProfileFieldSpec("communication.response_length", "communication",
+                     ProfileFieldStorage.ENTRY, "response_length", max_entries=8),
+    ProfileFieldSpec("communication.explanation_style", "communication",
+                     ProfileFieldStorage.ENTRY, "explanation_style", max_entries=8),
+    ProfileFieldSpec("communication.humor_preference", "communication",
+                     ProfileFieldStorage.ENTRY, "humor_preference", max_entries=8),
+    ProfileFieldSpec("communication.boundaries", "communication",
+                     ProfileFieldStorage.ENTRY, "communication_boundaries",
+                     max_entries=20),
+    # -- personality -----------------------------------------------------
+    ProfileFieldSpec("personality.traits", "personality",
+                     ProfileFieldStorage.ENTRY, "traits", max_entries=20),
+    ProfileFieldSpec("personality.behavior_patterns", "personality",
+                     ProfileFieldStorage.ENTRY, "behavior_patterns",
+                     max_entries=20),
+    ProfileFieldSpec("personality.thinking_style", "personality",
+                     ProfileFieldStorage.ENTRY, "thinking_style", max_entries=8),
+    ProfileFieldSpec("personality.decision_style", "personality",
+                     ProfileFieldStorage.ENTRY, "decision_style", max_entries=8),
+    # -- interests -------------------------------------------------------
+    ProfileFieldSpec("interests.topics", "interests",
+                     ProfileFieldStorage.ENTRY, "topics", max_entries=40),
+    ProfileFieldSpec("interests.likes", "interests",
+                     ProfileFieldStorage.ENTRY, "likes", max_entries=40),
+    ProfileFieldSpec("interests.dislikes", "interests",
+                     ProfileFieldStorage.ENTRY, "dislikes", max_entries=40),
+    # -- knowledge -------------------------------------------------------
+    ProfileFieldSpec("knowledge.domains", "knowledge",
+                     ProfileFieldStorage.ENTRY, "domains", max_entries=30),
+    ProfileFieldSpec("knowledge.skills", "knowledge",
+                     ProfileFieldStorage.ENTRY, "skills", max_entries=40),
+    ProfileFieldSpec("knowledge.experience", "knowledge",
+                     ProfileFieldStorage.ENTRY, "experience", max_entries=40),
+    # -- background ------------------------------------------------------
+    ProfileFieldSpec("background.education", "background",
+                     ProfileFieldStorage.ENTRY, "education", max_entries=12),
+    ProfileFieldSpec("background.occupation", "background",
+                     ProfileFieldStorage.ENTRY, "occupation", max_entries=8),
+    ProfileFieldSpec("background.history", "background",
+                     ProfileFieldStorage.ENTRY, "history", max_entries=40),
+    ProfileFieldSpec("background.stable_facts", "background",
+                     ProfileFieldStorage.ENTRY, "stable_facts", max_entries=40),
+    # -- projects --------------------------------------------------------
+    ProfileFieldSpec("projects.active", "projects",
+                     ProfileFieldStorage.ENTRY, "active_projects", max_entries=20),
+    ProfileFieldSpec("projects.paused", "projects",
+                     ProfileFieldStorage.ENTRY, "paused_projects", max_entries=20),
+    ProfileFieldSpec("projects.completed", "projects",
+                     ProfileFieldStorage.ENTRY, "completed_projects",
+                     max_entries=40),
+    # -- goals -----------------------------------------------------------
+    ProfileFieldSpec("goals.short_term", "goals",
+                     ProfileFieldStorage.ENTRY, "short_term_goals", max_entries=20),
+    ProfileFieldSpec("goals.long_term", "goals",
+                     ProfileFieldStorage.ENTRY, "long_term_goals", max_entries=20),
+    # Migration target for the pre-V0.9.7 generic "personal goals" list.
+    ProfileFieldSpec("goals.general", "goals",
+                     ProfileFieldStorage.ENTRY, "goals", max_entries=20),
+    # -- habits ----------------------------------------------------------
+    ProfileFieldSpec("habits.stable_habits", "habits",
+                     ProfileFieldStorage.ENTRY, "stable_habits", max_entries=30),
+    ProfileFieldSpec("habits.working_preferences", "habits",
+                     ProfileFieldStorage.ENTRY, "working_preferences",
+                     max_entries=20),
+    # -- values ----------------------------------------------------------
+    ProfileFieldSpec("values.priorities", "values",
+                     ProfileFieldStorage.ENTRY, "priorities", max_entries=20),
+    ProfileFieldSpec("values.motivations", "values",
+                     ProfileFieldStorage.ENTRY, "motivations", max_entries=20),
+    # -- interaction -----------------------------------------------------
+    ProfileFieldSpec("interaction.communication_feedback", "interaction",
+                     ProfileFieldStorage.ENTRY, "communication_feedback",
+                     max_entries=30),
+    ProfileFieldSpec("interaction.recurring_patterns", "interaction",
+                     ProfileFieldStorage.ENTRY, "recurring_patterns",
+                     max_entries=30),
+    ProfileFieldSpec("interaction.shared_context", "interaction",
+                     ProfileFieldStorage.ENTRY, "shared_context",
+                     max_entries=30),
+    ProfileFieldSpec("interaction.familiarity_notes", "interaction",
+                     ProfileFieldStorage.ENTRY, "familiarity_notes",
+                     max_entries=10),
+)
+
+_PROFILE_FIELD_INDEX: dict[str, ProfileFieldSpec] = {
+    spec.key: spec for spec in _PROFILE_FIELD_SPECS
+}
+
+# Legacy pre-V0.9.7 fields stay readable. A refinement may not target them
+# with free-form prose because they carry enum-validated interaction settings.
+LEGACY_ENTRY_MIGRATION: dict[str, str] = {
+    ProfileFieldKey.INTERESTS.value: "interests.topics",
+    ProfileFieldKey.ONGOING_PROJECTS.value: "projects.active",
+    ProfileFieldKey.USUAL_ACTIVITIES.value: "habits.stable_habits",
+    ProfileFieldKey.PERSONAL_GOALS.value: "goals.general",
+    ProfileFieldKey.RECURRING_TOPICS.value: "interaction.recurring_patterns",
+    ProfileFieldKey.COMMUNICATION_FEEDBACK.value: "interaction.communication_feedback",
+    ProfileFieldKey.OCCUPATION.value: "background.occupation",
+    ProfileFieldKey.FAMILIARITY_NOTES.value: "interaction.familiarity_notes",
+}
+
+STRICT_IDENTITY_FIELDS: frozenset[str] = frozenset(
+    spec.key for spec in _PROFILE_FIELD_SPECS if spec.strict_identity
+)
+
+ENTRY_FIELD_KEYS: frozenset[str] = frozenset(
+    spec.key
+    for spec in _PROFILE_FIELD_SPECS
+    if spec.storage is ProfileFieldStorage.ENTRY
+)
+
+PROFILE_FIELD_SPECS: tuple[ProfileFieldSpec, ...] = _PROFILE_FIELD_SPECS
+
+
+def profile_field_spec(field_key: str) -> Optional[ProfileFieldSpec]:
+    return _PROFILE_FIELD_INDEX.get(str(field_key or ""))
+
+
+def is_strict_identity_field(field_key: str) -> bool:
+    return str(field_key or "") in STRICT_IDENTITY_FIELDS
+
+
+def is_entry_field(field_key: str) -> bool:
+    return str(field_key or "") in ENTRY_FIELD_KEYS
+
+
+class ProfileEntry(BaseModel):
+    """One independent, traceable understanding item.
+
+    ``content`` is a short human-readable statement (not a JSON blob). The
+    original row stays in place when it is superseded: ``status`` changes and
+    ``superseded_by`` names the newer entry.
+    """
+
+    entry_id: str
+    person_id: str
+    field_key: str
+    content: str
+    status: str = ProfileEntryStatus.ACTIVE.value
+    source: str = ProfileSource.INTERACTION_INFERENCE.value
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    evidence_event_ids: list[str] = Field(default_factory=list)
+    evidence_memory_ids: list[str] = Field(default_factory=list)
+    merged_from: list[str] = Field(default_factory=list)
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    superseded_by: Optional[str] = None
+
+    def is_effective(self) -> bool:
+        return self.status in {
+            ProfileEntryStatus.ACTIVE.value,
+            ProfileEntryStatus.TENTATIVE.value,
+        }
 
 
 def validate_field_value(field_key: str, value: Any) -> Any:
@@ -238,6 +484,13 @@ class PersonInteractionProfile(BaseModel):
     display_name: str = "unknown"
     relationship_tier: str = "STRANGER"
     fields: dict[str, ProfileField] = Field(default_factory=dict)
+    # V0.9.7 independent understanding entries, grouped by field key. The
+    # pre-V0.9.7 ``fields`` map stays intact so existing readers keep working.
+    entries: dict[str, list[ProfileEntry]] = Field(default_factory=dict)
+    # Confirmed identity only. The registration label is ``display_name`` and
+    # is deliberately never used as the person's confirmed name.
+    identity: dict[str, Any] = Field(default_factory=dict)
+    relationship: dict[str, Any] = Field(default_factory=dict)
     candidates: list[ProfileCandidate] = Field(default_factory=list)
     compact_summary: str = ""
     metadata: ProfileMetadata = Field(default_factory=ProfileMetadata)
@@ -257,23 +510,42 @@ class PersonInteractionProfile(BaseModel):
         value = field.value
         return value if isinstance(value, list) else []
 
+    def entry_texts(self, field_key: str) -> list[str]:
+        """Effective entry contents for one registry key, oldest first."""
+        return [
+            entry.content
+            for entry in self.entries.get(str(field_key), [])
+            if entry.is_effective()
+        ]
+
 
 __all__ = [
     "ALL_FIELD_KEYS",
     "COMMUNICATION_FIELDS",
     "CandidateStatus",
+    "ENTRY_FIELD_KEYS",
+    "LEGACY_ENTRY_MIGRATION",
     "LIST_FIELDS",
     "MAX_ADDRESS_PREFERENCE",
     "MAX_LIST_ITEMS",
     "MAX_SHORT_TEXT",
+    "PROFILE_FIELD_SPECS",
     "PersonInteractionProfile",
     "ProfileCandidate",
+    "ProfileEntry",
+    "ProfileEntryStatus",
     "ProfileEvidence",
     "ProfileField",
     "ProfileFieldKey",
+    "ProfileFieldSpec",
     "ProfileFieldStatus",
+    "ProfileFieldStorage",
     "ProfileMetadata",
     "ProfileRevision",
     "ProfileSource",
+    "STRICT_IDENTITY_FIELDS",
+    "is_entry_field",
+    "is_strict_identity_field",
+    "profile_field_spec",
     "validate_field_value",
 ]

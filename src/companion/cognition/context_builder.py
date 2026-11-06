@@ -103,8 +103,8 @@ class ContextBuilder:
         current_label = labels.get(
             event.speaker_person_id, event.speaker_label or "unknown"
         )
-        person_profile_context = await self._profile_context(
-            event.speaker_person_id
+        person_profile_context, profile_revision = await self._profile_context(
+            event.speaker_person_id, query=event.text
         )
         agent_context = None
         if self.agent_service is not None:
@@ -126,6 +126,7 @@ class ContextBuilder:
             memories=memories,
             agent_context=agent_context,
             person_profile_context=person_profile_context,
+            person_profile_revision=profile_revision,
         )
 
     # -- internals ----------------------------------------------------------
@@ -178,6 +179,9 @@ class ContextBuilder:
             agent_context=agent_context,
             person_profile_context=getattr(
                 routing, "compact_person_profile", None
+            ),
+            person_profile_revision=getattr(
+                routing, "compact_person_profile_revision", None
             ),
         )
 
@@ -317,26 +321,34 @@ class ContextBuilder:
             self._people[person_id] = await self.registry.get(person_id)
         return self._people[person_id]
 
-    async def _profile_context(self, person_id: Optional[str]) -> Optional[str]:
+    async def _profile_context(
+        self, person_id: Optional[str], *, query: str = ""
+    ) -> tuple[Optional[str], Optional[int]]:
         """Build the *current speaker's* profile block, if they consented.
 
         The profile may reach an external model only when that person granted
         both local persistence and external AI use. A different person's
-        private profile is never loaded here.
+        private profile is never loaded here. One read supplies both the block
+        and the revision it was compiled from.
         """
         if self.profile_service is None or person_id is None:
-            return None
+            return None, None
         if not await self.registry.is_authorized(person_id):
-            return None
+            return None, None
         consent = await self.repos.person.get_consent(person_id)
         if (
             consent is None
             or not consent.allow_persistence
             or not consent.allow_external_ai
         ):
-            return None
+            return None, None
         profile = await self.profile_service.get(person_id)
-        return compile_profile_context(profile)
+        if profile is None:
+            return None, None
+        return (
+            compile_profile_context(profile, query=query),
+            int(profile.metadata.revision),
+        )
 
     async def _subject_ids_of(self, memory: dict) -> list[str]:
         """PERSON subject ids of a retrieved memory, for the privacy gateway."""
