@@ -2079,9 +2079,7 @@ async def cmd_repl(args) -> int:
         try:
             while True:
                 try:
-                    line = (
-                        await asyncio.to_thread(input, "you> ")
-                    ).strip()
+                    line = (await _read_line_with_proactive(rt)).strip()
                 except (EOFError, KeyboardInterrupt):
                     print()
                     break
@@ -2140,10 +2138,33 @@ async def cmd_repl(args) -> int:
                     speaker_person_id=person.person_id,
                     source=EventSource.CLI,
                 )
-                await _run_streaming_turn(
+                manager = getattr(rt, "proactive_manager", None)
+                if manager is not None:
+                    # Invalidate any pending check before the turn begins.
+                    manager.note_user_input(
+                        event.conversation_id, event.event_id
+                    )
+                delivery = await _run_streaming_turn(
                     rt, event, debug=bool(getattr(args, "debug", False))
                 )
+                if (
+                    manager is not None
+                    and delivery.get("delivered")
+                    and delivery.get("status") == "COMPLETED"
+                    and delivery.get("action") == "RESPOND"
+                ):
+                    # Only a real-user-triggered, complete, delivered normal
+                    # reply schedules a check. WAIT/IGNORE, failures,
+                    # cancellations and truncated output never do.
+                    manager.on_response_delivered(
+                        conversation_id=event.conversation_id,
+                        person_id=person.person_id,
+                        source_event_id=event.event_id,
+                    )
         finally:
+            manager = getattr(rt, "proactive_manager", None)
+            if manager is not None:
+                await manager.shutdown()
             if worker_started:
                 await rt.worker.stop()
     finally:
@@ -2151,7 +2172,82 @@ async def cmd_repl(args) -> int:
     return 0
 
 
-async def _run_streaming_turn(rt, event, *, debug: bool = False) -> None:
+def _readline_buffer() -> str:
+    """Best-effort read of the text a user has typed but not submitted.
+
+    Used only to preserve the visible input line when a proactive message is
+    written while ``input()`` is blocked. Any failure degrades to an empty
+    buffer rather than affecting chat.
+    """
+    try:
+        import readline
+
+        return readline.get_line_buffer() or ""
+    except Exception:
+        return ""
+
+
+def _write_proactive_line(text: str) -> None:
+    """Display one delivered proactive message without corrupting input.
+
+    On a TTY the current input line is cleared, the message is written, and
+    the prompt plus any partially typed text is restored. The message itself
+    uses the same ``assistant>`` surface as a normal reply.
+    """
+    is_tty = sys.stdout.isatty()
+    buffered = _readline_buffer() if is_tty else ""
+    if is_tty:
+        sys.stdout.write("\r\033[2K")
+    sys.stdout.write("assistant> " + text + "\n")
+    if is_tty:
+        sys.stdout.write("you> " + buffered)
+    sys.stdout.flush()
+
+
+def _render_proactive_event(event) -> None:
+    if event.type == "response_completed" and (event.text or "").strip():
+        _write_proactive_line(event.text)
+
+
+async def _read_line_with_proactive(rt) -> str:
+    """Read one line while allowing delivered proactive messages to appear.
+
+    Exactly one ``input()`` thread is started per prompt. The event loop races
+    that thread against the manager's response-event queue, so a proactive
+    reply can be displayed during the wait without spawning a second reader.
+    """
+    manager = getattr(rt, "proactive_manager", None)
+    if manager is None:
+        return await asyncio.to_thread(input, "you> ")
+
+    loop = asyncio.get_running_loop()
+    input_future = loop.run_in_executor(None, input, "you> ")
+    while True:
+        if input_future.done():
+            # The user has submitted this turn. Anything still queued belongs
+            # to the previous turn and must not appear after their input; the
+            # caller invalidates the check before processing. Events that were
+            # already displayed below were shown while they were still waiting.
+            return input_future.result()
+
+        event_future = asyncio.ensure_future(manager.next_event())
+        done, _pending = await asyncio.wait(
+            {input_future, event_future},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if event_future in done:
+            event = event_future.result()
+            if event is not None:
+                _render_proactive_event(event)
+            continue
+
+        event_future.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await event_future
+        return input_future.result()
+
+
+async def _run_streaming_turn(rt, event, *, debug: bool = False) -> dict:
     """Render one turn from the real streaming API.
 
     Deltas are written and flushed as they arrive; the full text is never
@@ -2167,6 +2263,8 @@ async def _run_streaming_turn(rt, event, *, debug: bool = False) -> None:
     saw_started = False
     saw_delta = False
     saw_terminal = False
+    completed_status = None
+    completed_action = None
     stream = rt.orchestrator.process_utterance_stream(event)
     try:
         async for item in stream:
@@ -2180,6 +2278,8 @@ async def _run_streaming_turn(rt, event, *, debug: bool = False) -> None:
                 sys.stdout.flush()
             elif item.type == "response_completed":
                 saw_terminal = True
+                completed_status = item.status
+                completed_action = item.action
                 if not saw_started:
                     sys.stdout.write("assistant> ")
                     saw_started = True
@@ -2212,28 +2312,33 @@ async def _run_streaming_turn(rt, event, *, debug: bool = False) -> None:
         if saw_started:
             sys.stdout.write("\n")
         print("[cancelled]")
-        return
+        return {"delivered": False}
     except Exception as exc:  # provider/validation failure is shown truthfully
         if saw_started:
             sys.stdout.write("\n")
         print(f"[failed] {type(exc).__name__}: {exc}")
-        return
+        return {"delivered": False}
 
     if saw_terminal:
-        return
+        return {
+            "delivered": True,
+            "status": completed_status,
+            "action": completed_action,
+        }
     # No response event was emitted: the local policy chose WAIT or IGNORE.
     # In the ordinary chat surface this is intentional silence, so nothing is
     # printed. Diagnostics remain available behind ``--debug``.
     if not debug:
-        return
+        return {"delivered": False}
     action = None
     with contextlib.suppress(Exception):
         action = await rt.repos.analysis.get_action(event.event_id)
     if action is None:
         print("[no action]")
-        return
+        return {"delivered": False}
     reason = f" ({action.reason_code.value})" if action.reason_code else ""
     print(f"[{action.action_type.value}{reason}]")
+    return {"delivered": False}
 
 
 def _brave_key_configured() -> bool:

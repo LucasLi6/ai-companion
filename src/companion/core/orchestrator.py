@@ -41,7 +41,7 @@ from companion.agent.character import (
 from companion.agent.dialogue_style import compile_dialogue_style
 from companion.agent.models import EffectiveAgentContext
 from companion.agent.persona_core import sanitise_prompt_core
-from companion.cognition.models import CognitiveContext
+from companion.cognition.models import ROLE_ASSISTANT, CognitiveContext
 from companion.cognition.nonresponse import NonresponseTrace, derive_nonresponse_trace
 from companion.cognition.scene_repository import SceneRevisionConflict
 from companion.cognition.silence import (
@@ -228,6 +228,16 @@ class Orchestrator:
             lock = asyncio.Lock()
             self._conversation_locks[conversation_id] = lock
         return lock
+
+    def is_processing(self, conversation_id: str) -> bool:
+        """Whether a real foreground turn currently owns this conversation.
+
+        The proactive manager uses this only as a read-only staleness check;
+        it never acquires the conversation lock for its own generation, so a
+        user turn is never blocked behind proactive work.
+        """
+        lock = self._conversation_locks.get(conversation_id)
+        return bool(lock is not None and lock.locked())
 
     def _foreground_scope(self):
         """Signal that a real foreground turn is active.
@@ -1579,6 +1589,187 @@ class Orchestrator:
                 exc,
             )
             return context
+
+    async def build_proactive_judge_context(
+        self, *, source_event, person_id: str
+    ) -> Optional[dict]:
+        """Assemble the bounded, committed view the Proactive Judge may see.
+
+        It contains recent real turns (including already delivered proactive
+        messages), the last delivered Ava reply, the committed scene and the
+        elapsed time since that reply. No full memory retrieval and no full
+        profile are performed here.
+        """
+        if self.context_builder is None:
+            return None
+        context = await self.context_builder.build_proactive(
+            source_event, [], history_limit=12
+        )
+        kept = [
+            turn
+            for turn in context.turns
+            if turn.role != ROLE_ASSISTANT and turn.event_id == source_event.event_id
+        ]
+        if not kept:
+            # The triggering turn did not survive privacy filtering.
+            return None
+
+        turns = []
+        for turn in context.turns[-12:]:
+            if not (turn.text or "").strip():
+                continue
+            item = {
+                "role": "assistant" if turn.role == ROLE_ASSISTANT else "user",
+                "text": turn.text,
+            }
+            if item["role"] == "user":
+                item["speaker"] = turn.speaker_label or "unknown"
+            turns.append(item)
+        last_ava = ""
+        for turn in reversed(context.turns):
+            if turn.role == ROLE_ASSISTANT and (turn.text or "").strip():
+                last_ava = turn.text
+                break
+
+        scene_context = None
+        if self.scene_manager is not None:
+            try:
+                record = await self.scene_manager.load(
+                    source_event.conversation_id, person_id
+                )
+                if record is not None:
+                    scene_context = record.state.prompt_dict()
+            except Exception as exc:  # a judge without scene is still valid
+                self.logger.warning(
+                    "proactive_scene_read_failed conversation_id=%s error=%s",
+                    source_event.conversation_id,
+                    exc,
+                )
+
+        seconds_since_last_response = 0.0
+        action = await self.repos.analysis.get_action(source_event.event_id)
+        if action is not None and action.created_at is not None:
+            seconds_since_last_response = max(
+                0.0, (utcnow() - action.created_at).total_seconds()
+            )
+
+        return {
+            "conversation_id": source_event.conversation_id,
+            "person_id": person_id,
+            "recent_turns": turns,
+            "last_ava_response": last_ava,
+            "scene_context": scene_context,
+            "seconds_since_last_response": seconds_since_last_response,
+        }
+
+    async def build_proactive_context(self, *, source_event, person_id: str):
+        """Build the full Speaker context for one Ava-initiated turn.
+
+        Persona, profile, memory retrieval, scene, emotion and runtime context
+        all come from the same services as a normal reply. This method never
+        holds the conversation lock and never writes conversation state.
+        """
+        if self.context_builder is None:
+            return None
+        try:
+            memories = await self.memory.retrieve(source_event.text, person_id)
+        except Exception as exc:
+            self.logger.warning(
+                "proactive_memory_retrieval_failed conversation_id=%s error=%s",
+                source_event.conversation_id,
+                exc,
+            )
+            memories = []
+        context = await self.context_builder.build_proactive(
+            source_event, memories, history_limit=12
+        )
+        if not any(
+            turn.role != ROLE_ASSISTANT and turn.event_id == source_event.event_id
+            for turn in context.turns
+        ):
+            return None
+
+        scene_enabled = await self._scene_enabled()
+        personality_enabled = await self._personality_enabled()
+        context, _scene_record = await self._prepare_dialogue(
+            source_event,
+            context,
+            list(context.memories or []),
+            [],
+            scene_enabled=scene_enabled,
+            personality_enabled=personality_enabled,
+        )
+        if self.runtime_snapshot_builder is not None:
+            try:
+                snapshot = await self.runtime_snapshot_builder.build(
+                    source_event,
+                    allow_external_ai=True,
+                    persist=False,
+                )
+                context = self._attach_runtime_snapshot(context, snapshot)
+            except Exception as exc:
+                self.logger.warning(
+                    "proactive_runtime_snapshot_failed conversation_id=%s error=%s",
+                    source_event.conversation_id,
+                    exc,
+                )
+        return await self._attach_live_affect(context, person_id)
+
+    async def _attach_live_affect(self, context, person_id: str):
+        """Reuse the current decayed emotion state without writing a new turn."""
+        if self.emotion_service is None or not isinstance(context, CognitiveContext):
+            return context
+        try:
+            agent_id = await self._resolve_agent_id()
+            if not agent_id:
+                return context
+            state = await self.emotion_service.get_state(agent_id, person_id)
+            affect_context = compile_affect_context(
+                state,
+                interaction_frame="UNKNOWN",
+                frame_changed=False,
+                config=getattr(self.emotion_service, "config", None),
+            )
+            return context.model_copy(
+                update={
+                    "emotion_state": state.as_dict(),
+                    "affect_context": affect_context,
+                }
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "proactive_affect_failed person_id=%s error=%s", person_id, exc
+            )
+            return context
+
+    async def generate_proactive_reply(self, *, source_event, person_id: str) -> dict:
+        """Generate one proactive reply through the existing Speaker path."""
+        context = await self.build_proactive_context(
+            source_event=source_event, person_id=person_id
+        )
+        if context is None:
+            raise RuntimeError("proactive context unavailable")
+        analysis = CognitiveResult(
+            event_id=source_event.event_id,
+            meaning="local proactive generation (no new user message)",
+            action=CognitiveAction.RESPOND,
+            reason_code=ReasonCode.DIRECT_AGENT_ADDRESS,
+            response_style="proactive",
+            provider="local_proactive",
+            intent="proactive",
+            addressed_to="agent",
+            reply_necessity=ReplyNecessity.USEFUL,
+            conversation_state="proactive",
+        )
+        generated = await self.response.generate_proactive(
+            source_event, analysis, context
+        )
+        return {
+            "text": str(generated).strip(),
+            "finish_reason": getattr(generated, "finish_reason", None),
+            "model": getattr(self.response, "last_model", "") or "",
+            "context": context,
+        }
 
     async def _prepare_context(
         self, event, context, memories, steps, routing_view=None

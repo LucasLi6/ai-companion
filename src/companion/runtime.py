@@ -63,6 +63,11 @@ from companion.providers.deepseek_profile import (
     DeepSeekProfileRefinementProvider,
     MockProfileRefinementProvider,
 )
+from companion.providers.deepseek_proactive import (
+    DeepSeekProactiveJudgeProvider,
+)
+from companion.proactive.judge import ProactiveJudge
+from companion.proactive.manager import ProactiveManager
 from companion.providers.deepseek_response import DeepSeekResponseProvider
 from companion.providers.deepseek_router import DeepSeekRouterProvider
 from companion.providers.mock import MockCognitiveProvider, MockResponseProvider
@@ -124,6 +129,7 @@ class Runtime:
     task_service: Optional[TaskService] = None
     research_engine: object = None
     profile_refinement_engine: object = None
+    proactive_manager: Optional[ProactiveManager] = None
 
 
 def build_runtime(
@@ -150,6 +156,9 @@ def build_runtime(
     real_idle_provider: Optional[bool] = None,
     profile_refinement_provider=None,
     profile_review_delay_seconds: float = 30.0,
+    proactive_judge=None,
+    proactive_delay_seconds: float = 2.0,
+    proactive_short_task_timeout: float = 1.0,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
 
@@ -633,6 +642,31 @@ def build_runtime(
         turn_analysis_delay_seconds=float(turn_analysis_delay_seconds),
         logger=logger,
     )
+
+    # V0.9.8: one lightweight proactive check after a delivered normal reply.
+    # It is wired only for the real external-AI path (the Judge is a model
+    # call); the manager itself is provider-agnostic and can be injected in
+    # tests. It never holds the conversation lock and never creates a second
+    # agent or task queue.
+    proactive_manager = None
+    if provider == "deepseek":
+        judge = proactive_judge
+        if judge is None:
+            judge = ProactiveJudge(
+                DeepSeekProactiveJudgeProvider(deepseek_client, logger=logger),
+                logger=logger,
+            )
+        proactive_manager = ProactiveManager(
+            repos=repos,
+            registry=registry,
+            conversations=conversations,
+            orchestrator=orchestrator,
+            judge=judge,
+            delay_seconds=proactive_delay_seconds,
+            short_task_timeout=proactive_short_task_timeout,
+            logger=logger,
+        )
+
     return Runtime(
         db=db,
         repos=repos,
@@ -670,4 +704,5 @@ def build_runtime(
         task_service=task_service,
         research_engine=research_engine,
         profile_refinement_engine=profile_refinement_engine,
+        proactive_manager=proactive_manager,
     )

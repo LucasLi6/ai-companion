@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1906,6 +1906,42 @@ MIGRATIONS: list[tuple[int, str]] = [
             ADD COLUMN execution_owner_id TEXT;
         ALTER TABLE profile_review_receipts
             ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0;
+        """,
+    ),
+    # Version 28 (V0.9.8): one locally persisted, independently identified
+    # assistant message for an Ava-initiated turn.
+    #
+    # ``agent_actions`` is one-to-one with a *user* event (UNIQUE(event_id)),
+    # so a second assistant message cannot live there without overwriting the
+    # normal reply. This table is a minimal parallel record: it links the
+    # conversation and the user turn that triggered the proactive check, has
+    # its own message id, and is never read as user speech by memory/profile
+    # extraction. ``UNIQUE(source_event_id)`` enforces at most one proactive
+    # utterance per triggering turn. ``ON DELETE CASCADE`` keeps the existing
+    # privacy-deletion semantics: deleting the source utterance or the person
+    # removes the derived proactive message too.
+    (
+        28,
+        """
+        CREATE TABLE IF NOT EXISTS proactive_messages (
+            message_id      TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL
+                            REFERENCES conversations(conversation_id)
+                            ON DELETE CASCADE,
+            person_id       TEXT NOT NULL
+                            REFERENCES persons(person_id) ON DELETE CASCADE,
+            source_event_id TEXT NOT NULL UNIQUE
+                            REFERENCES utterances(event_id) ON DELETE CASCADE,
+            origin          TEXT NOT NULL DEFAULT 'AVA_INITIATED',
+            text            TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            finish_reason   TEXT,
+            model           TEXT,
+            created_at      TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_proactive_messages_conversation
+            ON proactive_messages(conversation_id, created_at);
         """,
     ),
 ]

@@ -316,6 +316,114 @@ class ConversationRepository:
         )
 
 
+@dataclass(frozen=True)
+class ProactiveMessageRecord:
+    """One Ava-initiated message, stored beside (not inside) agent_actions.
+
+    ``origin`` is assigned locally and is always ``AVA_INITIATED`` for rows in
+    this repository. It is deliberately a separate record from the user
+    reply's ``AgentAction``: both may exist for the same source event, and the
+    normal reply must never be overwritten.
+    """
+
+    message_id: str
+    conversation_id: str
+    person_id: str
+    source_event_id: str
+    origin: str
+    text: str
+    status: str
+    finish_reason: Optional[str]
+    model: Optional[str]
+    created_at: datetime
+
+
+class ProactiveMessageRepository:
+    """Minimal persistence for independently identified proactive messages."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def save(self, message: ProactiveMessageRecord) -> None:
+        await self.db.execute(
+            "INSERT INTO proactive_messages(message_id, conversation_id,"
+            " person_id, source_event_id, origin, text, status, finish_reason,"
+            " model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                message.message_id,
+                message.conversation_id,
+                message.person_id,
+                message.source_event_id,
+                message.origin,
+                message.text,
+                message.status,
+                message.finish_reason,
+                message.model,
+                _iso(message.created_at),
+            ),
+        )
+
+    async def get(self, message_id: str) -> Optional[ProactiveMessageRecord]:
+        cur = await self.db.execute(
+            "SELECT message_id, conversation_id, person_id, source_event_id,"
+            " origin, text, status, finish_reason, model, created_at"
+            " FROM proactive_messages WHERE message_id = ?",
+            (message_id,),
+        )
+        row = await cur.fetchone()
+        return self._to_record(row) if row is not None else None
+
+    async def get_for_source_event(
+        self, source_event_id: str
+    ) -> Optional[ProactiveMessageRecord]:
+        cur = await self.db.execute(
+            "SELECT message_id, conversation_id, person_id, source_event_id,"
+            " origin, text, status, finish_reason, model, created_at"
+            " FROM proactive_messages WHERE source_event_id = ?",
+            (source_event_id,),
+        )
+        row = await cur.fetchone()
+        return self._to_record(row) if row is not None else None
+
+    async def delete(self, message_id: str) -> None:
+        """Remove an un-delivered message when its turn became stale."""
+        await self.db.execute(
+            "DELETE FROM proactive_messages WHERE message_id = ?",
+            (message_id,),
+        )
+
+    async def list_for_conversation(
+        self, conversation_id: str, limit: int = 50
+    ) -> list[ProactiveMessageRecord]:
+        """Oldest-first messages for one conversation, capped to the newest."""
+        cur = await self.db.execute(
+            "SELECT * FROM ("
+            "  SELECT message_id, conversation_id, person_id, source_event_id,"
+            "         origin, text, status, finish_reason, model, created_at"
+            "  FROM proactive_messages WHERE conversation_id = ?"
+            "  ORDER BY created_at DESC, message_id DESC LIMIT ?"
+            ") ORDER BY created_at ASC, message_id ASC",
+            (conversation_id, limit),
+        )
+        rows = await cur.fetchall()
+        return [self._to_record(row) for row in rows]
+
+    @staticmethod
+    def _to_record(row) -> ProactiveMessageRecord:
+        return ProactiveMessageRecord(
+            message_id=row["message_id"],
+            conversation_id=row["conversation_id"],
+            person_id=row["person_id"],
+            source_event_id=row["source_event_id"],
+            origin=row["origin"],
+            text=row["text"],
+            status=row["status"],
+            finish_reason=row["finish_reason"],
+            model=row["model"],
+            created_at=_dt(row["created_at"]),
+        )
+
+
 class UtteranceRepository:
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -1410,6 +1518,25 @@ class JobRepository:
             return None
         return self._to_job(row)
 
+    async def list_active_by_keys(self, job_keys) -> list[dict]:
+        """Rows for the given keys that are still PENDING or RUNNING.
+
+        This is a read-only observation used by the proactive manager. It
+        deliberately does not claim, cancel or reschedule anything.
+        """
+        keys = [key for key in job_keys if key]
+        if not keys:
+            return []
+        placeholders = ",".join("?" for _ in keys)
+        cur = await self.db.execute(
+            "SELECT job_id, job_key, status FROM processing_jobs"
+            f" WHERE job_key IN ({placeholders})"
+            " AND status IN ('PENDING', 'RUNNING')",
+            tuple(keys),
+        )
+        rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
     async def pending(
         self,
         limit: int = 100,
@@ -2045,6 +2172,7 @@ class Repositories:
     db: Database
     person: PersonRepository
     conversation: ConversationRepository
+    proactive: ProactiveMessageRepository
     utterance: UtteranceRepository
     analysis: AnalysisRepository
     memory_fact: MemoryFactRepository
@@ -2096,6 +2224,7 @@ def make_repositories(db: Database) -> Repositories:
         db=db,
         person=PersonRepository(db),
         conversation=ConversationRepository(db),
+        proactive=ProactiveMessageRepository(db),
         utterance=UtteranceRepository(db),
         analysis=AnalysisRepository(db),
         memory_fact=MemoryFactRepository(db),

@@ -51,6 +51,7 @@ from companion.prompts.addressee import (
     safe_speaker_label,
 )
 from companion.prompts.identity import compile_trait_tendencies
+from companion.prompts.proactive import PROACTIVE_MODE_BLOCK
 from companion.runtime_context.assembler import compile_runtime_context
 
 RESPONSE_PROMPT_VERSION = "response-v17"
@@ -1267,6 +1268,25 @@ def _current_user_content(
     )
 
 
+def _system_parts(
+    context: CognitiveContext, *, proactive: bool = False
+) -> list[str]:
+    """Trusted system content shared by normal and proactive generation."""
+    multi_person = is_multi_person(context)
+    parts = [
+        BASE_RESPONSE_PROMPT,
+        "\n".join(_identity_block(context)),
+    ]
+    trusted_lines = _trusted_turn_lines(context, multi_person=multi_person)
+    if trusted_lines:
+        parts.append("【当前相关的上下文】\n" + "\n".join(trusted_lines))
+    if proactive:
+        # A short, trusted mode note only. The persona above is unchanged and
+        # no fake user utterance is introduced anywhere in the request.
+        parts.append(PROACTIVE_MODE_BLOCK)
+    return parts
+
+
 def build_response_messages(
     context: CognitiveContext, analysis: CognitiveResult
 ) -> list[dict]:
@@ -1279,15 +1299,7 @@ def build_response_messages(
     multi_person = is_multi_person(context)
     agent_name = _agent_display_name(context)
 
-    system_parts = [
-        BASE_RESPONSE_PROMPT,
-        "\n".join(_identity_block(context)),
-    ]
-    trusted_lines = _trusted_turn_lines(context, multi_person=multi_person)
-    if trusted_lines:
-        system_parts.append(
-            "【当前相关的上下文】\n" + "\n".join(trusted_lines)
-        )
+    system_parts = _system_parts(context)
 
     messages: list[dict] = [
         {"role": "system", "content": "\n\n".join(system_parts)}
@@ -1314,6 +1326,34 @@ def build_response_messages(
             ),
         }
     )
+    return messages
+
+
+def build_proactive_response_messages(
+    context: CognitiveContext, analysis: CognitiveResult
+) -> list[dict]:
+    """Build a proactive generation request with no new user message.
+
+    It shares the exact same system/persona, native history and bounded
+    background assembly as :func:`build_response_messages`. The only
+    difference is the generation mode: a short trusted system note is added
+    and the request ends on the last *real* assistant turn. No synthetic
+    "please say something" user message is ever created, and the mode note is
+    never persisted as conversation history.
+    """
+    multi_person = is_multi_person(context)
+    agent_name = _agent_display_name(context)
+    messages: list[dict] = [
+        {"role": "system", "content": "\n\n".join(_system_parts(context, proactive=True))}
+    ]
+    messages.extend(
+        _history_messages(
+            context, multi_person=multi_person, agent_name=agent_name
+        )
+    )
+    background = _background_payload(context, include_actions=False)
+    if background:
+        messages.append(_background_message(background))
     return messages
 
 

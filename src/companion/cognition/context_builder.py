@@ -94,9 +94,77 @@ class ContextBuilder:
         actions = await self.repos.analysis.get_actions_for_events(
             [u.event_id for u in history]
         )
+        proactive = await self._proactive_by_source(history)
 
         labels = await self._resolve_labels(history, event)
-        turns = self._interleave(history, actions, labels)
+        turns = self._interleave(history, actions, labels, proactive)
+        turns = self._truncate(turns)
+        action_history = self._action_history(history, actions, turns)
+
+        current_label = labels.get(
+            event.speaker_person_id, event.speaker_label or "unknown"
+        )
+        person_profile_context, profile_revision = await self._profile_context(
+            event.speaker_person_id, query=event.text
+        )
+        agent_context = None
+        if self.agent_service is not None:
+            policy_config = await load_policy_config(self.repos.settings)
+            effective = await self.agent_service.effective(
+                event.speaker_person_id, policy=policy_config
+            )
+            agent_context = effective.as_dict()
+        return CognitiveContext(
+            conversation_id=event.conversation_id,
+            current_event_id=event.event_id,
+            current_speaker_id=event.speaker_person_id,
+            current_speaker_label=current_label,
+            current_text=event.text,
+            current_addressee_hint=event.addressee_hint.value,
+            quiet_mode=False,
+            turns=turns,
+            action_history=action_history,
+            memories=memories,
+            agent_context=agent_context,
+            person_profile_context=person_profile_context,
+            person_profile_revision=profile_revision,
+        )
+
+    async def build_proactive(
+        self,
+        event: UtteranceEvent,
+        memories: list[dict],
+        *,
+        history_limit: int = 12,
+    ) -> CognitiveContext:
+        """Build the shared Speaker context for an Ava-initiated turn.
+
+        Unlike :meth:`build`, the triggering user event is part of the history
+        (the proactive message continues that exchange). ``current_text`` and
+        ``current_event_id`` identify the triggering turn for local auditing
+        only: :func:`build_proactive_response_messages` never renders them, so
+        no synthetic user message is created. The same privacy filtering,
+        labels, profile and trusted agent context are reused.
+        """
+        self._people = {}
+
+        history = await self.repos.utterance.recent_context(
+            event.conversation_id,
+            exclude_event_id=None,
+            limit=history_limit,
+        )
+        if self.privacy_gateway is not None:
+            history = await self.privacy_gateway.filter_utterances(history)
+            memories, _dropped = await self.privacy_gateway.filter_memories(
+                memories, self._subject_ids_of
+            )
+        actions = await self.repos.analysis.get_actions_for_events(
+            [u.event_id for u in history]
+        )
+        proactive = await self._proactive_by_source(history)
+
+        labels = await self._resolve_labels(history, event)
+        turns = self._interleave(history, actions, labels, proactive)
         turns = self._truncate(turns)
         action_history = self._action_history(history, actions, turns)
 
@@ -201,15 +269,43 @@ class ContextBuilder:
             labels[pid] = person.display_name if person is not None else pid
         return labels
 
+    async def _proactive_by_source(self, history) -> dict:
+        """Load locally persisted Ava-initiated messages for kept turns.
+
+        Only conversations whose *source utterance survived* the privacy
+        filter are included, so a withdrawn speaker's proactive message can
+        never leak into the external model context as an orphan assistant
+        turn.
+        """
+        if not history:
+            return {}
+        event_ids = {u.event_id for u in history}
+        rows = await self.repos.proactive.list_for_conversation(
+            history[0].conversation_id,
+            limit=max(50, len(history) * 2),
+        )
+        grouped: dict[str, list] = {}
+        for row in rows:
+            if row.source_event_id in event_ids and row.text.strip():
+                grouped.setdefault(row.source_event_id, []).append(row)
+        return grouped
+
     def _interleave(
-        self, utterances, actions_by_event: dict, labels: dict
+        self,
+        utterances,
+        actions_by_event: dict,
+        labels: dict,
+        proactive_by_source: Optional[dict] = None,
     ) -> list[CognitiveTurn]:
         """Merge human utterances and agent responses into one ordered stream.
 
         ``utterances`` are expected oldest-first (as ``recent_context``
         returns). An assistant turn is emitted only when the agent actually
-        produced a non-empty response for that event.
+        produced a non-empty response for that event. A locally persisted
+        proactive message is appended after that event's assistant turn; it is
+        real delivered dialogue, never user speech.
         """
+        proactive_by_source = proactive_by_source or {}
         turns: list[CognitiveTurn] = []
         for u in utterances:
             label = labels.get(u.speaker_person_id, u.speaker_label or "unknown")
@@ -240,6 +336,19 @@ class ContextBuilder:
                         speaker_label="assistant",
                         addressee_hint=None,
                         text=action.response_text,
+                    )
+                )
+            for message in proactive_by_source.get(u.event_id, ()):
+                if message.status != "COMPLETED" or not message.text.strip():
+                    continue
+                turns.append(
+                    CognitiveTurn(
+                        event_id=u.event_id,
+                        role=ROLE_ASSISTANT,
+                        speaker_person_id=None,
+                        speaker_label="assistant",
+                        addressee_hint=None,
+                        text=message.text,
                     )
                 )
         return turns

@@ -14,7 +14,10 @@ from typing import Optional
 
 from companion.cognition.models import CognitiveContext
 from companion.domain.models import CognitiveResult, UtteranceEvent
-from companion.prompts.response import build_response_messages
+from companion.prompts.response import (
+    build_proactive_response_messages,
+    build_response_messages,
+)
 
 PROVIDER_NAME = "deepseek"
 
@@ -55,6 +58,8 @@ class DeepSeekResponseProvider:
         self.client = client
         self.privacy_gateway = privacy_gateway
         self.logger = logger or logging.getLogger("companion.deepseek.response")
+        # Diagnostic metadata for the proactive path only; never prompt data.
+        self.last_model = ""
 
     async def generate(
         self,
@@ -71,6 +76,33 @@ class DeepSeekResponseProvider:
             event_id=event.event_id,
             json_mode=False,
         )
+        return ResponseText(
+            response.content.strip(), getattr(response, "finish_reason", None)
+        )
+
+    async def generate_proactive(
+        self,
+        event: UtteranceEvent,
+        analysis: CognitiveResult,
+        context,
+    ) -> str:
+        """Generate one Ava-initiated utterance with no new user message.
+
+        The caller has already decided *whether* to speak. This path reuses
+        the same persona/history/memory/scene context and the same external-AI
+        authorization as a normal reply; only the generation-mode block and
+        the absence of a current user turn differ.
+        """
+        await self._authorize(event)
+        ctx = self._as_context(event, context, analysis)
+        messages = build_proactive_response_messages(ctx, analysis)
+        response = await self.client.complete(
+            messages,
+            request_type="response",
+            event_id=event.event_id,
+            json_mode=False,
+        )
+        self.last_model = getattr(response, "model", "") or self.last_model
         return ResponseText(
             response.content.strip(), getattr(response, "finish_reason", None)
         )
