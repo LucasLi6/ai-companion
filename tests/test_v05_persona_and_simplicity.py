@@ -232,8 +232,8 @@ async def test_no_mode_guidance_or_style_reference_in_the_final_request(db):
     assert "交流表达参考" not in system
     assert "SOCIAL" not in system
     assert "TASK" not in system
-    # Natural self-correction is a stated speaking habit, not a script.
-    assert "自然承认并纠正" in system
+    # Continuity is a stated speaking habit, not a per-turn mode block.
+    assert "你正在经历一段连续的交流，而不是每轮重新开始。" in system
 
 
 async def test_user_text_cannot_overwrite_the_stable_persona(db):

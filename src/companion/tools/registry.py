@@ -167,9 +167,10 @@ def build_default_tool_registry(
             ToolSpec(
                 name="weather.forecast",
                 description=(
-                    "Get the current weather and today's high/low for a named "
-                    "place using live weather data. Use for any weather "
-                    "question instead of guessing."
+                    "Get the current weather plus today's and tomorrow's "
+                    "high/low for a named place using live weather data. Use "
+                    "for any weather question—including a follow-up such as "
+                    "\"and tomorrow?\"—instead of guessing."
                 ),
                 argument_model=WeatherArguments,
                 permission="web.read",

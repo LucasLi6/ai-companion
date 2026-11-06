@@ -10,6 +10,9 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# macOS metadata
+.DS_Store
+
 # Stray nested clone of this repo (own .git/.venv); never commit it
 ai-companion/
 

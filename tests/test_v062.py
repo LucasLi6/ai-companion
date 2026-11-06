@@ -186,10 +186,13 @@ def test_persona_asset_carries_warmth_and_the_new_tone():
 
 
 def test_base_prompt_requires_a_single_paragraph_for_chat():
-    assert "普通聊天和简短问答，整个回复必须只有一个自然段，不使用换行或空行。" in BASE_RESPONSE_PROMPT
-    assert "不要使用固定的“先回答、再解释、最后追问”模式。" in BASE_RESPONSE_PROMPT
-    # Text input must never invent acoustic information.
-    assert "文字输入不包含声音语气" in BASE_RESPONSE_PROMPT
+    # V0.9.6 replaced the single-paragraph rule with a short-by-default rule;
+    # ordinary chat still never becomes a multi-section answer.
+    assert "默认一句话。" in BASE_RESPONSE_PROMPT
+    assert "不使用固定的“先回答、再解释、最后追问”结构。" in BASE_RESPONSE_PROMPT
+    assert "不要把简单问题变成小型知识讲座。" in BASE_RESPONSE_PROMPT
+    # Text input must never invent sensory or acoustic information.
+    assert "不会编造感官体验、身体经历或没有发生过的事情。" in BASE_RESPONSE_PROMPT
 
 
 def test_stable_warmth_coexists_with_neutral_short_term_emotion():
@@ -201,7 +204,7 @@ def test_stable_warmth_coexists_with_neutral_short_term_emotion():
         history_loaded=1,
     )
     system = build_response_messages(ctx, _analysis())[0]["content"]
-    assert "你对熟悉的人亲切、有兴致，也有自己的想法。" in system
+    assert "对熟悉的人可以更加放松，像已经有一定默契的人那样说话。" in system
     assert "【此刻的状态】此刻情绪中性（不明显）。" in system
     # NEUTRAL is a subtle shift, not an instruction to become cold.
     assert "冷淡" not in system.split("【此刻的状态】", 1)[1]

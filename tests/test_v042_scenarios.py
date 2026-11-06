@@ -259,7 +259,7 @@ def test_pragmatic_scenario_is_validated_and_rendered(
     assert f"主要行为: {expected_act}" not in system
     assert "想要的回应风格" not in system
     assert "可考虑的方向" not in system
-    assert "不要使用固定的“先回答、再解释、最后追问”模式。" in RESPONSE_SYSTEM
+    assert "不使用固定的“先回答、再解释、最后追问”结构。" in RESPONSE_SYSTEM
 
 
 def test_reference_previous_keeps_only_a_visible_antecedent():

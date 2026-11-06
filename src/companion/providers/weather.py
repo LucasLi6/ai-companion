@@ -2,8 +2,10 @@
 
 Two requests are made: a geocoding lookup turns a place name into coordinates
 and a timezone, and the forecast endpoint returns the current conditions plus
-today's high/low. Everything is normalised into a small, explicit structure so
-the Speaker never receives a raw provider payload.
+today's high/low and a compact tomorrow block (so a natural follow-up such as
+"那明天呢" is answered from data, not from an invented extension). Everything is
+normalised into a small, explicit structure so the Speaker never receives a raw
+provider payload.
 
 A missing place, an invalid response and a network failure are all distinct,
 truthful errors. An empty result set is never presented as successful weather.
@@ -27,10 +29,16 @@ CURRENT_FIELDS = (
     "wind_speed_10m"
 )
 DAILY_FIELDS = (
+    "weather_code,"
     "temperature_2m_max,"
     "temperature_2m_min,"
     "precipitation_probability_max"
 )
+# V0.9.6 continuity: "那明天呢" is a natural follow-up to a weather answer.
+# Two days are requested so tomorrow's figures are real data instead of an
+# invented extension of today's. Only tomorrow is exposed; the rest stays out.
+FORECAST_DAYS = 2
+TOMORROW_INDEX = 1
 
 # WMO weather interpretation codes used by Open-Meteo.
 WEATHER_CODES: dict[int, str] = {
@@ -227,7 +235,7 @@ class OpenMeteoProvider:
                 "current": CURRENT_FIELDS,
                 "daily": DAILY_FIELDS,
                 "timezone": resolved["timezone"],
-                "forecast_days": 1,
+                "forecast_days": FORECAST_DAYS,
             },
             label="forecast",
         )
@@ -268,6 +276,9 @@ class OpenMeteoProvider:
             "source": SOURCE_NAME,
             "source_url": SOURCE_URL,
         }
+        tomorrow = _daily_point(daily, TOMORROW_INDEX)
+        if tomorrow:
+            result["tomorrow"] = tomorrow
         if result["temperature"] is None and result["daily_max"] is None:
             raise WeatherError(
                 "weather_invalid_response", "no usable temperature values"
@@ -359,6 +370,30 @@ def _first_float(value) -> Optional[float]:
     if isinstance(value, (list, tuple)) and value:
         return _as_float(value[0])
     return _as_float(value)
+
+
+def _at(values, index: int):
+    if isinstance(values, (list, tuple)) and len(values) > index:
+        return values[index]
+    return None
+
+
+def _daily_point(daily: dict, index: int) -> Optional[dict]:
+    """One day of the daily arrays, with absent values omitted."""
+    code = _as_int(_at(daily.get("weather_code"), index))
+    point: dict = {}
+    if code is not None:
+        point["weather_code"] = code
+        point["weather"] = WEATHER_CODES.get(code, "未知")
+    for key, source in (
+        ("daily_max", "temperature_2m_max"),
+        ("daily_min", "temperature_2m_min"),
+        ("precipitation_probability", "precipitation_probability_max"),
+    ):
+        value = _as_float(_at(daily.get(source), index))
+        if value is not None:
+            point[key] = value
+    return point or None
 
 
 __all__ = [

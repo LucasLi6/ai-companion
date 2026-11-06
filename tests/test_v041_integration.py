@@ -255,7 +255,9 @@ def test_response_prompt_renders_character_core_from_trusted_context():
     assert "核心价值" not in system
     assert "humor=dry" not in system
     assert "重要偏好" not in system
-    assert "交流边界" not in system
+    # The base prompt's own 【交流边界】 section is present, but the snapshot's
+    # conversational_boundaries list is not duplicated into a second block.
+    assert "不编造经历" not in system
     assert "不喜欢空泛的安慰。" in system
     # Character guidance is not a fixed script.
     assert "保持连贯" in system

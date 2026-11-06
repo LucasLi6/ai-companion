@@ -138,19 +138,19 @@ def test_prompt_version_is_v15():
 
 
 def test_base_prompt_has_generation_goal_and_stopping_rule():
-    # V0.6.2 rewrote the base prompt around warmth and a single chat paragraph.
+    # V0.9.6 rewrote the base prompt around short, spoken turns.
     assert "【说话方式】" in BASE_RESPONSE_PROMPT
-    assert "一个意思表达清楚就够" in BASE_RESPONSE_PROMPT
-    assert "不必每轮都表达关心，也不必每轮都提问" in BASE_RESPONSE_PROMPT
-    assert "只输出 Ava 当下真正想说的话。" in BASE_RESPONSE_PROMPT
+    assert "先说最想说、最值得说的那一点，说完就停。" in BASE_RESPONSE_PROMPT
+    assert "默认一句话。" in BASE_RESPONSE_PROMPT
+    assert "像 Ava 自己一样，顺着这段交流，自然地说话。" in BASE_RESPONSE_PROMPT
 
 
 def test_speaking_style_is_one_unified_block_not_mode_switched():
     system = _system(build_response_messages(_context(), _analysis()))
 
     assert "【说话方式】" in system
-    assert "像日常聊天一样说话" in system
-    assert "不再另起一段补充解释、评价或劝告" in system
+    assert "可以使用自然的短句、省略、停顿和不完整表达。" in system
+    assert "不要默认补充背景、解释原因、总结意义或提出建议。" in system
     # No per-turn SOCIAL/TASK strategy is injected any more.
     assert "【当前交流模式：SOCIAL】" not in system
     assert "【当前交流模式：TASK】" not in system
@@ -158,13 +158,11 @@ def test_speaking_style_is_one_unified_block_not_mode_switched():
 
 
 def test_length_is_guidance_not_a_hard_cap():
-    # V0.6.2: chat turns are one natural paragraph; there is still no
-    # character-count cap, and structured requests may use several paragraphs.
-    assert "普通聊天和简短问答，整个回复必须只有一个自然段，不使用换行或空行。" in BASE_RESPONSE_PROMPT
-    assert (
-        "如果用户明确要求详细教程、代码、推导、列表或复杂分析，允许正常使用多段结构。"
-        in BASE_RESPONSE_PROMPT
-    )
+    # V0.9.6: ordinary chat defaults to one sentence; detailed requests expand
+    # as needed. There is still no character-count cap.
+    assert "默认一句话。" in BASE_RESPONSE_PROMPT
+    assert "普通交流默认简短；复杂任务按实际需要调整长度。" in BASE_RESPONSE_PROMPT
+    assert "如果对方明确要求详细教程、解释、推导、代码或完整信息，" in BASE_RESPONSE_PROMPT
 
 
 def test_style_examples_are_not_injected():

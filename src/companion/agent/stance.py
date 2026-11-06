@@ -89,6 +89,32 @@ _HYPOTHETICAL_OR_QUOTED = re.compile(
     r"\bif\b|\bwould\b|\bsuppose\b|\bquote\b)",
     re.IGNORECASE,
 )
+# V0.9.6: the speaker is now encouraged to react casually, joke and use
+# half-sentences. A reaction to *this* moment must not become permanent
+# character, even when it happens to start with "我觉得". These markers are
+# deliberately about register (laughter, surprise, unfinished speech) rather
+# than about any particular opinion.
+_CASUAL_REACTION = re.compile(
+    r"(哈哈|嘿+|诶|欸|哎|哟|唔|嗯|呃|嗐|"
+    r"笑死|好笑|好玩|离谱|绝了|服了|太真实|"
+    r"居然|竟然|没想到|吓一跳|"
+    r"……|~|～|!{2,}|！{2,})"
+)
+# A comment on the news result / event in front of us is a remark, not a
+# standing position. Only deictic references to the current item count; a
+# general preference ("我更看重可验证的证据") is unaffected.
+_EVENT_SPECIFIC_REMARK = re.compile(
+    r"(这次|这回|这波|这条|这个新闻|这条新闻|这条消息|这个结果|这局|"
+    r"刚才那|刚刚那|今天这)"
+)
+# "我觉得" / "我认为" / "对我来说" introduce any opinion, including a
+# prediction about tomorrow. On their own they are not a stated preference;
+# with them present, the sentence must also carry a value judgement.
+_GENERIC_OPINION_MARKERS = ("我觉得", "我认为", "对我来说")
+_VALUE_JUDGEMENT = re.compile(
+    r"(喜欢|讨厌|受不了|宁愿|更愿意|愿意|偏向|倾向|看重|在意|"
+    r"赞成|反对|值得|重要|更好|最好|适合|舍不得|热爱)"
+)
 
 _CJK_RUN = re.compile(r"[一-鿿]{2,}")
 _LATIN_WORD = re.compile(r"[A-Za-z]{3,}")
@@ -224,11 +250,25 @@ def extract_stance_candidates(
             # Hypotheticals, reported speech and quotations belong to someone
             # else's view, not to the companion's own stance.
             continue
+        if _CASUAL_REACTION.search(sentence):
+            # A joke, interjection, surprise or unfinished colloquial line is
+            # momentary wording, not a stable position.
+            continue
+        if _EVENT_SPECIFIC_REMARK.search(sentence):
+            # A passing comment on this turn's news/event is not character.
+            continue
         if any(sentence.startswith(prefix) for prefix in _NON_STANCE_PREFIXES):
             continue
         if _TRIVIAL_AGREEMENT.match(sentence):
             continue
-        if not any(marker in sentence for marker in _STANCE_MARKERS):
+        markers = [marker for marker in _STANCE_MARKERS if marker in sentence]
+        if not markers:
+            continue
+        if all(
+            marker in _GENERIC_OPINION_MARKERS for marker in markers
+        ) and not _VALUE_JUDGEMENT.search(sentence):
+            # "我觉得明天会下雨" is a prediction; "对我来说，只能靠语言了解"
+            # is an explanation of this moment. Neither is a stable position.
             continue
         stance = normalize_stance(sentence)
         if stance is None or stance in found:

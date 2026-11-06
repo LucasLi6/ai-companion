@@ -499,7 +499,10 @@ def test_prompt_budget_is_bounded_and_labelled_as_an_estimate():
         16,
         1800,
     )
-    assert budget["total_tokens_estimate"] < 2000
+    # V0.9.6's base prompt is deliberately longer (continuity + information
+    # digestion rules), so the ceiling moves with it; the per-section caps are
+    # unchanged and still bound the turn.
+    assert budget["total_tokens_estimate"] < 3200
 
 
 async def test_runtime_inspect_shows_metadata_without_conversation_text(
