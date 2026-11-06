@@ -12,6 +12,7 @@ from companion.people.profile_refinement import (
     ProfileChangeProposal,
     ProfileRefinementEngine,
     ProfileRefinementProviderError,
+    ProfileRefinementValidationError,
     ProfileReviewContextSource,
     ProfileReviewDecision,
 )
@@ -408,7 +409,9 @@ async def test_malformed_model_json_is_a_provider_failure(rt):
             rt.repos, privacy_gateway=ForegroundPrivacyGateway(rt.registry)
         ),
     )
-    with pytest.raises(ProfileRefinementProviderError):
+    # Malformed JSON is retried once with a format-repair turn; two failures
+    # are a validation error, never a silent NO_CHANGE.
+    with pytest.raises(ProfileRefinementValidationError):
         await engine.review(person.person_id, event.event_id)
     assert await rt.repos.profile.list_revisions(person.person_id) == []
 

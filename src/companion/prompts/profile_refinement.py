@@ -11,7 +11,7 @@ import json
 
 PROFILE_REFINEMENT_PROMPT_VERSION = "profile-refinement-v2"
 
-PROFILE_REFINEMENT_SYSTEM_PROMPT = """你是 Ava 的 Personal Profile Refinement 模块。
+_PROMPT_HEAD = """你是 Ava 的 Personal Profile Refinement 模块。
 
 你的职责不是收集对话中的所有个人信息，
 而是结合一个人的现有完整 Profile 与新对话，
@@ -80,31 +80,69 @@ ARCHIVE：标记已经过时或不再适用的内容。
 不得将模型旧推断当作新的独立证据。
 不得因为新信息与旧信息略有不同就假定旧信息错误。
 
-如果没有必要修改，返回 NO_CHANGE。
+如果没有必要修改，返回 NO_CHANGE。"""
 
-只输出一个 JSON 对象，字段名必须与下面完全一致，不得使用 action、
-proposals、updates 等其他命名：
-
-{
-  "decision": "NO_CHANGE" 或 "PROPOSE_CHANGES",
-  "reason": "简短理由",
-  "changes": [
+# Two real, parseable JSON examples. They are built with json.dumps so the
+# prompt can never drift from valid JSON again.
+PROFILE_NO_CHANGE_EXAMPLE = json.dumps(
     {
-      "operation": "ADD" | "UPDATE" | "CORRECT" | "MERGE" | "REFINE" | "ARCHIVE",
-      "field_key": "必须来自 allowed_field_keys",
-      "target_entry_ids": ["要修改的 entry_id；ADD 时为空数组"],
-      "proposed_content": "修改后的完整内容",
-      "evidence_event_ids": ["必须来自 new_evidence.allowed_event_ids"],
-      "evidence_quotes": ["与 evidence_event_ids 对应的原文摘录"],
-      "reason": "为什么需要这项修改",
-      "confidence": 0.0 到 1.0 之间的小数,
-      "requires_confirmation": true 或 false
-    }
-  ]
-}
+        "decision": "NO_CHANGE",
+        "reason": "现有 Profile 已足够准确，新对话没有提供稳定的新信息",
+        "changes": [],
+    },
+    ensure_ascii=False,
+    indent=2,
+)
 
-decision 为 NO_CHANGE 时 changes 必须为 []。
-不得输出数组以外的其他结构，不得输出解释性文字。"""
+PROFILE_PROPOSE_CHANGES_EXAMPLE = json.dumps(
+    {
+        "decision": "PROPOSE_CHANGES",
+        "reason": "本人明确说明了一个正在进行中的项目",
+        "changes": [
+            {
+                "operation": "ADD",
+                "field_key": "projects.active",
+                "target_entry_ids": [],
+                "proposed_content": "正在开发一个以 STM32 为主控的机器狗项目",
+                "evidence_event_ids": ["evt_example_allowed_event_id"],
+                "evidence_quotes": ["我最近在做一个机器狗项目，用 STM32 做主控。"],
+                "reason": "本人明确自述当前项目，属于稳定信息",
+                "confidence": 0.9,
+                "requires_confirmation": False,
+            }
+        ],
+    },
+    ensure_ascii=False,
+    indent=2,
+)
+
+_PROMPT_TAIL = """输出协议（必须严格遵守）：
+
+- 只输出一个 JSON 对象，不得输出 Markdown 代码块、解释性文字或任何其他内容。
+- 顶层字段只允许 decision、reason、changes。
+- decision 只允许 "NO_CHANGE" 或 "PROPOSE_CHANGES"。
+- 不得使用 "CHANGE"、"action"、"updates"、"proposals" 等替代字段或值。
+  如果需要修改，必须写 "PROPOSE_CHANGES" 并使用 "changes" 数组。
+- decision 为 "NO_CHANGE" 时，changes 必须为 []。
+- 不得输出 person_id 或 base_revision；本地程序会填入可信值。
+- field_key 必须来自 allowed_field_keys。
+- evidence_event_ids 必须来自 new_evidence.allowed_event_ids，不得编造。
+
+示例一（NO_CHANGE）：
+__NO_CHANGE_EXAMPLE__
+
+示例二（PROPOSE_CHANGES）：
+__PROPOSE_CHANGES_EXAMPLE__"""
+
+PROFILE_REFINEMENT_SYSTEM_PROMPT = (
+    _PROMPT_HEAD
+    + "\n\n"
+    + _PROMPT_TAIL.replace(
+        "__NO_CHANGE_EXAMPLE__", PROFILE_NO_CHANGE_EXAMPLE
+    ).replace(
+        "__PROPOSE_CHANGES_EXAMPLE__", PROFILE_PROPOSE_CHANGES_EXAMPLE
+    )
+)
 
 
 def build_profile_refinement_messages(payload: dict) -> list[dict]:
@@ -125,8 +163,33 @@ def build_profile_refinement_messages(payload: dict) -> list[dict]:
     ]
 
 
+def build_profile_refinement_repair_message(
+    problem: str,
+) -> dict:
+    """One format-repair turn. It carries the error type, never model output.
+
+    The original task messages are reused unchanged; this only adds a short
+    instruction with the validation failure, so the model can regenerate a
+    schema-valid object without the app echoing raw content anywhere.
+    """
+    return {
+        "role": "user",
+        "content": (
+            "上一次输出未通过本地 JSON Schema 校验"
+            f"（错误类型：{problem}）。\n"
+            "请基于上面的原始任务重新输出，只输出一个符合协议的 JSON 对象。\n"
+            "不要输出解释，不要使用 action、updates、CHANGE 等替代字段或值。\n"
+            "不得编造 field_key、证据 ID 或人物信息；如果无法形成合法变更，"
+            "返回 NO_CHANGE。"
+        ),
+    }
+
+
 __all__ = [
     "PROFILE_REFINEMENT_PROMPT_VERSION",
     "PROFILE_REFINEMENT_SYSTEM_PROMPT",
+    "PROFILE_NO_CHANGE_EXAMPLE",
+    "PROFILE_PROPOSE_CHANGES_EXAMPLE",
     "build_profile_refinement_messages",
+    "build_profile_refinement_repair_message",
 ]
