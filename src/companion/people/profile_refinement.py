@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from companion.people.profile_models import (
+    ENTRY_FIELD_KEYS,
     ProfileFieldSpec,
     ProfileFieldStorage,
     profile_field_spec,
@@ -401,6 +403,23 @@ class ProfileApplyResult(BaseModel):
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class ProfileReviewExecution:
+    """Trusted identity of one background review execution.
+
+    Constructed by the worker handler from values only trusted code knows: the
+    claimed receipt, the source event and the person-level lease owner. It
+    carries no permission the model could claim. The service re-checks all
+    four values inside the final write transaction, so a worker that lost its
+    lease (or whose receipt was taken over) can never commit a profile change.
+    """
+
+    person_id: str
+    review_id: str
+    lease_owner_id: str
+    source_event_id: str
+
+
 # -- local validation --------------------------------------------------------
 
 
@@ -552,6 +571,9 @@ class ProfileRefinementEngine:
             "profile_revision": existing.revision,
             "existing_profile": snapshot["existing_profile"],
             "entry_ids": snapshot["entry_ids"],
+            # The complete local field vocabulary: a model may only target a
+            # key from this list, and local validation still checks every one.
+            "allowed_field_keys": sorted(ENTRY_FIELD_KEYS),
             "pending_proposals": snapshot["pending_proposals"],
             "legacy_unconverted": snapshot["legacy_unconverted"],
             "compact_summary": snapshot["compact_summary"],
@@ -759,11 +781,16 @@ class ProfileRefinementEngine:
 
     # -- apply -------------------------------------------------------------
 
-    async def apply_proposals(self, review: ProfileReviewResult) -> ProfileApplyResult:
+    async def apply_proposals(
+        self,
+        review: ProfileReviewResult,
+        execution: Optional[ProfileReviewExecution] = None,
+    ) -> ProfileApplyResult:
         return await self.profiles.apply_refinement(
             review.person_id,
             review,
             source_event_id=review.source_event_id,
+            execution=execution,
         )
 
 
@@ -902,6 +929,7 @@ __all__ = [
     "ProfileRefinementValidationError",
     "ProfileReviewContextSource",
     "ProfileReviewDecision",
+    "ProfileReviewExecution",
     "ProfileReviewResult",
     "SnapshotEntry",
     "ValidatedChange",

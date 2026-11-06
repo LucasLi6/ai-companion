@@ -284,7 +284,7 @@ async def test_schema_16_rows_read_as_unknown_persona_not_as_matching(tmp_path):
     try:
         await db.initialize()
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 26
+        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 27
 
         repo = AnalysisRepository(db)
         stored = await repo.get_analysis_persona("evt_legacy")

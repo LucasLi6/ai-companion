@@ -439,16 +439,21 @@ class PersonProfileRepository:
         rows = await cur.fetchall()
         return [self._receipt_row(row) for row in rows]
 
-    async def claim_review_receipt(self, review_id: str) -> bool:
+    async def claim_review_receipt(
+        self, review_id: str, execution_owner_id: Optional[str] = None
+    ) -> bool:
         """Atomically take ownership of one pending review.
 
         Two workers may see the same pending list; only one conditional
-        ``UPDATE`` can move a row out of ``PENDING``.
+        ``UPDATE`` can move a row out of ``PENDING``. When the caller passes
+        its execution token, the row records that token and a fencing epoch so
+        every later transition can be scoped to this exact execution.
         """
         cur = await self.db.execute(
             "UPDATE profile_review_receipts SET status = 'RUNNING',"
+            " execution_owner_id = ?, lease_epoch = lease_epoch + 1,"
             " updated_at = ? WHERE review_id = ? AND status = 'PENDING'",
-            (_iso(utcnow()), review_id),
+            (execution_owner_id, _iso(utcnow()), review_id),
         )
         return (cur.rowcount or 0) == 1
 
@@ -461,6 +466,7 @@ class PersonProfileRepository:
         cutoff = _iso(utcnow() - timedelta(seconds=max(60, older_than_seconds)))
         cur = await self.db.execute(
             "UPDATE profile_review_receipts SET status = 'PENDING',"
+            " execution_owner_id = NULL,"
             " last_error = 'stale_runner_recovered', updated_at = ?"
             " WHERE person_id = ? AND status = 'RUNNING' AND updated_at < ?",
             (_iso(utcnow()), person_id, cutoff),
@@ -494,18 +500,29 @@ class PersonProfileRepository:
         rows = await cur.fetchall()
         return [self._receipt_row(row) for row in rows]
 
-    async def release_review_receipt(self, review_id: str, *, reason: str) -> bool:
+    async def release_review_receipt(
+        self,
+        review_id: str,
+        *,
+        reason: str,
+        execution_owner_id: Optional[str] = None,
+    ) -> bool:
         """Return a claimed receipt to PENDING after a lost execution lease.
 
-        Conditional on the receipt still being ``RUNNING``: a terminal or
-        newly claimed receipt is never reopened.
+        Conditional on the receipt still being ``RUNNING`` *and*, when a token
+        is supplied, on that token still owning the row: a stale worker can
+        never reopen a receipt a newer execution has claimed.
         """
-        cur = await self.db.execute(
+        sql = (
             "UPDATE profile_review_receipts SET status = 'PENDING',"
-            " last_error = ?, updated_at = ?"
-            " WHERE review_id = ? AND status = 'RUNNING'",
-            (reason[:500], _iso(utcnow()), review_id),
+            " execution_owner_id = NULL, last_error = ?, updated_at = ?"
+            " WHERE review_id = ? AND status = 'RUNNING'"
         )
+        params: list[Any] = [reason[:500], _iso(utcnow()), review_id]
+        if execution_owner_id is not None:
+            sql += " AND execution_owner_id = ?"
+            params.append(execution_owner_id)
+        cur = await self.db.execute(sql, tuple(params))
         return int(cur.rowcount or 0) == 1
 
     async def prepare_review_receipt_retry(
@@ -518,7 +535,7 @@ class PersonProfileRepository:
             " job_key = ?, base_revision = NULL, result_revision = NULL,"
             " decision = NULL, reason = NULL, changes_json = '[]',"
             " attempt_count = 0, last_error = NULL, completed_at = NULL,"
-            " updated_at = ?"
+            " execution_owner_id = NULL, updated_at = ?"
             " WHERE review_id = ? AND status != 'COMPLETED'",
             (job_key, now, review_id),
         )
@@ -531,7 +548,7 @@ class PersonProfileRepository:
         cur = await self.db.execute(
             "UPDATE profile_review_receipts SET status = 'CANCELLED',"
             " decision = 'CANCELLED', reason = 'source_event_deleted',"
-            " completed_at = ?, updated_at = ?"
+            " execution_owner_id = NULL, completed_at = ?, updated_at = ?"
             " WHERE person_id = ? AND source_event_id = ?"
             " AND status IN ('PENDING', 'RUNNING')",
             (
@@ -583,34 +600,55 @@ class PersonProfileRepository:
         increment_attempt: bool = False,
         last_error: Optional[str] = None,
         completed: bool = False,
-    ) -> None:
+        execution_owner_id: Optional[str] = None,
+    ) -> bool:
+        """Update a receipt, optionally only while ``execution_owner_id`` owns it.
+
+        A worker passing its token can never overwrite a receipt that a newer
+        execution has since claimed. A terminal transition also clears the
+        ownership token so the row is visibly finished.
+        """
         receipt = await self.get_review_receipt_by_id(review_id)
         if receipt is None:
-            return
+            return False
         now = _iso(utcnow())
-        await self.db.execute(
+        next_status = status if status is not None else receipt["status"]
+        clear_owner = next_status in (
+            "COMPLETED",
+            "SKIPPED",
+            "FAILED",
+            "CANCELLED",
+            "PENDING",
+        )
+        sql = (
             "UPDATE profile_review_receipts SET status = ?, base_revision = ?,"
             " result_revision = ?, decision = ?, reason = ?, changes_json = ?,"
             " attempt_count = ?, last_error = ?, updated_at = ?,"
-            " completed_at = ? WHERE review_id = ?",
-            (
-                status if status is not None else receipt["status"],
-                base_revision
-                if base_revision is not None
-                else receipt["base_revision"],
-                result_revision
-                if result_revision is not None
-                else receipt["result_revision"],
-                decision if decision is not None else receipt["decision"],
-                reason if reason is not None else receipt["reason"],
-                _json(changes) if changes is not None else _json(receipt["changes"]),
-                receipt["attempt_count"] + (1 if increment_attempt else 0),
-                last_error if last_error is not None else receipt["last_error"],
-                now,
-                now if completed else receipt["completed_at"],
-                review_id,
-            ),
+            " completed_at = ?, execution_owner_id = ? WHERE review_id = ?"
         )
+        params: list[Any] = [
+            next_status,
+            base_revision
+            if base_revision is not None
+            else receipt["base_revision"],
+            result_revision
+            if result_revision is not None
+            else receipt["result_revision"],
+            decision if decision is not None else receipt["decision"],
+            reason if reason is not None else receipt["reason"],
+            _json(changes) if changes is not None else _json(receipt["changes"]),
+            receipt["attempt_count"] + (1 if increment_attempt else 0),
+            last_error if last_error is not None else receipt["last_error"],
+            now,
+            now if completed else receipt["completed_at"],
+            None if clear_owner else receipt.get("execution_owner_id"),
+            review_id,
+        ]
+        if execution_owner_id is not None:
+            sql += " AND execution_owner_id = ?"
+            params.append(execution_owner_id)
+        cur = await self.db.execute(sql, tuple(params))
+        return int(cur.rowcount or 0) == 1
 
     @staticmethod
     def _receipt_row(row) -> dict:
@@ -627,6 +665,16 @@ class PersonProfileRepository:
             "changes": _loads(row["changes_json"], []),
             "attempt_count": int(row["attempt_count"] or 0),
             "last_error": row["last_error"],
+            "execution_owner_id": (
+                row["execution_owner_id"]
+                if "execution_owner_id" in row.keys()
+                else None
+            ),
+            "lease_epoch": (
+                int(row["lease_epoch"] or 0)
+                if "lease_epoch" in row.keys()
+                else 0
+            ),
             "created_at": _dt(row["created_at"]),
             "updated_at": _dt(row["updated_at"]),
             "completed_at": _dt(row["completed_at"]),

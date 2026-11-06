@@ -55,11 +55,14 @@ def _extract_json(content: str) -> dict:
     return data
 
 
-def _sanitise_decision(data: dict) -> dict:
+def _sanitise_decision(
+    data: dict, *, person_id: str, base_revision: int
+) -> dict:
     """Keep only fields the trusted local schema knows about.
 
-    Unknown keys are discarded rather than interpreted. A model cannot add a
-    person id, operation or permission that the local policy did not ask for.
+    Unknown keys are discarded rather than interpreted. The person id and
+    revision always come from the trusted payload the local program built —
+    whatever the model writes there is ignored.
     """
     decision = str(data.get("decision", "")).strip().upper()
     if decision not in ("NO_CHANGE", "PROPOSE_CHANGES"):
@@ -77,8 +80,8 @@ def _sanitise_decision(data: dict) -> dict:
             clean = {key: item[key] for key in _PROPOSAL_KEYS if key in item}
             changes.append(clean)
     return {
-        "person_id": str(data.get("person_id") or ""),
-        "base_revision": data.get("base_revision", 0),
+        "person_id": person_id,
+        "base_revision": base_revision,
         "decision": decision,
         "reason": str(data.get("reason") or "")[:500],
         "changes": changes,
@@ -118,7 +121,11 @@ class DeepSeekProfileRefinementProvider:
                 f"profile refinement call failed: {type(exc).__name__}"
             ) from exc
         self.last_model = getattr(response, "model", "") or ""
-        data = _sanitise_decision(_extract_json(response.content))
+        data = _sanitise_decision(
+            _extract_json(response.content),
+            person_id=str(payload.get("person_id") or ""),
+            base_revision=int(payload.get("profile_revision") or 0),
+        )
         try:
             return ProfileReviewDecision.model_validate(data)
         except Exception as exc:

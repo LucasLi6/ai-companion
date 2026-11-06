@@ -49,6 +49,7 @@ from companion.people.profile_refinement import (
     FullProfileSnapshot,
     ProfileApplyResult,
     ProfileChangeProposal,
+    ProfileReviewExecution,
     ProfileReviewResult,
     SnapshotEntry,
     ValidatedChange,
@@ -114,6 +115,14 @@ class ProfileProposalStale(ValueError):
         self.candidate_id = candidate_id
         self.expected_revision = expected_revision
         self.current_revision = current_revision
+        self.reason = reason
+
+
+class ReviewExecutionLost(ValueError):
+    """The review execution no longer owns the profile write slot."""
+
+    def __init__(self, reason: str = "review_execution_lost") -> None:
+        super().__init__(reason)
         self.reason = reason
 
 
@@ -777,6 +786,7 @@ class PersonProfileService:
         *,
         source_event_id: Optional[str] = None,
         actor: str = "profile_refinement",
+        execution: Optional[ProfileReviewExecution] = None,
     ) -> ProfileApplyResult:
         """Validate and apply one review's proposals atomically.
 
@@ -785,6 +795,13 @@ class PersonProfileService:
         snapshot; this method re-checks authorization, revision, ownership,
         evidence and limits, then commits everything in one SQLite
         transaction. A stale ``base_revision`` is reported, never overwritten.
+
+        When ``execution`` is supplied (the background worker path), the final
+        ``BEGIN IMMEDIATE`` transaction also proves that this exact execution
+        still owns the person lease and the ``RUNNING`` receipt. The check is
+        repeated just before the revision row is inserted, so a lease that
+        expired — or a receipt taken over by a newer worker — aborts the whole
+        transaction instead of committing a partial change.
         """
         status = str(getattr(decision, "status", "") or "")
         base_revision = int(getattr(decision, "base_revision", 0) or 0)
@@ -843,7 +860,10 @@ class PersonProfileService:
         rejected.extend(late_rejected)
 
         if not accepted:
-            async with self.repo.db.transaction():
+            async with self.repo.db.transaction(immediate=True):
+                await self._assert_review_execution_locked(
+                    person_id, source_event_id, execution
+                )
                 row = await self.repo.get(person_id)
                 if row is None:
                     return ProfileApplyResult(
@@ -876,7 +896,12 @@ class PersonProfileService:
                 reason=reason,
             )
 
-        async with self.repo.db.transaction():
+        async with self.repo.db.transaction(immediate=True):
+            # Believing we still hold the lease is not enough: prove it in the
+            # same write-locked transaction that commits the change.
+            await self._assert_review_execution_locked(
+                person_id, source_event_id, execution
+            )
             row = await self.repo.get(person_id)
             if row is None:
                 return ProfileApplyResult(
@@ -928,6 +953,11 @@ class PersonProfileService:
                     person_id, change, base_revision
                 )
                 stored_pending.append(self._pending_summary(change))
+            # Last check before the commit point: a lease that expired while
+            # the local checks ran must roll back everything above.
+            await self._assert_review_execution_locked(
+                person_id, source_event_id, execution
+            )
             await self.repo.insert_revision(
                 person_id=person_id,
                 revision=new_revision,
@@ -960,6 +990,45 @@ class PersonProfileService:
             rejected=rejected,
             reason=reason,
         )
+
+    async def _assert_review_execution_locked(
+        self,
+        person_id: str,
+        source_event_id: Optional[str],
+        execution: Optional[ProfileReviewExecution],
+    ) -> None:
+        """Prove this execution may commit, inside the write transaction."""
+        if execution is None:
+            return
+        if (
+            execution.person_id != person_id
+            or execution.source_event_id != source_event_id
+        ):
+            raise ReviewExecutionLost("review_execution_scope_mismatch")
+        lease = await self.repo.get_review_lease(person_id)
+        if (
+            lease is None
+            or lease["owner_id"] != execution.lease_owner_id
+            or lease["expires_at"] < utcnow()
+        ):
+            raise ReviewExecutionLost("review_lease_lost")
+        receipt = await self.repo.get_review_receipt(
+            person_id, execution.source_event_id
+        )
+        if (
+            receipt is None
+            or receipt["review_id"] != execution.review_id
+            or receipt["status"] != "RUNNING"
+            or receipt.get("execution_owner_id") != execution.lease_owner_id
+        ):
+            raise ReviewExecutionLost("review_receipt_not_owned")
+        # A permanently deleted event must never reach a profile write.
+        cur = await self.persons.db.execute(
+            "SELECT 1 FROM utterances WHERE event_id = ?",
+            (execution.source_event_id,),
+        )
+        if await cur.fetchone() is None:
+            raise ReviewExecutionLost("source_event_deleted")
 
     async def confirm_profile_proposal(
         self,
@@ -1303,11 +1372,16 @@ class PersonProfileService:
                 rows = await cur.fetchall()
                 user_texts = {row["event_id"]: row["text"] for row in rows}
                 if not set(evidence) <= set(user_texts):
-                    pending.append(
-                        change.model_copy(
-                            update={"auto_apply": False,
-                                    "pending_reason": "evidence_event_not_accessible"}
-                        )
+                    # The cited message no longer exists (privacy-deleted) or
+                    # belongs to someone else. It can never become valid later,
+                    # so reject the whole proposal instead of persisting a
+                    # pending candidate that quotes a dead source.
+                    rejected.append(
+                        {
+                            "operation": proposal.operation,
+                            "field_key": proposal.field_key,
+                            "reason": "evidence_event_not_accessible",
+                        }
                     )
                     continue
                 event_ids.update(user_texts)
@@ -1749,47 +1823,49 @@ class PersonProfileService:
 
     # -- evidence / memory linkage ----------------------------------------
 
-    async def invalidate_profile_source(
+    async def invalidate_profile_sources(
         self,
         person_id: str,
         *,
-        event_id: Optional[str] = None,
-        memory_id: Optional[str] = None,
+        event_ids: Iterable[str] = (),
+        memory_ids: Iterable[str] = (),
         deletion_mode: str = "RETRACTION",
     ) -> ProfileInvalidationResult:
-        """Remove one event/memory as support for this person's understanding.
+        """Remove a *set* of sources from one person's profile in one commit.
 
-        ``RETRACTION`` withdraws a source: entries that still have another
-        independent source keep their content (a merged entry whose remaining
-        sources cannot be proven to support the whole text becomes
-        ``PENDING_REVIEW``); entries with no support left stop being effective.
-
-        ``PRIVACY_DELETE`` is the explicit "remove my data" path: affected
-        entries and candidates are deleted, and derived copies in revisions and
-        review receipts are redacted rather than merely archived. The method
-        runs in one SQLite transaction, so raw deletion and profile
-        invalidation either both happen or neither does.
+        The caller must collect the complete source set before deleting
+        anything: an entry that cites only a derived memory must still be found
+        when its originating event is deleted. Entries, candidates, legacy
+        fields, receipts, revisions and the summary are processed in one SQLite
+        transaction with a single revision bump.
         """
+        events = {str(item) for item in event_ids if item}
+        memories = {str(item) for item in memory_ids if item}
         mode = str(deletion_mode or "RETRACTION").upper()
         if mode not in ("RETRACTION", "PRIVACY_DELETE"):
             raise ValueError("unsupported_deletion_mode")
-        if not event_id and not memory_id:
+        if not events and not memories:
             raise ValueError("event_id_or_memory_id_required")
         privacy = mode == "PRIVACY_DELETE"
         result = ProfileInvalidationResult(
             person_id=person_id,
-            event_id=event_id,
-            memory_id=memory_id,
+            event_id=next(iter(events)) if len(events) == 1 else None,
+            memory_id=next(iter(memories)) if len(memories) == 1 else None,
             deletion_mode=mode,
         )
 
-        def touched(evidence_events: list[str], evidence_memories: list[str]) -> bool:
+        def touched(
+            evidence_events: list[str], evidence_memories: list[str]
+        ) -> bool:
             return bool(
-                (event_id and event_id in evidence_events)
-                or (memory_id and memory_id in evidence_memories)
+                events.intersection(evidence_events or [])
+                or memories.intersection(evidence_memories or [])
             )
 
-        async with self.repo.db.transaction():
+        def remaining(values: list[str], removed: set[str]) -> list[str]:
+            return [item for item in values or [] if item not in removed]
+
+        async with self.repo.db.transaction(immediate=True):
             row = await self.repo.get(person_id)
             if row is None:
                 return result
@@ -1801,9 +1877,18 @@ class PersonProfileService:
                     entry["evidence_event_ids"], entry["evidence_memory_ids"]
                 )
             ]
-            candidates = await self.repo.list_candidates_referencing_source(
-                person_id, event_id=event_id, memory_id=memory_id
-            )
+            candidate_map: dict[str, dict] = {}
+            for event_id in events:
+                for candidate in await self.repo.list_candidates_referencing_source(
+                    person_id, event_id=event_id
+                ):
+                    candidate_map[candidate["candidate_id"]] = candidate
+            for memory_id in memories:
+                for candidate in await self.repo.list_candidates_referencing_source(
+                    person_id, memory_id=memory_id
+                ):
+                    candidate_map[candidate["candidate_id"]] = candidate
+            candidates = list(candidate_map.values())
             fields = [
                 field
                 for field in await self.repo.list_fields(person_id)
@@ -1831,16 +1916,10 @@ class PersonProfileService:
                     await self.repo.delete_entry(entry["entry_id"])
                     result.entries_deleted += 1
                     continue
-                remaining_events = [
-                    item
-                    for item in entry["evidence_event_ids"]
-                    if item != event_id
-                ]
-                remaining_memories = [
-                    item
-                    for item in entry["evidence_memory_ids"]
-                    if item != memory_id
-                ]
+                remaining_events = remaining(entry["evidence_event_ids"], events)
+                remaining_memories = remaining(
+                    entry["evidence_memory_ids"], memories
+                )
                 effective = entry["status"] in (
                     ProfileEntryStatus.ACTIVE.value,
                     ProfileEntryStatus.TENTATIVE.value,
@@ -1853,7 +1932,7 @@ class PersonProfileService:
                             valid_until=utcnow(),
                         )
                         result.entries_archived += 1
-                    # The retracted source may no longer be cited as support.
+                    # The retracted sources may no longer be cited as support.
                     await self.repo.replace_entry_evidence(
                         entry["entry_id"],
                         evidence_event_ids=remaining_events,
@@ -1892,23 +1971,17 @@ class PersonProfileService:
                     )
                     result.entries_archived += 1
                     continue
-                remaining_events = [
-                    item
-                    for item in field["evidence_event_ids"]
-                    if item != event_id
-                ]
-                remaining_memories = [
-                    item
-                    for item in field["evidence_memory_ids"]
-                    if item != memory_id
-                ]
+                remaining_events = remaining(field["evidence_event_ids"], events)
+                remaining_memories = remaining(
+                    field["evidence_memory_ids"], memories
+                )
                 value = field["value"]
                 if field_key in LIST_FIELDS:
                     old_items = list(value or [])
                     value = [
                         item
                         for item in old_items
-                        if not (memory_id and item.get("memory_id") == memory_id)
+                        if item.get("memory_id") not in memories
                     ]
                     removed_item = len(value) != len(old_items)
                 else:
@@ -1937,16 +2010,12 @@ class PersonProfileService:
                     await self.repo.delete_candidate(candidate["candidate_id"])
                     result.candidates_cleaned += 1
                     continue
-                remaining_events = [
-                    item
-                    for item in candidate["evidence_event_ids"]
-                    if item != event_id
-                ]
-                remaining_memories = [
-                    item
-                    for item in candidate["evidence_memory_ids"]
-                    if item != memory_id
-                ]
+                remaining_events = remaining(
+                    candidate["evidence_event_ids"], events
+                )
+                remaining_memories = remaining(
+                    candidate["evidence_memory_ids"], memories
+                )
                 if not remaining_events and not remaining_memories:
                     await self.repo.set_candidate_status(
                         candidate["candidate_id"],
@@ -1962,10 +2031,10 @@ class PersonProfileService:
                 result.candidates_cleaned += 1
 
             if privacy:
-                await self.repo.delete_evidence_for_source(
-                    person_id, event_id=event_id, memory_id=memory_id
-                )
-                if event_id:
+                for event_id in events:
+                    await self.repo.delete_evidence_for_source(
+                        person_id, event_id=event_id
+                    )
                     result.receipts_cleaned += (
                         await self.repo.cancel_review_receipts_for_source(
                             person_id, event_id
@@ -1976,6 +2045,10 @@ class PersonProfileService:
                     )
                     await self.repo.scrub_receipts_for_source(
                         person_id, event_id
+                    )
+                for memory_id in memories:
+                    await self.repo.delete_evidence_for_source(
+                        person_id, memory_id=memory_id
                     )
                 if affected_ids:
                     await self.repo.scrub_revisions_for_entries(
@@ -1991,8 +2064,10 @@ class PersonProfileService:
                     revision=new_revision,
                     changes={
                         "source_invalidated": {
-                            "event_deleted": bool(event_id),
-                            "memory_deleted": bool(memory_id),
+                            "event_deleted": bool(events),
+                            "memory_deleted": bool(memories),
+                            "event_count": len(events),
+                            "memory_count": len(memories),
                             "mode": mode,
                             "entries": len(entries),
                             "candidates": len(candidates),
@@ -2013,6 +2088,22 @@ class PersonProfileService:
                 result.revision = new_revision
         return result
 
+    async def invalidate_profile_source(
+        self,
+        person_id: str,
+        *,
+        event_id: Optional[str] = None,
+        memory_id: Optional[str] = None,
+        deletion_mode: str = "RETRACTION",
+    ) -> ProfileInvalidationResult:
+        """Single-source compatibility wrapper around the set-based path."""
+        return await self.invalidate_profile_sources(
+            person_id,
+            event_ids=(event_id,) if event_id else (),
+            memory_ids=(memory_id,) if memory_id else (),
+            deletion_mode=deletion_mode,
+        )
+
     async def propagate_memory_retraction(self, memory_id: str) -> int:
         """Stop referencing a revoked/deleted memory in every person profile.
 
@@ -2031,15 +2122,19 @@ class PersonProfileService:
     # -- helpers -----------------------------------------------------------
 
     async def _refresh_summary(self, person_id: str) -> None:
-        """Keep a bounded, human-readable summary on the main profile row."""
+        """Keep a bounded, human-readable summary on the main profile row.
+
+        The summary is always written, including the empty string: after a
+        deletion the compiled block may be empty, and leaving the previous
+        value in place would keep deleted content alive in the profile row.
+        """
         profile = await self.get(person_id)
         if profile is None:
             return
-        block = compile_profile_context(profile)
-        if block:
-            await self.repo.set_summary(
-                person_id, block, updated_by="profile_service"
-            )
+        block = compile_profile_context(profile) or ""
+        await self.repo.set_summary(
+            person_id, block, updated_by="profile_service"
+        )
 
     async def _assert_evidence_locked(
         self,

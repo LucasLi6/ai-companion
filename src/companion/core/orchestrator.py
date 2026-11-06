@@ -2809,14 +2809,14 @@ class Orchestrator:
                     return
 
     async def _observe_profile(self, event, enabled: bool) -> None:
-        """Record local learning and request a background review.
+        """Request a background review; never write the profile locally.
 
-        Both run inside the turn's commit transaction. Local learning never
-        makes a model call and a local failure is logged and ignored. The
-        review *request* is different: its receipt and job must commit with
-        the turn, otherwise a committed conversation could silently lose its
-        review. It is only a small same-DB insert — the actual model review
-        runs later in the worker.
+        A conversation turn may only *register* the review request, in the same
+        transaction as the turn. The single authoritative path for changing the
+        profile is: read the complete old profile -> model proposes -> local
+        rules validate -> atomic commit. The old regex learner is kept for
+        explicit callers but is no longer allowed to mutate the profile from
+        ordinary conversation text.
         """
         if not enabled:
             return
@@ -2824,24 +2824,12 @@ class Orchestrator:
         if person_id is None:
             return
         if self.profile_learning is not None:
-            try:
-                result = await self.profile_learning.observe(
-                    person_id, event.text, event_id=event.event_id
-                )
-                if result.preferences or result.candidates or result.corrections:
-                    self.logger.info(
-                        "profile_learning event_id=%s preferences=%d candidates=%d"
-                        " corrections=%d",
-                        event.event_id,
-                        len(result.preferences),
-                        len(result.candidates),
-                        len(result.corrections),
-                    )
-            except Exception as exc:  # pragma: no cover - defensive isolation
-                self.logger.warning(
-                    "profile_learning_failed event_id=%s error=%s",
+            signals = self.profile_learning.observe_signals(event.text)
+            if signals:
+                self.logger.info(
+                    "profile_signals_observed event_id=%s fields=%s",
                     event.event_id,
-                    type(exc).__name__,
+                    ",".join(signal.field_key for signal in signals),
                 )
         if self.profile_review is not None:
             # Deliberately not swallowed: losing this insert would leave a

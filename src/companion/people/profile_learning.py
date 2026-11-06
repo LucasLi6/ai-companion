@@ -248,6 +248,16 @@ class PersonProfileLearningService:
         self.profiles = profiles
         self.confirmation_threshold = confirmation_threshold
 
+    def observe_signals(self, text: str) -> list[ProfileSignal]:
+        """Extract optional language signals *without* writing anything.
+
+        The normal conversation path uses this only for diagnostics. A regex
+        match is never permission to change a permanent profile: the single
+        authoritative path is the background Profile Review, which reads the
+        complete profile first and lets local rules validate every change.
+        """
+        return extract_signals(text)
+
     async def observe(
         self,
         person_id: str,

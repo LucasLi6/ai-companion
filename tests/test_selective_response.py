@@ -192,7 +192,13 @@ async def test_no_response_provider_is_called_for_local_ignore(tmp_path):
 
 @pytest.mark.asyncio
 async def test_local_ignore_still_records_the_event_and_learns_profile(tmp_path):
-    """Silence is not a lost turn: it is recorded and may update the profile."""
+    """Silence is not a lost turn: it is recorded and enters profile review.
+
+    V0.9.7.2: ordinary conversation text can no longer mutate the profile from
+    the turn path. The silent turn persists the event, registers exactly one
+    recoverable review request, and only the review (AI read -> local validate
+    -> atomic commit) may apply the change.
+    """
     from companion.runtime import build_runtime
     from companion.storage.database import Database
 
@@ -230,10 +236,73 @@ async def test_local_ignore_still_records_the_event_and_learns_profile(tmp_path)
     action = await rt.repos.analysis.get_action(event.event_id)
     assert action is not None and action.action_type == CognitiveAction.IGNORE
 
-    # Authorised profile learning still runs for the silent turn.
+    # Local regex signals are diagnostics only: the profile is untouched.
     profile = await rt.profile_service.get(person.person_id)
     assert profile is not None
-    assert (
-        profile.communication_value(ProfileFieldKey.FORMALITY) == "casual"
+    assert profile.communication_value(ProfileFieldKey.FORMALITY) == "UNKNOWN"
+
+    # The turn registered exactly one recoverable review request.
+    receipt = await rt.repos.profile.get_review_receipt(
+        person.person_id, event.event_id
     )
+    assert receipt is not None and receipt["status"] == "PENDING"
+
+    # The AI review path is the only writer; once it runs, the learned value
+    # is visible in the profile.
+    import logging
+
+    from companion.cognition.privacy import ForegroundPrivacyGateway
+    from companion.jobs.profile_review import build_profile_review_handler
+    from companion.people.profile_refinement import (
+        ProfileChangeProposal,
+        ProfileRefinementEngine,
+        ProfileReviewContextSource,
+        ProfileReviewDecision,
+    )
+    from companion.providers.deepseek_profile import (
+        ScriptedProfileRefinementProvider,
+    )
+
+    engine = ProfileRefinementEngine(
+        rt.profile_service,
+        rt.repos.profile,
+        ScriptedProfileRefinementProvider(
+            [
+                ProfileReviewDecision(
+                    person_id=person.person_id,
+                    base_revision=profile.metadata.revision,
+                    decision="PROPOSE_CHANGES",
+                    reason="silent_turn",
+                    changes=[
+                        ProfileChangeProposal(
+                            operation="ADD",
+                            field_key="interaction.communication_feedback",
+                            proposed_content="希望说话不要太正式，随意自然一点",
+                            evidence_event_ids=[event.event_id],
+                            confidence=0.95,
+                        )
+                    ],
+                )
+            ]
+        ),
+        ProfileReviewContextSource(
+            rt.repos, privacy_gateway=ForegroundPrivacyGateway(rt.registry)
+        ),
+    )
+    await build_profile_review_handler(engine)(
+        {"person_id": person.person_id, "source_event_id": event.event_id},
+        rt.repos,
+        logging.getLogger("test.selective_response"),
+    )
+    entries = await rt.repos.profile.list_entries(
+        person.person_id,
+        statuses=("ACTIVE", "TENTATIVE"),
+        field_key="interaction.communication_feedback",
+    )
+    assert len(entries) == 1
+    assert "正式" in entries[0]["content"]
+    # The enum interaction switch stays as it was: only the review-chosen
+    # feedback entry was added.
+    learned = await rt.profile_service.get(person.person_id)
+    assert learned.communication_value(ProfileFieldKey.FORMALITY) == "UNKNOWN"
     await db.close()

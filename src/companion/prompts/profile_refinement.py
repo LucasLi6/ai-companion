@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-PROFILE_REFINEMENT_PROMPT_VERSION = "profile-refinement-v1"
+PROFILE_REFINEMENT_PROMPT_VERSION = "profile-refinement-v2"
 
 PROFILE_REFINEMENT_SYSTEM_PROMPT = """你是 Ava 的 Personal Profile Refinement 模块。
 
@@ -82,7 +82,29 @@ ARCHIVE：标记已经过时或不再适用的内容。
 
 如果没有必要修改，返回 NO_CHANGE。
 
-只输出符合指定 Schema 的 JSON。"""
+只输出一个 JSON 对象，字段名必须与下面完全一致，不得使用 action、
+proposals、updates 等其他命名：
+
+{
+  "decision": "NO_CHANGE" 或 "PROPOSE_CHANGES",
+  "reason": "简短理由",
+  "changes": [
+    {
+      "operation": "ADD" | "UPDATE" | "CORRECT" | "MERGE" | "REFINE" | "ARCHIVE",
+      "field_key": "必须来自 allowed_field_keys",
+      "target_entry_ids": ["要修改的 entry_id；ADD 时为空数组"],
+      "proposed_content": "修改后的完整内容",
+      "evidence_event_ids": ["必须来自 new_evidence.allowed_event_ids"],
+      "evidence_quotes": ["与 evidence_event_ids 对应的原文摘录"],
+      "reason": "为什么需要这项修改",
+      "confidence": 0.0 到 1.0 之间的小数,
+      "requires_confirmation": true 或 false
+    }
+  ]
+}
+
+decision 为 NO_CHANGE 时 changes 必须为 []。
+不得输出数组以外的其他结构，不得输出解释性文字。"""
 
 
 def build_profile_refinement_messages(payload: dict) -> list[dict]:

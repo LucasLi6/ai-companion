@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1892,6 +1892,20 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE INDEX IF NOT EXISTS idx_profile_review_leases_expiry
             ON profile_review_leases(expires_at);
+        """,
+    ),
+    # Version 27 (V0.9.7.2): fence every review receipt transition to the
+    # execution that owns it. ``execution_owner_id`` is the same trusted token
+    # as the person lease owner; ``lease_epoch`` increments on every claim so
+    # a later execution can always be distinguished from an earlier one that
+    # resumes late. Existing rows keep NULL/0 and are recovered normally.
+    (
+        27,
+        """
+        ALTER TABLE profile_review_receipts
+            ADD COLUMN execution_owner_id TEXT;
+        ALTER TABLE profile_review_receipts
+            ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0;
         """,
     ),
 ]

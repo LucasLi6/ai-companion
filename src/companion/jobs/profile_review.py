@@ -28,7 +28,8 @@ from typing import Optional
 
 from companion.domain.enums import JobStatus, JobType
 from companion.domain.models import utcnow
-from companion.people.profile_service import ProfileUnauthorized
+from companion.people.profile_refinement import ProfileReviewExecution
+from companion.people.profile_service import ProfileUnauthorized, ReviewExecutionLost
 from companion.tasks.context import current_task_context
 from companion.tasks.models import TaskPaused
 
@@ -203,6 +204,18 @@ def build_profile_review_handler(
             if receipt["status"] in TERMINAL_RECEIPT_STATUSES:
                 return
 
+            # A deleted source must never be sent to the model or applied.
+            # The receipt is normally CANCELLED by the deletion transaction;
+            # this is the defensive check for a job that raced the delete.
+            await _cancel_if_source_missing(
+                repos, repository, receipt, log
+            )
+            receipt = await repository.get_review_receipt(
+                person_id, source_event_id
+            )
+            if receipt is None or receipt["status"] in TERMINAL_RECEIPT_STATUSES:
+                return
+
             pending = await repository.list_review_receipts(
                 person_id, status="PENDING", limit=max(1, int(max_receipts))
             )
@@ -212,7 +225,17 @@ def build_profile_review_handler(
             for item in pending:
                 if item["status"] != "PENDING":
                     continue
-                if not await repository.claim_review_receipt(item["review_id"]):
+                await _cancel_if_source_missing(
+                    repos, repository, item, log
+                )
+                item = await repository.get_review_receipt_by_id(
+                    item["review_id"]
+                )
+                if item is None or item["status"] != "PENDING":
+                    continue
+                if not await repository.claim_review_receipt(
+                    item["review_id"], owner
+                ):
                     continue
                 outcome = await _review_one(
                     engine,
@@ -259,6 +282,30 @@ async def _renew_or_abort(
         raise JobError("profile_review_lease_lost")
 
 
+async def _cancel_if_source_missing(
+    repos, repository, receipt: dict, log: logging.Logger
+) -> bool:
+    """Cancel a review whose source event was permanently deleted."""
+    if repos is None:
+        return False
+    event = await repos.utterance.get(receipt["source_event_id"])
+    if event is not None:
+        return False
+    await repository.update_review_receipt(
+        receipt["review_id"],
+        status="CANCELLED",
+        decision="CANCELLED",
+        reason="source_event_deleted",
+        completed=True,
+    )
+    log.info(
+        "profile_review_source_missing person_id=%s event_id=%s",
+        receipt["person_id"],
+        receipt["source_event_id"],
+    )
+    return True
+
+
 async def _review_one(
     engine,
     repository,
@@ -271,13 +318,23 @@ async def _review_one(
 ) -> str:
     person_id = receipt["person_id"]
     source_event_id = receipt["source_event_id"]
+    execution = (
+        ProfileReviewExecution(
+            person_id=person_id,
+            review_id=receipt["review_id"],
+            lease_owner_id=owner,
+            source_event_id=source_event_id,
+        )
+        if owner is not None
+        else None
+    )
     try:
         result = await engine.review(person_id, source_event_id)
     except ProfileUnauthorized:
-        await _complete(repository, receipt, "SKIPPED", "unauthorized")
+        await _complete(repository, receipt, "SKIPPED", "unauthorized", owner)
         return "done"
     except Exception as exc:
-        await _fail_or_retry(repository, receipt, repos, exc)
+        await _fail_or_retry(repository, receipt, repos, exc, owner)
         raise JobError(f"profile review failed: {exc}") from exc
 
     if owner is not None:
@@ -285,16 +342,20 @@ async def _review_one(
             await _renew_or_abort(repository, person_id, owner, lease_seconds)
         except JobError:
             await repository.release_review_receipt(
-                receipt["review_id"], reason="review_lease_lost"
+                receipt["review_id"],
+                reason="review_lease_lost",
+                execution_owner_id=owner,
             )
             raise
 
     if result.status in ("NO_PROFILE", "UNAUTHORIZED"):
-        await _complete(repository, receipt, "SKIPPED", result.reason or result.status)
+        await _complete(
+            repository, receipt, "SKIPPED", result.reason or result.status, owner
+        )
         return "done"
 
     try:
-        applied = await engine.apply_proposals(result)
+        applied = await engine.apply_proposals(result, execution=execution)
         if applied.status == "REVISION_CONFLICT":
             # Reload the full profile and ask again against the newer
             # revision. Never just replace base_revision on the old proposal.
@@ -308,14 +369,23 @@ async def _review_one(
                 await _renew_or_abort(
                     repository, person_id, owner, lease_seconds
                 )
-            applied = await engine.apply_proposals(result)
+            applied = await engine.apply_proposals(result, execution=execution)
+    except ReviewExecutionLost:
+        await repository.release_review_receipt(
+            receipt["review_id"],
+            reason="review_lease_lost",
+            execution_owner_id=owner,
+        )
+        raise JobError("profile_review_lease_lost")
     except JobError:
         await repository.release_review_receipt(
-            receipt["review_id"], reason="review_lease_lost"
+            receipt["review_id"],
+            reason="review_lease_lost",
+            execution_owner_id=owner,
         )
         raise
     except Exception as exc:
-        await _fail_or_retry(repository, receipt, repos, exc)
+        await _fail_or_retry(repository, receipt, repos, exc, owner)
         raise JobError(f"profile review apply failed: {exc}") from exc
 
     changes = (
@@ -333,10 +403,11 @@ async def _review_one(
             changes=changes,
             increment_attempt=True,
             last_error="revision_conflict_after_retry",
+            execution_owner_id=owner,
         )
         return "retry"
     if applied.status == "UNAUTHORIZED":
-        await _complete(repository, receipt, "SKIPPED", applied.reason)
+        await _complete(repository, receipt, "SKIPPED", applied.reason, owner)
         return "done"
 
     decision = (
@@ -355,6 +426,7 @@ async def _review_one(
         reason=applied.reason or result.reason,
         changes=changes,
         completed=True,
+        execution_owner_id=owner,
     )
     log.info(
         "profile_review_applied person_id=%s event_id=%s status=%s"
@@ -370,7 +442,9 @@ async def _review_one(
     return "done"
 
 
-async def _fail_or_retry(repository, receipt: dict, repos, exc: Exception) -> None:
+async def _fail_or_retry(
+    repository, receipt: dict, repos, exc: Exception, owner: Optional[str] = None
+) -> None:
     """Record the failure, or fail the receipt when the job is out of retries.
 
     The worker only retries a finite number of times. Without this, the last
@@ -396,11 +470,12 @@ async def _fail_or_retry(repository, receipt: dict, repos, exc: Exception) -> No
         last_error=error,
         increment_attempt=True,
         completed=exhausted,
+        execution_owner_id=owner,
     )
 
 
 async def _complete(
-    repository, receipt: dict, status: str, reason: str
+    repository, receipt: dict, status: str, reason: str, owner: Optional[str] = None
 ) -> None:
     await repository.update_review_receipt(
         receipt["review_id"],
@@ -408,6 +483,7 @@ async def _complete(
         decision=status,
         reason=(reason or status)[:500],
         completed=True,
+        execution_owner_id=owner,
     )
 
 
@@ -441,6 +517,20 @@ async def reconcile_profile_review_jobs(
         job_key = receipt.get("job_key") or profile_review_job_key(
             receipt["person_id"], receipt["source_event_id"]
         )
+        # Never re-queue or repair a review whose source was deleted. The
+        # deletion transaction normally cancels the receipt; this covers a
+        # crash between the two writes.
+        source = await repos.utterance.get(receipt["source_event_id"])
+        if source is None:
+            await repository.update_review_receipt(
+                receipt["review_id"],
+                status="CANCELLED",
+                decision="CANCELLED",
+                reason="source_event_deleted",
+                completed=True,
+            )
+            fixed["cancelled"] += 1
+            continue
         job = await repos.job.get_by_key(job_key) if job_key else None
         if receipt["status"] == "RUNNING":
             if job is None or job.status != JobStatus.RUNNING:

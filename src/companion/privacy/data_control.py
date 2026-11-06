@@ -323,9 +323,9 @@ class DataControlService:
         async with self.repos.db.transaction(immediate=True):
             await self.memory_service.delete(memory_id, access=access)
             if self.profile_service is not None:
-                await self.profile_service.invalidate_profile_source(
+                await self.profile_service.invalidate_profile_sources(
                     person_id,
-                    memory_id=memory_id,
+                    memory_ids=(memory_id,),
                     deletion_mode="PRIVACY_DELETE",
                 )
         return {"deleted": {"memory": 1}, "memory_id": memory_id}
@@ -342,12 +342,19 @@ class DataControlService:
             raise MemoryPermissionDeniedError(event_id)
         access = AccessContext(actor_id=person_id, is_admin=True, role="data_control")
         async with self.repos.db.transaction(immediate=True):
-            # Memories learned from this event are deleted first: the utterance
-            # delete cascades the candidate/provenance bookkeeping, so this is
-            # the last moment the provenance lookup can find them.
+            # Collect the *complete* source set while every relation still
+            # exists: an entry may cite only a derived memory and never the
+            # original event, so invalidating the event alone would miss it.
             derived = await self.memory_service.repo.list_memory_ids_for_source_event(
                 event_id
             )
+            if self.profile_service is not None:
+                await self.profile_service.invalidate_profile_sources(
+                    person_id,
+                    event_ids=(event_id,),
+                    memory_ids=derived,
+                    deletion_mode="PRIVACY_DELETE",
+                )
             deleted_memories = 0
             for memory_id in derived:
                 try:
@@ -360,12 +367,6 @@ class DataControlService:
             )
             if not deleted:
                 raise MemoryPermissionDeniedError(event_id)
-            if self.profile_service is not None:
-                await self.profile_service.invalidate_profile_source(
-                    person_id,
-                    event_id=event_id,
-                    deletion_mode="PRIVACY_DELETE",
-                )
         return {
             "deleted": {"event": 1, "memory": deleted_memories},
             "event_id": event_id,
