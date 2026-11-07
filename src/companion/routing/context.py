@@ -329,6 +329,13 @@ def build_speaker_context(
 
 
 def _route_payload(route) -> dict:
+    """Project the validated route for the Speaker.
+
+    ``reason`` is intentionally absent. It is the router's natural-language
+    explanation of its own judgment; it stays on the decision object (and in
+    the ``route_decisions`` audit row, via ``audit_dict``) but must not reach
+    the Speaker, where it would read as advice about what to say.
+    """
     return {
         "source": "semantic_router",
         "action": route.action.value,
@@ -336,7 +343,6 @@ def _route_payload(route) -> dict:
         "addressee_assessment": route.addressee_assessment.value,
         "turn_state": route.turn_state.value,
         "processing_intents": [item.value for item in route.processing_intents],
-        "reason": (route.reason or "")[:500],
         "tool_requests": [
             {
                 "tool_name": item.tool_name,

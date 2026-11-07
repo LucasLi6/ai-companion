@@ -199,7 +199,7 @@ def _analysis(**updates):
 
 
 def test_response_prompt_renders_compact_affect_not_style_vectors():
-    assert RESPONSE_PROMPT_VERSION == "response-v18"
+    assert RESPONSE_PROMPT_VERSION == "response-v19"
     ctx = _context(
         affect_context="此刻情绪偏向关切（明显）。",
         # Legacy fields are ignored by the model: V0.5 removed the numeric

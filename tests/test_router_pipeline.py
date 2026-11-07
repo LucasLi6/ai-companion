@@ -178,13 +178,17 @@ async def test_tool_results_and_route_reach_the_speaker_context(semantic_runtime
     person = await rt.registry.register(
         "Lucas", "friend", allow_processing=True, allow_persistence=True, allow_memory_learning=True, allow_external_ai=True
     )
-    _, report = await _say(rt, person.person_id, "what time is it")
+    event, report = await _say(rt, person.person_id, "what time is it")
 
     assert report.action == CognitiveAction.RESPOND
     assert len(rt.response.calls) == 1
     context = rt.response.calls[0][2]
     assert context.route_context["action"] == "RESPOND"
-    assert context.route_context["reason"] == "semantic test decision"
+    # The router's prose explanation is not handed to the Speaker...
+    assert "reason" not in context.route_context
+    # ...but the audit row still records the complete decision, reason included.
+    decisions = await rt.repos.routing.list_decisions(event.event_id)
+    assert decisions[0]["decision"]["reason"] == "semantic test decision"
     assert context.tool_results[0]["tool_name"] == "runtime.current_time"
     assert context.tool_results[0]["status"] == "SUCCESS"
 

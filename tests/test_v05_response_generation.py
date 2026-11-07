@@ -134,7 +134,7 @@ async def test_exactly_one_model_call_per_generation():
 
 
 def test_prompt_version_is_v15():
-    assert RESPONSE_PROMPT_VERSION == "response-v18"
+    assert RESPONSE_PROMPT_VERSION == "response-v19"
 
 
 def test_base_prompt_has_generation_goal_and_stopping_rule():

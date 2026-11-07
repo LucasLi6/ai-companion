@@ -103,7 +103,10 @@ async def test_speaker_context_reuses_base_and_labels_route_data(rt, register):
     assert speaker.memories == base.memories
     assert speaker.current_text == current.text
     assert speaker.route_context["action"] == "RESPOND"
-    assert speaker.route_context["reason"] == "semantic reason"
+    # The router's prose explanation stays on the decision (and its audit row);
+    # it is not part of the Speaker's context.
+    assert "reason" not in speaker.route_context
+    assert route.reason == "semantic reason"
     assert speaker.tool_results[0]["tool_name"] == "runtime.current_time"
 
 

@@ -259,7 +259,9 @@ def test_each_section_uses_its_own_budget():
     assert len(scene) <= MAX_SCENE_CONTEXT_CHARS
 
     route = background["route"]
-    assert len(route["reason"]) <= 240
+    # Only structured judgment reaches the Speaker; the router's prose reason
+    # stays in the decision record and audit row.
+    assert "reason" not in route
     assert len(route["processing_intents"]) <= 4
     assert len(route["tools_requested"]) <= 4
     assert len(json.dumps(route, ensure_ascii=False)) <= MAX_ROUTE_CONTEXT_CHARS

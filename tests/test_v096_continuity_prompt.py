@@ -70,7 +70,7 @@ def _context(**overrides):
 
 
 def test_prompt_version_and_alias_are_preserved():
-    assert RESPONSE_PROMPT_VERSION == "response-v18"
+    assert RESPONSE_PROMPT_VERSION == "response-v19"
     assert SYSTEM_PROMPT is BASE_RESPONSE_PROMPT
 
 
