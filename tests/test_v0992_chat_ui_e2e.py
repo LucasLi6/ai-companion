@@ -2,8 +2,9 @@
 
 These drive the actual ``/chat`` page through NiceGUI's simulated user: the
 page subscribes to the shared chat runtime, sends a real utterance through the
-orchestrator, renders streamed deltas, shows the confirmation question once,
-and renders proactive events through the same bubble function. The DeepSeek
+orchestrator, renders streamed deltas, writes an explicit self-report without
+asking a confirmation question, and renders proactive events through the same
+bubble function. The DeepSeek
 client is replaced by an offline fake; nothing touches the network.
 
 If NiceGUI's testing plugin is unavailable the module is skipped.
@@ -27,7 +28,6 @@ from companion.providers.deepseek_client import ChatResponse, StreamDelta  # noq
 from companion.storage.repositories import ProactiveMessageRecord  # noqa: E402
 from companion.ui import app as ui_app  # noqa: E402
 
-QUESTION = "确认一下，你的中文名是李约，对吗？"
 LIVE_TEXT = "夜深了，记得早点休息。"
 
 
@@ -129,33 +129,38 @@ async def _type_and_send(user, text: str) -> None:
     user.find("发送").click()
 
 
-async def test_chat_page_streams_the_confirmation_question_once(user, web_app):
+async def test_chat_page_streams_a_direct_self_report_without_a_question(
+    user, web_app
+):
     rt = web_app._COORDINATOR.runtime
     person = await _owner(rt)
     await user.open("/chat")
 
     await _type_and_send(user, "我叫李约")
-    await user.should_see(QUESTION, retries=50)
-    question_labels = _labels_containing(user, QUESTION)
-    assert len(question_labels) == 1
+    await user.should_see("好的。", retries=50)
+    # No confirmation question is added to the reply.
+    assert _labels_containing(user, "确认一下") == []
 
-    action_texts = [element.text for element in question_labels]
-    assert len(action_texts) == 1
     action = await rt.repos.analysis.get_action(
         (await rt.repos.utterance.recent_context(
             f"chat:{person.person_id}", None, limit=1
         ))[-1].event_id
     )
-    # Persisted text, completed event text and the visible bubble agree.
-    assert action.response_text == action_texts[0]
-
-    await _type_and_send(user, "对")
-    await _wait_until(lambda: _labels_with(user, "好的。"))
+    assert "确认一下" not in (action.response_text or "")
     entries = await rt.repos.profile.list_entries(
         person.person_id, statuses=("ACTIVE",), field_key="identity.name"
     )
     assert [entry["content"] for entry in entries] == ["李约"]
-    assert len(_labels_containing(user, QUESTION)) == 1
+
+    await _type_and_send(user, "对")
+    await _wait_until(
+        lambda: len(_labels_with(user, "好的。")) >= 2
+    )
+    assert _labels_containing(user, "确认一下") == []
+    entries = await rt.repos.profile.list_entries(
+        person.person_id, statuses=("ACTIVE",), field_key="identity.name"
+    )
+    assert [entry["content"] for entry in entries] == ["李约"]
 
 
 async def test_chat_page_renders_live_proactive_events_without_duplicates(

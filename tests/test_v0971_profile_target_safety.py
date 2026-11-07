@@ -125,7 +125,7 @@ async def test_add_may_not_target_an_existing_entry(rt):
         ),
         event,
     )
-    assert applied.status == "NO_CHANGE"
+    assert applied.status == "REJECTED"
     assert applied.rejected[0]["reason"] == "add_must_not_target_entries"
     assert (await rt.profile_service.get(person.person_id)).metadata.revision == 2
 
@@ -151,7 +151,7 @@ async def test_cross_field_update_is_rejected_unless_an_explicit_transition(rt):
         ),
         event,
     )
-    assert applied.status == "NO_CHANGE"
+    assert applied.status == "REJECTED"
     assert applied.rejected[0]["reason"] == "field_transition_not_allowed"
     # The project row is untouched.
     assert (await rt.repos.profile.get_entry(project_id))["field_key"] == (
@@ -226,7 +226,7 @@ async def test_completed_project_may_not_silently_restart(rt):
         ),
         event,
     )
-    assert applied.status == "NO_CHANGE"
+    assert applied.status == "REJECTED"
     assert applied.rejected[0]["reason"] == "field_transition_not_allowed"
     assert (await rt.repos.profile.get_entry(completed_id))["field_key"] == (
         "projects.completed"
@@ -356,7 +356,7 @@ async def test_service_final_commit_revalidates_even_without_engine_checks(
     revision_before = (await rt.profile_service.get(person.person_id)).metadata.revision
 
     async def passthrough(person_id, changes):
-        return list(changes), [], []
+        return list(changes), []
 
     monkeypatch.setattr(
         rt.profile_service, "_precheck_changes", passthrough, raising=False
@@ -375,7 +375,6 @@ async def test_service_final_commit_revalidates_even_without_engine_checks(
                     evidence_event_ids=[event.event_id],
                     confidence=1.0,
                 ),
-                auto_apply=True,
             )
         ],
     )

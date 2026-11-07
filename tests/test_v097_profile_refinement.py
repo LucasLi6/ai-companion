@@ -16,10 +16,6 @@ from companion.people.profile_refinement import (
     ProfileReviewContextSource,
     ProfileReviewDecision,
 )
-from companion.people.profile_service import (
-    ProfileProposalStale,
-    TRUSTED_CONFIRMATION,
-)
 from companion.providers.deepseek_profile import (
     DeepSeekProfileRefinementProvider,
     ScriptedProfileRefinementProvider,
@@ -257,7 +253,7 @@ async def test_obsolete_project_moves_to_completed_and_keeps_old_row(rt):
     assert [item["content"] for item in completed] == ["期末考试（已完成）"]
 
 
-async def test_confirmed_name_requires_explicit_confirmation(rt):
+async def test_identity_is_written_only_by_the_explicit_self_report_path(rt):
     person = await _person(rt, "Identity")
     entry_id = await _entry(rt, person, "identity.name", "小明")
     event = await _event(rt, person, "以后叫我阿明吧。")
@@ -272,26 +268,30 @@ async def test_confirmed_name_requires_explicit_confirmation(rt):
         ),
     )
     review = await engine.review(person.person_id, event.event_id)
-    assert review.pending_changes()
     applied = await engine.apply_proposals(review)
-    assert applied.status == "PENDING_CONFIRMATION"
+    assert applied.status == "REJECTED"
+    assert applied.applied == []
     assert (await rt.repos.profile.get_entry(entry_id))["content"] == "小明"
     profile = await rt.profile_service.get(person.person_id)
     assert profile.metadata.revision == 1
-    candidate = applied.pending[0]
-    pending = await rt.repos.profile.find_pending(person.person_id, "identity.name")
-    assert pending and pending[0]["requires_confirmation"]
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
-    revision = await rt.profile_service.confirm_profile_proposal(
-        pending[0]["candidate_id"],
-        actor="user",
-        authority=TRUSTED_CONFIRMATION,
+    # The same words are enough for the trusted local path: the person's own
+    # explicit statement is the authorization, and it is applied immediately.
+    result = await rt.profile_service.apply_direct_self_report(
+        person_id=person.person_id,
+        field_key="identity.preferred_name",
+        value="阿明",
+        source_event_id=event.event_id,
     )
-    assert revision == 2
-    assert (await rt.repos.profile.get_entry(entry_id))["content"] == "阿明"
-    assert (await rt.repos.profile.get_candidate(
-        pending[0]["candidate_id"]
-    ))["status"] == "CONFIRMED"
+    assert result.status == "APPLIED"
+    assert result.revision == 2
+    entries = await rt.repos.profile.list_entries(
+        person.person_id, statuses=("ACTIVE",), field_key="identity.preferred_name"
+    )
+    assert [item["content"] for item in entries] == ["阿明"]
+    # The old name entry is untouched: this is a preferred name, not a CORRECT.
+    assert (await rt.repos.profile.get_entry(entry_id))["content"] == "小明"
 
 
 async def test_lossy_merge_is_rejected(rt):
@@ -312,7 +312,8 @@ async def test_lossy_merge_is_rejected(rt):
     review = await engine.review(person.person_id, event.event_id)
     assert review.status == "REJECTED"
     applied = await engine.apply_proposals(review)
-    assert applied.status == "NO_CHANGE"
+    assert applied.status == "REJECTED"
+    assert applied.rejected[0]["reason"] == "lossy_change_rejects_existing_facts"
     entries = await rt.repos.profile.list_entries(
         person.person_id, statuses=("ACTIVE",)
     )
@@ -380,7 +381,8 @@ async def test_invalid_evidence_and_provider_failure_leave_no_partial_change(rt)
     review = await engine.review(person.person_id, event.event_id)
     assert review.status == "REJECTED"
     applied = await engine.apply_proposals(review)
-    assert applied.status == "NO_CHANGE"
+    assert applied.status == "REJECTED"
+    assert applied.rejected[0]["reason"] == "evidence_event_not_authorized"
     assert await rt.repos.profile.list_entries(person.person_id) == []
 
     failing, _ = _engine(
@@ -535,7 +537,7 @@ async def test_sixty_turn_conversation_stays_concise_sourced_and_complete(rt):
         "今天还行。",
         "随便说说。",
         "我还在弄别的。",
-        "我其实叫阿明。",
+        "我叫阿明。",
         "嗯。",
         "好。",
         "继续。",
@@ -591,9 +593,7 @@ async def test_sixty_turn_conversation_stays_concise_sourced_and_complete(rt):
         content="Ava 长期记忆（已完成）",
         evidence=[events[40].event_id],
     )
-    decisions[45] = _decision(
-        "ADD", "identity.name", content="阿明", evidence=[events[45].event_id]
-    )
+    decisions[45] = no_change
     decisions[50] = _decision(
         "ADD",
         "knowledge.skills",
@@ -656,53 +656,23 @@ async def test_sixty_turn_conversation_stays_concise_sourced_and_complete(rt):
         for change in revision["changes"]["changes"]
     )
 
-    pending = await rt.repos.profile.find_pending(person.person_id, "identity.name")
-    assert len(pending) == 1
-    assert pending[0]["requires_confirmation"]
+    # The model never writes strict identity; that turn produced nothing.
     assert not any(item["field_key"] == "identity.name" for item in active)
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
-    # The identity proposal was made at turn 45 on the then-current revision;
-    # four later changes have moved the profile. It must not overwrite that
-    # newer state: confirmation is explicitly stale, nothing is bumped, and the
-    # candidate is kept for re-review.
-    with pytest.raises(ProfileProposalStale):
-        await rt.profile_service.confirm_profile_proposal(
-            pending[0]["candidate_id"],
-            actor="user",
-            authority=TRUSTED_CONFIRMATION,
-        )
-    assert (await rt.profile_service.get(person.person_id)).metadata.revision == 8
-    stale = await rt.repos.profile.get_candidate(pending[0]["candidate_id"])
-    assert stale["status"] == "NEEDS_REVIEW"
-    assert not any(
-        item["field_key"] == "identity.name" for item in active
+    # The person's own explicit statement ("我叫阿明") is the authorization and
+    # is written immediately, with its own revision and event source.
+    result = await rt.profile_service.apply_direct_self_report(
+        person_id=person.person_id,
+        field_key="identity.name",
+        value="阿明",
+        source_event_id=events[45].event_id,
     )
-
-    # Re-reviewing the same turn against the *current* profile produces a
-    # fresh proposal bound to revision 8; only that may be confirmed.
-    re_review_engine, _ = _engine(rt, decisions[45])
-    review = await re_review_engine.review(person.person_id, events[45].event_id)
-    reapplied = await re_review_engine.apply_proposals(review)
-    assert reapplied.status == "PENDING_CONFIRMATION"
-    fresh = [
-        item
-        for item in await rt.repos.profile.find_pending(
-            person.person_id, "identity.name"
-        )
-        if item["status"] == "PENDING" and item["expected_revision"] == 8
-    ]
-    assert len(fresh) == 1
-
-    # The strict identity change only happens through the explicit path.
-    assert (
-        await rt.profile_service.confirm_profile_proposal(
-            fresh[0]["candidate_id"],
-            actor="user",
-            authority=TRUSTED_CONFIRMATION,
-        )
-        == 9
-    )
+    assert result.status == "APPLIED"
+    assert result.revision == 9
     final = await rt.repos.profile.list_entries(
         person.person_id, statuses=("ACTIVE",), field_key="identity.name"
     )
     assert [item["content"] for item in final] == ["阿明"]
+    assert (await rt.profile_service.get(person.person_id)).metadata.revision == 9
+    assert len(await rt.repos.profile.list_revisions(person.person_id)) == 8

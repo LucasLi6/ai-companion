@@ -187,7 +187,8 @@ async def test_later_correction_does_not_rewrite_the_earlier_decision(rt):
         ),
     )
     result = await engine.review(person.person_id, first.event_id)
-    assert result.changes and result.changes[0].auto_apply
+    assert result.status == "ACCEPTED"
+    assert result.changes and result.changes[0].accepted
     assert result.rejected == []
 
 
@@ -298,7 +299,7 @@ async def test_wrong_nonexistent_and_foreign_events_are_refused(rt):
     assert other_person.rejected[0]["reason"] == "evidence_event_not_authorized"
 
 
-async def test_no_evidence_or_confidence_alone_stays_pending(rt):
+async def test_no_evidence_or_confidence_alone_is_rejected(rt):
     person = await _person(rt)
     event = await _event(rt, person, "我可能喜欢赛车吧。")
     result = await _engine(
@@ -310,12 +311,12 @@ async def test_no_evidence_or_confidence_alone_stays_pending(rt):
             confidence=1.0,
         ),
     ).review(person.person_id, event.event_id)
-    assert result.rejected == []
-    assert result.changes[0].auto_apply is False
-    assert result.changes[0].pending_reason == "no_evidence"
+    assert result.status == "REJECTED"
+    assert result.accepted_changes() == []
+    assert result.rejected[0]["reason"] == "no_evidence"
 
 
-async def test_hypothetical_and_third_party_claims_are_pending(rt):
+async def test_hypothetical_and_third_party_claims_are_rejected(rt):
     person = await _person(rt)
     event = await _event(rt, person, "如果我有时间，我也想学冲浪。")
     result = await _engine(
@@ -327,7 +328,8 @@ async def test_hypothetical_and_third_party_claims_are_pending(rt):
             quotes=["如果我有时间"],
         ),
     ).review(person.person_id, event.event_id)
-    assert result.changes[0].pending_reason == "uncertain_evidence_requires_review"
+    assert result.status == "REJECTED"
+    assert result.rejected[0]["reason"] == "hypothetical_or_reported_evidence"
 
     third_party = await _event(rt, person, "他说我喜欢潜水。")
     reported = await _engine(
@@ -339,9 +341,8 @@ async def test_hypothetical_and_third_party_claims_are_pending(rt):
             quotes=["他说我喜欢潜水"],
         ),
     ).review(person.person_id, third_party.event_id)
-    assert (
-        reported.changes[0].pending_reason == "uncertain_evidence_requires_review"
-    )
+    assert reported.status == "REJECTED"
+    assert reported.rejected[0]["reason"] == "hypothetical_or_reported_evidence"
 
 
 async def test_a_quote_must_be_located_in_the_cited_event(rt):
@@ -364,7 +365,8 @@ async def test_a_quote_must_be_located_in_the_cited_event(rt):
         rt,
         _proposal("interests.topics", "机器人", quotes=["我喜欢机器人"]),
     ).review(person.person_id, event.event_id)
-    assert unanchored.changes[0].pending_reason == "evidence_quote_without_event"
+    assert unanchored.status == "REJECTED"
+    assert unanchored.rejected[0]["reason"] == "evidence_quote_without_event"
 
 
 async def test_service_write_boundary_rechecks_evidence(rt, monkeypatch):
@@ -379,7 +381,7 @@ async def test_service_write_boundary_rechecks_evidence(rt, monkeypatch):
     foreign = await _event(rt, other, "我喜欢摄影。", conversation="c9")
 
     async def passthrough(person_id, changes):
-        return list(changes), [], []
+        return list(changes), []
 
     monkeypatch.setattr(
         rt.profile_service, "_precheck_changes", passthrough, raising=False
@@ -397,8 +399,7 @@ async def test_service_write_boundary_rechecks_evidence(rt, monkeypatch):
                     proposed_content="摄影",
                     evidence_event_ids=[foreign.event_id],
                     confidence=1.0,
-                ),
-                auto_apply=True,
+                )
             )
         ],
     )

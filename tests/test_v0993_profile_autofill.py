@@ -249,7 +249,7 @@ async def test_t08_existing_empty_profile_is_usable(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.status == "PROPOSED"
+    assert result.status == "ACCEPTED"
     assert result.base_revision == 1
     assert len(result.changes) == 1
 
@@ -282,7 +282,7 @@ async def test_t09_four_fields_auto_apply_without_confidence_gate(rt):
     provider = ScriptedProfileRefinementProvider([_acceptance_decision(event.event_id)])
 
     result = await _review(rt, provider, person.person_id, event.event_id)
-    assert result.status == "PROPOSED"
+    assert result.status == "ACCEPTED"
     applied = await _engine(rt, provider).apply_proposals(result)
 
     assert applied.status == "APPLIED"
@@ -294,7 +294,7 @@ async def test_t09_four_fields_auto_apply_without_confidence_gate(rt):
         ("communication.preferred_tone", "偏好不太正式的回答"),
     }
     assert (await rt.profile_service.get(person.person_id)).metadata.revision == 2
-    assert await rt.repos.profile.list_candidates(person.person_id, status=None) == []
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
     evidence = await rt.repos.profile.list_evidence(person.person_id)
     assert len(evidence) == 4
     assert {item["source_event_id"] for item in evidence} == {event.event_id}
@@ -312,7 +312,7 @@ async def test_t10_very_low_confidence_is_metadata_not_a_block(rt):
     applied = await _engine(rt, provider).apply_proposals(result)
 
     assert applied.applied[0]["status"] == "APPLIED"
-    assert applied.pending == []
+    assert applied.rejected == []
 
 
 async def test_t11_proposed_content_is_written_verbatim(rt):
@@ -378,8 +378,8 @@ async def test_t14_inferred_trait_without_quote_stays_pending(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.changes[0].auto_apply is False
-    assert result.changes[0].pending_reason == "trait_inference_requires_review"
+    assert result.status == "REJECTED"
+    assert result.rejected[0]["reason"] == "trait_inference_requires_self_description"
     applied = await _engine(rt, provider).apply_proposals(result)
     assert applied.applied == []
     assert await _active_entries(rt, person.person_id) == []
@@ -395,7 +395,8 @@ async def test_t14b_inferred_habit_without_quote_stays_pending(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.changes[0].pending_reason == "trait_inference_requires_review"
+    assert result.status == "REJECTED"
+    assert result.rejected[0]["reason"] == "trait_inference_requires_self_description"
 
 
 async def test_t15_sensitive_content_stays_pending(rt):
@@ -408,7 +409,8 @@ async def test_t15_sensitive_content_stays_pending(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.changes[0].pending_reason == "sensitive_field_requires_review"
+    assert result.status == "REJECTED"
+    assert result.rejected[0]["reason"] == "sensitive_attribute_not_auto_saved"
 
 
 async def test_t16_hypothetical_stays_pending(rt):
@@ -421,7 +423,8 @@ async def test_t16_hypothetical_stays_pending(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.changes[0].pending_reason == "uncertain_evidence_requires_review"
+    assert result.status == "REJECTED"
+    assert result.rejected[0]["reason"] == "hypothetical_or_reported_evidence"
 
 
 async def test_t17_strict_identity_stays_pending(rt):
@@ -434,7 +437,11 @@ async def test_t17_strict_identity_stays_pending(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.changes[0].pending_reason == "confirmed_identity_requires_confirmation"
+    assert result.status == "REJECTED"
+    assert (
+        result.rejected[0]["reason"]
+        == "strict_identity_requires_explicit_self_report"
+    )
 
 
 async def test_t18_no_evidence_stays_pending(rt):
@@ -449,7 +456,8 @@ async def test_t18_no_evidence_stays_pending(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.changes[0].pending_reason == "no_evidence"
+    assert result.status == "REJECTED"
+    assert result.rejected[0]["reason"] == "no_evidence"
 
 
 async def test_t19_quote_not_in_text_is_rejected(rt):
@@ -491,16 +499,28 @@ async def test_t21_model_requested_confirmation_stays_pending(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.changes[0].pending_reason == "model_requested_confirmation"
+    assert result.status == "REJECTED"
+    assert result.rejected[0]["reason"] == "trait_inferred_from_single_act"
+
+
+LIMIT_TEXT = (
+    "我喜欢爵士乐、摄影、露营、徒步、钓鱼、跑步、游泳、编程、写作、"
+    "咖啡、电影、旅行。"
+)
+LIMIT_LABELS = [
+    "爵士乐", "摄影", "露营", "徒步", "钓鱼", "跑步",
+    "游泳", "编程", "写作", "咖啡", "电影", "旅行",
+]
 
 
 async def test_t22_change_limit_is_ten(rt):
     assert MAX_REFINEMENT_CHANGES == 10
     person = await _person(rt)
-    event = await _event(rt, person, "我喜欢很多事。")
+    event = await _event(rt, person, LIMIT_TEXT)
     changes = [
-        _add("interests.likes", f"兴趣{i}", event.event_id, quote="我喜欢很多事")
-        for i in range(12)
+        _add("interests.likes", f"喜欢{label}", event.event_id,
+             quote=label)
+        for label in LIMIT_LABELS
     ]
     provider = ScriptedProfileRefinementProvider([_decision(*changes)])
 
@@ -515,10 +535,11 @@ async def test_t22_change_limit_is_ten(rt):
 
 async def test_t23_nine_changes_are_all_accepted(rt):
     person = await _person(rt)
-    event = await _event(rt, person, "我喜欢很多事。")
+    event = await _event(rt, person, LIMIT_TEXT)
     changes = [
-        _add("interests.likes", f"兴趣{i}", event.event_id, quote="我喜欢很多事")
-        for i in range(9)
+        _add("interests.likes", f"喜欢{label}", event.event_id,
+             quote=label)
+        for label in LIMIT_LABELS[:9]
     ]
     provider = ScriptedProfileRefinementProvider([_decision(*changes)])
 
@@ -553,7 +574,10 @@ async def test_t24_human_confirmed_target_requires_review(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.changes[0].pending_reason == "human_confirmed_target_requires_review"
+    assert result.status == "REJECTED"
+    assert (
+        result.rejected[0]["reason"] == "human_confirmed_target_requires_review"
+    )
     applied = await _engine(rt, provider).apply_proposals(result)
     assert applied.applied == []
     stored = await rt.repos.profile.get_entry(entry_id)
@@ -582,7 +606,7 @@ async def test_t25_field_capacity_still_protected(rt):
     result = await _review(rt, provider, person.person_id, event.event_id)
     applied = await _engine(rt, provider).apply_proposals(result)
 
-    assert applied.pending[0]["reason"] == "field_capacity_reached"
+    assert applied.rejected[0]["reason"] == "field_capacity_reached"
     assert len(await _active_entries(rt, person.person_id)) == 8
 
 
@@ -598,7 +622,7 @@ def test_t26_equivalence_unit_cases():
     assert entries_equivalent("喜欢爵士乐", "喜欢古典乐") is False
 
 
-async def test_t27_exact_duplicate_add_is_rejected(rt):
+async def test_t27_exact_duplicate_add_is_no_change(rt):
     person = await _person(rt)
     await rt.repos.profile.insert_entry(
         person_id=person.person_id,
@@ -618,7 +642,8 @@ async def test_t27_exact_duplicate_add_is_rejected(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.status == "REJECTED"
+    # A duplicate is not a failure: nothing new, no revision bump.
+    assert result.status == "NO_CHANGE"
     assert result.rejected[0]["reason"] == "already_present"
 
 
@@ -672,7 +697,7 @@ async def test_t29_same_entity_with_new_detail_is_not_a_duplicate(rt):
 
     result = await _review(rt, provider, person.person_id, event.event_id)
 
-    assert result.status == "PROPOSED"
+    assert result.status == "ACCEPTED"
     assert result.rejected == []
 
 
@@ -965,7 +990,7 @@ async def test_t41_full_turn_worker_apply_reads_back(rt, say):
     }
     evidence = await rt.repos.profile.list_evidence(person.person_id)
     assert {item["source_event_id"] for item in evidence} == {report.event_id}
-    assert await rt.repos.profile.list_candidates(person.person_id, status=None) == []
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
 
 async def test_t42_profile_survives_restart(rt, say):
@@ -1050,8 +1075,8 @@ async def test_t45_ordinary_changes_do_not_require_identity_confirmation(rt):
     applied = await _engine(rt, provider).apply_proposals(result)
 
     assert applied.status == "APPLIED"
-    assert applied.pending == []
-    assert await rt.repos.profile.list_candidates(person.person_id, status=None) == []
+    assert applied.rejected == []
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
     profile = await rt.profile_service.get(person.person_id)
     assert profile.identity["name"] == "UNKNOWN"
     assert profile.identity["preferred_name"] == "UNKNOWN"

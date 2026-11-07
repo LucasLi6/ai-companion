@@ -53,14 +53,6 @@ from companion.core.response_events import (
 )
 from companion.domain.enums import CognitiveAction, EventSource
 from companion.domain.models import make_utterance_event
-from companion.people.profile_confirmation import (
-    STATE_ACCEPTED_SELF_REPORT,
-    STATE_AWAITING_REPLY,
-    STATE_CONFIRMED,
-    STATE_PENDING_QUESTION,
-    STATE_REJECTED,
-    ProfileConfirmationService,
-)
 from companion.proactive.departure import detect_explicit_stop
 from companion.proactive.judge import ProactiveJudge
 from companion.proactive.manager import MODE_IMMEDIATE, MODE_LONG_IDLE
@@ -71,7 +63,6 @@ from companion.ui.app import load_chat_history
 from companion.ui.chat_coordinator import ChatCoordinator
 
 CONVERSATION = "chat:test-owner"
-QUESTION = "确认一下，你的中文名是李约，对吗？"
 
 
 # -- offline providers -----------------------------------------------------
@@ -140,16 +131,6 @@ class TruncatingClient(FakeClient):
         )
 
 
-class CountingConfirmation(ProfileConfirmationService):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.resume_calls = 0
-
-    async def resume_pending(self) -> int:
-        self.resume_calls += 1
-        return await super().resume_pending()
-
-
 # -- harness ---------------------------------------------------------------
 
 
@@ -163,7 +144,6 @@ async def chat(tmp_path):
         client=None,
         decisions=(),
         idle_delay: float = 0.02,
-        confirmation_timeout: float | None = None,
         provider: str = "deepseek",
     ):
         client = client or FakeClient()
@@ -180,14 +160,6 @@ async def chat(tmp_path):
                 proactive_judge=judge,
                 proactive_idle_delay_seconds=idle_delay,
             )
-            if confirmation_timeout is not None:
-                confirmation = CountingConfirmation(
-                    profile_service=rt.profile_service,
-                    repos=rt.repos,
-                    no_reply_timeout_seconds=confirmation_timeout,
-                )
-                rt.profile_confirmation = confirmation
-                rt.orchestrator.profile_confirmation = confirmation
             return rt
 
         coordinator = ChatCoordinator(
@@ -291,11 +263,14 @@ async def _name_entries(rt, person):
     )
 
 
-# -- T01-T04: streaming confirmation delivery ------------------------------
+# -- T01-T04: direct self-report during a streamed web turn ----------------
+# V0.9.9.6: there is no confirmation question and no second "yes" turn. An
+# explicit statement is written before the reply is generated, so truncation
+# or a dropped stream cannot lose it, and it is never written twice.
 
 
 async def test_deltas_completed_and_persisted_text_are_the_same_string(chat):
-    """T01: the question is visible once and every surface agrees."""
+    """T01: every streaming surface agrees and no question is appended."""
     coordinator, rt, client, _ = await chat(
         client=FakeClient(
             response_text="好的。\n\n我记住了。",
@@ -310,12 +285,10 @@ async def test_deltas_completed_and_persisted_text_are_the_same_string(chat):
     assert completed is not None
     assert completed.status == "COMPLETED"
     assert deltas == completed.text
-    assert deltas.count(QUESTION) == 1
-    assert deltas.endswith(QUESTION)
+    assert "确认一下" not in deltas
     # The layout normaliser collapsed the paragraph break, and the persisted
     # action carries exactly the visible text.
     assert "好的。 我记住了。" in deltas
-    assert "\n\n" not in deltas.removesuffix("\n\n" + QUESTION)
 
     action = await rt.repos.analysis.get_action(event.event_id)
     assert action.response_text == completed.text
@@ -329,83 +302,32 @@ async def test_deltas_completed_and_persisted_text_are_the_same_string(chat):
     assert sequences == sorted(sequences)
     assert len(set(sequences)) == len(sequences)
 
-    record = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert record.state == STATE_AWAITING_REPLY
-    assert record.question_message_id == action.action_id
-    assert await _name_entries(rt, person) == []
-
-
-async def test_question_already_emitted_by_the_model_is_not_reprinted(chat):
-    """T01 (retry case): the model itself produced the exact question."""
-    coordinator, rt, client, _ = await chat(
-        client=FakeClient(
-            response_text=QUESTION,
-            chunks=["确认一下，", "你的中文名是李约，", "对吗？"],
-        )
-    )
-    person = await _owner(rt)
-    _, _, deltas, completed = await _web_turn(coordinator, rt, person, "我叫李约")
-    assert deltas == completed.text == QUESTION
-    assert deltas.count(QUESTION) == 1
-    record = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert record.state == STATE_AWAITING_REPLY
-
-
-async def test_confirming_reply_writes_the_name_once(chat):
-    """T02: "对" resolves the question and never asks again."""
-    coordinator, rt, client, _ = await chat(
-        client=FakeClient(response_text="好的。", chunks=["好", "的。"])
-    )
-    person = await _owner(rt)
-    await _web_turn(coordinator, rt, person, "我叫李约")
-
-    _, _, deltas, completed = await _web_turn(coordinator, rt, person, "对")
-    assert "确认一下" not in deltas
-    assert deltas == completed.text
+    # The explicit statement was already written during the turn.
     assert [entry["content"] for entry in await _name_entries(rt, person)] == [
         "李约"
     ]
-    records = await rt.repos.profile_confirmation.list_for_person(person.person_id)
-    assert [record.state for record in records] == [STATE_CONFIRMED]
-
-    # A later unrelated turn must not write it again.
-    await _web_turn(coordinator, rt, person, "今天好热")
-    assert len(await _name_entries(rt, person)) == 1
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
 
-async def test_denial_rejects_without_writing(chat):
-    """T03."""
+async def test_one_statement_is_never_written_twice(chat):
+    """The same explicit name in a later turn is a no-op, not a new row."""
     coordinator, rt, client, _ = await chat()
     person = await _owner(rt)
     await _web_turn(coordinator, rt, person, "我叫李约")
+    revision = (await rt.profile_service.get(person.person_id)).metadata.revision
 
-    await _web_turn(coordinator, rt, person, "不是")
-    assert await _name_entries(rt, person) == []
-    records = await rt.repos.profile_confirmation.list_for_person(person.person_id)
-    assert records[-1].state == STATE_REJECTED
-
-
-async def test_deferral_is_not_a_confirmation_and_is_not_re_asked(chat):
-    """An ambiguous reply neither confirms nor reprints the question."""
-    coordinator, rt, client, _ = await chat()
-    person = await _owner(rt)
-    await _web_turn(coordinator, rt, person, "我叫李约")
-
-    _, _, deltas, _ = await _web_turn(coordinator, rt, person, "嗯，先说别的")
+    _, _, deltas, _ = await _web_turn(coordinator, rt, person, "我叫李约")
     assert "确认一下" not in deltas
-    assert await _name_entries(rt, person) == []
-    record = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert record.state == STATE_AWAITING_REPLY
-
-    # The explicit yes still resolves it exactly once.
-    await _web_turn(coordinator, rt, person, "对")
     assert [entry["content"] for entry in await _name_entries(rt, person)] == [
         "李约"
     ]
+    assert (
+        await rt.profile_service.get(person.person_id)
+    ).metadata.revision == revision
 
 
-async def test_truncated_normal_reply_does_not_deliver_the_question(chat):
-    """T04 (truncation): an incomplete reply never carries a confirmation."""
+async def test_truncated_reply_keeps_the_explicit_self_report(chat):
+    """T04 (truncation): an incomplete reply cannot undo a direct write."""
     coordinator, rt, client, _ = await chat(client=TruncatingClient())
     person = await _owner(rt)
     _, _, deltas, completed = await _web_turn(
@@ -413,15 +335,14 @@ async def test_truncated_normal_reply_does_not_deliver_the_question(chat):
     )
     assert completed.status == "TRUNCATED"
     assert completed.action == "RESPOND"
-    assert QUESTION not in deltas
     assert deltas == "我记住了。"
-    record = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert record.state == STATE_PENDING_QUESTION
-    assert await _name_entries(rt, person) == []
+    assert [entry["content"] for entry in await _name_entries(rt, person)] == [
+        "李约"
+    ]
 
 
-async def test_interrupted_stream_shows_no_question_and_writes_nothing(chat):
-    """T04: a failed turn is never a delivered confirmation."""
+async def test_interrupted_stream_keeps_the_explicit_self_report(chat):
+    """T04: a failed reply is not a failed self-report."""
     coordinator, rt, client, _ = await chat(client=InterruptingClient())
     person = await _owner(rt)
     await rt.conversations.get_or_create(CONVERSATION)
@@ -440,13 +361,12 @@ async def test_interrupted_stream_shows_no_question_and_writes_nothing(chat):
     deltas = "".join(
         item.delta or "" for item in events if item.type == "response_delta"
     )
-    assert QUESTION not in deltas
+    assert "确认一下" not in deltas
     assert not any(item.type == RESPONSE_COMPLETED for item in events)
     assert any(item.type == "response_failed" for item in events)
-
-    record = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert record.state == STATE_PENDING_QUESTION
-    assert await _name_entries(rt, person) == []
+    assert [entry["content"] for entry in await _name_entries(rt, person)] == [
+        "李约"
+    ]
 
 
 # -- T05-T07: explicit stop boundary and judge triggering ------------------
@@ -866,7 +786,9 @@ async def test_mock_provider_has_no_proactive_manager_and_no_extra_call(chat):
     coordinator, rt, client, judge = await chat(provider="mock")
     assert rt.provider == "mock"
     assert rt.proactive_manager is None
-    assert rt.profile_confirmation is None
+    # The direct self-report detector is provider-independent and makes no
+    # model call, so it is present even for the offline mock provider.
+    assert rt.profile_confirmation is not None
 
     person = await rt.registry.register(
         "Mock",
@@ -906,61 +828,45 @@ async def test_proactive_delivery_never_schedules_another_cycle(chat):
     assert [row.mode for row in rows] == [MODE_IMMEDIATE, MODE_LONG_IDLE]
 
 
-async def test_pending_confirmation_blocks_only_the_immediate_stage(chat):
-    """T23."""
+async def test_explicit_self_report_does_not_block_the_immediate_stage(chat):
+    """T23: the old pending question used to suppress stage one; it is gone."""
     coordinator, rt, client, judge = await chat(
-        decisions=[False], idle_delay=0.02
+        decisions=[False, False], idle_delay=0.02
     )
     await _attach_tab(coordinator)
     person = await _owner(rt)
     await _web_turn(coordinator, rt, person, "我叫李约")
     await _wait_for(lambda: judge.payloads)
-    assert [payload.mode for payload in judge.payloads] == [MODE_LONG_IDLE]
-
-    # Answering the question resolves it; no duplicate confirmation appears.
-    _, _, deltas, _ = await _web_turn(coordinator, rt, person, "对")
-    assert "确认一下" not in deltas
+    assert judge.payloads[0].mode == MODE_IMMEDIATE
     assert [entry["content"] for entry in await _name_entries(rt, person)] == [
         "李约"
     ]
 
 
-async def test_restart_resumes_the_timer_without_a_duplicate_question(chat):
-    """T24."""
-    first, rt, client, _ = await chat(
-        confirmation_timeout=0.05, decisions=[], idle_delay=10.0
-    )
+async def test_restart_does_not_duplicate_or_lose_the_direct_write(chat):
+    """T24: the profile is durable; restart has no pending queue to resume."""
+    first, rt, client, _ = await chat(decisions=[], idle_delay=10.0)
     person = await _owner(rt)
     await _web_turn(first, rt, person, "我叫李约")
-    record = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert record.state == STATE_AWAITING_REPLY
-    assert await _name_entries(rt, person) == []
-    await first.close()
-
-    second, rt2, _, _ = await chat(
-        confirmation_timeout=0.05, decisions=[], idle_delay=10.0
-    )
-    assert rt2.profile_confirmation.resume_calls == 1
-    await asyncio.sleep(0.2)
-    assert [entry["content"] for entry in await _name_entries(rt2, person)] == [
+    assert [entry["content"] for entry in await _name_entries(rt, person)] == [
         "李约"
     ]
-    records = await rt2.repos.profile_confirmation.list_for_person(
-        person.person_id
+    revision = (await rt.profile_service.get(person.person_id)).metadata.revision
+    await first.close()
+
+    second, rt2, _, _ = await chat(decisions=[], idle_delay=10.0)
+    entries = await rt2.repos.profile.list_entries(
+        person.person_id, statuses=("ACTIVE",), field_key="identity.name"
     )
-    assert len(records) == 1
-    assert records[0].state == STATE_ACCEPTED_SELF_REPORT
+    assert [entry["content"] for entry in entries] == ["李约"]
+    profile = await rt2.profile_service.get(person.person_id)
+    assert profile.metadata.revision == revision
 
 
-async def test_start_is_idempotent_and_resumes_pending_only_once(chat):
-    """T24 (duplicate timers): a second start must not resume again."""
-    coordinator, rt, client, _ = await chat(
-        confirmation_timeout=60.0, decisions=[], idle_delay=10.0
-    )
-    confirmation = rt.profile_confirmation
-    assert confirmation.resume_calls == 1
+async def test_start_is_idempotent_without_confirmation_timers(chat):
+    """T24 (duplicate starts): the coordinator reuses the same runtime."""
+    coordinator, rt, client, _ = await chat(decisions=[], idle_delay=10.0)
     assert await coordinator.start() is rt
-    assert confirmation.resume_calls == 1
 
 
 async def test_input_in_one_conversation_keeps_the_other_queued_event(chat):

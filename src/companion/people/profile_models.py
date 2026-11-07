@@ -95,16 +95,6 @@ class ProfileFieldStatus(str, Enum):
     RETIRED = "RETIRED"
 
 
-class CandidateStatus(str, Enum):
-    PENDING = "PENDING"
-    CONFIRMED = "CONFIRMED"
-    REJECTED = "REJECTED"
-    SUPERSEDED = "SUPERSEDED"
-    # V0.9.7: two pending values that genuinely conflict stay visible instead
-    # of one silently replacing the other. Neither is treated as effective.
-    NEEDS_REVIEW = "NEEDS_REVIEW"
-
-
 class ProfileEntryStatus(str, Enum):
     """Lifecycle of one independent understanding entry.
 
@@ -439,22 +429,6 @@ class ProfileField(BaseModel):
     updated_at: Optional[datetime] = None
 
 
-class ProfileCandidate(BaseModel):
-    candidate_id: str
-    person_id: str
-    field_key: str
-    candidate_value: Any
-    source: ProfileSource = ProfileSource.INTERACTION_INFERENCE
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    status: CandidateStatus = CandidateStatus.PENDING
-    evidence_memory_ids: list[str] = Field(default_factory=list)
-    evidence_event_ids: list[str] = Field(default_factory=list)
-    evidence_candidate_ids: list[str] = Field(default_factory=list)
-    reason: Optional[str] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
 class ProfileRevision(BaseModel):
     revision_id: str
     person_id: str
@@ -491,7 +465,6 @@ class PersonInteractionProfile(BaseModel):
     # is deliberately never used as the person's confirmed name.
     identity: dict[str, Any] = Field(default_factory=dict)
     relationship: dict[str, Any] = Field(default_factory=dict)
-    candidates: list[ProfileCandidate] = Field(default_factory=list)
     compact_summary: str = ""
     metadata: ProfileMetadata = Field(default_factory=ProfileMetadata)
 
@@ -522,7 +495,6 @@ class PersonInteractionProfile(BaseModel):
 __all__ = [
     "ALL_FIELD_KEYS",
     "COMMUNICATION_FIELDS",
-    "CandidateStatus",
     "ENTRY_FIELD_KEYS",
     "LEGACY_ENTRY_MIGRATION",
     "LIST_FIELDS",
@@ -531,7 +503,6 @@ __all__ = [
     "MAX_SHORT_TEXT",
     "PROFILE_FIELD_SPECS",
     "PersonInteractionProfile",
-    "ProfileCandidate",
     "ProfileEntry",
     "ProfileEntryStatus",
     "ProfileEvidence",

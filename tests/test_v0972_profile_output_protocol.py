@@ -21,6 +21,7 @@ from companion.people.profile_refinement import (
 from companion.prompts.profile_refinement import (
     PROFILE_NO_CHANGE_EXAMPLE,
     PROFILE_PROPOSE_CHANGES_EXAMPLE,
+    PROFILE_REFINEMENT_PROMPT_VERSION,
     PROFILE_REFINEMENT_SYSTEM_PROMPT,
     build_profile_refinement_messages,
 )
@@ -28,7 +29,7 @@ from companion.providers.deepseek_profile import (
     DeepSeekProfileRefinementProvider,
 )
 
-PROMPT_VERSION = "profile-refinement-v3"
+PROMPT_VERSION = PROFILE_REFINEMENT_PROMPT_VERSION
 PAYLOAD = {"person_id": "person_trusted", "profile_revision": 4}
 LOG_NAME = "companion.profile_refinement.provider"
 

@@ -50,7 +50,7 @@ def test_memory_result_cannot_call_candidate_a_saved_active_memory():
     )
 
 
-async def test_paraphrased_name_becomes_retrievable_and_still_needs_profile_confirmation(rt):
+async def test_paraphrased_name_becomes_retrievable_and_is_written_directly(rt):
     person = await rt.registry.register(
         "Owner",
         "owner",
@@ -92,14 +92,22 @@ async def test_paraphrased_name_becomes_retrievable_and_still_needs_profile_conf
     recalled = await rt.memory.retrieve("我的名字是什么", person.person_id)
     assert any(item["memory_id"] == saved.memory_id for item in recalled)
 
-    # Profile name is a separate, stricter confirmation path.
-    from companion.people.profile_confirmation import ProfileConfirmationService
-    service = ProfileConfirmationService(profile_service=rt.profile_service, repos=rt.repos)
-    question = await service.begin_turn(event=event, person_id=person.person_id)
-    assert question and "李约" in question
-    assert await rt.repos.profile.list_entries(
+    # The profile name is a separate path. The person's explicit "我是李约" is
+    # itself the authorization, so local code writes it in the same turn and
+    # asks no confirmation question.
+    from companion.people.profile_confirmation import ProfileDirectSelfReportService
+
+    service = ProfileDirectSelfReportService(
+        profile_service=rt.profile_service, repos=rt.repos
+    )
+    assert await service.begin_turn(
+        event=event, person_id=person.person_id
+    ) is None
+    entries = await rt.repos.profile.list_entries(
         person.person_id, statuses=("ACTIVE",), field_key="identity.name"
-    ) == []
+    )
+    assert [entry["content"] for entry in entries] == ["李约"]
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
 
 async def test_explicit_followup_promotes_only_verified_legacy_name_candidate(rt):

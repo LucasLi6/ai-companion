@@ -13,7 +13,6 @@ from companion.people.profile_refinement import (
     ProfileReviewContextSource,
     ProfileReviewDecision,
 )
-from companion.people.profile_service import TRUSTED_CONFIRMATION
 from companion.providers.deepseek_profile import ScriptedProfileRefinementProvider
 
 
@@ -178,7 +177,8 @@ async def test_replaying_the_same_event_is_idempotent(rt):
     assert len(await rt.repos.profile.list_revisions(person.person_id)) == 1
 
 
-async def test_pending_only_review_does_not_bump_until_confirmed(rt):
+async def test_strict_identity_from_model_is_rejected_without_candidate(rt):
+    """A model proposal can never write strict identity, not even as pending."""
     person = await _person(rt)
     event = await _event(rt, person, "我叫阿明。")
     engine = _engine(
@@ -191,22 +191,27 @@ async def test_pending_only_review_does_not_bump_until_confirmed(rt):
     )
     review = await engine.review(person.person_id, event.event_id)
     applied = await engine.apply_proposals(review)
-    assert applied.status == "PENDING_CONFIRMATION"
+    assert applied.status == "REJECTED"
+    assert applied.applied == []
     assert (await rt.profile_service.get(person.person_id)).metadata.revision == 1
-    pending = await rt.repos.profile.find_pending(person.person_id, "identity.name")
-    assert len(pending) == 1
+    assert await rt.repos.profile.list_entries(person.person_id) == []
+    assert await rt.repos.profile.list_revisions(person.person_id) == []
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
-    revision = await rt.profile_service.confirm_profile_proposal(
-        pending[0]["candidate_id"], authority=TRUSTED_CONFIRMATION
+    # The person's own explicit statement still writes directly.
+    result = await rt.profile_service.apply_direct_self_report(
+        person_id=person.person_id,
+        field_key="identity.name",
+        value="阿明",
+        source_event_id=event.event_id,
     )
-    assert revision == 2
+    assert result.status == "APPLIED"
+    assert result.revision == 2
     entries = await rt.repos.profile.list_entries(
         person.person_id, statuses=("ACTIVE",)
     )
     assert [item["content"] for item in entries] == ["阿明"]
-    with pytest.raises(ValueError):
-        await rt.profile_service.confirm_profile_proposal(pending[0]["candidate_id"])
-    assert (await rt.profile_service.get(person.person_id)).metadata.revision == 2
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
 
 async def test_multi_change_review_is_all_or_nothing(rt, monkeypatch):

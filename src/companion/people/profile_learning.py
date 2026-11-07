@@ -1,22 +1,16 @@
 """Deterministic profile learning from one utterance.
 
 Every turn feeds this module *locally*; it never calls a model, so learning
-adds no latency and no extra API cost. The existing background extraction job
-remains responsible for long-term memory facts; this layer only interprets
-explicit self-report and records unconfirmed inferences.
+adds no latency and no extra API cost.
 
-Decision rules (V0.7):
+Decision rules (V0.9.9.6):
 
 - A stated communication preference (``不用这么正式``) updates the profile
   immediately and is attributed to a direct self report.
-- A stated fact (``我现在在学习嵌入式开发``) is *not* promoted to an effective
-  attribute. It becomes a candidate, anchored to the event, and is linked to
-  the confirmed memory later. This is what keeps "learning about embedded
-  systems" from silently becoming ``occupation = embedded engineer``.
-- Ava's own inference (tone, brevity) also becomes a candidate. A single turn
-  or a model-generated confidence value can never confirm it.
-- Repeated independent evidence may confirm a candidate. A user correction
-  outranks that inference and rejects its pending candidates.
+- A stated fact is routed to Profile Review. Review owns evidence validation
+  and the direct write; this module never parks facts in a candidate queue.
+- An inference alone is never written. There is no confirmation queue to keep
+  it in.
 """
 
 from __future__ import annotations
@@ -34,10 +28,6 @@ from companion.people.profile_service import (
     PersonProfileService,
     ProfileUnauthorized,
 )
-
-# Three independent turns is the minimum for automatic confirmation. Model
-# confidence is deliberately not part of this decision.
-CONFIRMATION_EVIDENCE_EVENTS = 3
 
 _MISSING = object()
 
@@ -175,7 +165,6 @@ class ProfileSignal:
 class LearningResult:
     authorized: bool = False
     preferences: list[str] = field(default_factory=list)
-    candidates: list[str] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
 
@@ -239,14 +228,8 @@ def extract_signals(text: str) -> list[ProfileSignal]:
 
 
 class PersonProfileLearningService:
-    def __init__(
-        self,
-        profiles: PersonProfileService,
-        *,
-        confirmation_threshold: int = CONFIRMATION_EVIDENCE_EVENTS,
-    ) -> None:
+    def __init__(self, profiles: PersonProfileService) -> None:
         self.profiles = profiles
-        self.confirmation_threshold = confirmation_threshold
 
     def observe_signals(self, text: str) -> list[ProfileSignal]:
         """Extract optional language signals *without* writing anything.
@@ -290,25 +273,10 @@ class PersonProfileLearningService:
                     else:
                         result.skipped.append(signal.field_key)
                 else:
-                    candidate = await self.profiles.propose_candidate(
-                        person_id,
-                        signal.field_key,
-                        signal.value,
-                        source=(
-                            ProfileSource.USER_CORRECTION
-                            if correction
-                            else ProfileSource.DIRECT_SELF_REPORT
-                        ),
-                        confidence=0.9 if correction else 0.7,
-                        event_id=event_id,
-                        reason="explicit_self_report",
-                        actor=actor,
-                    )
-                    if candidate is None:
-                        result.skipped.append(signal.field_key)
-                    else:
-                        result.candidates.append(candidate)
-                        await self._maybe_confirm(candidate, actor=actor)
+                    # A fact needs the full review path: the model extracts it,
+                    # local code proves it against this event, and only then is
+                    # it written. This deterministic regex is not evidence.
+                    result.skipped.append(signal.field_key)
             except (ProfileUnauthorized, ValueError):
                 result.skipped.append(signal.field_key)
         return result
@@ -362,21 +330,14 @@ class PersonProfileLearningService:
         confidence: float = 0.5,
         memory_ids: Iterable[str] = (),
         reason: Optional[str] = None,
-    ) -> Optional[str]:
-        """Record Ava's own inference as a candidate (never effective)."""
-        candidate = await self.profiles.propose_candidate(
-            person_id,
-            field_key,
-            value,
-            source=ProfileSource.INTERACTION_INFERENCE,
-            confidence=confidence,
-            event_id=event_id,
-            memory_ids=list(memory_ids),
-            reason=reason or "interaction_inference",
-        )
-        if candidate is not None:
-            await self._maybe_confirm(candidate)
-        return candidate
+    ) -> None:
+        """Do not store an unvalidated inference.
+
+        V0.9.9.6 removed the candidate queue. An inference is only written by
+        the background Profile Review after trusted local validation, so this
+        compatibility entry point deliberately has no effect.
+        """
+        return None
 
     async def apply_correction(
         self,
@@ -390,9 +351,9 @@ class PersonProfileLearningService:
     ) -> str:
         """Correction path used when the correction target is known.
 
-        An effective value is corrected immediately; a still-pending fact is
-        rejected and replaced with a correction-sourced candidate instead of
-        being promoted without confirmation.
+        An explicit user correction is trusted and written immediately. With no
+        candidate queue there is nothing else that could resurrect an older
+        inferred value.
         """
         profile = await self.profiles.get(person_id)
         active = profile.fields.get(field_key) if profile is not None else None
@@ -408,11 +369,7 @@ class PersonProfileLearningService:
             return "corrected"
         if value is _MISSING:
             return "ignored"
-        for candidate in await self.profiles.repo.find_pending(person_id, field_key):
-            await self.profiles.reject_candidate(
-                candidate["candidate_id"], reason="user_correction"
-            )
-        await self.profiles.propose_candidate(
+        await self.profiles.set_field(
             person_id,
             field_key,
             value,
@@ -421,7 +378,7 @@ class PersonProfileLearningService:
             event_id=event_id,
             reason=reason or "user_correction",
         )
-        return "candidate"
+        return "corrected"
 
     async def link_output_memory(
         self, person_id: str, event_id: str, memory_id: str
@@ -435,11 +392,6 @@ class PersonProfileLearningService:
         if not affected:
             return
         fields = {item["field_key"] for item in affected}
-        candidates = {
-            item["candidate_id"]
-            for item in affected
-            if item["candidate_id"] is not None
-        }
         async with self.profiles.repo.db.transaction():
             for field_key in fields:
                 field = await self.profiles.repo.get_field(person_id, field_key)
@@ -466,37 +418,9 @@ class PersonProfileLearningService:
                     evidence_candidate_ids=field["evidence_candidate_ids"],
                     revision=field["revision"],
                 )
-            for candidate_id in candidates:
-                await self.profiles.repo.add_candidate_evidence(
-                    candidate_id,
-                    memory_ids=[memory_id],
-                    event_ids=[],
-                    candidate_ids=[],
-                )
-
-    async def _maybe_confirm(
-        self, candidate_id: str, *, actor: str = "learning"
-    ) -> bool:
-        """Confirm only after several independent evidence events."""
-        candidate = await self.profiles.repo.get_candidate(candidate_id)
-        if candidate is None:
-            return False
-        events = set(candidate["evidence_event_ids"])
-        if len(events) < self.confirmation_threshold:
-            return False
-        try:
-            await self.profiles.confirm_candidate(
-                candidate_id,
-                reason=f"repeated_evidence:{len(events)}",
-                actor=actor,
-            )
-            return True
-        except (ProfileUnauthorized, ValueError):
-            return False
 
 
 __all__ = [
-    "CONFIRMATION_EVIDENCE_EVENTS",
     "LearningResult",
     "PersonProfileLearningService",
     "ProfileSignal",

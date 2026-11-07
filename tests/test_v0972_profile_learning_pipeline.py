@@ -28,10 +28,6 @@ from companion.people.profile_refinement import (
     ProfileReviewContextSource,
     ProfileReviewDecision,
 )
-from companion.people.profile_service import (
-    ProfileUnauthorized,
-    TRUSTED_CONFIRMATION,
-)
 from companion.providers.deepseek_profile import ScriptedProfileRefinementProvider
 from companion.routing.models import DataControlRequest
 
@@ -133,7 +129,7 @@ async def test_reported_speech_never_preemptively_changes_the_profile(rt, say):
     profile = await rt.profile_service.get(person.person_id)
     assert profile.metadata.revision == revision
     assert profile.communication_value(ProfileFieldKey.FORMALITY) == "casual"
-    assert await rt.repos.profile.list_candidates(person.person_id) == []
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
     receipt = await rt.repos.profile.get_review_receipt(
         person.person_id, report.event_id
@@ -148,7 +144,7 @@ async def test_reported_speech_never_preemptively_changes_the_profile(rt, say):
         LOG,
     )
     assert await _revision(rt, person) == revision
-    assert await rt.repos.profile.list_candidates(person.person_id) == []
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
 
 async def test_the_review_reads_the_complete_profile_before_proposing(rt, say):
@@ -175,7 +171,9 @@ async def test_the_review_reads_the_complete_profile_before_proposing(rt, say):
         assert "formality=casual" in payload["compact_summary"]
         # The model is told exactly which field keys it may target.
         assert "projects.active" in payload["allowed_field_keys"]
-        assert "identity.name" in payload["allowed_field_keys"]
+        # Strict identity is never offered to the model; the local direct
+        # self-report path is the only writer.
+        assert "identity.name" not in payload["allowed_field_keys"]
         return _add("projects.active", "STM32 学习板", report.event_id)
 
     await _handler(rt, ScriptedProfileRefinementProvider([propose]))(
@@ -191,7 +189,8 @@ async def test_the_review_reads_the_complete_profile_before_proposing(rt, say):
     assert await _revision(rt, person) == revision + 1
 
 
-async def test_an_address_phrase_in_chat_is_not_a_profile_command(rt, say):
+async def test_an_explicit_address_phrase_in_chat_writes_directly(rt, say):
+    """An explicit self-report is now the command; no confirmation is asked."""
     person = await _person(rt)
     revision = await _revision(rt, person)
     report = await say(
@@ -199,16 +198,26 @@ async def test_an_address_phrase_in_chat_is_not_a_profile_command(rt, say):
     )
 
     profile = await rt.profile_service.get(person.person_id)
-    assert profile.metadata.revision == revision
-    assert profile.communication_value(ProfileFieldKey.ADDRESS) == "UNKNOWN"
-    assert await rt.repos.profile.list_candidates(person.person_id) == []
+    # The one statement supplies both a preferred name and the address form
+    # it implies; each is a separately audited revision.
+    assert profile.metadata.revision == revision + 2
+    assert profile.communication_value(ProfileFieldKey.ADDRESS) == "小明"
+    entries = await rt.repos.profile.list_entries(
+        person.person_id,
+        statuses=("ACTIVE", "TENTATIVE"),
+        field_key="identity.preferred_name",
+    )
+    assert [entry["content"] for entry in entries] == ["小明"]
+    assert entries[0]["source"] == ProfileSource.DIRECT_SELF_REPORT.value
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
     receipt = await rt.repos.profile.get_review_receipt(
         person.person_id, report.event_id
     )
+    # The direct write never pretends the asynchronous review already ran.
     assert receipt is not None and receipt["status"] == "PENDING"
 
 
-async def test_explicit_trusted_confirmation_still_writes_identity(rt):
+async def test_model_identity_proposal_is_rejected_but_self_report_writes(rt):
     person = await _person(rt)
     event = await _event(rt, person, "我叫阿明。")
     revision = await _revision(rt, person)
@@ -218,27 +227,23 @@ async def test_explicit_trusted_confirmation_still_writes_identity(rt):
     applied = await engine.apply_proposals(
         await engine.review(person.person_id, event.event_id)
     )
-    assert applied.status == "PENDING_CONFIRMATION"
+    assert applied.status == "REJECTED"
     assert await _revision(rt, person) == revision
-    pending = await rt.repos.profile.find_pending(person.person_id, "identity.name")
-    assert len(pending) == 1
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
-    with pytest.raises(ProfileUnauthorized):
-        await rt.profile_service.confirm_profile_proposal(
-            pending[0]["candidate_id"], actor="user"
-        )
-
-    new_revision = await rt.profile_service.confirm_profile_proposal(
-        pending[0]["candidate_id"], authority=TRUSTED_CONFIRMATION
+    result = await rt.profile_service.apply_direct_self_report(
+        person_id=person.person_id,
+        field_key="identity.name",
+        value="阿明",
+        source_event_id=event.event_id,
     )
-    assert new_revision == revision + 1
+    assert result.status == "APPLIED"
+    assert result.revision == revision + 1
     entries = await rt.repos.profile.list_entries(
         person.person_id, field_key="identity.name"
     )
     assert [entry["content"] for entry in entries] == ["阿明"]
     assert entries[0]["evidence_event_ids"] == [event.event_id]
-    stored = await rt.repos.profile.get_candidate(pending[0]["candidate_id"])
-    assert stored["status"] == "CONFIRMED"
 
 
 async def test_a_summary_write_failure_rolls_back_the_whole_review(rt, monkeypatch):

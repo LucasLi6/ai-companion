@@ -38,7 +38,6 @@ MAX_ENTRY_CHARS = 1200
 MAX_QUOTE_CHARS = 500
 DEFAULT_RECENT_TURNS = 8
 DEFAULT_RECENT_CHARS = 2000
-MAX_SNAPSHOT_PENDING = 20
 MAX_SNAPSHOT_LEGACY_FIELDS = 40
 MAX_SNAPSHOT_TEXT_CHARS = 4000
 
@@ -76,8 +75,8 @@ def validate_change_targets(
     ``target_entries`` are the *actual* stored rows (dicts with ``entry_id``
     and ``field_key``), never the model's claim about them. The function raises
     ``ValueError`` with a stable reason code; both the engine's pre-validation
-    and the final write transaction call it, so a caller that constructs
-    ``ValidatedChange(auto_apply=True)`` directly cannot bypass it.
+    and the final write transaction call it, so a caller cannot bypass it by
+    constructing a ``ValidatedChange`` directly.
     """
     operation = str(operation or "").upper()
     entries = list(target_entries or [])
@@ -219,7 +218,6 @@ class FullProfileSnapshot(BaseModel):
     interaction: dict[str, Any] = Field(default_factory=dict)
     entries: dict[str, list[SnapshotEntry]] = Field(default_factory=dict)
     legacy_fields: dict[str, Any] = Field(default_factory=dict)
-    pending_candidates: list[dict] = Field(default_factory=list)
     compact_summary: str = ""
     updated_at: Optional[str] = None
     last_reviewed_at: Optional[str] = None
@@ -252,18 +250,6 @@ class FullProfileSnapshot(BaseModel):
                 ("interaction", self.interaction),
             )
         }
-        pending = [
-            {
-                "candidate_id": item.get("candidate_id"),
-                "field_key": item.get("field_key"),
-                "operation": item.get("operation", "ADD"),
-                "target_entry_ids": list(item.get("target_entry_ids") or []),
-                "proposed_content": str(item.get("proposed_content") or "")[:240],
-                "status": item.get("status") or "PENDING",
-                "review_status": item.get("review_status") or "PENDING",
-            }
-            for item in self.pending_candidates[:MAX_SNAPSHOT_PENDING]
-        ]
         legacy_names = sorted(self.legacy_fields)
         legacy = {
             key: self.legacy_fields[key]
@@ -282,18 +268,13 @@ class FullProfileSnapshot(BaseModel):
                 key: [entry.entry_id for entry in items]
                 for key, items in self.entries.items()
             },
-            # A pending proposal is explicitly NOT confirmed understanding.
-            "pending_proposals": pending,
             "legacy_unconverted": legacy,
             "compact_summary": self.compact_summary[:MAX_SNAPSHOT_TEXT_CHARS],
             "snapshot_limits": {
-                "pending_total": len(self.pending_candidates),
-                "pending_included": len(pending),
                 "legacy_total": len(legacy_names),
                 "legacy_included": len(legacy),
                 "truncated": (
-                    len(self.pending_candidates) > len(pending)
-                    or len(legacy_names) > len(legacy)
+                    len(legacy_names) > len(legacy)
                     or len(self.compact_summary) > MAX_SNAPSHOT_TEXT_CHARS
                 ),
             },
@@ -319,6 +300,8 @@ class ProfileChangeProposal(BaseModel):
     evidence_quotes: list[str] = Field(default_factory=list)
     reason: str = Field(default="", max_length=500)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Legacy model output key. It is accepted for compatibility but is *never*
+    # consulted: a model cannot block a locally legal write by setting it.
     requires_confirmation: bool = False
 
     @field_validator("target_entry_ids", "evidence_event_ids")
@@ -354,11 +337,16 @@ class ProfileReviewDecision(BaseModel):
 
 
 class ValidatedChange(BaseModel):
+    """One locally validated proposal.
+
+    Validation is terminal: a change is either accepted for the write
+    transaction or rejected with a stable reason. There is no "maybe" state and
+    no proposal is ever parked for a later confirmation.
+    """
+
     proposal: ProfileChangeProposal
     accepted: bool = True
-    auto_apply: bool = True
     issue: Optional[str] = None
-    pending_reason: Optional[str] = None
 
 
 class ProfileReviewResult(BaseModel):
@@ -374,18 +362,7 @@ class ProfileReviewResult(BaseModel):
     status: str = "NO_CHANGE"
 
     def accepted_changes(self) -> list[ValidatedChange]:
-        return [
-            change
-            for change in self.changes
-            if change.accepted and change.auto_apply
-        ]
-
-    def pending_changes(self) -> list[ValidatedChange]:
-        return [
-            change
-            for change in self.changes
-            if change.accepted and not change.auto_apply
-        ]
+        return [change for change in self.changes if change.accepted]
 
     def has_changes(self) -> bool:
         return bool(self.accepted_changes())
@@ -398,9 +375,39 @@ class ProfileApplyResult(BaseModel):
     base_revision: int = 0
     new_revision: Optional[int] = None
     applied: list[dict] = Field(default_factory=list)
-    pending: list[dict] = Field(default_factory=list)
     rejected: list[dict] = Field(default_factory=list)
     reason: str = ""
+
+    @property
+    def applied_count(self) -> int:
+        return len(self.applied)
+
+    @property
+    def rejected_count(self) -> int:
+        return len(self.rejected)
+
+    def receipt(self) -> dict:
+        """The stable, content-free result a review receipt records."""
+        return {
+            "status": self.status,
+            "applied_count": self.applied_count,
+            "rejected_count": self.rejected_count,
+            "new_revision": self.new_revision,
+            "base_revision": self.base_revision,
+        }
+
+
+class DirectSelfReportResult(BaseModel):
+    """Outcome of one trusted, explicit first-person profile statement."""
+
+    person_id: str
+    field_key: str
+    value: Any = None
+    status: str = "NO_CHANGE"
+    revision: Optional[int] = None
+    reason: str = ""
+    entry_id: Optional[str] = None
+
 
 
 @dataclass(frozen=True)
@@ -458,12 +465,30 @@ _FILLER = re.compile(r"^(喜欢|爱好|兴趣|擅长|正在|在|做|搞|研究|�
 # only a conservative textual flag: it sends the proposal to pending review,
 # it does not claim to understand the sentence.
 _HYPOTHETICAL = re.compile(
-    r"(如果|假如|假设|要是|开玩笑|说着玩|玩笑|据说|听说|别人说|他说|她说)"
+    r"(如果|假如|假设|要是|开玩笑|说着玩|玩笑|据说|听说|别人说|他说|她说|"
+    r"他们说|她们说|有人说|朋友说|同事说|同学说)"
 )
 _SENSITIVE = re.compile(
     r"(健康|疾病|病历|诊断|医院|用药|药物|抑郁|焦虑症|"
     r"银行|信用卡|贷款|工资|收入|存款|密码|"
     r"住址|家庭地址|身份证|护照号)"
+)
+
+# A trait/habit must be described by the person, not inferred from one act.
+# These markers are required inside the supporting quote for inference-only
+# fields (personality, stable habits, working preferences).
+_TRAIT_SELF_DESCRIPTION = re.compile(
+    r"(我是|我比较|我做事|我做|我通常|我一般|我经常|我常常|我每天|我每周|"
+    r"我习惯|我喜欢|我不喜欢|我讨厌|我倾向于|我偏向|对我来说|"
+    r"我性格|我这个人|我这人|我很少|我从不|我不太|我更喜欢|"
+    r"我容易|我总是|我平时)"
+)
+
+# Negation changes meaning. "喜欢正式回答" and "不喜欢正式回答" must never
+# deduplicate into one stored item.
+_NEGATION = re.compile(
+    r"(不喜欢|不想要|不需要|不爱|讨厌|不想|不再|不常|很少|从不|"
+    r"没有|不是|不用|不太|别|勿)"
 )
 
 # A single observed behaviour is not a stable trait. These fields may still be
@@ -505,14 +530,26 @@ def _entry_terms(core: str) -> set[str]:
     return {term for term in terms if len(term) >= 2}
 
 
+def _polarity(text: Any) -> str:
+    """Whether a statement is affirmative or negated.
+
+    This is intentionally shallow and local: it exists only so de-duplication
+    never collapses opposite statements.
+    """
+    return "NEG" if _NEGATION.search(_normalise_text(text)) else "POS"
+
+
 def entries_equivalent(left: Any, right: Any) -> bool:
     """Conservative local "same item" check (no model call).
 
     Exact duplicates, one text containing the other's core entity, and very
     high bigram overlap are treated as the same stored item. Unrelated
     projects ("机器狗" / "奶茶机") stay distinct; genuinely new details belong
-    in an UPDATE, not a second ADD.
+    in an UPDATE, not a second ADD. Opposite polarity ("喜欢" / "不喜欢") is
+    never equivalent.
     """
+    if _polarity(left) != _polarity(right):
+        return False
     a, b = _entry_core(left), _entry_core(right)
     if not a or not b:
         return False
@@ -528,6 +565,32 @@ def entries_equivalent(left: Any, right: Any) -> bool:
     if not terms_a or not terms_b:
         return False
     return len(terms_a & terms_b) / len(terms_a | terms_b) >= 0.75
+
+
+def content_supported_by_text(content: Any, texts: list[str]) -> bool:
+    """Whether a proposed statement has concrete support in the source text.
+
+    This is a conservative local anti-fabrication guard, not a semantic judge:
+    at least one distinctive term of the proposal must occur in the person's
+    own cited words. A model may paraphrase, but may not attach a real quote to
+    an unrelated invention.
+    """
+    # A trailing state marker such as "（已完成）" describes the change the
+    # UPDATE is making; it is not a new fact that the source text must contain.
+    core = re.sub(r"[（(][^）)]*[）)]", "", str(content or ""))
+    terms = _distinctive_terms(_entry_core(core)) or _distinctive_terms(core)
+    if not terms:
+        return False
+    corpus: set[str] = set()
+    for text in texts or []:
+        corpus |= _distinctive_terms(text)
+    if not corpus:
+        return False
+    # At least one distinctive term of the proposal must occur in the
+    # person's own cited words. This is deliberately not a semantic judge:
+    # the point is to catch a proposal built from nothing, not to penalise
+    # legitimate paraphrase ("期末考试" -> "考试结束了").
+    return bool(terms & corpus)
 
 
 def requires_direct_quote(field_key: str) -> bool:
@@ -673,15 +736,23 @@ class ProfileRefinementEngine:
         # should change and proposes minimal edits. It never sees a different
         # revision than the one above.
         snapshot = existing.model_input()
+        # Strict identity/relationship fields are written only by the trusted
+        # direct self-report path. Hiding them from the model keeps the prompt
+        # honest and the token budget small; local validation still rejects any
+        # crafted output that names one.
+        allowed_field_keys = sorted(
+            key
+            for key in ENTRY_FIELD_KEYS
+            if (spec := profile_field_spec(key)) is not None
+            and spec.model_writable
+            and not spec.strict_identity
+        )
         payload = {
             "person_id": person_id,
             "profile_revision": existing.revision,
             "existing_profile": snapshot["existing_profile"],
             "entry_ids": snapshot["entry_ids"],
-            # The complete local field vocabulary: a model may only target a
-            # key from this list, and local validation still checks every one.
-            "allowed_field_keys": sorted(ENTRY_FIELD_KEYS),
-            "pending_proposals": snapshot["pending_proposals"],
+            "allowed_field_keys": allowed_field_keys,
             "legacy_unconverted": snapshot["legacy_unconverted"],
             "compact_summary": snapshot["compact_summary"],
             "snapshot_limits": snapshot["snapshot_limits"],
@@ -735,6 +806,16 @@ class ProfileRefinementEngine:
         evidence: ProfileEvidenceBundle,
         decision: ProfileReviewDecision,
     ) -> ProfileReviewResult:
+        """Validate every proposal locally.
+
+        The result has exactly three terminal outcomes:
+
+        - ``NO_CHANGE``: nothing legal to write (including an exact duplicate);
+        - ``ACCEPTED``: one or more changes may be written atomically;
+        - ``REJECTED``: proposals exist but none is legal.
+
+        A proposal is never parked in a candidate or pending queue.
+        """
         result = ProfileReviewResult(
             person_id=existing.person_id,
             source_event_id=evidence.source_event_id,
@@ -751,7 +832,7 @@ class ProfileRefinementEngine:
         validated: list[ValidatedChange] = []
 
         for index, proposal in enumerate(decision.changes):
-            issue, pending_reason = self._check_proposal(
+            issue = self._check_proposal(
                 proposal, existing, entries_by_id, user_texts
             )
             if issue is None and index >= self.registry.max_changes:
@@ -762,20 +843,23 @@ class ProfileRefinementEngine:
                         "operation": proposal.operation,
                         "field_key": proposal.field_key,
                         "reason": issue,
+                        "status": "REJECTED",
                     }
                 )
                 continue
-            validated.append(
-                ValidatedChange(
-                    proposal=proposal,
-                    accepted=True,
-                    auto_apply=pending_reason is None,
-                    pending_reason=pending_reason,
-                )
-            )
+            validated.append(ValidatedChange(proposal=proposal, accepted=True))
 
         result.changes = validated
-        result.status = "PROPOSED" if validated else "REJECTED"
+        if validated:
+            result.status = "ACCEPTED"
+        elif result.rejected and all(
+            item["reason"] == "already_present" for item in result.rejected
+        ):
+            # Identical information is not a failure and must not bump the
+            # revision; it is simply nothing new.
+            result.status = "NO_CHANGE"
+        else:
+            result.status = "REJECTED"
         return result
 
     def _check_proposal(
@@ -784,33 +868,32 @@ class ProfileRefinementEngine:
         existing: FullProfileSnapshot,
         entries_by_id: dict[str, SnapshotEntry],
         user_texts: dict[str, str],
-    ) -> tuple[Optional[str], Optional[str]]:
-        """Return ``(issue, pending_reason)``.
+    ) -> Optional[str]:
+        """Return a stable rejection reason, or ``None`` when the change is legal.
 
-        ``issue`` rejects the proposal entirely. ``pending_reason`` keeps it as
-        a durable pending candidate that a person can confirm later. Target
-        checks use the *stored* entry rows, never the model's label for them.
+        Target checks use the *stored* entry rows, never the model's label for
+        them. Every rejection is final; there is no confirmation branch.
         """
         spec = self.registry.spec(proposal.field_key)
         if spec is None:
-            return "unknown_field_key", None
+            return "unknown_field_key"
         if not self.registry.is_entry(proposal.field_key):
-            return "field_not_an_understanding_entry", None
+            return "field_not_an_understanding_entry"
         if not proposal.proposed_content and proposal.operation != "ARCHIVE":
-            return "missing_proposed_content", None
+            return "missing_proposed_content"
 
         if proposal.operation == "ADD":
             if proposal.target_entry_ids:
-                return "add_must_not_target_entries", None
+                return "add_must_not_target_entries"
             if not self._add_is_new(existing, proposal):
-                return "already_present", None
+                return "already_present"
             target_entries: list[dict] = []
         else:
             if not proposal.target_entry_ids:
-                return "missing_target_entry_ids", None
+                return "missing_target_entry_ids"
             unique_ids = list(dict.fromkeys(proposal.target_entry_ids))
             if any(entry_id not in entries_by_id for entry_id in unique_ids):
-                return "target_entry_not_in_this_profile", None
+                return "target_entry_not_in_this_profile"
             target_entries = [
                 entries_by_id[entry_id].model_dump() for entry_id in unique_ids
             ]
@@ -819,7 +902,7 @@ class ProfileRefinementEngine:
                     proposal.operation, proposal.field_key, target_entries
                 )
             except ValueError as exc:
-                return str(exc) or "invalid_change_target", None
+                return str(exc) or "invalid_change_target"
 
         if proposal.operation in ("MERGE", "REFINE"):
             targets = [item["content"] for item in target_entries]
@@ -828,30 +911,35 @@ class ProfileRefinementEngine:
             # CORRECT may replace a fact (university -> high school); an UPDATE
             # may change a project's state. Those are judged on evidence.
             if _coverage(targets, content) < 0.45:
-                return "lossy_change_rejects_existing_facts", None
-            # A merge/refine may shorten wording, not delete every specific.
+                return "lossy_change_rejects_existing_facts"
             if content and _FILLER.match(content.strip()):
-                return "lossy_change_rejects_existing_facts", None
+                return "lossy_change_rejects_existing_facts"
 
+        # Strict identity and relationship values are written only through the
+        # trusted direct self-report path, never from model output.
+        if self.registry.is_strict(proposal.field_key):
+            return "strict_identity_requires_explicit_self_report"
+        if not self.registry.is_model_writable(proposal.field_key):
+            return "field_not_model_writable"
         if proposal.operation != "ADD" and any(
             is_human_confirmed_source(item.get("source")) for item in target_entries
         ):
             # A fact the person explicitly corrected or confirmed outranks a
-            # model rewrite. Keep the change visible for review instead of
-            # silently replacing the person's own words.
-            return None, "human_confirmed_target_requires_review"
+            # model rewrite. Only a new explicit correction may replace it.
+            return "human_confirmed_target_requires_review"
+        if _SENSITIVE.search(proposal.proposed_content or ""):
+            return "sensitive_attribute_not_auto_saved"
 
         allowed_event_ids = set(user_texts)
         if proposal.evidence_event_ids and not set(
             proposal.evidence_event_ids
         ) <= allowed_event_ids:
-            return "evidence_event_not_authorized", None
+            return "evidence_event_not_authorized"
+        cited_texts: list[str] = []
         if proposal.evidence_quotes:
             cited = list(dict.fromkeys(proposal.evidence_event_ids))
             if not cited:
-                # A quote that is not tied to a specific user message cannot be
-                # verified; it may not silently auto-apply.
-                return None, "evidence_quote_without_event"
+                return "evidence_quote_without_event"
             cited_texts = [
                 _normalise_text(user_texts[event_id])
                 for event_id in cited
@@ -862,28 +950,50 @@ class ProfileRefinementEngine:
                 if not any(
                     normalised and normalised in text for text in cited_texts
                 ):
-                    return "evidence_quote_not_found", None
+                    return "evidence_quote_not_found"
+        else:
+            cited_texts = [
+                _normalise_text(user_texts[event_id])
+                for event_id in dict.fromkeys(proposal.evidence_event_ids)
+                if event_id in user_texts
+            ]
         if not proposal.evidence_event_ids and not proposal.evidence_quotes:
-            # New stable understanding needs some evidence. A no-evidence
-            # proposal is kept for a person to confirm rather than applied.
-            return None, "no_evidence"
+            # No source event means no legal write. A model statement alone is
+            # never evidence.
+            return "no_evidence"
+
         quoted = " ".join(proposal.evidence_quotes)
-        if _HYPOTHETICAL.search(f"{proposal.proposed_content or ''} {quoted}"):
-            # Jokes, hypotheticals and third-party claims are not stable
-            # self-report; a person can still confirm them explicitly.
-            return None, "uncertain_evidence_requires_review"
-        if _SENSITIVE.search(proposal.proposed_content or ""):
-            return None, "sensitive_field_requires_review"
-        if self.registry.is_strict(proposal.field_key):
-            return None, "confirmed_identity_requires_confirmation"
-        if proposal.requires_confirmation:
-            return None, "model_requested_confirmation"
-        if requires_direct_quote(proposal.field_key) and not proposal.evidence_quotes:
-            # A personality-like trait inferred from behaviour is not a fact
-            # about the person. Without a verbatim self-description it stays a
-            # candidate for review; a direct quote may auto-apply.
-            return None, "trait_inference_requires_review"
-        return None, None
+        evidence_corpus = " ".join(cited_texts)
+        if _HYPOTHETICAL.search(
+            f"{proposal.proposed_content or ''} {quoted} {evidence_corpus}"
+        ):
+            # Jokes, hypotheticals and third-party reports are not stable
+            # self-report and are never auto-written.
+            return "hypothetical_or_reported_evidence"
+        if requires_direct_quote(proposal.field_key):
+            if not proposal.evidence_quotes:
+                return "trait_inference_requires_self_description"
+            if not any(
+                _TRAIT_SELF_DESCRIPTION.search(_normalise_text(quote))
+                for quote in proposal.evidence_quotes
+            ):
+                # A single observed act is not a stable personality trait or
+                # habit, even when the act itself is quoted.
+                return "trait_inferred_from_single_act"
+        if proposal.operation in ("ADD", "UPDATE", "CORRECT") and not (
+            content_supported_by_text(
+                proposal.proposed_content or "",
+                cited_texts or list(user_texts.values()),
+            )
+        ):
+            return "content_not_supported_by_evidence"
+        if (
+            proposal.operation == "ADD"
+            and spec.single_value
+            and existing.entries.get(proposal.field_key)
+        ):
+            return "unresolved_conflict_with_existing_value"
+        return None
 
     @staticmethod
     def _add_is_new(
@@ -1032,10 +1142,10 @@ class ProfileReviewContextSource:
 
 __all__ = [
     "ALLOWED_FIELD_TRANSITIONS",
+    "DirectSelfReportResult",
     "FullProfileSnapshot",
     "INFERENCE_ONLY_FIELDS",
     "MAX_SNAPSHOT_LEGACY_FIELDS",
-    "MAX_SNAPSHOT_PENDING",
     "MAX_CHANGES_PER_REVIEW",
     "ProfileApplyResult",
     "ProfileChangeProposal",
@@ -1051,6 +1161,7 @@ __all__ = [
     "ProfileReviewResult",
     "SnapshotEntry",
     "ValidatedChange",
+    "content_supported_by_text",
     "entries_equivalent",
     "is_human_confirmed_source",
     "is_strict_field",

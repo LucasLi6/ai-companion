@@ -82,7 +82,7 @@ async def _trace(rt, person_id) -> str:
     parts: list[str] = []
     for sql in (
         "SELECT content FROM person_profile_entries WHERE person_id = ?",
-        "SELECT candidate_value_json FROM person_profile_candidates WHERE person_id = ?",
+        "SELECT candidate_value_json FROM person_profile_candidates_legacy WHERE person_id = ?",
         "SELECT changes_json FROM person_profile_revisions WHERE person_id = ?",
         "SELECT changes_json, reason, last_error FROM profile_review_receipts"
         " WHERE person_id = ?",
@@ -168,7 +168,7 @@ async def test_memory_retraction_follows_the_same_rules(rt):
 
 
 async def _secret_profile(rt, person):
-    """One applied entry, one pending candidate, one receipt for one event."""
+    """Two applied entries and one review receipt for one event."""
     event = await _event(rt, person, "我的秘密代号是蓝鲸。")
     proposal = ProfileChangeProposal(
         operation="ADD",
@@ -242,12 +242,11 @@ async def test_privacy_delete_leaves_no_recoverable_private_body(rt):
     result = await rt.profile_service.invalidate_profile_source(
         person.person_id, event_id=event.event_id, deletion_mode="PRIVACY_DELETE"
     )
-    assert result.entries_deleted >= 1
-    assert result.candidates_cleaned >= 1
+    assert result.entries_deleted >= 2
 
     assert await rt.repos.profile.list_entries(person.person_id) == []
     assert (
-        await rt.repos.profile.list_candidates(person.person_id)
+        await rt.repos.profile.list_legacy_candidates(person.person_id)
     ) == []
     receipt = await rt.repos.profile.get_review_receipt_by_id(review_id)
     assert receipt["changes"] == []

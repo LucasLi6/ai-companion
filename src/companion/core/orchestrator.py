@@ -1058,12 +1058,10 @@ class Orchestrator:
                 cognitive_context, runtime_snapshot
             )
 
-            # 8b. V0.9.9: read the next user reply to an identity confirmation
-            # and detect a new explicit self-report. This runs before Speaker
-            # generation; it never waits for the delayed Profile Review. The
-            # question is only *prepared* here — it is appended below only if
-            # this turn actually produces a deliverable reply.
-            confirmation_question = await self._begin_profile_confirmation(
+            # 8b. V0.9.9.6: an explicit first-person statement is written
+            # directly here, before Speaker generation. There is no question to
+            # prepare or append, and a failed write never affects the turn.
+            await self._apply_direct_profile_self_reports(
                 event, person_id, persist=persist
             )
 
@@ -1182,36 +1180,6 @@ class Orchestrator:
                     timings["speaker_first_token_ms"] = stream_meta[
                         "first_token_ms"
                     ]
-            # V0.9.9: append the prepared confirmation question only to a
-            # complete, deliverable normal reply. WAIT/IGNORE, quiet mode, a
-            # local safety reply or truncated output leave the pending question
-            # for the next deliverable reply.
-            question_delivered = False
-            if confirmation_question and final_action == CognitiveAction.RESPOND:
-                if existing_action is None:
-                    if (
-                        not safety.triggered
-                        and not context.quiet_mode
-                        and action_status
-                        not in ("TRUNCATED", "FAILED", "CANCELLED")
-                        and response_text
-                    ):
-                        if confirmation_question not in response_text:
-                            response_text = (
-                                response_text.rstrip()
-                                + "\n\n"
-                                + confirmation_question
-                            )
-                        question_delivered = True
-                elif (
-                    response_text
-                    and confirmation_question in response_text
-                    and action_status
-                    not in ("TRUNCATED", "FAILED", "CANCELLED")
-                ):
-                    # A retry reuses the already-committed action; never
-                    # rewrite it, only acknowledge the question it carries.
-                    question_delivered = True
             action_obj = AgentAction(
                     action_id=new_id("act"),
                     event_id=event.event_id,
@@ -1254,51 +1222,9 @@ class Orchestrator:
                     await self._record_stances(event, action_obj, cognitive_context)
             timings["commit_ms"] = (time.monotonic() - t_commit) * 1000
 
-            if question_delivered and self.profile_confirmation is not None:
-                try:
-                    await self.profile_confirmation.mark_question_delivered(
-                        person_id=person_id,
-                        conversation_id=event.conversation_id,
-                        question_message_id=(
-                            action_obj.action_id
-                            if action_obj is not None
-                            else response_id
-                        ),
-                    )
-                except Exception as exc:
-                    # The reply was delivered; a state-bookkeeping failure must
-                    # never turn a successful turn into an error.
-                    self.logger.warning(
-                        "profile_confirmation_delivery_state_failed"
-                        " conversation_id=%s error=%s",
-                        event.conversation_id,
-                        type(exc).__name__,
-                    )
-
             if job_id is not None:
                 steps.append("[MEMORY_JOB] Queued")
             steps.append("[STATUS] Completed")
-            if (
-                question_delivered
-                and existing_action is None
-                and stream is not None
-                and stream_emitted
-            ):
-                # The provider-streamed deltas did not include the appended
-                # confirmation question. Send the exact remaining suffix only
-                # now — after the action and its confirmation state are
-                # committed — so the visible text, the completed event, the
-                # persisted action and the question's state cannot diverge.
-                emitted = str(stream_meta.get("emitted_text") or "")
-                if emitted and response_text.startswith(emitted):
-                    suffix = response_text[len(emitted):]
-                elif confirmation_question in emitted:
-                    # The model already produced the exact question text.
-                    suffix = ""
-                else:
-                    suffix = "\n\n" + confirmation_question
-                if suffix:
-                    stream.delta(response_id, suffix)
             if (
                 stream is not None
                 and final_action == CognitiveAction.RESPOND
@@ -1750,22 +1676,22 @@ class Orchestrator:
             )
             return context
 
-    async def _begin_profile_confirmation(
+    async def _apply_direct_profile_self_reports(
         self, event, person_id: str, *, persist: bool
-    ) -> Optional[str]:
-        """Resolve/ask one identity confirmation; never affect the turn."""
+    ) -> None:
+        """Write explicit self-reports directly; never affect the turn."""
         service = self.profile_confirmation
         if service is None or not persist:
             return None
         try:
-            return await service.begin_turn(event=event, person_id=person_id)
+            await service.begin_turn(event=event, person_id=person_id)
         except Exception as exc:
             self.logger.warning(
-                "profile_confirmation_failed conversation_id=%s error=%s",
+                "profile_self_report_failed conversation_id=%s error=%s",
                 event.conversation_id,
                 type(exc).__name__,
             )
-            return None
+        return None
 
     async def build_proactive_judge_context(
         self, *, source_event, person_id: str, mode: str = "IMMEDIATE"

@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -2018,6 +2018,58 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON profile_confirmations(person_id, state, created_at);
         CREATE INDEX IF NOT EXISTS idx_profile_confirmations_candidate
             ON profile_confirmations(candidate_id);
+        """,
+    ),
+    # Version 30 (V0.9.9.6): Person Profile writes directly.
+    #
+    # ``person_profile_candidates`` was a model-facing middle queue: a legal
+    # fact could sit there forever waiting for a human confirmation that the
+    # product no longer has. Runtime code stops reading and writing it in this
+    # release. The rows are not dropped: the table is renamed to
+    # ``person_profile_candidates_legacy`` so the one-time migration command
+    # can revalidate each value against its original event and write only what
+    # still passes. After that command retires the legacy rows, nothing reads
+    # the table. ``profile_candidate_migrations`` is the local audit of what
+    # each old row became; its UNIQUE(candidate_id) makes a retry a no-op.
+    #
+    # Review receipts gain the two counts the worker now records, so a
+    # completed review can state "extracted N, wrote M, rejected K" without
+    # persisting any user text.
+    (
+        30,
+        """
+        ALTER TABLE person_profile_candidates
+            RENAME TO person_profile_candidates_legacy;
+
+        CREATE TABLE IF NOT EXISTS profile_candidate_migrations (
+            migration_id        TEXT PRIMARY KEY,
+            candidate_id        TEXT NOT NULL UNIQUE,
+            person_id           TEXT NOT NULL
+                                REFERENCES persons(person_id) ON DELETE CASCADE,
+            field_key           TEXT NOT NULL,
+            operation           TEXT NOT NULL DEFAULT 'ADD',
+            candidate_value_json TEXT,
+            source_event_id     TEXT,
+            status              TEXT NOT NULL,
+            reason              TEXT,
+            entry_id            TEXT,
+            revision            INTEGER,
+            created_at          TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_candidate_migrations_person
+            ON profile_candidate_migrations(person_id, status);
+
+        ALTER TABLE profile_review_receipts
+            ADD COLUMN applied_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE profile_review_receipts
+            ADD COLUMN rejected_count INTEGER NOT NULL DEFAULT 0;
+
+        UPDATE profile_confirmations
+           SET state = 'MIGRATED',
+               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE state NOT IN ('CONFIRMED', 'REJECTED', 'ACCEPTED_SELF_REPORT',
+                             'MIGRATED');
         """,
     ),
 ]

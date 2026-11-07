@@ -125,7 +125,7 @@ async def _seed_v24(path):
 
 async def test_fresh_database_has_current_schema_structures(db):
     cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 29
+    assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 30
 
     names = {
         row["name"]
@@ -163,7 +163,7 @@ async def test_migration_24_adds_columns_without_changing_old_rows(tmp_path):
         await db.initialize()
 
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 29
+        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 30
 
         cur = await db.execute(
             "SELECT * FROM person_interaction_profiles WHERE person_id='person_old'"
@@ -174,7 +174,9 @@ async def test_migration_24_adds_columns_without_changing_old_rows(tmp_path):
 
         columns = {
             row["name"]
-            for row in await (await db.execute("PRAGMA table_info(person_profile_candidates)")).fetchall()
+            for row in await (await db.execute(
+                "PRAGMA table_info(person_profile_candidates_legacy)"
+            )).fetchall()
         }
         assert {
             "operation",
@@ -256,8 +258,16 @@ async def test_old_candidates_are_not_auto_upgraded(tmp_path):
     db = await Database(path).connect()
     try:
         await db.initialize()
+        # V0.9.9.6 renames the retired queue instead of dropping it. Nothing
+        # reads or applies it implicitly.
+        old = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='person_profile_candidates'"
+        )
+        assert await old.fetchone() is None
         cur = await db.execute(
-            "SELECT * FROM person_profile_candidates WHERE candidate_id='pfc_old'"
+            "SELECT * FROM person_profile_candidates_legacy"
+            " WHERE candidate_id='pfc_old'"
         )
         candidate = await cur.fetchone()
         assert candidate["status"] == "PENDING"
@@ -281,6 +291,11 @@ async def test_old_candidates_are_not_auto_upgraded(tmp_path):
         assert revision["revision"] == 4
         assert revision["changes_json"] == '{"changes": []}'
 
+        cur = await db.execute(
+            "SELECT COUNT(*) AS n FROM profile_candidate_migrations"
+        )
+        assert (await cur.fetchone())["n"] == 0
+
         cur = await db.execute("SELECT COUNT(*) AS n FROM profile_review_receipts")
         assert (await cur.fetchone())["n"] == 0
     finally:
@@ -294,7 +309,7 @@ async def test_migration_25_is_additive_from_23(tmp_path):
     try:
         await db.initialize()
         cur = await db.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == 29
+        assert (await cur.fetchone())["v"] == 30
         cur = await db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
             " AND name='person_profile_entries'"

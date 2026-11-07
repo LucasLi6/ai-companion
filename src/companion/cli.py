@@ -18,8 +18,10 @@ import contextlib
 import ipaddress
 import json
 import os
+import shutil
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from companion.config import configure_logging, default_db_path
@@ -56,11 +58,10 @@ from companion.people.profile_models import (
     ProfileFieldStorage,
     profile_field_spec,
 )
-from companion.people.profile_service import (
-    ProfileProposalStale,
-    ProfileUnauthorized,
-    TRUSTED_CONFIRMATION,
+from companion.people.profile_candidate_migration import (
+    migrate_profile_candidates,
 )
+from companion.people.profile_service import ProfileUnauthorized
 from companion.jobs.profile_review import (
     ProfileReviewScheduler,
     repair_skipped_reviews,
@@ -219,12 +220,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pp_history.add_argument("--person", required=True)
     pp_history.set_defaults(func=cmd_profile_history)
-    pp_candidates = p_profile_sub.add_parser(
-        "candidates", parents=[_common_parser()],
-        help="Show pending change proposals",
+    pp_migrate = p_profile_sub.add_parser(
+        "migrate-candidates", parents=[_common_parser()],
+        help=(
+            "Revalidate retired profile candidates and write only legal"
+            " values (dry-run by default)"
+        ),
     )
-    pp_candidates.add_argument("--person", required=True)
-    pp_candidates.set_defaults(func=cmd_profile_candidates)
+    pp_migrate.add_argument("--person", required=True)
+    pp_migrate_mode = pp_migrate.add_mutually_exclusive_group()
+    pp_migrate_mode.add_argument(
+        "--dry-run", dest="apply", action="store_false",
+        help="Report what would be written without writing (default)",
+    )
+    pp_migrate_mode.add_argument(
+        "--apply", dest="apply", action="store_true",
+        help="Back up the database, then write validated changes",
+    )
+    pp_migrate.set_defaults(apply=False)
+    pp_migrate.add_argument(
+        "--backup-path", default=None,
+        help="Backup file for --apply (default: <db>.backup-<timestamp>)",
+    )
+    pp_migrate.set_defaults(func=cmd_profile_migrate_candidates)
     pp_review = p_profile_sub.add_parser(
         "review", parents=[_common_parser()],
         help="Run or check a formal profile review for one turn",
@@ -236,18 +254,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_provider_arg(pp_review)
     pp_review.set_defaults(func=cmd_profile_review)
-    pp_confirm = p_profile_sub.add_parser(
-        "confirm", parents=[_common_parser()],
-        help="Confirm one pending proposal (explicit trusted write)",
-    )
-    pp_confirm.add_argument("candidate_id")
-    pp_confirm.set_defaults(func=cmd_profile_confirm)
-    pp_reject = p_profile_sub.add_parser(
-        "reject", parents=[_common_parser()],
-        help="Reject one pending proposal",
-    )
-    pp_reject.add_argument("candidate_id")
-    pp_reject.set_defaults(func=cmd_profile_reject)
     pp_repair = p_profile_sub.add_parser(
         "repair-reviews", parents=[_common_parser()],
         help=(
@@ -852,16 +858,18 @@ async def cmd_profile_show(args) -> int:
                     f" ({entry.status}, source={entry.source},"
                     f" confidence={entry.confidence:.2f})"
                 )
-        print(f"pending_proposals: {len(snapshot.pending_candidates)}")
         receipt = await rt.repos.profile.latest_review_receipt(args.person)
         if receipt is not None:
             print(
                 "last_review: status={status} decision={decision}"
-                " revision={base}->{result} source_event={event}".format(
+                " revision={base}->{result} applied={applied}"
+                " rejected={rejected} source_event={event}".format(
                     status=receipt["status"],
                     decision=receipt["decision"] or "-",
                     base=receipt["base_revision"] or "-",
                     result=receipt["result_revision"] or "-",
+                    applied=receipt.get("applied_count", 0),
+                    rejected=receipt.get("rejected_count", 0),
                     event=receipt["source_event_id"],
                 )
             )
@@ -908,35 +916,6 @@ async def cmd_profile_history(args) -> int:
             return 0
         for revision in revisions:
             _print_revision(revision)
-    finally:
-        await db.close()
-    return 0
-
-
-async def cmd_profile_candidates(args) -> int:
-    db = await _connect(args.db)
-    try:
-        rt = build_runtime(db)
-        if not await rt.profile_service.can_persist(args.person):
-            print("profile candidates unavailable: no persistence consent")
-            return 1
-        candidates = []
-        for status in ("PENDING", "NEEDS_REVIEW"):
-            candidates.extend(
-                await rt.repos.profile.list_candidates(args.person, status=status)
-            )
-        if not candidates:
-            print("no pending profile proposals")
-            return 0
-        for item in candidates:
-            print(
-                f"{item['candidate_id']}  {item.get('operation') or 'ADD'}"
-                f"  {item['field_key']}  status={item['status']}"
-                f"  confirm={bool(item.get('requires_confirmation'))}"
-                f"  confidence={item['confidence']:.2f}"
-            )
-            print(f"  proposed: {item['candidate_value']}")
-            print(f"  reason: {item['reason'] or '-'}")
     finally:
         await db.close()
     return 0
@@ -999,6 +978,62 @@ async def cmd_profile_review(args) -> int:
     return 0
 
 
+async def cmd_profile_migrate_candidates(args) -> int:
+    """One-time migration of the retired Person Profile candidate table.
+
+    Dry-run is the default and performs no writes. ``--apply`` makes a backup
+    first, then revalidates every old row locally; model confidence is not
+    trusted and no model is called.
+    """
+    if args.apply:
+        source = Path(args.db)
+        if not source.exists():
+            print(f"database not found: {args.db}")
+            return 1
+        backup = (
+            Path(args.backup_path)
+            if args.backup_path
+            else source.with_name(
+                f"{source.name}.backup-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            )
+        )
+        if backup.exists():
+            print(f"backup already exists, refusing to overwrite: {backup}")
+            return 1
+        shutil.copy2(source, backup)
+        print(f"backup: {backup}")
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        summary = await migrate_profile_candidates(
+            rt.profile_service,
+            args.person,
+            dry_run=not args.apply,
+        )
+        print(
+            "mode={mode} person={person} scanned={scanned} applied={applied}"
+            " already_present={present} already_migrated={migrated}"
+            " skipped={skipped}".format(
+                mode="apply" if args.apply else "dry-run",
+                person=args.person,
+                scanned=summary["scanned"],
+                applied=summary["applied"],
+                present=summary["already_present"],
+                migrated=summary["already_migrated"],
+                skipped=summary["skipped"],
+            )
+        )
+        for item in summary["results"]:
+            print(
+                f"  {item['status']} {item.get('field_key') or '-'}"
+                f" reason={item.get('reason') or '-'}"
+                f" revision={item.get('revision') or '-'}"
+            )
+    finally:
+        await db.close()
+    return 0
+
+
 async def cmd_profile_repair_reviews(args) -> int:
     """Repair legacy SKIPPED reviews for one person.
 
@@ -1035,61 +1070,6 @@ async def cmd_profile_repair_reviews(args) -> int:
             print(f"  skip {item['review_id'] or '-'} reason={item['reason']}")
         if args.apply and summary["retried"]:
             print("requeued; the background worker will process these reviews")
-    finally:
-        await db.close()
-    return 0
-
-
-async def cmd_profile_confirm(args) -> int:
-    db = await _connect(args.db)
-    try:
-        rt = build_runtime(db)
-        candidate = await rt.repos.profile.get_candidate(args.candidate_id)
-        if candidate is None:
-            print(f"candidate not found: {args.candidate_id}")
-            return 1
-        spec = profile_field_spec(candidate["field_key"])
-        try:
-            if spec is not None and spec.storage is ProfileFieldStorage.ENTRY:
-                revision = await rt.profile_service.confirm_profile_proposal(
-                    args.candidate_id,
-                    actor="user",
-                    authority=TRUSTED_CONFIRMATION,
-                )
-            else:
-                revision = await rt.profile_service.confirm_candidate(
-                    args.candidate_id, actor="user"
-                )
-        except ProfileProposalStale as exc:
-            print(f"STALE_PROPOSAL {exc}")
-            return 2
-        except (ValueError, ProfileUnauthorized) as exc:
-            print(f"cannot confirm: {exc}")
-            return 1
-        print(f"confirmed {args.candidate_id} at revision {revision}")
-    finally:
-        await db.close()
-    return 0
-
-
-async def cmd_profile_reject(args) -> int:
-    db = await _connect(args.db)
-    try:
-        rt = build_runtime(db)
-        candidate = await rt.repos.profile.get_candidate(args.candidate_id)
-        if candidate is None:
-            print(f"candidate not found: {args.candidate_id}")
-            return 1
-        spec = profile_field_spec(candidate["field_key"])
-        if spec is not None and spec.storage is ProfileFieldStorage.ENTRY:
-            await rt.profile_service.reject_profile_proposal(
-                args.candidate_id, reason="rejected_by_user"
-            )
-        else:
-            await rt.profile_service.reject_candidate(
-                args.candidate_id, reason="rejected_by_user", actor="user"
-            )
-        print(f"rejected {args.candidate_id}")
     finally:
         await db.close()
     return 0

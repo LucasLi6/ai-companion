@@ -141,17 +141,6 @@ async def test_privacy_delete_removes_everything_a_memory_alone_supports(rt):
     secret = await _entry(rt, person, content="蓝鲸项目", memories=[m1])
     shared = await _entry(rt, person, content="蓝鲸与露营", memories=[m1, m2])
     unrelated = await _entry(rt, person, content="露营", memories=[m2])
-    candidate = await rt.repos.profile.insert_candidate(
-        person_id=person.person_id,
-        field_key="interests.topics",
-        value="蓝鲸秘密",
-        source="INTERACTION_INFERENCE",
-        confidence=0.7,
-        evidence_memory_ids=[m1],
-        evidence_event_ids=[],
-        evidence_candidate_ids=[],
-    )
-
     result = await _delete_memory(rt, person, m1, event)
     assert result.status == "COMPLETED"
     assert await rt.memory_service.repo.get(m1) is None
@@ -163,7 +152,8 @@ async def test_privacy_delete_removes_everything_a_memory_alone_supports(rt):
     kept = await rt.repos.profile.get_entry(unrelated)
     assert kept["status"] == "ACTIVE"
     assert kept["content"] == "露营"
-    assert await rt.repos.profile.get_candidate(candidate) is None
+    # V0.9.9.6: no candidate queue exists, so nothing can survive the delete.
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
     profile = await rt.profile_service.get(person.person_id)
     assert "蓝鲸" not in profile.compact_summary
@@ -205,20 +195,12 @@ async def test_a_failed_privacy_delete_rolls_back_the_whole_source_graph(rt, mon
     entry = await _entry(rt, person, content="蓝鲸项目", memories=[m1])
     revision = (await rt.profile_service.get(person.person_id)).metadata.revision
 
-    async def explode(candidate_id):
+    async def explode(**kwargs):
         raise RuntimeError("simulated failure after profile invalidation")
 
-    monkeypatch.setattr(rt.repos.profile, "delete_candidate", explode)
-    await rt.repos.profile.insert_candidate(
-        person_id=person.person_id,
-        field_key="interests.topics",
-        value="蓝鲸",
-        source="INTERACTION_INFERENCE",
-        confidence=0.7,
-        evidence_memory_ids=[m1],
-        evidence_event_ids=[],
-        evidence_candidate_ids=[],
-    )
+    # Fail at the final revision write, after entries and the summary have
+    # already been touched inside the same profile transaction.
+    monkeypatch.setattr(rt.repos.profile, "insert_revision", explode)
 
     result = await _delete_memory(rt, person, m1, event)
     assert result.status == "FAILED"

@@ -99,7 +99,7 @@ async def _trace(rt, person_id) -> str:
     parts: list[str] = []
     for sql in (
         "SELECT content FROM person_profile_entries WHERE person_id = ?",
-        "SELECT candidate_value_json FROM person_profile_candidates WHERE person_id = ?",
+        "SELECT candidate_value_json FROM person_profile_candidates_legacy WHERE person_id = ?",
         "SELECT changes_json, reason, last_error FROM profile_review_receipts"
         " WHERE person_id = ?",
         "SELECT changes_json FROM person_profile_revisions WHERE person_id = ?",
@@ -144,19 +144,8 @@ async def test_event_delete_removes_a_memory_only_entry_and_all_its_bodies(rt):
     person = await _person(rt)
     event = await _event(rt, person, "我的秘密代号是蓝鲸。")
     memory_id = await _memory(rt, person, "代号蓝鲸", event.event_id)
-    # The entry and candidate cite only the derived memory, never the event.
+    # The entry cites only the derived memory, never the event.
     entry_id = await _entry(rt, person, content="蓝鲸项目", memories=[memory_id])
-    candidate_id = await rt.repos.profile.insert_candidate(
-        person_id=person.person_id,
-        field_key="interests.topics",
-        value="蓝鲸",
-        source="INTERACTION_INFERENCE",
-        confidence=0.7,
-        evidence_memory_ids=[memory_id],
-        evidence_event_ids=[],
-        evidence_candidate_ids=[],
-        reason="derived_memory_only",
-    )
     scheduler = ProfileReviewScheduler(rt.repos.profile, rt.repos.job)
     review_id = await scheduler.request(person.person_id, event.event_id)
     await rt.repos.profile.update_review_receipt(
@@ -171,8 +160,7 @@ async def test_event_delete_removes_a_memory_only_entry_and_all_its_bodies(rt):
     assert await rt.repos.utterance.get(event.event_id) is None
     assert await rt.memory_service.repo.get(memory_id) is None
     assert await rt.repos.profile.get_entry(entry_id) is None
-    assert await rt.repos.profile.get_candidate(candidate_id) is None
-    assert await rt.repos.profile.list_candidates(person.person_id) == []
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
     receipt = await rt.repos.profile.get_review_receipt_by_id(review_id)
     assert receipt["status"] == "CANCELLED"
@@ -215,8 +203,7 @@ async def test_a_deleted_event_and_memory_are_never_valid_evidence_again(rt):
                         proposed_content="蓝鲸",
                         evidence_event_ids=[event.event_id],
                         confidence=1.0,
-                    ),
-                    auto_apply=True,
+                    )
                 )
             ],
         },
@@ -226,14 +213,14 @@ async def test_a_deleted_event_and_memory_are_never_valid_evidence_again(rt):
         decision,
         source_event_id=event.event_id,
     )
-    assert applied.status == "NO_CHANGE"
+    assert applied.status == "REJECTED"
     assert applied.rejected[0]["reason"] == "evidence_event_not_accessible"
     assert (
         await rt.profile_service.get(person.person_id)
     ).metadata.revision == revision
     assert await rt.repos.profile.list_entries(person.person_id) == []
     # A rejected proposal is not stored, so it cannot re-introduce the secret.
-    assert await rt.repos.profile.list_candidates(person.person_id) == []
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
     assert await rt.memory_service.repo.get(memory_id) is None
 
 

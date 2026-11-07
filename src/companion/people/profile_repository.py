@@ -601,6 +601,8 @@ class PersonProfileRepository:
         last_error: Optional[str] = None,
         completed: bool = False,
         execution_owner_id: Optional[str] = None,
+        applied_count: Optional[int] = None,
+        rejected_count: Optional[int] = None,
     ) -> bool:
         """Update a receipt, optionally only while ``execution_owner_id`` owns it.
 
@@ -624,7 +626,8 @@ class PersonProfileRepository:
             "UPDATE profile_review_receipts SET status = ?, base_revision = ?,"
             " result_revision = ?, decision = ?, reason = ?, changes_json = ?,"
             " attempt_count = ?, last_error = ?, updated_at = ?,"
-            " completed_at = ?, execution_owner_id = ? WHERE review_id = ?"
+            " completed_at = ?, execution_owner_id = ?, applied_count = ?,"
+            " rejected_count = ? WHERE review_id = ?"
         )
         params: list[Any] = [
             next_status,
@@ -642,6 +645,12 @@ class PersonProfileRepository:
             now,
             now if completed else receipt["completed_at"],
             None if clear_owner else receipt.get("execution_owner_id"),
+            applied_count
+            if applied_count is not None
+            else int(receipt.get("applied_count") or 0),
+            rejected_count
+            if rejected_count is not None
+            else int(receipt.get("rejected_count") or 0),
             review_id,
         ]
         if execution_owner_id is not None:
@@ -663,6 +672,16 @@ class PersonProfileRepository:
             "decision": row["decision"],
             "reason": row["reason"],
             "changes": _loads(row["changes_json"], []),
+            "applied_count": (
+                int(row["applied_count"] or 0)
+                if "applied_count" in row.keys()
+                else 0
+            ),
+            "rejected_count": (
+                int(row["rejected_count"] or 0)
+                if "rejected_count" in row.keys()
+                else 0
+            ),
             "attempt_count": int(row["attempt_count"] or 0),
             "last_error": row["last_error"],
             "execution_owner_id": (
@@ -799,264 +818,6 @@ class PersonProfileRepository:
             "revision": int(row["revision"]),
             "created_at": _dt(row["created_at"]),
             "updated_at": _dt(row["updated_at"]),
-        }
-
-    # -- candidates --------------------------------------------------------
-
-    async def insert_candidate(
-        self,
-        *,
-        person_id: str,
-        field_key: str,
-        value: Any,
-        source: str,
-        confidence: float,
-        evidence_memory_ids: list[str],
-        evidence_event_ids: list[str],
-        evidence_candidate_ids: list[str],
-        reason: Optional[str] = None,
-        operation: str = "ADD",
-        target_entry_ids: Optional[list[str]] = None,
-        expected_revision: Optional[int] = None,
-        requires_confirmation: bool = False,
-        review_status: str = "PENDING",
-    ) -> str:
-        candidate_id = new_id("pfc")
-        now = _iso(utcnow())
-        await self.db.execute(
-            "INSERT INTO person_profile_candidates("
-            " candidate_id, person_id, field_key, candidate_value_json, source,"
-            " confidence, status, evidence_memory_ids_json,"
-            " evidence_event_ids_json, evidence_candidate_ids_json, reason,"
-            " created_at, updated_at, operation, target_entry_ids_json,"
-            " expected_revision, requires_confirmation, review_status)"
-            " VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                candidate_id,
-                person_id,
-                field_key,
-                _json(value),
-                source,
-                float(confidence),
-                _json(sorted(set(evidence_memory_ids))),
-                _json(sorted(set(evidence_event_ids))),
-                _json(sorted(set(evidence_candidate_ids))),
-                reason,
-                now,
-                now,
-                operation,
-                _json(sorted(set(target_entry_ids or []))),
-                int(expected_revision) if expected_revision is not None else None,
-                1 if requires_confirmation else 0,
-                review_status,
-            ),
-        )
-        return candidate_id
-
-    async def set_candidate_review_status(
-        self, candidate_id: str, review_status: str, *, reason: Optional[str] = None
-    ) -> None:
-        await self.db.execute(
-            "UPDATE person_profile_candidates SET review_status = ?,"
-            " reason = COALESCE(?, reason), updated_at = ? WHERE candidate_id = ?",
-            (review_status, reason, _iso(utcnow()), candidate_id),
-        )
-
-    async def get_candidate(self, candidate_id: str) -> Optional[dict]:
-        cur = await self.db.execute(
-            "SELECT * FROM person_profile_candidates WHERE candidate_id = ?",
-            (candidate_id,),
-        )
-        row = await cur.fetchone()
-        return self._candidate_row(row) if row is not None else None
-
-    async def list_candidates(
-        self, person_id: str, *, status: Optional[str] = "PENDING"
-    ) -> list[dict]:
-        """Candidate rows, newest last.
-
-        ``status=None`` returns every status; the review snapshot needs the
-        parked ``NEEDS_REVIEW`` proposals too, not only fresh ``PENDING`` ones.
-        """
-        if status is None:
-            cur = await self.db.execute(
-                "SELECT * FROM person_profile_candidates"
-                " WHERE person_id = ? ORDER BY created_at ASC",
-                (person_id,),
-            )
-        else:
-            cur = await self.db.execute(
-                "SELECT * FROM person_profile_candidates"
-                " WHERE person_id = ? AND status = ? ORDER BY created_at ASC",
-                (person_id, status),
-            )
-        rows = await cur.fetchall()
-        return [self._candidate_row(row) for row in rows]
-
-    async def find_pending(
-        self, person_id: str, field_key: str
-    ) -> list[dict]:
-        return [
-            candidate
-            for candidate in await self.list_candidates(person_id)
-            if candidate["field_key"] == field_key
-        ]
-
-    async def set_candidate_status(
-        self, candidate_id: str, status: str, *, reason: Optional[str] = None
-    ) -> None:
-        await self.db.execute(
-            "UPDATE person_profile_candidates SET status = ?, updated_at = ?,"
-            " reason = COALESCE(?, reason) WHERE candidate_id = ?",
-            (status, _iso(utcnow()), reason, candidate_id),
-        )
-
-    async def set_candidate_source(
-        self, candidate_id: str, *, source: str, confidence: float
-    ) -> None:
-        """Upgrade a pending candidate's provenance (V0.9.9).
-
-        A background inference that is later repeated by the person's own
-        explicit statement becomes a direct self-report candidate, so the
-        single-turn confirmation can apply it with the real source.
-        """
-        await self.db.execute(
-            "UPDATE person_profile_candidates SET source = ?, confidence = ?,"
-            " updated_at = ? WHERE candidate_id = ?",
-            (source, float(confidence), _iso(utcnow()), candidate_id),
-        )
-
-    async def add_candidate_evidence(
-        self,
-        candidate_id: str,
-        *,
-        memory_ids: list[str],
-        event_ids: list[str],
-        candidate_ids: list[str],
-    ) -> None:
-        candidate = await self.get_candidate(candidate_id)
-        if candidate is None:
-            return
-        await self.db.execute(
-            "UPDATE person_profile_candidates SET"
-            " evidence_memory_ids_json = ?, evidence_event_ids_json = ?,"
-            " evidence_candidate_ids_json = ?, updated_at = ?"
-            " WHERE candidate_id = ?",
-            (
-                _json(
-                    sorted(
-                        set(candidate["evidence_memory_ids"]) | set(memory_ids)
-                    )
-                ),
-                _json(
-                    sorted(set(candidate["evidence_event_ids"]) | set(event_ids))
-                ),
-                _json(
-                    sorted(
-                        set(candidate["evidence_candidate_ids"])
-                        | set(candidate_ids)
-                    )
-                ),
-                _iso(utcnow()),
-                candidate_id,
-            ),
-        )
-
-    async def list_candidates_referencing_source(
-        self,
-        person_id: str,
-        *,
-        event_id: Optional[str] = None,
-        memory_id: Optional[str] = None,
-    ) -> list[dict]:
-        """All candidate rows (any status) that cite this event or memory."""
-        cur = await self.db.execute(
-            "SELECT * FROM person_profile_candidates WHERE person_id = ?",
-            (person_id,),
-        )
-        rows = await cur.fetchall()
-        candidates = [self._candidate_row(row) for row in rows]
-        return [
-            candidate
-            for candidate in candidates
-            if (event_id and event_id in candidate["evidence_event_ids"])
-            or (memory_id and memory_id in candidate["evidence_memory_ids"])
-        ]
-
-    async def replace_candidate_evidence(
-        self,
-        candidate_id: str,
-        *,
-        evidence_event_ids: list[str],
-        evidence_memory_ids: list[str],
-    ) -> None:
-        await self.db.execute(
-            "UPDATE person_profile_candidates SET evidence_event_ids_json = ?,"
-            " evidence_memory_ids_json = ?, updated_at = ? WHERE candidate_id = ?",
-            (
-                _json(sorted(set(evidence_event_ids))),
-                _json(sorted(set(evidence_memory_ids))),
-                _iso(utcnow()),
-                candidate_id,
-            ),
-        )
-
-    async def delete_candidate(self, candidate_id: str) -> None:
-        await self.db.execute(
-            "DELETE FROM person_profile_candidates WHERE candidate_id = ?",
-            (candidate_id,),
-        )
-
-    async def reject_pending(self, person_id: str, reason: str) -> int:
-        cur = await self.db.execute(
-            "UPDATE person_profile_candidates SET status = 'REJECTED',"
-            " updated_at = ?, reason = ? WHERE person_id = ? AND status = 'PENDING'",
-            (_iso(utcnow()), reason, person_id),
-        )
-        return int(cur.rowcount or 0)
-
-    @staticmethod
-    def _candidate_row(row) -> dict:
-        keys = row.keys() if hasattr(row, "keys") else ()
-        extra = {
-            "operation": row["operation"] if "operation" in keys else "ADD",
-            "target_entry_ids": _loads(
-                row["target_entry_ids_json"]
-                if "target_entry_ids_json" in keys
-                else None,
-                [],
-            ),
-            "expected_revision": (
-                row["expected_revision"] if "expected_revision" in keys else None
-            ),
-            "requires_confirmation": bool(
-                row["requires_confirmation"]
-                if "requires_confirmation" in keys
-                else 0
-            ),
-            "review_status": (
-                row["review_status"] if "review_status" in keys else "PENDING"
-            ),
-        }
-        return {
-            "candidate_id": row["candidate_id"],
-            "person_id": row["person_id"],
-            "field_key": row["field_key"],
-            "candidate_value": _loads(row["candidate_value_json"], None),
-            "source": row["source"],
-            "confidence": float(row["confidence"]),
-            "status": row["status"],
-            "evidence_memory_ids": _loads(
-                row["evidence_memory_ids_json"], []
-            ),
-            "evidence_event_ids": _loads(row["evidence_event_ids_json"], []),
-            "evidence_candidate_ids": _loads(
-                row["evidence_candidate_ids_json"], []
-            ),
-            "reason": row["reason"],
-            "created_at": _dt(row["created_at"]),
-            "updated_at": _dt(row["updated_at"]),
-            **extra,
         }
 
     # -- revisions / evidence ---------------------------------------------
@@ -1359,6 +1120,66 @@ class PersonProfileRepository:
         rows = await cur.fetchall()
         return [row["person_id"] for row in rows]
 
+    # -- legacy candidate migration (read-only archive) --------------------
+
+    async def list_legacy_candidates(self, person_id: str) -> list[dict]:
+        """Read rows from the retired candidate table for the one-time tool.
+
+        Runtime code never calls this. The rows are kept only so the explicit
+        ``profile migrate-candidates`` command can revalidate them.
+        """
+        cur = await self.db.execute(
+            "SELECT * FROM person_profile_candidates_legacy"
+            " WHERE person_id = ? ORDER BY created_at ASC, candidate_id ASC",
+            (person_id,),
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+    async def get_candidate_migration(self, candidate_id: str) -> Optional[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM profile_candidate_migrations WHERE candidate_id = ?",
+            (candidate_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row is not None else None
+
+    async def record_candidate_migration(
+        self,
+        *,
+        candidate_id: str,
+        person_id: str,
+        field_key: str,
+        operation: str,
+        candidate_value: Any,
+        source_event_id: Optional[str],
+        status: str,
+        reason: Optional[str] = None,
+        entry_id: Optional[str] = None,
+        revision: Optional[int] = None,
+    ) -> None:
+        """Record the terminal outcome for one old candidate (idempotent)."""
+        await self.db.execute(
+            "INSERT OR IGNORE INTO profile_candidate_migrations("
+            " migration_id, candidate_id, person_id, field_key, operation,"
+            " candidate_value_json, source_event_id, status, reason, entry_id,"
+            " revision, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                new_id("pcm"),
+                candidate_id,
+                person_id,
+                field_key,
+                operation,
+                _json(candidate_value),
+                source_event_id,
+                status,
+                (reason or "")[:500] or None,
+                entry_id,
+                int(revision) if revision is not None else None,
+                _iso(utcnow()),
+            ),
+        )
+
     # -- deletion ----------------------------------------------------------
 
     async def purge(self, person_id: str) -> None:
@@ -1369,7 +1190,9 @@ class PersonProfileRepository:
         """
         for table in (
             "person_profile_evidence",
-            "person_profile_candidates",
+            "person_profile_candidates_legacy",
+            "profile_candidate_migrations",
+            "profile_confirmations",
             "person_profile_revisions",
             "person_profile_fields",
             "person_profile_entries",
@@ -1379,6 +1202,40 @@ class PersonProfileRepository:
             await self.db.execute(
                 f"DELETE FROM {table} WHERE person_id = ?", (person_id,)
             )
+
+    async def delete_legacy_candidates_for_source(
+        self,
+        person_id: str,
+        *,
+        event_id: Optional[str] = None,
+        memory_id: Optional[str] = None,
+    ) -> int:
+        """Remove legacy candidate rows that cite a privacy-deleted source.
+
+        The legacy table is never used by runtime code. It still contains user
+        text, so a deletion must remove anything derived from that source
+        before the table is retired by the migration command.
+        """
+        cur = await self.db.execute(
+            "SELECT candidate_id, evidence_event_ids_json,"
+            " evidence_memory_ids_json FROM person_profile_candidates_legacy"
+            " WHERE person_id = ?",
+            (person_id,),
+        )
+        removed = 0
+        for row in await cur.fetchall():
+            events = _loads(row["evidence_event_ids_json"], [])
+            memories = _loads(row["evidence_memory_ids_json"], [])
+            if (event_id and event_id in events) or (
+                memory_id and memory_id in memories
+            ):
+                await self.db.execute(
+                    "DELETE FROM person_profile_candidates_legacy"
+                    " WHERE candidate_id = ?",
+                    (row["candidate_id"],),
+                )
+                removed += 1
+        return removed
 
 
 __all__ = ["PersonProfileRepository"]

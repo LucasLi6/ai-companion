@@ -612,11 +612,11 @@ def build_runtime(
         except ValueError:
             turn_analysis_delay_seconds = 60.0
 
-    # V0.9.9: one-turn identity confirmation. Detection and the state machine
-    # are local; in real chat mode the question rides on the next deliverable
-    # normal reply. Tests may inject a service explicitly.
+    # V0.9.9.6: explicit self-reports are detected and written locally in the
+    # same turn. There is no confirmation question and no candidate queue, so
+    # this service is useful with every provider (it makes no model call).
     confirmation_service = profile_confirmation
-    if confirmation_service is None and provider == "deepseek":
+    if confirmation_service is None:
         confirmation_service = ProfileConfirmationService(
             profile_service=profile_service,
             repos=repos,

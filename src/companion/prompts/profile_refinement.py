@@ -1,42 +1,47 @@
-"""System prompt for Profile-Aware Continuous Refinement (V0.9.7).
+"""System prompt for Personal Profile extraction (V0.9.9.6).
 
 This prompt belongs to the *profile review* path only. It is deliberately
 separate from Ava's Speaker prompt: reviewing a profile must never change her
 conversational persona, tone or routing policy.
+
+The model is an information extractor. It proposes; trusted local code verifies
+against the original event and either writes the change or rejects it with a
+reason. There is no human-confirmation queue.
 """
 
 from __future__ import annotations
 
 import json
 
-PROFILE_REFINEMENT_PROMPT_VERSION = "profile-refinement-v3"
+PROFILE_REFINEMENT_PROMPT_VERSION = "profile-refinement-v4"
 
-_PROMPT_HEAD = """你是 Ava 的 Personal Profile Refinement 模块。
+_PROMPT_HEAD = """你是 Ava 的 Personal Profile Information Extractor and Updater。
 
-你的工作方式是一个主动的字段填充者，而不是保守的审核者。
-结合这个人的现有完整 Profile 与新对话，
-只要出现了可靠地归属于本人的个人信息，
-并且它适合 allowed_field_keys 中的某个字段，
-就应该提出变更，让 Profile 更完整、更准确。
+你的职责有两步：
+1. 从这个人本人发出的新发言中，识别真实、可靠的个人信息；
+2. 把信息映射到 allowed_field_keys，并提出新增或更新。
 
-供你判断的是“这条信息是否可靠地属于本人、是否适合某个字段”，
-不是“它是否重要、是否值得长期记住、是否配得上改变理解”。
+你只负责提取和整理；是否真正写入由本地可信程序验证证据后决定。
+不存在人工确认环节，也不存在“先放进候选队列等人确认”的流程。
+不要声称所有建议都会被保存：没有可靠证据的建议会被本地程序拒绝。
+
+判断标准只有“信息是否真实、是否属于本人、是否适合该字段”，
+不是“是否重要、是否值得长期记住、是否配得上写入”。
 不存在重要性门槛，也不要求 Profile 保持精简。
-不要因为信息看起来日常、普通、暂时或篇幅短就拒绝记录。
 
 工作顺序：
 
 第一，阅读现有 Profile。
-关注已有条目、字段、待确认候选及其之间的关系。
+只以现有 ACTIVE 条目和字段为准；旧候选或旧模型推断不再有效。
 
-第二，逐条检查新对话中的个人信息。
+第二，逐条检查新对话。
 明确区分：
-- 本人自述（“我喜欢…”“我在做…”“我最近在学…”）；
+- 本人自述（“我叫…”“我喜欢…”“我在做…”“我最近在学…”）；
 - 假设、玩笑、引用、转述、第三方信息；
 - 一次性临时状态，与当前持续状态；
-- 对旧信息的明确纠正。
+- 对旧信息的明确否定、纠正或新状态。
 
-第三，把可靠的本人的信息映射到字段。
+第三，把可靠信息映射到字段。
 至少考虑：
 - 长期属性：性格倾向、价值观、背景、技能、语言、交流偏好；
 - 当前状态：正在进行的项目、短期目标、暂停或完成的项目；
@@ -74,33 +79,34 @@ ARCHIVE：标记本人明确表示已过时或不再适用的内容。
 - proposed_content 必须忠于本人原话表达的事实，
   可以整理成简洁陈述，但不得添加原话没有的信息，
   不得把推断写成事实，不得改变程度、时间和对象。
+- 不得虚构事件、原话或证据 ID。
 - 关于性格、长期习惯、心理状态的描述属于推断：
   只有本人明确自述时才能作为事实提出；
-  仅从单次行为推测时，你仍可提出，但必须设置
-  requires_confirmation=true，并降低 confidence。
+  仅从单次行为推测的，不要提出。
+- 一次行为不能说成长期习惯；
+  “最近做过一次”不得写成“经常做”。
+- 用户明确的否定、纠正或新状态优先于旧推断。
+- 不要为了让 Profile 变化而强行提出变更。
+- 同一轮可以提出多个不同字段的合法变更，但不得超过现有数量上限。
 - confidence 只是元数据，供本地程序参考和排序，
-  它不是自动写入的门槛。
+  它不是写入门槛，也不能替代证据。
 - 证据必须来自 this person 的真实发言：
   evidence_event_ids 只能取自 new_evidence.allowed_event_ids，
-  evidence_quotes 必须是这些发言中的原文片段。
+  evidence_quotes 必须是这些发言中真实存在的原文子串。
+- 如果信息没有来源事件，或来源已被删除，不要提出。
 
-已确认身份字段不得由你直接修改。
-你只能提出待本人确认的变更。
+严格身份字段（例如 identity.name、identity.preferred_name、
+identity.nicknames、identity.pronouns）不在 allowed_field_keys 中，
+你不得修改，也不得推断。本人明确自述时由本地可信路径直接写入。
 
-你的输出只是一份变更建议。
-最终是否提交由本地可信程序决定。
+你的输出只是一份提取结果。
+本地可信程序会逐条验证证据、字段、内容与冲突；
+通过就写入并生成 Revision，不通过就拒绝并记录原因。"""
 
-不得虚构人物信息。
-不得自行生成证据 ID。
-不得将模型旧推断当作新的独立证据。
-不得因为新信息与旧信息略有不同就假定旧信息错误。"""
-
-# Two real, parseable JSON examples. They are built with json.dumps so the
-# prompt can never drift from valid JSON again.
 PROFILE_NO_CHANGE_EXAMPLE = json.dumps(
     {
         "decision": "NO_CHANGE",
-        "reason": "现有 Profile 已足够准确，新对话没有提供稳定的新信息",
+        "reason": "新对话没有提供属于本人的可靠新信息",
         "changes": [],
     },
     ensure_ascii=False,
@@ -121,7 +127,6 @@ PROFILE_PROPOSE_CHANGES_EXAMPLE = json.dumps(
                 "evidence_quotes": ["我最近在学葡萄牙语，也在做一个机器人项目。"],
                 "reason": "本人明确自述当前项目",
                 "confidence": 0.9,
-                "requires_confirmation": False,
             },
             {
                 "operation": "ADD",
@@ -132,7 +137,6 @@ PROFILE_PROPOSE_CHANGES_EXAMPLE = json.dumps(
                 "evidence_quotes": ["我最近在学葡萄牙语，也在做一个机器人项目。"],
                 "reason": "本人明确自述正在学习的技能",
                 "confidence": 0.9,
-                "requires_confirmation": False,
             },
             {
                 "operation": "ADD",
@@ -143,7 +147,6 @@ PROFILE_PROPOSE_CHANGES_EXAMPLE = json.dumps(
                 "evidence_quotes": ["我喜欢爵士乐，不太喜欢太正式的回答。"],
                 "reason": "本人明确自述兴趣",
                 "confidence": 0.9,
-                "requires_confirmation": False,
             },
             {
                 "operation": "ADD",
@@ -154,7 +157,6 @@ PROFILE_PROPOSE_CHANGES_EXAMPLE = json.dumps(
                 "evidence_quotes": ["我喜欢爵士乐，不太喜欢太正式的回答。"],
                 "reason": "本人明确说明交流风格偏好",
                 "confidence": 0.9,
-                "requires_confirmation": False,
             },
         ],
     },
@@ -173,6 +175,7 @@ _PROMPT_TAIL = """输出协议（必须严格遵守）：
 - 不得输出 person_id 或 base_revision；本地程序会填入可信值。
 - field_key 必须来自 allowed_field_keys。
 - evidence_event_ids 必须来自 new_evidence.allowed_event_ids，不得编造。
+- changes 中不得出现 requires_confirmation；它不会影响本地是否写入。
 
 示例一（NO_CHANGE）：
 __NO_CHANGE_EXAMPLE__
@@ -198,7 +201,7 @@ def build_profile_refinement_messages(payload: dict) -> list[dict]:
     and allowed evidence ids all come from the database, not from a model.
     """
     user_content = (
-        "请审查以下人物 Profile 与新对话。\n"
+        "请从以下新对话中提取这个人的 Personal Profile 信息。\n"
         "person_id、profile_revision、entry_id、allowed_event_ids 均由本地程序提供，"
         "不得修改、不得编造。\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)

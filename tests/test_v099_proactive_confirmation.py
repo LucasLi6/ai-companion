@@ -1,9 +1,9 @@
-"""V0.9.9 key checks: dual-stage proactive speech and one-turn confirmation.
+"""V0.9.9 key checks: direct self-reports and proactive speech boundaries.
 
-Offline and deliberately small. They pin the behaviours the feature must not
-get wrong: identity self-reports are detected narrowly and confirmed in one
-turn, silence never overwrites a confirmed identity or counts as a yes, and a
-clear departure is passed to the long-idle judge while a question is not.
+Offline and deliberately small. V0.9.9.6 removed the one-turn confirmation
+question: an explicit first-person statement is written immediately by local
+code. These tests pin that narrow detection and the proactive boundaries that
+must never depend on a "yes" reply.
 """
 
 from __future__ import annotations
@@ -12,23 +12,9 @@ import asyncio
 import json
 
 from companion.domain.enums import EventSource
-from companion.domain.models import make_utterance_event, utcnow
-from companion.people.profile_confirmation import (    KIND_AMBIGUOUS,
-    KIND_CONFIRM,
-    KIND_CORRECT,
-    KIND_DENY,
-    KIND_IGNORED,
-    STATE_ACCEPTED_SELF_REPORT,
-    STATE_AWAITING_REPLY,
-    STATE_CONFIRMED,
-    STATE_NEEDS_REVIEW,
-    STATE_PENDING_QUESTION,
-    STATE_REJECTED,
-    ProfileConfirmationService,
-    build_confirmation_question,
-    detect_self_reports,
-    interpret_reply,
-)
+from companion.domain.models import make_utterance_event
+from companion.people.profile_confirmation import ProfileDirectSelfReportService
+from companion.people.profile_self_report import detect_self_reports
 from companion.proactive.departure import (
     detect_explicit_departure,
     detect_explicit_stop,
@@ -37,7 +23,6 @@ from companion.proactive.judge import ProactiveJudge
 from companion.providers.deepseek_client import ChatResponse, StreamDelta
 from companion.providers.deepseek_proactive import ScriptedProactiveJudgeProvider
 from companion.runtime import build_runtime
-from companion.storage.repositories import ProfileConfirmationRecord
 
 
 class _FakeClient:
@@ -105,29 +90,10 @@ async def _event(rt, person, text, conversation="c1", *, save=True):
     return event
 
 
-def _service(rt, *, no_reply_timeout_seconds: float = 60.0):
-    return ProfileConfirmationService(
+def _service(rt):
+    return ProfileDirectSelfReportService(
         profile_service=rt.profile_service,
         repos=rt.repos,
-        no_reply_timeout_seconds=no_reply_timeout_seconds,
-    )
-
-
-def _record(field_key: str, value: str) -> ProfileConfirmationRecord:
-    now = utcnow()
-    return ProfileConfirmationRecord(
-        confirmation_id="pcfm-test",
-        person_id="p1",
-        conversation_id="c1",
-        source_event_id="e1",
-        question_message_id=None,
-        candidate_id=None,
-        field_key=field_key,
-        value=value,
-        quote="",
-        state=STATE_AWAITING_REPLY,
-        created_at=now,
-        updated_at=now,
     )
 
 
@@ -140,19 +106,11 @@ async def _active_name(rt, person):
 # -- detection -------------------------------------------------------------
 
 
-def test_explicit_name_fields_are_detected_and_merged_into_one_question():
+def test_explicit_name_fields_are_detected_together():
     detected = {
         item.field_key: item.value for item in detect_self_reports("我叫李约，英文名 Lucas")
     }
     assert detected == {"identity.name": "李约", "identity.preferred_name": "Lucas"}
-
-    records = [
-        _record("identity.name", "李约"),
-        _record("identity.preferred_name", "Lucas"),
-    ]
-    assert build_confirmation_question(records) == (
-        "确认一下，你的中文名是李约，你的英文名是 Lucas，对吗？"
-    )
 
 
 def test_future_self_report_keeps_only_the_name():
@@ -175,210 +133,80 @@ def test_questions_hypotheticals_quotes_and_third_person_are_refused():
         assert detect_self_reports(text) == (), text
 
 
-def test_reply_interpretation_is_conservative():
-    records = [_record("identity.name", "李约")]
-
-    assert interpret_reply("对", records).kind == KIND_CONFIRM
-    assert interpret_reply("我叫李约", records).kind == KIND_CONFIRM
-    assert interpret_reply("不是", records).kind == KIND_DENY
-    corrected = interpret_reply("我叫李明", records)
-    assert corrected.kind == KIND_CORRECT
-    assert corrected.detected[0].value == "李明"
-    assert interpret_reply("李约是谁？", records).kind == KIND_AMBIGUOUS
-    assert interpret_reply("今天天气不错", records).kind == KIND_IGNORED
-    # A reply that merely starts with an affirmation token is not agreement.
-    assert interpret_reply("嗯，先说别的", records).kind == KIND_AMBIGUOUS
-    assert interpret_reply("对了，我们聊其他话题", records).kind == KIND_AMBIGUOUS
-    assert interpret_reply("好的，谢谢", records).kind == KIND_IGNORED
+# -- direct write on the same turn ----------------------------------------
 
 
-# -- confirmation state machine -------------------------------------------
-
-
-async def test_confirm_writes_once_with_the_real_source(rt):
+async def test_explicit_name_is_written_once_with_the_real_source(rt):
     person = await _person(rt)
     service = _service(rt)
     first = await _event(rt, person, "我叫李约")
 
-    question = await service.begin_turn(event=first, person_id=person.person_id)
-    assert question == "确认一下，你的中文名是李约，对吗？"
-    assert await _active_name(rt, person) == []
-    record = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert record.state == STATE_PENDING_QUESTION
-
-    await service.mark_question_delivered(
-        person_id=person.person_id,
-        conversation_id="c1",
-        question_message_id="act-1",
-    )
-    assert (
-        await rt.repos.profile_confirmation.get(record.confirmation_id)
-    ).state == STATE_AWAITING_REPLY
-
-    second = await _event(rt, person, "对")
-    assert await service.begin_turn(event=second, person_id=person.person_id) is None
-
+    assert await service.begin_turn(event=first, person_id=person.person_id) is None
     entries = await _active_name(rt, person)
     assert [entry["content"] for entry in entries] == ["李约"]
+    assert entries[0]["evidence_event_ids"] == [first.event_id]
     profile = await rt.profile_service.get(person.person_id)
     assert profile.metadata.revision == 2
     revisions = await rt.repos.profile.list_revisions(person.person_id)
     assert revisions[-1]["changes"]["source"] == "DIRECT_SELF_REPORT"
-    assert revisions[-1]["changes"]["confirmed"] is True
-    assert (
-        await rt.repos.profile_confirmation.get(record.confirmation_id)
-    ).state == STATE_CONFIRMED
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
     # A later turn never writes the same name again.
     third = await _event(rt, person, "嗯，今天好热")
     await service.begin_turn(event=third, person_id=person.person_id)
     assert len(await _active_name(rt, person)) == 1
-    await service.shutdown()
+    assert (
+        await rt.profile_service.get(person.person_id)
+    ).metadata.revision == 2
 
 
-async def test_deny_rejects_without_a_write(rt):
+async def test_denial_text_alone_writes_nothing(rt):
     person = await _person(rt)
     service = _service(rt)
     first = await _event(rt, person, "我叫李约")
     await service.begin_turn(event=first, person_id=person.person_id)
-    await service.mark_question_delivered(
-        person_id=person.person_id, conversation_id="c1", question_message_id="act-1"
-    )
-
     second = await _event(rt, person, "不是")
-    assert await service.begin_turn(event=second, person_id=person.person_id) is None
-    assert await _active_name(rt, person) == []
-    records = await rt.repos.profile_confirmation.list_for_person(person.person_id)
-    assert records[0].state == STATE_REJECTED
-    await service.shutdown()
+    await service.begin_turn(event=second, person_id=person.person_id)
+    # "不是" denies nothing because there is no open question; the only
+    # evidence in the conversation is the person's own explicit statement.
+    assert [entry["content"] for entry in await _active_name(rt, person)] == [
+        "李约"
+    ]
 
 
-async def test_correction_replaces_the_old_question(rt):
+async def test_new_explicit_name_replaces_the_old_one(rt):
     person = await _person(rt)
     service = _service(rt)
     first = await _event(rt, person, "我叫李约")
     await service.begin_turn(event=first, person_id=person.person_id)
-    await service.mark_question_delivered(
-        person_id=person.person_id, conversation_id="c1", question_message_id="act-1"
-    )
 
     second = await _event(rt, person, "我叫李明")
-    question = await service.begin_turn(event=second, person_id=person.person_id)
-    assert question == "确认一下，你的中文名是李明，对吗？"
-    assert await _active_name(rt, person) == []
-    active = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert active.value == "李明"
-    await service.mark_question_delivered(
-        person_id=person.person_id, conversation_id="c1", question_message_id="act-2"
-    )
-
-    third = await _event(rt, person, "对")
-    assert await service.begin_turn(event=third, person_id=person.person_id) is None
-    assert [entry["content"] for entry in await _active_name(rt, person)] == ["李明"]
-    await service.shutdown()
+    await service.begin_turn(event=second, person_id=person.person_id)
+    active = await _active_name(rt, person)
+    assert [entry["content"] for entry in active] == ["李明"]
+    # The correction updates the one identity entry; history keeps the old
+    # value in the revision log rather than as a second active fact.
+    revisions = await rt.repos.profile.list_revisions(person.person_id)
+    assert revisions[-1]["changes"]["old"] == ["李约"]
+    assert revisions[-1]["changes"]["new"] == "李明"
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
 
-async def test_unrelated_reply_accepts_a_clear_self_report_without_confirmation(rt):
+async def test_unrelated_turn_does_not_touch_a_written_name(rt):
     person = await _person(rt)
     service = _service(rt)
     first = await _event(rt, person, "我叫李约")
     await service.begin_turn(event=first, person_id=person.person_id)
-    await service.mark_question_delivered(
-        person_id=person.person_id, conversation_id="c1", question_message_id="act-1"
-    )
+    revision = (await rt.profile_service.get(person.person_id)).metadata.revision
 
     second = await _event(rt, person, "今天天气不错")
     await service.begin_turn(event=second, person_id=person.person_id)
-    assert [entry["content"] for entry in await _active_name(rt, person)] == ["李约"]
-    record = (
-        await rt.repos.profile_confirmation.list_for_person(person.person_id)
-    )[0]
-    assert record.state == STATE_ACCEPTED_SELF_REPORT
-    revisions = await rt.repos.profile.list_revisions(person.person_id)
-    assert revisions[-1]["changes"]["source"] == "DIRECT_SELF_REPORT"
-    assert revisions[-1]["changes"]["confirmed"] is False
-
-    # The same value is never written twice.
-    third = await _event(rt, person, "嗯")
-    await service.begin_turn(event=third, person_id=person.person_id)
-    assert len(await _active_name(rt, person)) == 1
-    await service.shutdown()
-
-
-async def test_silence_after_a_clear_self_report_still_writes(rt):
-    person = await _person(rt)
-    service = _service(rt, no_reply_timeout_seconds=0.02)
-    first = await _event(rt, person, "我叫李约")
-    await service.begin_turn(event=first, person_id=person.person_id)
-    await service.mark_question_delivered(
-        person_id=person.person_id, conversation_id="c1", question_message_id="act-1"
-    )
-
-    await asyncio.sleep(0.15)
-    assert [entry["content"] for entry in await _active_name(rt, person)] == ["李约"]
-    record = (
-        await rt.repos.profile_confirmation.list_for_person(person.person_id)
-    )[0]
-    assert record.state == STATE_ACCEPTED_SELF_REPORT
-    await service.shutdown()
-
-
-async def test_silence_never_overwrites_a_confirmed_identity(rt):
-    person = await _person(rt)
-    service = _service(rt, no_reply_timeout_seconds=0.02)
-    first = await _event(rt, person, "我叫李约")
-    await service.begin_turn(event=first, person_id=person.person_id)
-    await service.mark_question_delivered(
-        person_id=person.person_id, conversation_id="c1", question_message_id="act-1"
-    )
-    confirmed = await _event(rt, person, "对")
-    await service.begin_turn(event=confirmed, person_id=person.person_id)
-    assert [entry["content"] for entry in await _active_name(rt, person)] == ["李约"]
-
-    # A later, different self-report cannot replace it just because the
-    # confirmation question went unanswered.
-    second = await _event(rt, person, "我叫李明")
-    question = await service.begin_turn(event=second, person_id=person.person_id)
-    assert question == "确认一下，你的中文名是李明，对吗？"
-    await service.mark_question_delivered(
-        person_id=person.person_id, conversation_id="c1", question_message_id="act-2"
-    )
-    await asyncio.sleep(0.15)
-
-    assert [entry["content"] for entry in await _active_name(rt, person)] == ["李约"]
-    records = await rt.repos.profile_confirmation.list_for_person(person.person_id)
-    assert records[-1].state == STATE_NEEDS_REVIEW
-    await service.shutdown()
-
-
-async def test_background_review_candidate_is_reused_not_duplicated(rt):
-    person = await _person(rt)
-    event = await _event(rt, person, "我叫李约")
-    # A background Profile Review proposed the same value first.
-    shared = await rt.repos.profile.insert_candidate(
-        person_id=person.person_id,
-        field_key="identity.name",
-        value="李约",
-        source="INTERACTION_INFERENCE",
-        confidence=0.8,
-        evidence_memory_ids=[],
-        evidence_event_ids=[event.event_id],
-        evidence_candidate_ids=[],
-        reason="background_review",
-        operation="ADD",
-        target_entry_ids=[],
-        expected_revision=None,
-        requires_confirmation=True,
-        review_status="PENDING",
-    )
-
-    service = _service(rt)
-    await service.begin_turn(event=event, person_id=person.person_id)
-    pending = await rt.repos.profile.find_pending(person.person_id, "identity.name")
-    assert [item["candidate_id"] for item in pending] == [shared]
-    assert pending[0]["source"] == "DIRECT_SELF_REPORT"
-    assert event.event_id in pending[0]["evidence_event_ids"]
-    await service.shutdown()
+    assert [entry["content"] for entry in await _active_name(rt, person)] == [
+        "李约"
+    ]
+    assert (
+        await rt.profile_service.get(person.person_id)
+    ).metadata.revision == revision
 
 
 # -- interaction with proactive speech ------------------------------------
@@ -430,11 +258,11 @@ async def test_long_idle_judge_context_carries_departure_and_mode(db):
     assert long_idle["explicit_departure"] is True
 
 
-async def test_immediate_judge_does_not_interject_while_confirming(db):
+async def test_direct_self_report_does_not_add_a_question_to_the_reply(db):
     rt = build_runtime(
         db,
         provider="deepseek",
-        deepseek_client=_FakeClient(),
+        deepseek_client=_FakeClient(response_text="好的。"),
         with_worker=False,
         router_mode="legacy",
     )
@@ -443,26 +271,10 @@ async def test_immediate_judge_does_not_interject_while_confirming(db):
     event = await _event(rt, person, "我叫李约", save=False)
     report = await rt.orchestrator.process_utterance(event)
     assert report.status == "COMPLETED"
-    assert "确认一下" in report.response_text
-    record = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert record.state == STATE_AWAITING_REPLY
-
-    manager = rt.proactive_manager
-    manager.idle_delay_seconds = 0.01
-    judge = ScriptedProactiveJudgeProvider([False])
-    manager.judge = ProactiveJudge(judge)
-    manager.on_response_delivered(
-        conversation_id="c1",
-        person_id=person.person_id,
-        source_event_id=event.event_id,
-    )
-    await asyncio.sleep(0.15)
-
-    # The immediate stage is skipped while the question is open; only the
-    # long-idle stage is judged.
-    assert [payload.mode for payload in judge.payloads] == ["LONG_IDLE"]
-    await manager.shutdown()
-    await rt.profile_confirmation.shutdown()
+    assert "确认一下" not in (report.response_text or "")
+    assert [entry["content"] for entry in await _active_name(rt, person)] == [
+        "李约"
+    ]
 
 
 async def test_explicit_refusal_blocks_both_proactive_stages(db):
@@ -494,42 +306,12 @@ async def test_explicit_refusal_blocks_both_proactive_stages(db):
     assert judge.payloads == []
     assert await rt.repos.proactive.get_for_source_event(event.event_id) is None
     await manager.shutdown()
-    await rt.profile_confirmation.shutdown()
-
-
-async def test_confirmation_timeout_resumes_after_restart(rt):
-    person = await _person(rt)
-    first = await _event(rt, person, "我叫李约")
-    before = _service(rt)
-    await before.begin_turn(event=first, person_id=person.person_id)
-    await before.mark_question_delivered(
-        person_id=person.person_id, conversation_id="c1", question_message_id="act-1"
-    )
-    # Simulate a process exit: the in-memory timer is gone.
-    await before.shutdown()
-    assert await _active_name(rt, person) == []
-
-    after = _service(rt, no_reply_timeout_seconds=0.02)
-    assert await after.resume_pending() == 1
-    await asyncio.sleep(0.15)
-    assert [entry["content"] for entry in await _active_name(rt, person)] == ["李约"]
-    record = (
-        await rt.repos.profile_confirmation.list_for_person(person.person_id)
-    )[0]
-    assert record.state == STATE_ACCEPTED_SELF_REPORT
-    await after.shutdown()
 
 
 # -- real streaming path ---------------------------------------------------
 
 
-async def _stream_events(rt, event):
-    return [
-        item async for item in rt.orchestrator.process_utterance_stream(event)
-    ]
-
-
-async def test_confirmation_question_is_delivered_through_stream_deltas(db):
+async def test_self_report_is_written_without_being_reprinted(db):
     client = _FakeClient(response_text="好的。", chunks=["好", "的。"])
     rt = build_runtime(
         db,
@@ -542,25 +324,9 @@ async def test_confirmation_question_is_delivered_through_stream_deltas(db):
     await rt.conversations.get_or_create("c1")
 
     first = await _event(rt, person, "我叫李约", save=False)
-    events = await _stream_events(rt, first)
-    deltas = "".join(
-        item.delta or "" for item in events if item.type == "response_delta"
-    )
-    completed = next(
-        item for item in events if item.type == "response_completed"
-    )
-    assert "确认一下，你的中文名是李约，对吗？" in deltas
-    # What the chat surface showed, the terminal event and the persisted
-    # action are the same full reply.
-    assert deltas == completed.text
-    action = await rt.repos.analysis.get_action(first.event_id)
-    assert action.response_text == completed.text
-    record = await rt.repos.profile_confirmation.get_active(person.person_id)
-    assert record.state == STATE_AWAITING_REPLY
-    assert record.question_message_id == action.action_id
-
-    second = await _event(rt, person, "对", save=False)
-    events = await _stream_events(rt, second)
+    events = [
+        item async for item in rt.orchestrator.process_utterance_stream(first)
+    ]
     deltas = "".join(
         item.delta or "" for item in events if item.type == "response_delta"
     )
@@ -568,8 +334,21 @@ async def test_confirmation_question_is_delivered_through_stream_deltas(db):
         item for item in events if item.type == "response_completed"
     )
     assert "确认一下" not in deltas
+    # What the chat surface showed, the terminal event and the persisted
+    # action are the same full reply.
     assert deltas == completed.text
-    assert [entry["content"] for entry in await _active_name(rt, person)] == ["李约"]
-    stored = await rt.repos.profile_confirmation.get(record.confirmation_id)
-    assert stored.state == STATE_CONFIRMED
-    await rt.profile_confirmation.shutdown()
+    action = await rt.repos.analysis.get_action(first.event_id)
+    assert action.response_text == completed.text
+    assert [entry["content"] for entry in await _active_name(rt, person)] == [
+        "李约"
+    ]
+
+    second = await _event(rt, person, "对", save=False)
+    events = [
+        item async for item in rt.orchestrator.process_utterance_stream(second)
+    ]
+    deltas = "".join(
+        item.delta or "" for item in events if item.type == "response_delta"
+    )
+    assert "确认一下" not in deltas
+    assert len(await _active_name(rt, person)) == 1

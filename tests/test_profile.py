@@ -92,70 +92,51 @@ async def test_profiles_are_isolated_per_person(rt, register):
     assert b_profile.communication_value(ProfileFieldKey.FORMALITY) == "UNKNOWN"
 
 
-async def test_explicit_fact_stays_a_candidate_and_never_becomes_occupation(
+async def test_explicit_fact_is_skipped_for_review_not_written(
     rt, register
 ):
     person = await register("Embedded")
-    await learning(rt).observe(
+    result = await learning(rt).observe(
         person.person_id, "我现在在学习嵌入式开发。", event_id="evt-fact"
     )
     profile = await rt.profile_service.get(person.person_id)
-    # It is a current activity, not an occupation.
+    # It is a current activity, not an occupation, and the regex learner does
+    # not claim facts: only the evidence-checked review may write them.
     assert ProfileFieldKey.OCCUPATION.value not in profile.fields
-    occupations = [
-        candidate
-        for candidate in profile.candidates
-        if candidate.field_key == ProfileFieldKey.OCCUPATION.value
-    ]
-    assert occupations == []
-    projects = [
-        candidate
-        for candidate in profile.candidates
-        if candidate.field_key == ProfileFieldKey.ONGOING_PROJECTS.value
-    ]
-    assert len(projects) == 1
-    assert projects[0].candidate_value[0]["label"] == "嵌入式开发"
-    assert projects[0].status.value == "PENDING"
-
-    # A single chat or a single model confidence can never confirm it.
-    assert profile.fields.get(ProfileFieldKey.ONGOING_PROJECTS.value) is None
+    assert ProfileFieldKey.ONGOING_PROJECTS.value not in profile.fields
+    assert ProfileFieldKey.ONGOING_PROJECTS.value in result.skipped
+    assert await rt.repos.profile.list_entries(person.person_id) == []
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
 
-async def test_single_inference_never_confirms(rt, register):
+async def test_single_inference_never_writes(rt, register):
     person = await register("Infer")
-    candidate = await learning(rt).record_inference(
-        person.person_id,
-        ProfileFieldKey.DEPTH.value,
-        "concise",
-        event_id="evt-1",
-        confidence=0.99,
+    assert (
+        await learning(rt).record_inference(
+            person.person_id,
+            ProfileFieldKey.DEPTH.value,
+            "concise",
+            event_id="evt-1",
+            confidence=0.99,
+        )
+        is None
     )
-    assert candidate is not None
+    for event_id in ("evt-2", "evt-3"):
+        await learning(rt).record_inference(
+            person.person_id,
+            ProfileFieldKey.DEPTH.value,
+            "concise",
+            event_id=event_id,
+            confidence=0.2,
+        )
     profile = await rt.profile_service.get(person.person_id)
     assert ProfileFieldKey.DEPTH.value not in profile.fields
-
-    # Three independent evidence events may confirm, not one and not confidence.
-    await learning(rt).record_inference(
-        person.person_id,
-        ProfileFieldKey.DEPTH.value,
-        "concise",
-        event_id="evt-2",
-        confidence=0.2,
-    )
-    profile = await rt.profile_service.get(person.person_id)
-    assert ProfileFieldKey.DEPTH.value not in profile.fields
-    await learning(rt).record_inference(
-        person.person_id,
-        ProfileFieldKey.DEPTH.value,
-        "concise",
-        event_id="evt-3",
-        confidence=0.1,
-    )
-    profile = await rt.profile_service.get(person.person_id)
-    assert profile.fields[ProfileFieldKey.DEPTH.value].value == "concise"
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
 
-async def test_correction_replaces_wrong_value_and_rejects_candidates(rt, register):
+async def test_correction_replaces_wrong_value_and_leaves_no_pending(
+    rt, register
+):
     person = await register("Correct")
     service: PersonProfileService = rt.profile_service
     await service.set_field(
@@ -164,13 +145,6 @@ async def test_correction_replaces_wrong_value_and_rejects_candidates(rt, regist
         "老师",
         source=ProfileSource.DIRECT_SELF_REPORT,
         event_id="evt-old",
-    )
-    await service.propose_candidate(
-        person.person_id,
-        ProfileFieldKey.OCCUPATION.value,
-        "医生",
-        source=ProfileSource.INTERACTION_INFERENCE,
-        event_id="evt-guess",
     )
     revision = await learning(rt).apply_correction(
         person.person_id,
@@ -184,18 +158,7 @@ async def test_correction_replaces_wrong_value_and_rejects_candidates(rt, regist
     field = profile.fields[ProfileFieldKey.OCCUPATION.value]
     assert field.value == "工程师"
     assert field.source == ProfileSource.USER_CORRECTION
-    pending = await rt.repos.profile.find_pending(
-        person.person_id, ProfileFieldKey.OCCUPATION.value
-    )
-    assert pending == []
-    statuses = [
-        candidate["status"]
-        for candidate in await rt.repos.profile.list_candidates(
-            person.person_id, status="REJECTED"
-        )
-        if candidate["field_key"] == ProfileFieldKey.OCCUPATION.value
-    ]
-    assert "REJECTED" in statuses
+    assert await rt.repos.profile.list_legacy_candidates(person.person_id) == []
 
 
 async def test_correction_can_retire_a_field(rt, register):
@@ -311,15 +274,15 @@ async def test_creating_a_profile_never_grants_consent(rt, register):
     assert consent.allow_memory_learning is False
 
 
-async def test_compiler_is_bounded_and_hides_candidates(rt, register):
+async def test_compiler_is_bounded_and_hides_unwritten_inferences(rt, register):
     person = await register("Compile")
     learner = learning(rt)
     await learner.observe(person.person_id, "不用这么正式。", event_id="e1")
-    await rt.profile_service.propose_candidate(
+    # An inference has no storage path until a review proves it.
+    await learner.record_inference(
         person.person_id,
         ProfileFieldKey.OCCUPATION.value,
         "嵌入式工程师",
-        source=ProfileSource.INTERACTION_INFERENCE,
         event_id="e2",
     )
     profile = await rt.profile_service.get(person.person_id)
@@ -382,16 +345,17 @@ async def test_profile_memory_reference_is_linked(rt, register):
         self_reported=True,
     )
     learner = learning(rt)
-    candidate = await learner.record_inference(
+    await rt.profile_service.set_field(
         person.person_id,
-        ProfileFieldKey.ONGOING_PROJECTS.value,
-        "嵌入式开发",
+        ProfileFieldKey.DEPTH.value,
+        "concise",
+        source=ProfileSource.DIRECT_SELF_REPORT,
         event_id="evt-link",
     )
-    assert candidate is not None
     await learner.link_output_memory(person.person_id, "evt-link", memory.memory_id)
-    candidates = await rt.repos.profile.list_candidates(person.person_id)
-    assert memory.memory_id in candidates[0]["evidence_memory_ids"]
+    profile = await rt.profile_service.get(person.person_id)
+    field = profile.fields[ProfileFieldKey.DEPTH.value]
+    assert memory.memory_id in field.evidence_memory_ids
     evidence = await rt.repos.profile.list_evidence(person.person_id)
     assert any(item["memory_id"] == memory.memory_id for item in evidence)
 

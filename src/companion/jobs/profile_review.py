@@ -392,11 +392,7 @@ async def _review_one(
         await _fail_or_retry(repository, receipt, repos, exc, owner)
         raise JobError(f"profile review apply failed: {exc}") from exc
 
-    changes = (
-        list(applied.applied)
-        + list(applied.pending)
-        + list(applied.rejected)
-    )
+    changes = list(applied.applied) + list(applied.rejected)
     if applied.status == "REVISION_CONFLICT":
         await repository.update_review_receipt(
             receipt["review_id"],
@@ -414,13 +410,14 @@ async def _review_one(
         await _complete(repository, receipt, "SKIPPED", applied.reason, owner)
         return "done"
 
-    decision = (
-        "NO_CHANGE"
-        if applied.status == "NO_CHANGE"
-        else "PENDING_CONFIRMATION"
-        if applied.status == "PENDING_CONFIRMATION"
-        else "PROPOSE_CHANGES"
-    )
+    if applied.status == "APPLIED":
+        decision = "PROPOSE_CHANGES"
+    elif applied.status == "NO_CHANGE":
+        decision = "NO_CHANGE"
+    else:
+        # REJECTED (or any defensive failure status) is a completed review with
+        # reasons, not a second confirmation stage.
+        decision = "NO_CHANGE"
     await repository.update_review_receipt(
         receipt["review_id"],
         status="COMPLETED",
@@ -431,17 +428,19 @@ async def _review_one(
         changes=changes,
         completed=True,
         execution_owner_id=owner,
+        applied_count=applied.applied_count,
+        rejected_count=applied.rejected_count,
     )
     log.info(
         "profile_review_applied person_id=%s event_id=%s status=%s"
-        " revision=%s->%s applied=%d pending=%d",
+        " revision=%s->%s applied=%d rejected=%d",
         person_id,
         source_event_id,
         applied.status,
         applied.base_revision,
         applied.new_revision,
-        len(applied.applied),
-        len(applied.pending),
+        applied.applied_count,
+        applied.rejected_count,
     )
     return "done"
 
