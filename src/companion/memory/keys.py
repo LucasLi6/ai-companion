@@ -37,7 +37,7 @@ _LEAD_SUBJECT = re.compile(
 _TRAILING_PARTICLES = re.compile(r"(?:了|啦|呀|啊|呢|吧|哦|嘛|而已|的)+$")
 
 _NAME = re.compile(
-    r"^(?:(?:我的?|本人的?)(?:名字|姓名)(?:是|叫|为)|我叫|称呼我为|称呼我叫)"
+    r"^(?:(?:我的?|本人的?)(?:名字|姓名)(?:是|叫|为)|我叫|称呼我为|称呼我叫|自称(?:名字|姓名)(?:是|叫|为))"
     r"\s*(.+)$"
 )
 _AGE = re.compile(r"^(?:我)?(?:(?:今年|现在|已经)\s*)?(\d{1,3})\s*岁")
@@ -298,6 +298,17 @@ def claim_is_grounded(
         return entity in utterance_n and any(
             cue in utterance_n for cue in _PROJECT_CUES
         )
+    # A factual extraction may paraphrase "我是李约" as "用户自称名字为李约".
+    # Require the same *entire* direct self-introduction, not a coincidental
+    # occurrence of the name somewhere in third-party speech. This preserves
+    # the evidence gate without turning an unquoted inference into ACTIVE.
+    if attribute == "identity:name" and key.value:
+        value = normalize_text(key.value)
+        if value and utterance_n in {
+            f"我是{value}", f"我叫{value}", f"我的名字是{value}",
+            f"我的名字叫{value}", f"我名叫{value}",
+        }:
+            return True
     cues = _IDENTITY_CUES.get(attribute)
     if cues and key.value:
         value = normalize_text(key.value)
