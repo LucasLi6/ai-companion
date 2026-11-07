@@ -203,6 +203,7 @@ def _outcome_line(outcome: dict) -> str:
         "DENIED": "未保存（无权限）",
         "FAILED": "保存失败",
         "NO_MEMORY": "无需保存",
+        "EXPLICIT_NO_MEMORY": "这次未保存（未找到可确认的事实，请说明要保存的内容）",
     }
     # SAVED can represent a CANDIDATE row, not an ACTIVE searchable memory.
     if label == "SAVED":
@@ -500,7 +501,7 @@ def _trusted_turn_lines(
     actionable = [
         outcome
         for outcome in context.memory_write_outcomes
-        if outcome.get("outcome")
+        if outcome.get("outcome") and outcome.get("outcome") != "NO_MEMORY"
     ]
     if actionable:
         lines.append("【本轮记忆写入结果】（只按这些事实说明）")
