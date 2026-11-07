@@ -28,6 +28,11 @@ class ProactiveJudgeContext:
 
     There is deliberately no full memory retrieval and no full profile here.
     The task is to read the current exchange, not to re-learn the person.
+
+    V0.9.9 adds ``mode``. ``IMMEDIATE`` runs right after a delivered reply and
+    asks whether a natural continuation is welcome. ``LONG_IDLE`` runs after a
+    2-4 minute silence and asks whether Ava may start a *new* exchange. The
+    two questions deliberately use different guidance.
     """
 
     conversation_id: str
@@ -36,17 +41,23 @@ class ProactiveJudgeContext:
     last_ava_response: str = ""
     scene_context: Optional[dict] = None
     seconds_since_last_response: float = 0.0
+    mode: str = "IMMEDIATE"
+    # Structurally validated local signal for LONG_IDLE only. It is a floor,
+    # never the decision: the judge still reads the conversation.
+    explicit_departure: bool = False
 
     def as_dict(self) -> dict:
         return {
             "conversation_id": self.conversation_id,
             "person_id": self.person_id,
+            "mode": self.mode,
             "recent_turns": self.recent_turns,
             "last_ava_response": self.last_ava_response,
             "scene_context": self.scene_context,
             "seconds_since_last_response": round(
                 float(self.seconds_since_last_response), 3
             ),
+            "explicit_departure": bool(self.explicit_departure),
         }
 
 

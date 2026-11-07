@@ -2162,6 +2162,9 @@ async def cmd_repl(args) -> int:
                         source_event_id=event.event_id,
                     )
         finally:
+            confirmation = getattr(rt, "profile_confirmation", None)
+            if confirmation is not None:
+                await confirmation.shutdown()
             manager = getattr(rt, "proactive_manager", None)
             if manager is not None:
                 await manager.shutdown()

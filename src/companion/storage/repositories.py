@@ -336,6 +336,8 @@ class ProactiveMessageRecord:
     finish_reason: Optional[str]
     model: Optional[str]
     created_at: datetime
+    # V0.9.9: one message per stage per triggering turn (IMMEDIATE/LONG_IDLE).
+    mode: str = "IMMEDIATE"
 
 
 class ProactiveMessageRepository:
@@ -347,13 +349,15 @@ class ProactiveMessageRepository:
     async def save(self, message: ProactiveMessageRecord) -> None:
         await self.db.execute(
             "INSERT INTO proactive_messages(message_id, conversation_id,"
-            " person_id, source_event_id, origin, text, status, finish_reason,"
-            " model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " person_id, source_event_id, mode, origin, text, status,"
+            " finish_reason, model, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 message.message_id,
                 message.conversation_id,
                 message.person_id,
                 message.source_event_id,
+                message.mode,
                 message.origin,
                 message.text,
                 message.status,
@@ -366,7 +370,7 @@ class ProactiveMessageRepository:
     async def get(self, message_id: str) -> Optional[ProactiveMessageRecord]:
         cur = await self.db.execute(
             "SELECT message_id, conversation_id, person_id, source_event_id,"
-            " origin, text, status, finish_reason, model, created_at"
+            " mode, origin, text, status, finish_reason, model, created_at"
             " FROM proactive_messages WHERE message_id = ?",
             (message_id,),
         )
@@ -374,14 +378,24 @@ class ProactiveMessageRepository:
         return self._to_record(row) if row is not None else None
 
     async def get_for_source_event(
-        self, source_event_id: str
+        self, source_event_id: str, mode: Optional[str] = None
     ) -> Optional[ProactiveMessageRecord]:
-        cur = await self.db.execute(
-            "SELECT message_id, conversation_id, person_id, source_event_id,"
-            " origin, text, status, finish_reason, model, created_at"
-            " FROM proactive_messages WHERE source_event_id = ?",
-            (source_event_id,),
-        )
+        """Return the message for one stage (or the newest when unspecified)."""
+        if mode is None:
+            cur = await self.db.execute(
+                "SELECT message_id, conversation_id, person_id, source_event_id,"
+                " mode, origin, text, status, finish_reason, model, created_at"
+                " FROM proactive_messages WHERE source_event_id = ?"
+                " ORDER BY created_at DESC, message_id DESC LIMIT 1",
+                (source_event_id,),
+            )
+        else:
+            cur = await self.db.execute(
+                "SELECT message_id, conversation_id, person_id, source_event_id,"
+                " mode, origin, text, status, finish_reason, model, created_at"
+                " FROM proactive_messages WHERE source_event_id = ? AND mode = ?",
+                (source_event_id, mode),
+            )
         row = await cur.fetchone()
         return self._to_record(row) if row is not None else None
 
@@ -399,7 +413,8 @@ class ProactiveMessageRepository:
         cur = await self.db.execute(
             "SELECT * FROM ("
             "  SELECT message_id, conversation_id, person_id, source_event_id,"
-            "         origin, text, status, finish_reason, model, created_at"
+            "         mode, origin, text, status, finish_reason, model,"
+            "         created_at"
             "  FROM proactive_messages WHERE conversation_id = ?"
             "  ORDER BY created_at DESC, message_id DESC LIMIT ?"
             ") ORDER BY created_at ASC, message_id ASC",
@@ -421,6 +436,163 @@ class ProactiveMessageRepository:
             finish_reason=row["finish_reason"],
             model=row["model"],
             created_at=_dt(row["created_at"]),
+            mode=row["mode"] if "mode" in row.keys() else "IMMEDIATE",
+        )
+
+
+@dataclass(frozen=True)
+class ProfileConfirmationRecord:
+    """Local state for one critical identity self-report awaiting an answer.
+
+    This record never decides what is true. It only tracks which question was
+    asked, when, and what the person said in reply. The final write still goes
+    through ``ProfileService`` and its revision/evidence/authorization checks.
+    """
+
+    confirmation_id: str
+    person_id: str
+    conversation_id: str
+    source_event_id: str
+    field_key: str
+    value: Any
+    quote: str
+    state: str
+    question_message_id: Optional[str]
+    candidate_id: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProfileConfirmationRepository:
+    """Persistence for the small confirmation state machine."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def save(self, record: ProfileConfirmationRecord) -> None:
+        await self.db.execute(
+            "INSERT INTO profile_confirmations(confirmation_id, person_id,"
+            " conversation_id, source_event_id, question_message_id,"
+            " candidate_id, field_key, value_json, quote, state, created_at,"
+            " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record.confirmation_id,
+                record.person_id,
+                record.conversation_id,
+                record.source_event_id,
+                record.question_message_id,
+                record.candidate_id,
+                record.field_key,
+                json.dumps(record.value, ensure_ascii=False),
+                record.quote,
+                record.state,
+                _iso(record.created_at),
+                _iso(record.updated_at),
+            ),
+        )
+
+    async def get(self, confirmation_id: str) -> Optional[ProfileConfirmationRecord]:
+        cur = await self.db.execute(
+            "SELECT * FROM profile_confirmations WHERE confirmation_id = ?",
+            (confirmation_id,),
+        )
+        row = await cur.fetchone()
+        return self._to_record(row) if row is not None else None
+
+    async def get_by_candidate(
+        self, candidate_id: str
+    ) -> Optional[ProfileConfirmationRecord]:
+        cur = await self.db.execute(
+            "SELECT * FROM profile_confirmations WHERE candidate_id = ?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (candidate_id,),
+        )
+        row = await cur.fetchone()
+        return self._to_record(row) if row is not None else None
+
+    async def get_active(
+        self, person_id: str, conversation_id: Optional[str] = None
+    ) -> Optional[ProfileConfirmationRecord]:
+        """The newest confirmation still waiting for a question or an answer."""
+        states = ("PENDING_QUESTION", "AWAITING_REPLY")
+        if conversation_id is None:
+            cur = await self.db.execute(
+                "SELECT * FROM profile_confirmations WHERE person_id = ?"
+                " AND state IN (?, ?) ORDER BY created_at DESC LIMIT 1",
+                (person_id, *states),
+            )
+        else:
+            cur = await self.db.execute(
+                "SELECT * FROM profile_confirmations WHERE person_id = ?"
+                " AND conversation_id = ? AND state IN (?, ?)"
+                " ORDER BY created_at DESC LIMIT 1",
+                (person_id, conversation_id, *states),
+            )
+        row = await cur.fetchone()
+        return self._to_record(row) if row is not None else None
+
+    async def list_for_person(
+        self, person_id: str, *, states: Optional[tuple[str, ...]] = None
+    ) -> list[ProfileConfirmationRecord]:
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            cur = await self.db.execute(
+                "SELECT * FROM profile_confirmations WHERE person_id = ?"
+                f" AND state IN ({placeholders}) ORDER BY created_at ASC",
+                (person_id, *states),
+            )
+        else:
+            cur = await self.db.execute(
+                "SELECT * FROM profile_confirmations WHERE person_id = ?"
+                " ORDER BY created_at ASC",
+                (person_id,),
+            )
+        rows = await cur.fetchall()
+        return [self._to_record(row) for row in rows]
+
+    async def update_state(
+        self,
+        confirmation_id: str,
+        state: str,
+        *,
+        question_message_id: Optional[str] = None,
+        candidate_id: Optional[str] = None,
+    ) -> None:
+        await self.db.execute(
+            "UPDATE profile_confirmations SET state = ?,"
+            " question_message_id = COALESCE(?, question_message_id),"
+            " candidate_id = COALESCE(?, candidate_id), updated_at = ?"
+            " WHERE confirmation_id = ?",
+            (
+                state,
+                question_message_id,
+                candidate_id,
+                _iso(utcnow()),
+                confirmation_id,
+            ),
+        )
+
+    async def delete_for_source_event(self, source_event_id: str) -> None:
+        await self.db.execute(
+            "DELETE FROM profile_confirmations WHERE source_event_id = ?",
+            (source_event_id,),
+        )
+
+    @staticmethod
+    def _to_record(row) -> ProfileConfirmationRecord:
+        return ProfileConfirmationRecord(
+            confirmation_id=row["confirmation_id"],
+            person_id=row["person_id"],
+            conversation_id=row["conversation_id"],
+            source_event_id=row["source_event_id"],
+            field_key=row["field_key"],
+            value=json.loads(row["value_json"]),
+            quote=row["quote"] or "",
+            state=row["state"],
+            question_message_id=row["question_message_id"],
+            candidate_id=row["candidate_id"],
+            created_at=_dt(row["created_at"]),
+            updated_at=_dt(row["updated_at"]),
         )
 
 
@@ -2173,6 +2345,7 @@ class Repositories:
     person: PersonRepository
     conversation: ConversationRepository
     proactive: ProactiveMessageRepository
+    profile_confirmation: ProfileConfirmationRepository
     utterance: UtteranceRepository
     analysis: AnalysisRepository
     memory_fact: MemoryFactRepository
@@ -2225,6 +2398,7 @@ def make_repositories(db: Database) -> Repositories:
         person=PersonRepository(db),
         conversation=ConversationRepository(db),
         proactive=ProactiveMessageRepository(db),
+        profile_confirmation=ProfileConfirmationRepository(db),
         utterance=UtteranceRepository(db),
         analysis=AnalysisRepository(db),
         memory_fact=MemoryFactRepository(db),

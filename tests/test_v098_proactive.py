@@ -1,10 +1,10 @@
-"""V0.9.8 key checks: one proactive judgment after one delivered reply.
+"""V0.9.8 key checks, updated for the V0.9.9 dual-stage lifecycle.
 
-These tests are deliberately small and offline. They pin the four behaviours
-the feature must not get wrong: timing is bounded, new user input invalidates
-stale work, NO is silent and YES speaks exactly once, and the proactive
-message is saved/read as real assistant history without scheduling another
-check.
+These tests are deliberately small and offline. They pin the behaviours the
+feature must not get wrong: the immediate stage runs without waiting for
+background jobs, new user input invalidates stale work, NO is silent and YES
+speaks exactly once per stage, and the proactive message is saved/read as real
+assistant history without scheduling another check.
 """
 
 from __future__ import annotations
@@ -113,8 +113,7 @@ async def _delivered_normal_turn(rt, person, text="我在研究机器人控制")
 
 def _scripted_manager(rt, decisions):
     manager = rt.proactive_manager
-    manager.delay_seconds = 0.01
-    manager.short_task_timeout = 0.0
+    manager.idle_delay_seconds = 0.01
     manager.judge = ProactiveJudge(ScriptedProactiveJudgeProvider(decisions))
     return manager
 
@@ -143,7 +142,8 @@ async def test_judge_no_is_silent_and_yes_speaks_exactly_once(db):
     assert await rt.repos.proactive.get_for_source_event(first.event_id) is None
 
     second = await _delivered_normal_turn(rt, person, "那控制频率呢？")
-    manager.judge = ProactiveJudge(ScriptedProactiveJudgeProvider([True]))
+    # IMMEDIATE says yes, LONG_IDLE says no: exactly one message.
+    manager.judge = ProactiveJudge(ScriptedProactiveJudgeProvider([True, False]))
     manager.on_response_delivered(
         conversation_id="c1",
         person_id=person.person_id,
@@ -174,7 +174,7 @@ async def test_proactive_message_becomes_real_history_and_schedules_no_next_chec
     person = await _person(rt)
     await rt.conversations.get_or_create("c1")
     first = await _delivered_normal_turn(rt, person)
-    manager = _scripted_manager(rt, [True])
+    manager = _scripted_manager(rt, [True, False])
     manager.on_response_delivered(
         conversation_id="c1",
         person_id=person.person_id,
@@ -208,22 +208,29 @@ async def test_new_user_input_invalidates_a_pending_check(db):
     event = await _delivered_normal_turn(rt, person)
 
     manager = rt.proactive_manager
-    manager.delay_seconds = 0.3
-    manager.short_task_timeout = 0.0
-    judge = ScriptedProactiveJudgeProvider([True])
+    manager.idle_delay_seconds = 0.3
+    judge = ScriptedProactiveJudgeProvider([False, True])
     manager.judge = ProactiveJudge(judge)
     manager.on_response_delivered(
         conversation_id="c1",
         person_id=person.person_id,
         source_event_id=event.event_id,
     )
+    # Let the immediate stage run (it declines) so the idle wait is the only
+    # remaining work when the user speaks again.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 1.0
+    while not judge.payloads and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    assert [payload.mode for payload in judge.payloads] == ["IMMEDIATE"]
 
     new_event = _event(person.person_id, "等等，我换个问题", conversation="c1")
     await rt.repos.utterance.save(new_event)
     manager.note_user_input("c1", new_event.event_id)
 
     await asyncio.sleep(0.5)
-    assert judge.payloads == []
+    # The long-idle judge never runs after the user came back.
+    assert [payload.mode for payload in judge.payloads] == ["IMMEDIATE"]
     assert manager.poll_event() is None
     assert await rt.repos.proactive.get_for_source_event(event.event_id) is None
     await manager.shutdown()
@@ -240,7 +247,7 @@ async def test_new_user_input_during_generation_discards_the_reply(db, monkeypat
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def blocked_generation(*, source_event, person_id):
+    async def blocked_generation(*, source_event, person_id, mode="IMMEDIATE"):
         started.set()
         await release.wait()
         return {
@@ -270,27 +277,25 @@ async def test_new_user_input_during_generation_discards_the_reply(db, monkeypat
     await manager.shutdown()
 
 
-async def test_short_task_wait_is_bounded_and_ignores_long_jobs(db):
+async def test_immediate_stage_does_not_observe_background_jobs(db):
     client = FakeDeepSeekClient()
     rt = await _runtime(db, client)
     person = await _person(rt)
     await rt.conversations.get_or_create("c1")
     event = await _delivered_normal_turn(rt, person)
     manager = rt.proactive_manager
-    manager.delay_seconds = 0.0
-    manager.short_task_timeout = 0.25
-    manager.short_task_poll_seconds = 0.02
+    # A long idle wait makes any observation of background jobs visible as
+    # extra latency before the immediate judge runs.
+    manager.idle_delay_seconds = 2.0
     judge = ScriptedProactiveJudgeProvider([False])
     manager.judge = ProactiveJudge(judge)
 
-    # A delayed extraction job is observed but cannot extend the deadline.
     await rt.repos.job.enqueue(
         JobType.TURN_ANALYSIS,
         f"turn_analysis:{event.event_id}",
         {"event_id": event.event_id},
         next_run_at=utcnow() + timedelta(seconds=60),
     )
-    # A long job is not observed at all.
     await rt.repos.job.enqueue(
         JobType.MEMORY_CONSOLIDATION,
         f"memory:{event.event_id}",
@@ -306,11 +311,12 @@ async def test_short_task_wait_is_bounded_and_ignores_long_jobs(db):
     )
     deadline = started + 2.0
     while not judge.payloads and loop.time() < deadline:
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.01)
     elapsed = loop.time() - started
 
-    assert judge.payloads, "judge must run after the bounded wait"
-    assert elapsed < 1.0, f"proactive check took {elapsed:.3f}s"
+    assert judge.payloads, "the immediate judge must run"
+    assert judge.payloads[0].mode == "IMMEDIATE"
+    assert elapsed < 1.0, f"immediate check took {elapsed:.3f}s"
     await manager.shutdown()
 
 

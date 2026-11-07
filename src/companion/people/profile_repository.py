@@ -911,6 +911,21 @@ class PersonProfileRepository:
             (status, _iso(utcnow()), reason, candidate_id),
         )
 
+    async def set_candidate_source(
+        self, candidate_id: str, *, source: str, confidence: float
+    ) -> None:
+        """Upgrade a pending candidate's provenance (V0.9.9).
+
+        A background inference that is later repeated by the person's own
+        explicit statement becomes a direct self-report candidate, so the
+        single-turn confirmation can apply it with the real source.
+        """
+        await self.db.execute(
+            "UPDATE person_profile_candidates SET source = ?, confidence = ?,"
+            " updated_at = ? WHERE candidate_id = ?",
+            (source, float(confidence), _iso(utcnow()), candidate_id),
+        )
+
     async def add_candidate_evidence(
         self,
         candidate_id: str,

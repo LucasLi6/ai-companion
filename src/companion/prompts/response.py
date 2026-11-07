@@ -51,7 +51,10 @@ from companion.prompts.addressee import (
     safe_speaker_label,
 )
 from companion.prompts.identity import compile_trait_tendencies
-from companion.prompts.proactive import PROACTIVE_MODE_BLOCK
+from companion.prompts.proactive import (
+    PROACTIVE_MODE_BLOCK,
+    PROACTIVE_MODE_BLOCK_LONG_IDLE,
+)
 from companion.runtime_context.assembler import compile_runtime_context
 
 RESPONSE_PROMPT_VERSION = "response-v17"
@@ -1269,7 +1272,10 @@ def _current_user_content(
 
 
 def _system_parts(
-    context: CognitiveContext, *, proactive: bool = False
+    context: CognitiveContext,
+    *,
+    proactive: bool = False,
+    proactive_mode: str = "IMMEDIATE",
 ) -> list[str]:
     """Trusted system content shared by normal and proactive generation."""
     multi_person = is_multi_person(context)
@@ -1283,7 +1289,12 @@ def _system_parts(
     if proactive:
         # A short, trusted mode note only. The persona above is unchanged and
         # no fake user utterance is introduced anywhere in the request.
-        parts.append(PROACTIVE_MODE_BLOCK)
+        block = (
+            PROACTIVE_MODE_BLOCK_LONG_IDLE
+            if str(proactive_mode).upper() == "LONG_IDLE"
+            else PROACTIVE_MODE_BLOCK
+        )
+        parts.append(block)
     return parts
 
 
@@ -1330,7 +1341,10 @@ def build_response_messages(
 
 
 def build_proactive_response_messages(
-    context: CognitiveContext, analysis: CognitiveResult
+    context: CognitiveContext,
+    analysis: CognitiveResult,
+    *,
+    mode: str = "IMMEDIATE",
 ) -> list[dict]:
     """Build a proactive generation request with no new user message.
 
@@ -1340,11 +1354,19 @@ def build_proactive_response_messages(
     and the request ends on the last *real* assistant turn. No synthetic
     "please say something" user message is ever created, and the mode note is
     never persisted as conversation history.
+
+    ``mode`` selects the IMMEDIATE continuation note or the LONG_IDLE
+    new-exchange note. It is trusted local context, not user content.
     """
     multi_person = is_multi_person(context)
     agent_name = _agent_display_name(context)
     messages: list[dict] = [
-        {"role": "system", "content": "\n\n".join(_system_parts(context, proactive=True))}
+        {
+            "role": "system",
+            "content": "\n\n".join(
+                _system_parts(context, proactive=True, proactive_mode=mode)
+            ),
+        }
     ]
     messages.extend(
         _history_messages(

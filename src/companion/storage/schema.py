@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1942,6 +1942,82 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE INDEX IF NOT EXISTS idx_proactive_messages_conversation
             ON proactive_messages(conversation_id, created_at);
+        """,
+    ),
+    # Version 29 (V0.9.9): two-stage proactive speech.
+    #
+    # The lifecycle can now deliver an IMMEDIATE message (right after a normal
+    # reply) and later one LONG_IDLE message (from the same user turn, after a
+    # 2-4 minute idle period). ``UNIQUE(source_event_id)`` from V0.9.8 would
+    # forbid the second, so the table is rebuilt with ``mode`` and a composite
+    # ``UNIQUE(source_event_id, mode)``: at most one message per stage per
+    # triggering turn, never an unbounded loop.
+    #
+    # The same migration adds the small, local confirmation state for critical
+    # identity self-reports. It references the existing candidate table; it
+    # never replaces Profile Review, ProfileService or its safety checks.
+    (
+        29,
+        """
+        CREATE TABLE proactive_messages_v29 (
+            message_id      TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL
+                            REFERENCES conversations(conversation_id)
+                            ON DELETE CASCADE,
+            person_id       TEXT NOT NULL
+                            REFERENCES persons(person_id) ON DELETE CASCADE,
+            source_event_id TEXT NOT NULL
+                            REFERENCES utterances(event_id) ON DELETE CASCADE,
+            mode            TEXT NOT NULL DEFAULT 'IMMEDIATE',
+            origin          TEXT NOT NULL DEFAULT 'AVA_INITIATED',
+            text            TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            finish_reason   TEXT,
+            model           TEXT,
+            created_at      TEXT NOT NULL,
+            UNIQUE (source_event_id, mode)
+        );
+
+        INSERT INTO proactive_messages_v29(
+            message_id, conversation_id, person_id, source_event_id, mode,
+            origin, text, status, finish_reason, model, created_at
+        )
+        SELECT message_id, conversation_id, person_id, source_event_id,
+               'IMMEDIATE', origin, text, status, finish_reason, model,
+               created_at
+        FROM proactive_messages;
+
+        DROP TABLE proactive_messages;
+        ALTER TABLE proactive_messages_v29 RENAME TO proactive_messages;
+
+        CREATE INDEX IF NOT EXISTS idx_proactive_messages_conversation
+            ON proactive_messages(conversation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_proactive_messages_source
+            ON proactive_messages(source_event_id, mode);
+
+        CREATE TABLE IF NOT EXISTS profile_confirmations (
+            confirmation_id     TEXT PRIMARY KEY,
+            person_id           TEXT NOT NULL
+                                REFERENCES persons(person_id) ON DELETE CASCADE,
+            conversation_id     TEXT NOT NULL
+                                REFERENCES conversations(conversation_id)
+                                ON DELETE CASCADE,
+            source_event_id     TEXT NOT NULL
+                                REFERENCES utterances(event_id) ON DELETE CASCADE,
+            question_message_id TEXT,
+            candidate_id        TEXT,
+            field_key           TEXT NOT NULL,
+            value_json          TEXT NOT NULL,
+            quote               TEXT NOT NULL DEFAULT '',
+            state               TEXT NOT NULL,
+            created_at          TEXT NOT NULL,
+            updated_at          TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_confirmations_person
+            ON profile_confirmations(person_id, state, created_at);
+        CREATE INDEX IF NOT EXISTS idx_profile_confirmations_candidate
+            ON profile_confirmations(candidate_id);
         """,
     ),
 ]

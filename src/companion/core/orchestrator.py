@@ -77,6 +77,7 @@ from companion.memory.requests import (
     is_memory_sample_request,
 )
 from companion.people.registry import PersonRegistry
+from companion.proactive.departure import detect_explicit_departure
 from companion.prompts.layout import normalize_response_text, response_layout_for
 from companion.runtime_context.connection import ConnectionInfo
 from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
@@ -141,6 +142,7 @@ class Orchestrator:
         explicit_memory_operations=None,
         data_control=None,
         task_service=None,
+        profile_confirmation=None,
         turn_analysis_delay_seconds: float = 60.0,
         turn_analysis_batch_size: int = 5,
         logger: Optional[logging.Logger] = None,
@@ -214,6 +216,11 @@ class Orchestrator:
         # V0.9: task execution is Off-task. The orchestrator only publishes a
         # foreground activity signal; it never runs background work inline.
         self.task_service = task_service
+        # V0.9.9: one-turn confirmation of an explicit identity self-report.
+        # Detection runs before Speaker generation; the question is appended to
+        # a deliverable reply and the next real user message resolves it. The
+        # service (not the Speaker) owns every profile write.
+        self.profile_confirmation = profile_confirmation
         # V0.6.1: a Fast Path turn only queues lightweight extraction. The job
         # waits up to ``delay`` seconds so several turns can share one small
         # request; once ``batch_size`` events are waiting it runs immediately.
@@ -979,6 +986,15 @@ class Orchestrator:
                 cognitive_context, runtime_snapshot
             )
 
+            # 8b. V0.9.9: read the next user reply to an identity confirmation
+            # and detect a new explicit self-report. This runs before Speaker
+            # generation; it never waits for the delayed Profile Review. The
+            # question is only *prepared* here — it is appended below only if
+            # this turn actually produces a deliverable reply.
+            confirmation_question = await self._begin_profile_confirmation(
+                event, person_id, persist=persist
+            )
+
             # 9. Reuse the durable action if it already exists, else generate a
             # response and persist the action.
             existing_action = (
@@ -1094,7 +1110,37 @@ class Orchestrator:
                     timings["speaker_first_token_ms"] = stream_meta[
                         "first_token_ms"
                     ]
-                action_obj = AgentAction(
+            # V0.9.9: append the prepared confirmation question only to a
+            # complete, deliverable normal reply. WAIT/IGNORE, quiet mode, a
+            # local safety reply or truncated output leave the pending question
+            # for the next deliverable reply.
+            question_delivered = False
+            if confirmation_question and final_action == CognitiveAction.RESPOND:
+                if existing_action is None:
+                    if (
+                        not safety.triggered
+                        and not context.quiet_mode
+                        and action_status
+                        not in ("TRUNCATED", "FAILED", "CANCELLED")
+                        and response_text
+                    ):
+                        if confirmation_question not in response_text:
+                            response_text = (
+                                response_text.rstrip()
+                                + "\n\n"
+                                + confirmation_question
+                            )
+                        question_delivered = True
+                elif (
+                    response_text
+                    and confirmation_question in response_text
+                    and action_status
+                    not in ("TRUNCATED", "FAILED", "CANCELLED")
+                ):
+                    # A retry reuses the already-committed action; never
+                    # rewrite it, only acknowledge the question it carries.
+                    question_delivered = True
+            action_obj = AgentAction(
                     action_id=new_id("act"),
                     event_id=event.event_id,
                     action_type=final_action,
@@ -1135,6 +1181,27 @@ class Orchestrator:
                 if existing_action is None:
                     await self._record_stances(event, action_obj, cognitive_context)
             timings["commit_ms"] = (time.monotonic() - t_commit) * 1000
+
+            if question_delivered and self.profile_confirmation is not None:
+                try:
+                    await self.profile_confirmation.mark_question_delivered(
+                        person_id=person_id,
+                        conversation_id=event.conversation_id,
+                        question_message_id=(
+                            action_obj.action_id
+                            if action_obj is not None
+                            else response_id
+                        ),
+                    )
+                except Exception as exc:
+                    # The reply was delivered; a state-bookkeeping failure must
+                    # never turn a successful turn into an error.
+                    self.logger.warning(
+                        "profile_confirmation_delivery_state_failed"
+                        " conversation_id=%s error=%s",
+                        event.conversation_id,
+                        type(exc).__name__,
+                    )
 
             if job_id is not None:
                 steps.append("[MEMORY_JOB] Queued")
@@ -1590,8 +1657,25 @@ class Orchestrator:
             )
             return context
 
+    async def _begin_profile_confirmation(
+        self, event, person_id: str, *, persist: bool
+    ) -> Optional[str]:
+        """Resolve/ask one identity confirmation; never affect the turn."""
+        service = self.profile_confirmation
+        if service is None or not persist:
+            return None
+        try:
+            return await service.begin_turn(event=event, person_id=person_id)
+        except Exception as exc:
+            self.logger.warning(
+                "profile_confirmation_failed conversation_id=%s error=%s",
+                event.conversation_id,
+                type(exc).__name__,
+            )
+            return None
+
     async def build_proactive_judge_context(
-        self, *, source_event, person_id: str
+        self, *, source_event, person_id: str, mode: str = "IMMEDIATE"
     ) -> Optional[dict]:
         """Assemble the bounded, committed view the Proactive Judge may see.
 
@@ -1599,6 +1683,10 @@ class Orchestrator:
         messages), the last delivered Ava reply, the committed scene and the
         elapsed time since that reply. No full memory retrieval and no full
         profile are performed here.
+
+        ``mode`` is ``IMMEDIATE`` (right after a delivered reply) or
+        ``LONG_IDLE`` (after a 2-4 minute silence). Only ``LONG_IDLE`` carries
+        the structurally validated explicit-departure floor.
         """
         if self.context_builder is None:
             return None
@@ -1660,6 +1748,12 @@ class Orchestrator:
             "last_ava_response": last_ava,
             "scene_context": scene_context,
             "seconds_since_last_response": seconds_since_last_response,
+            "mode": "LONG_IDLE" if str(mode).upper() == "LONG_IDLE" else "IMMEDIATE",
+            "explicit_departure": (
+                detect_explicit_departure(getattr(source_event, "text", ""))
+                if str(mode).upper() == "LONG_IDLE"
+                else False
+            ),
         }
 
     async def build_proactive_context(self, *, source_event, person_id: str):
@@ -1742,7 +1836,9 @@ class Orchestrator:
             )
             return context
 
-    async def generate_proactive_reply(self, *, source_event, person_id: str) -> dict:
+    async def generate_proactive_reply(
+        self, *, source_event, person_id: str, mode: str = "IMMEDIATE"
+    ) -> dict:
         """Generate one proactive reply through the existing Speaker path."""
         context = await self.build_proactive_context(
             source_event=source_event, person_id=person_id
@@ -1762,7 +1858,7 @@ class Orchestrator:
             conversation_state="proactive",
         )
         generated = await self.response.generate_proactive(
-            source_event, analysis, context
+            source_event, analysis, context, mode=mode
         )
         return {
             "text": str(generated).strip(),

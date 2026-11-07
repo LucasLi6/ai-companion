@@ -52,6 +52,7 @@ from companion.people.profile_refinement import (
     ProfileReviewContextSource,
 )
 from companion.people.profile_service import PersonProfileService
+from companion.people.profile_confirmation import ProfileConfirmationService
 from companion.privacy.data_control import DataControlService
 from companion.providers.deepseek_client import (
     DeepSeekConfigError,
@@ -130,6 +131,7 @@ class Runtime:
     research_engine: object = None
     profile_refinement_engine: object = None
     proactive_manager: Optional[ProactiveManager] = None
+    profile_confirmation: Optional[ProfileConfirmationService] = None
 
 
 def build_runtime(
@@ -157,8 +159,8 @@ def build_runtime(
     profile_refinement_provider=None,
     profile_review_delay_seconds: float = 30.0,
     proactive_judge=None,
-    proactive_delay_seconds: float = 2.0,
-    proactive_short_task_timeout: float = 1.0,
+    proactive_idle_delay_seconds: Optional[float] = None,
+    profile_confirmation=None,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
 
@@ -610,6 +612,17 @@ def build_runtime(
         except ValueError:
             turn_analysis_delay_seconds = 60.0
 
+    # V0.9.9: one-turn identity confirmation. Detection and the state machine
+    # are local; in real chat mode the question rides on the next deliverable
+    # normal reply. Tests may inject a service explicitly.
+    confirmation_service = profile_confirmation
+    if confirmation_service is None and provider == "deepseek":
+        confirmation_service = ProfileConfirmationService(
+            profile_service=profile_service,
+            repos=repos,
+            logger=logger,
+        )
+
     orchestrator = Orchestrator(
         repos=repos,
         registry=registry,
@@ -639,15 +652,17 @@ def build_runtime(
         explicit_memory_operations=explicit_memory_operations,
         data_control=data_control,
         task_service=task_service,
+        profile_confirmation=confirmation_service,
         turn_analysis_delay_seconds=float(turn_analysis_delay_seconds),
         logger=logger,
     )
 
-    # V0.9.8: one lightweight proactive check after a delivered normal reply.
-    # It is wired only for the real external-AI path (the Judge is a model
-    # call); the manager itself is provider-agnostic and can be injected in
-    # tests. It never holds the conversation lock and never creates a second
-    # agent or task queue.
+    # V0.9.9: dual-stage proactive cycle after a delivered normal reply.
+    # Stage 1 judges immediately; stage 2 waits a random 120-240 s from Ava's
+    # last delivered message. It is wired only for the real external-AI path
+    # (the Judge is a model call); the manager itself is provider-agnostic and
+    # can be injected in tests. It never holds the conversation lock and never
+    # creates a second agent or task queue.
     proactive_manager = None
     if provider == "deepseek":
         judge = proactive_judge
@@ -662,8 +677,7 @@ def build_runtime(
             conversations=conversations,
             orchestrator=orchestrator,
             judge=judge,
-            delay_seconds=proactive_delay_seconds,
-            short_task_timeout=proactive_short_task_timeout,
+            idle_delay_seconds=proactive_idle_delay_seconds,
             logger=logger,
         )
 
@@ -705,4 +719,5 @@ def build_runtime(
         research_engine=research_engine,
         profile_refinement_engine=profile_refinement_engine,
         proactive_manager=proactive_manager,
+        profile_confirmation=confirmation_service,
     )

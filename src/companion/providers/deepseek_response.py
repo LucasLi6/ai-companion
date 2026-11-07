@@ -85,6 +85,8 @@ class DeepSeekResponseProvider:
         event: UtteranceEvent,
         analysis: CognitiveResult,
         context,
+        *,
+        mode: str = "IMMEDIATE",
     ) -> str:
         """Generate one Ava-initiated utterance with no new user message.
 
@@ -92,10 +94,13 @@ class DeepSeekResponseProvider:
         the same persona/history/memory/scene context and the same external-AI
         authorization as a normal reply; only the generation-mode block and
         the absence of a current user turn differ.
+
+        ``mode`` is ``IMMEDIATE`` or ``LONG_IDLE`` and only changes the short
+        trusted generation note.
         """
         await self._authorize(event)
         ctx = self._as_context(event, context, analysis)
-        messages = build_proactive_response_messages(ctx, analysis)
+        messages = build_proactive_response_messages(ctx, analysis, mode=mode)
         response = await self.client.complete(
             messages,
             request_type="response",
