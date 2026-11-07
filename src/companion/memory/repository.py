@@ -143,6 +143,45 @@ class MemoryRepository:
         )
         return (cur.rowcount if hasattr(cur, "rowcount") else 0) == 1
 
+    async def add_source(
+        self,
+        memory_id: str,
+        source: MemorySource,
+        evidence: MemoryEvidence | None = None,
+    ) -> None:
+        """Attach one more citable source to an existing memory.
+
+        Used when an ongoing episode is extended: older evidence must stay,
+        while the new batch adds its own source ids. ``INSERT OR IGNORE`` makes
+        a retried batch a no-op instead of an error.
+        """
+        await self.db.conn.execute(
+            "INSERT OR IGNORE INTO memory_sources(source_id, source_type, source_ref,"
+            " title, url, retrieved_at, published_at, extra) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                source.source_id,
+                source.source_type,
+                source.source_ref,
+                source.title,
+                source.url,
+                _iso(source.retrieved_at),
+                _iso(source.published_at),
+                json.dumps({"provider": source.provider}) if source.provider else "{}",
+            ),
+        )
+        if evidence is not None:
+            await self.db.conn.execute(
+                "INSERT OR IGNORE INTO memory_evidence(memory_id, source_id, evidence_span,"
+                " verification_level, retrieved_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    memory_id,
+                    evidence.source_id,
+                    evidence.evidence_span,
+                    evidence.verification_level.value,
+                    _iso(evidence.retrieved_at),
+                ),
+            )
+
     async def sync_fts(self, memory_id: str, content: str) -> None:
         """Rewrite the FTS entry for one item (delete then insert)."""
         await self.db.conn.execute(

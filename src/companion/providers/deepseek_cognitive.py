@@ -52,6 +52,11 @@ from companion.domain.models import (
     validate_pragmatic_analysis,
     validate_scene_proposal,
 )
+from companion.memory.episodes import (
+    MAX_EPISODES_PER_BATCH,
+    EpisodeProposal,
+    ExtractionOutcome,
+)
 from companion.memory.store import validate_referenced_memory_ids
 from companion.prompts.cognitive import build_cognitive_messages, build_repair_messages
 from companion.prompts.extraction import build_extraction_messages
@@ -111,10 +116,25 @@ class _RawExtractionItem(BaseModel):
     memory_candidates: list[_RawCandidate] = Field(default_factory=list)
 
 
+class _RawEpisode(BaseModel):
+    """One model-proposed episode. All fields degrade locally, never fail the
+    whole batch: a malformed episode is dropped, the facts still get saved."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    title: str = ""
+    summary: str = ""
+    topic: str = ""
+    status: str = "UNKNOWN"
+    source_event_ids: list[str] = Field(default_factory=list)
+    continues_title: Optional[str] = None
+
+
 class _RawExtraction(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     results: list[_RawExtractionItem] = Field(default_factory=list)
+    episodes: list[_RawEpisode] = Field(default_factory=list)
 
 
 def _parse_json_object(content: str) -> dict:
@@ -212,16 +232,41 @@ class DeepSeekCognitiveProvider:
         speaker_label: str,
         prior_turns: list[dict] | None = None,
     ) -> dict[str, list[MemoryCandidate]]:
-        """Extract memory candidates for one same-speaker batch.
+        """Backward-compatible single-purpose entry point.
 
-        This is the cheap background pass used after a Fast Path turn. It does
-        not decide an action, does not see persona or retrieval context, and
-        never replaces the truthful local analysis. Trust rules are the same
-        as :meth:`analyze`: ids and subjects come from trusted metadata, and an
+        Existing callers (explicit remember/correction) only need candidates;
+        episodes are computed but discarded here. The batch job uses
+        :meth:`extract_events_with_episodes` to persist both from one call.
+        """
+        outcome = await self.extract_events_with_episodes(
+            events, speaker_label=speaker_label, prior_turns=prior_turns
+        )
+        return outcome.candidates
+
+    async def extract_events_with_episodes(
+        self,
+        events: list[UtteranceEvent],
+        *,
+        speaker_label: str,
+        prior_turns: list[dict] | None = None,
+        replies: dict[str, str] | None = None,
+        recent_episodes: list[dict] | None = None,
+    ) -> ExtractionOutcome:
+        """Extract memory candidates and episode summaries in one call.
+
+        This is the cheap background pass used after a turn. It does not decide
+        an action, does not see persona or retrieval context, and never
+        replaces the truthful local analysis. Trust rules are the same as
+        :meth:`analyze`: ids and subjects come from trusted metadata, and an
         evidence span is kept only when it is a verbatim part of *that* event.
+
+        ``replies`` are the real delivered Ava texts for these turns (never an
+        invented completion), and ``recent_episodes`` are short titles/topics
+        only. The model can say "continues <title>" but can never choose a
+        person, permission or database key.
         """
         if not events:
-            return {}
+            return ExtractionOutcome()
         by_id = {event.event_id: event for event in events}
         speaker_id = events[0].speaker_person_id
         if self.privacy_gateway is not None:
@@ -245,6 +290,8 @@ class DeepSeekCognitiveProvider:
             ],
             speaker_label=speaker_label,
             prior_turns=prior_turns,
+            replies=replies,
+            recent_episodes=recent_episodes,
         )
         response = await self.client.complete(
             messages,
@@ -280,7 +327,52 @@ class DeepSeekCognitiveProvider:
                 self._candidate(candidate, event)
                 for candidate in item.memory_candidates
             )
-        return extracted
+
+        episodes = self._episodes(raw.episodes, by_id)
+        return ExtractionOutcome(candidates=extracted, episodes=episodes)
+
+    def _episodes(
+        self, raw_episodes: list[_RawEpisode], by_id: dict[str, UtteranceEvent]
+    ) -> list[EpisodeProposal]:
+        """Validate episode citations locally; drop anything not grounded."""
+        proposals: list[EpisodeProposal] = []
+        for raw in raw_episodes:
+            if len(proposals) >= MAX_EPISODES_PER_BATCH:
+                break
+            cited = list(dict.fromkeys(raw.source_event_ids))
+            valid = [event_id for event_id in cited if event_id in by_id]
+            if len(valid) != len(cited):
+                self.logger.info(
+                    "deepseek_episode_unknown_source dropped=%d",
+                    len(cited) - len(valid),
+                )
+            if not cited:
+                self.logger.info("deepseek_episode_without_sources")
+                continue
+            if not valid:
+                # Every citation was invented or belonged to another batch;
+                # the episode cannot be grounded at all.
+                continue
+            title = " ".join(str(raw.title or "").split())[:200]
+            summary = " ".join(str(raw.summary or "").split())[:2000]
+            if not title or not summary:
+                self.logger.info("deepseek_episode_empty_text")
+                continue
+            continues = " ".join(str(raw.continues_title or "").split())[:200]
+            try:
+                proposals.append(
+                    EpisodeProposal(
+                        title=title,
+                        summary=summary,
+                        topic=" ".join(str(raw.topic or "").split())[:200],
+                        status=raw.status,
+                        source_event_ids=valid,
+                        continues_title=continues or None,
+                    )
+                )
+            except ValidationError:
+                self.logger.info("deepseek_episode_invalid")
+        return proposals
 
     # -- request/parse ------------------------------------------------------
 

@@ -284,6 +284,8 @@ class MemoryService:
         status: MemoryStatus | str | None = None,
         visibility: MemoryVisibility | str | None = None,
         reason: str | None = None,
+        sources: list[MemorySource] | None = None,
+        evidence: list[MemoryEvidence] | None = None,
     ) -> MemoryItem:
         item = await self.repo.get(memory_id)
         if item is None:
@@ -306,6 +308,9 @@ class MemoryService:
             }
         )
         content_changed = new_item.content != item.content
+        evidence_by_source = {
+            ev.source_id: ev for ev in (evidence or [])
+        }
         async with self.repo.db.transaction():
             ok = await self.repo.replace_item(new_item, item.version)
             if not ok:
@@ -314,6 +319,10 @@ class MemoryService:
                 )
             if content_changed:
                 await self.repo.sync_fts(memory_id, new_item.content)
+            for source in sources or []:
+                await self.repo.add_source(
+                    memory_id, source, evidence_by_source.get(source.source_id)
+                )
             await self.repo.insert_revision(
                 MemoryRevision(
                     revision_id=new_id("rev"),

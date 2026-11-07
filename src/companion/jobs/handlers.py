@@ -22,9 +22,16 @@ from __future__ import annotations
 import logging
 
 from companion.core.safety import assess_safety
-from companion.domain.enums import JobType
+from companion.domain.enums import (
+    CognitiveAction,
+    JobType,
+    MemoryKind,
+    MemoryStatus,
+)
 from companion.memory.candidates import prepare_candidates
 from companion.memory.consolidation import MemoryWriter
+from companion.memory.episodes import EpisodeWriter, parse_episode_content
+from companion.memory.repository import MemoryRepository
 from companion.memory.service import build_memory_service
 from companion.people.profile_learning import PersonProfileLearningService
 from companion.people.profile_service import PersonProfileService
@@ -147,8 +154,11 @@ def build_turn_analysis_handler(
             logger.info("turn_analysis_skipped event_id=%s reason=consent", event_id)
             return
 
-        extract = getattr(cognitive, "extract_events", None)
-        if extract is None:
+        extract_with_episodes = getattr(
+            cognitive, "extract_events_with_episodes", None
+        )
+        extract_plain = getattr(cognitive, "extract_events", None)
+        if extract_with_episodes is None and extract_plain is None:
             # A provider without the lightweight pass is not silently given a
             # full analysis instead: that would reintroduce the cost this job
             # exists to remove.
@@ -187,14 +197,34 @@ def build_turn_analysis_handler(
         prior_turns = await _prior_turns(
             repos, context_builder, eligible[0], event.speaker_person_id
         )
+        replies = await _delivered_replies(repos, eligible)
+        recent_episodes = await _recent_episodes(
+            repos, event.speaker_person_id
+        )
         try:
-            extracted = await extract(
-                eligible,
-                speaker_label=event.speaker_label
-                or event.speaker_person_id
-                or "unknown",
-                prior_turns=prior_turns,
-            )
+            if extract_with_episodes is not None:
+                outcome = await extract_with_episodes(
+                    eligible,
+                    speaker_label=event.speaker_label
+                    or event.speaker_person_id
+                    or "unknown",
+                    prior_turns=prior_turns,
+                    replies=replies,
+                    recent_episodes=recent_episodes,
+                )
+                extracted = outcome.candidates
+                episodes = outcome.episodes
+            else:
+                # Older/mock providers keep working unchanged; they simply
+                # cannot propose episodes.
+                extracted = await extract_plain(
+                    eligible,
+                    speaker_label=event.speaker_label
+                    or event.speaker_person_id
+                    or "unknown",
+                    prior_turns=prior_turns,
+                )
+                episodes = []
         except CognitivePermissionDenied as exc:
             for candidate_event in eligible:
                 await repos.extraction.mark(
@@ -209,7 +239,11 @@ def build_turn_analysis_handler(
         except Exception as exc:  # noqa: BLE001 — surfaced to the worker for retry
             raise JobError(f"event extraction failed: {exc}") from exc
 
+        # Facts are committed first, and marked processed only after the
+        # episode step. A failed episode write therefore retries the job
+        # without ever discarding candidates that were legitimately extracted.
         async with repos.db.transaction():
+            prepared_counts: dict[str, int] = {}
             for candidate_event in eligible:
                 prepared = await prepare_candidates(
                     repos,
@@ -217,13 +251,9 @@ def build_turn_analysis_handler(
                     extracted.get(candidate_event.event_id, []),
                     explicit_remember_request=False,
                 )
+                prepared_counts[candidate_event.event_id] = len(prepared)
                 for candidate in prepared:
                     await repos.analysis.save_candidate(candidate)
-                await repos.extraction.mark(
-                    candidate_event.event_id,
-                    EXTRACTION_STATUS_PROCESSED,
-                    len(prepared),
-                )
                 if prepared:
                     await repos.job.enqueue(
                         JobType.MEMORY_CONSOLIDATION,
@@ -231,14 +261,63 @@ def build_turn_analysis_handler(
                         {"event_id": candidate_event.event_id},
                     )
 
+        episode_failed = False
+        if episodes:
+            service = getattr(memory, "service", None)
+            if service is None:
+                service = build_memory_service(repos)
+            writer = EpisodeWriter(repos, service, logger=logger)
+            for proposal in episodes:
+                try:
+                    result = await writer.write(
+                        proposal,
+                        person_id=event.speaker_person_id,
+                        conversation_id=event.conversation_id,
+                    )
+                    logger.info(
+                        "turn_analysis_episode event_id=%s outcome=%s reason=%s",
+                        event_id,
+                        result.outcome,
+                        result.reason,
+                    )
+                except Exception as exc:  # noqa: BLE001 — retry the batch
+                    # Validation failures are returned by the writer, not
+                    # raised. Anything raised here is infrastructural (DB), and
+                    # must leave the events unprocessed so the worker retries.
+                    episode_failed = True
+                    logger.warning(
+                        "turn_analysis_episode_failed event_id=%s error=%s",
+                        event_id,
+                        type(exc).__name__,
+                    )
+
+        if episode_failed:
+            # Deliberately do not mark these events processed: the worker's
+            # retry must be able to re-attempt the episode. Candidate rows are
+            # already committed and INSERT OR IGNORE makes the re-run a no-op
+            # for them, so facts are never lost and never duplicated.
+            logger.warning(
+                "turn_analysis_episode_retry event_id=%s", event_id
+            )
+            raise JobError("episode write failed; batch left retryable")
+
+        async with repos.db.transaction():
+            for candidate_event in eligible:
+                await repos.extraction.mark(
+                    candidate_event.event_id,
+                    EXTRACTION_STATUS_PROCESSED,
+                    prepared_counts.get(candidate_event.event_id, 0),
+                )
+
         logger.info(
-            "turn_analysis_done event_id=%s events=%d candidates=%d",
+            "turn_analysis_done event_id=%s events=%d candidates=%d episodes=%d",
             event_id,
             len(eligible),
             sum(
                 len(extracted.get(candidate_event.event_id, []))
                 for candidate_event in eligible
             ),
+            len(episodes),
         )
 
     return turn_analysis
@@ -269,6 +348,62 @@ async def _prior_turns(
     if gateway is not None:
         history = await gateway.filter_utterances(history)
     return [
-        {"occurred_at": turn.occurred_at.isoformat(), "text": turn.text}
+        {"occurred_at": turn.occurred_at.isoformat(), "text": turn.text, "role": "USER"}
         for turn in history[-2:]
     ]
+
+
+async def _delivered_replies(repos: Repositories, events) -> dict[str, str]:
+    """Real, delivered Ava texts for this batch, keyed by the user's event id.
+
+    Only a completed RESPOND is a real reply. WAIT/IGNORE, failed or truncated
+    actions are absent, so an episode can never quote an answer Ava did not
+    actually finish delivering.
+    """
+    actions = await repos.analysis.get_actions_for_events(
+        [event.event_id for event in events]
+    )
+    replies: dict[str, str] = {}
+    for event_id, action in actions.items():
+        text = (action.response_text or "").strip()
+        if (
+            action.action_type == CognitiveAction.RESPOND
+            and action.status == "COMPLETED"
+            and text
+        ):
+            replies[event_id] = text
+    return replies
+
+
+async def _recent_episodes(
+    repos: Repositories, person_id: str, limit: int = 5
+) -> list[dict]:
+    """Short titles/topics of this person's model-written episodes.
+
+    The model only needs to recognise a continuation; it must never see a
+    memory id, another person's episode, a human-confirmed record, or an
+    episode that was retracted.
+    """
+    rows = await MemoryRepository(repos.db).list_for_subject(
+        person_id,
+        statuses=[MemoryStatus.ACTIVE.value],
+        kinds=[MemoryKind.EPISODE.value],
+        limit=20,
+    )
+    out: list[dict] = []
+    for row in rows:
+        if row.get("human_confirmed") or not row.get("model_inferred"):
+            continue
+        parsed = parse_episode_content(row.get("content"))
+        if parsed is None:
+            continue
+        out.append(
+            {
+                "title": parsed["title"],
+                "topic": parsed.get("topic") or "",
+                "status": parsed.get("status") or "UNKNOWN",
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out

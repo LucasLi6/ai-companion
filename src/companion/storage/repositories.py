@@ -2280,13 +2280,23 @@ class JobRepository:
         )
 
 
+#: Analyses that answer a turn without extracting memory candidates. A local
+#: fast-path decision and a semantic-router decision both qualify: the reply
+#: happened, but no model pass has turned the event into memories yet, so the
+#: deferred extraction job is the only place it can happen. A deliberation
+#: analysis (``cognitive.analyze``) is excluded because it already produced
+#: candidates synchronously.
+EXTRACTION_SOURCE_PROVIDERS = (LOCAL_PROVIDER, "semantic_router")
+
+
 class ExtractionRepository:
     """Bookkeeping for the lightweight background event-extraction job.
 
     A row exists once an event has been handed to the extraction pass. The row
     is the idempotency marker: a retried or restarted job sees it and does not
-    call the model again. Only ``local_fast_path`` events are candidates;
-    deliberation turns already have a full, locally validated analysis.
+    call the model again. Only events whose analysis never produced candidate
+    memories are candidates: ``local_fast_path`` and ``semantic_router`` turns.
+    Deliberation turns already have a full, locally validated analysis.
     """
 
     def __init__(self, db: Database) -> None:
@@ -2319,7 +2329,7 @@ class ExtractionRepository:
             " LEFT JOIN turn_extractions x ON x.event_id = u.event_id"
             " WHERE u.conversation_id = ? AND u.speaker_person_id = ?"
             "   AND u.processing_status = ?"
-            "   AND a.provider = ?"
+            "   AND a.provider IN (?, ?)"
             "   AND x.event_id IS NULL"
             " ORDER BY u.occurred_at ASC, u.event_id ASC"
             " LIMIT ?",
@@ -2327,7 +2337,7 @@ class ExtractionRepository:
                 conversation_id,
                 person_id,
                 ProcessingStatus.COMPLETED.value,
-                LOCAL_PROVIDER,
+                *EXTRACTION_SOURCE_PROVIDERS,
                 limit,
             ),
         )

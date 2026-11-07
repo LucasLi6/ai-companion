@@ -68,6 +68,12 @@ from companion.domain.models import (
 )
 from companion.emotion.expression_policy import compile_affect_context
 from companion.emotion.transition import build_conversational_affect
+from companion.memory.auto_recall import (
+    build_recall_query,
+    router_requested_memory,
+    select_auto_recalled,
+    should_auto_recall,
+)
 from companion.memory.explicit_operations import MemoryOperationResult
 from companion.tasks.models import TaskPriority, TaskRejected, TaskRequest, TaskSource
 from companion.memory.candidates import prepare_candidates
@@ -495,6 +501,51 @@ class Orchestrator:
                         t0=t0,
                         persist=persist,
                     )
+
+                # 4a-ter. Conditional auto-recall (V0.9.9.3). Only for a
+                # validated RESPOND turn whose wording clearly continues an
+                # earlier experience, and only when the router did *not*
+                # involve a memory tool. This never changes whether a reply
+                # happens, never invents a tool result, and never bypasses the
+                # store's access checks: it just gives the speaker the same
+                # authorized background records it would have had.
+                if (
+                    self.memory is not None
+                    and person_id is not None
+                    and not router_requested_memory(route, route_tool_results)
+                    and should_auto_recall(route, event.text, routing_view)
+                ):
+                    recall_query = build_recall_query(event.text, routing_view)
+                    if recall_query:
+                        try:
+                            recalled = await self.memory.retrieve(
+                                recall_query, person_id
+                            )
+                        except Exception as exc:  # recall is never fatal
+                            self.logger.warning(
+                                "auto_recall_failed event_id=%s error=%s",
+                                event.event_id,
+                                type(exc).__name__,
+                            )
+                            recalled = []
+                        selected = select_auto_recalled(
+                            recalled,
+                            recall_query,
+                            exclude_ids={
+                                str(item.get("memory_id"))
+                                for item in memories
+                                if item.get("memory_id")
+                            },
+                        )
+                        if selected:
+                            memories = [*memories, *selected]
+                            steps.append(
+                                f"[MEMORY] auto_recall items={len(selected)}"
+                            )
+                        else:
+                            self.logger.info(
+                                "auto_recall_empty event_id=%s", event.event_id
+                            )
 
             # 4b. Build the external-AI context (privacy-filtered history,
             # labels, memories) when the real provider is wired in. Mock mode
