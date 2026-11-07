@@ -111,6 +111,18 @@ class _Interpretation:
 
 
 _SELF_REPORT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # A direct introduction using "我是李约" was not previously recognised,
+    # even though the memory extractor recorded it as a name. Keep this
+    # narrower than an unrestricted "我是..." so occupations and roles such as
+    # "我是学生" do not become names.
+    (
+        "identity.name",
+        re.compile(
+            r"(?<![\\w])我是\\s*(?P<value>"
+            r"[李王张刘陈杨黄赵周吴徐孙胡朱高林何郭马罗梁宋郑谢韩唐冯于董萧程曹袁邓许傅沈曾彭吕苏卢蒋蔡贾丁魏薛叶阎余潘杜戴夏钟汪田任姜范方石姚谭廖邹熊金陆郝孔白崔康毛邱秦江史顾侯邵孟龙万段雷钱汤尹黎易常武乔贺赖龚文]"
+            r"[一-鿿]{1,2})(?=$|[，。.!！?？\\s])"
+        ),
+    ),
     # identity.name: "我叫李约" / "我的名字是李约"
     (
         "identity.name",
@@ -202,6 +214,13 @@ def detect_self_reports(text: str) -> tuple[DetectedSelfReport, ...]:
                 continue
             cleaned = _clean_name(match.group("value"))
             if not cleaned:
+                continue
+            # Guard role descriptions resembling a Chinese name in a bare
+            # "我是..." introduction (e.g. "我是高三生").
+            if match.group(0).startswith("我是") and cleaned in {
+                "高三生", "高中生", "大学生", "研究生", "初中生", "小学生",
+                "王老师", "李老师", "程序员", "中国人", "巴西人",
+            }:
                 continue
             found[field_key] = DetectedSelfReport(
                 field_key=field_key, value=cleaned, quote=value[:200]
