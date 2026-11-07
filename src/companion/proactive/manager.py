@@ -346,6 +346,9 @@ class ProactiveManager:
         text = str(generated.get("text") or "").strip()
         if not text:
             return
+        display_text = generated.get("display_text")
+        if display_text is not None:
+            display_text = str(display_text)
         finish_reason = generated.get("finish_reason")
         if finish_reason == "length":
             # An incomplete proactive utterance is not delivered.
@@ -392,6 +395,7 @@ class ProactiveManager:
         sink.completed(
             message.message_id,
             text=text,
+            display_text=display_text,
             finish_reason=finish_reason,
             report_status="COMPLETED",
             action="RESPOND",

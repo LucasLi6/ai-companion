@@ -14,6 +14,7 @@ from typing import Optional
 
 from companion.cognition.models import CognitiveContext
 from companion.domain.models import CognitiveResult, UtteranceEvent
+from companion.prompts.layout import RESPONSE_LAYOUT_CHAT, response_layout_for
 from companion.prompts.response import (
     build_proactive_response_messages,
     build_response_messages,
@@ -60,6 +61,15 @@ class DeepSeekResponseProvider:
         self.logger = logger or logging.getLogger("companion.deepseek.response")
         # Diagnostic metadata for the proactive path only; never prompt data.
         self.last_model = ""
+        # Off by default. When enabled, ordinary conversational replies may
+        # carry the optional voice-expression labels; structured output tasks
+        # never receive the protocol.
+        self.speech_expression_enabled = False
+
+    def _speech_expression_for(self, event: UtteranceEvent) -> bool:
+        if not self.speech_expression_enabled:
+            return False
+        return response_layout_for(event.text) == RESPONSE_LAYOUT_CHAT
 
     async def generate(
         self,
@@ -69,7 +79,9 @@ class DeepSeekResponseProvider:
     ) -> str:
         await self._authorize(event)
         ctx = self._as_context(event, context, analysis)
-        messages = build_response_messages(ctx, analysis)
+        messages = build_response_messages(
+            ctx, analysis, speech_expression=self._speech_expression_for(event)
+        )
         response = await self.client.complete(
             messages,
             request_type="response",
@@ -100,7 +112,12 @@ class DeepSeekResponseProvider:
         """
         await self._authorize(event)
         ctx = self._as_context(event, context, analysis)
-        messages = build_proactive_response_messages(ctx, analysis, mode=mode)
+        messages = build_proactive_response_messages(
+            ctx,
+            analysis,
+            mode=mode,
+            speech_expression=self.speech_expression_enabled,
+        )
         response = await self.client.complete(
             messages,
             request_type="response",
@@ -126,7 +143,9 @@ class DeepSeekResponseProvider:
         """
         await self._authorize(event)
         ctx = self._as_context(event, context, analysis)
-        messages = build_response_messages(ctx, analysis)
+        messages = build_response_messages(
+            ctx, analysis, speech_expression=self._speech_expression_for(event)
+        )
         async for delta in self.client.stream_completion(
             messages,
             request_type="response",

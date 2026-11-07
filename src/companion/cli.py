@@ -2158,6 +2158,15 @@ async def cmd_repl(args) -> int:
                     elif cmd == "/to" and len(parts) == 2 and parts[1] in ("agent", "human", "unknown"):
                         addressee = parts[1]
                         print(f"addressee -> {addressee}")
+                    elif cmd == "/speech" and len(parts) == 2 and parts[1] in ("on", "off"):
+                        enabled = parts[1] == "on"
+                        rt.orchestrator.speech_expression_enabled = enabled
+                        provider_obj = getattr(rt.orchestrator, "response", None)
+                        if hasattr(provider_obj, "speech_expression_enabled"):
+                            provider_obj.speech_expression_enabled = enabled
+                        print(
+                            f"speech expression: {'on' if enabled else 'off'}"
+                        )
                     elif cmd == "/history":
                         for e in await rt.repos.utterance.list_events(None, 20):
                             print(f"  {e.event_id} to={e.addressee_hint.value} {e.text}")
@@ -2169,6 +2178,10 @@ async def cmd_repl(args) -> int:
                         print(f"conversation: {args.conversation}")
                         print(f"addressee: {addressee}")
                         print(f"quiet_mode: {'on' if ctx and ctx.quiet_mode else 'off'}")
+                        print(
+                            "speech expression: "
+                            f"{'on' if getattr(rt.orchestrator, 'speech_expression_enabled', False) else 'off'}"
+                        )
                         try:
                             web_enabled = await rt.repos.settings.get_bool(
                                 "web_search.enabled", False
@@ -2186,7 +2199,7 @@ async def cmd_repl(args) -> int:
                     elif cmd == "/help":
                         print(
                             "commands: /to agent|human|unknown  /quiet on|off"
-                            "  /history  /status  /quit"
+                            "  /speech on|off  /history  /status  /quit"
                         )
                     else:
                         print("unknown command (see /help)")
@@ -2264,7 +2277,13 @@ def _print_proactive_line(text: str) -> None:
 async def _render_proactive_event(event, session=None) -> None:
     if event.type != "response_completed" or not (event.text or "").strip():
         return
-    text = event.text
+    # display_text keeps voice-expression labels for the surface; text remains
+    # the canonical, persisted reply.
+    text = (
+        event.display_text
+        if getattr(event, "display_text", None) is not None
+        else event.text
+    )
     app = getattr(session, "app", None) if session is not None else None
     if app is not None and getattr(app, "is_running", False):
         # Print inside prompt_toolkit's terminal, above the live input line.
@@ -2393,7 +2412,13 @@ async def _run_streaming_turn(rt, event, *, debug: bool = False) -> dict:
                 sys.stdout.flush()
             elif item.type == "response_delta":
                 saw_delta = True
-                sys.stdout.write(item.delta or "")
+                # The display channel keeps voice labels inline; the canonical
+                # ``delta`` remains the persisted text.
+                sys.stdout.write(
+                    item.display_delta
+                    if item.display_delta is not None
+                    else (item.delta or "")
+                )
                 sys.stdout.flush()
             elif item.type == "response_completed":
                 saw_terminal = True
@@ -2402,10 +2427,10 @@ async def _run_streaming_turn(rt, event, *, debug: bool = False) -> dict:
                 if not saw_started:
                     sys.stdout.write("assistant> ")
                     saw_started = True
-                if not saw_delta and item.text:
+                if not saw_delta and (item.display_text or item.text):
                     # A provider without incremental chunks still produces a
                     # real reply; show it once, here, not twice.
-                    sys.stdout.write(item.text)
+                    sys.stdout.write(item.display_text or item.text)
                 if item.status == "TRUNCATED":
                     sys.stdout.write("\n[truncated: token limit]\n")
                 else:

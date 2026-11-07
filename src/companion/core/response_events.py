@@ -42,6 +42,8 @@ class ResponseEvent:
     status: str
     delta: Optional[str] = None
     text: Optional[str] = None
+    display_delta: Optional[str] = None
+    display_text: Optional[str] = None
     finish_reason: Optional[str] = None
     error: Optional[str] = None
     usage: Optional[dict] = None
@@ -60,6 +62,8 @@ class ResponseEvent:
         for name in (
             "delta",
             "text",
+            "display_delta",
+            "display_text",
             "finish_reason",
             "error",
             "usage",
@@ -103,14 +107,27 @@ class ResponseEventSink:
     def started(self, response_id: str) -> ResponseEvent:
         return self._next(RESPONSE_STARTED, response_id, "STREAMING")
 
-    def delta(self, response_id: str, text: str) -> ResponseEvent:
-        return self._next(RESPONSE_DELTA, response_id, "STREAMING", delta=text)
+    def delta(
+        self,
+        response_id: str,
+        text: str,
+        *,
+        display_delta: Optional[str] = None,
+    ) -> ResponseEvent:
+        return self._next(
+            RESPONSE_DELTA,
+            response_id,
+            "STREAMING",
+            delta=text,
+            display_delta=display_delta,
+        )
 
     def completed(
         self,
         response_id: str,
         *,
         text: str,
+        display_text: Optional[str] = None,
         finish_reason: Optional[str] = None,
         usage: Optional[dict] = None,
         report_status: str = "COMPLETED",
@@ -122,6 +139,7 @@ class ResponseEventSink:
             response_id,
             status,
             text=text,
+            display_text=display_text,
             finish_reason=finish_reason,
             usage=usage,
             report_status=report_status,

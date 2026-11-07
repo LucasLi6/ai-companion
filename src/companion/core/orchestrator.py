@@ -85,9 +85,15 @@ from companion.memory.requests import (
 from companion.people.registry import PersonRegistry
 from companion.proactive.departure import detect_explicit_departure
 from companion.prompts.layout import (
+    RESPONSE_LAYOUT_CHAT,
+    RESPONSE_LAYOUT_STRUCTURED,
     StreamingTextNormalizer,
     normalize_response_text,
     response_layout_for,
+)
+from companion.speech_expression.parser import (
+    SpeechMarkupParser,
+    parse_speech_expressions,
 )
 from companion.runtime_context.connection import ConnectionInfo
 from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
@@ -155,6 +161,7 @@ class Orchestrator:
         profile_confirmation=None,
         turn_analysis_delay_seconds: float = 60.0,
         turn_analysis_batch_size: int = 5,
+        speech_expression_enabled: bool = False,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repos = repos
@@ -236,6 +243,11 @@ class Orchestrator:
         # request; once ``batch_size`` events are waiting it runs immediately.
         self.turn_analysis_delay_seconds = max(0.0, float(turn_analysis_delay_seconds))
         self.turn_analysis_batch_size = max(1, int(turn_analysis_batch_size))
+        # Optional voice-expression labels. Off by default: when disabled the
+        # speaker prompt and the stored/streamed text are byte-for-byte the
+        # previous behaviour. When enabled, recognised labels are separated
+        # before persistence and only the display channel carries them.
+        self.speech_expression_enabled = bool(speech_expression_enabled)
         self.logger = logger or logging.getLogger("companion.orchestrator")
         self._conversation_locks: dict[str, asyncio.Lock] = {}
 
@@ -1165,6 +1177,17 @@ class Orchestrator:
                                 event, analysis, response_context
                             )
                             response_text = str(generated)
+                            if (
+                                self.speech_expression_enabled
+                                and response_layout_for(event.text)
+                                == RESPONSE_LAYOUT_CHAT
+                            ):
+                                # Same parser as the streaming path: only the
+                                # canonical text may continue to the action,
+                                # history, memory and profile code.
+                                parsed = parse_speech_expressions(response_text)
+                                response_text = parsed.text.strip()
+                                stream_meta["display_text"] = parsed.display_text
                             # A provider may report that it stopped at the
                             # token limit; the reply is real but incomplete, so
                             # it must not be persisted as COMPLETED.
@@ -1234,6 +1257,7 @@ class Orchestrator:
                 stream.completed(
                     response_id,
                     text=response_text or "",
+                    display_text=stream_meta.get("display_text"),
                     finish_reason=stream_meta.get("finish_reason"),
                     usage=stream_meta.get("usage"),
                     report_status=ReportStatus.COMPLETED.value,
@@ -1879,8 +1903,18 @@ class Orchestrator:
         generated = await self.response.generate_proactive(
             source_event, analysis, context, mode=mode
         )
+        text = str(generated).strip()
+        display_text: Optional[str] = None
+        if self.speech_expression_enabled:
+            # Proactive generation is always ordinary conversation, so the same
+            # parser and canonical/display split applies. ProactiveMessageRecord
+            # stores only ``text``.
+            parsed = parse_speech_expressions(text)
+            text = parsed.text.strip()
+            display_text = parsed.display_text
         return {
-            "text": str(generated).strip(),
+            "text": text,
+            "display_text": display_text,
             "finish_reason": getattr(generated, "finish_reason", None),
             "model": getattr(self.response, "last_model", "") or "",
             "context": context,
@@ -2283,6 +2317,20 @@ class Orchestrator:
         first_token = False
         first_token_ms: Optional[float] = None
         layout = response_layout_for(event.text)
+        speech_active = (
+            self.speech_expression_enabled and layout == RESPONSE_LAYOUT_CHAT
+        )
+        parser = SpeechMarkupParser() if speech_active else None
+        # The parser can expose leading/trailing whitespace after a tag is
+        # removed (e.g. "[giggles] 你好" or "你好 [giggles]"). A structured-layout
+        # normalizer is exactly a streaming trimmer: it drops leading whitespace
+        # and holds trailing whitespace until real text arrives. It runs on the
+        # canonical channel only, so the display keeps every tag untouched.
+        canonical_trim = (
+            StreamingTextNormalizer(RESPONSE_LAYOUT_STRUCTURED)
+            if parser is not None
+            else None
+        )
         # Emit already-normalised deltas so the text a surface displays is the
         # same string the database stores. A trailing whitespace run is held
         # back until the next real character, which makes the concatenation of
@@ -2300,8 +2348,25 @@ class Orchestrator:
                     chunks.append(delta.content)
                     visible = normalizer.feed(delta.content)
                     if visible:
-                        emitted_chunks.append(visible)
-                        stream.delta(response_id, visible)
+                        if parser is not None:
+                            parsed = parser.feed(visible)
+                            emitted_text = canonical_trim.feed(parsed.text)
+                            if not emitted_text and not parsed.display_text:
+                                # The parser is still holding a possible tag;
+                                # nothing is confirmed yet, so emit no event.
+                                continue
+                            emitted_chunks.append(emitted_text)
+                            # Emit even when only a tag was confirmed: the
+                            # surface must see it, while ``delta`` stays
+                            # canonical (possibly empty).
+                            stream.delta(
+                                response_id,
+                                emitted_text,
+                                display_delta=parsed.display_text,
+                            )
+                        else:
+                            emitted_chunks.append(visible)
+                            stream.delta(response_id, visible)
                 if delta.finish_reason:
                     finish_reason = delta.finish_reason
                 if delta.usage_reported and delta.total_tokens is not None:
@@ -2311,7 +2376,13 @@ class Orchestrator:
                         "total_tokens": delta.total_tokens,
                     }
         except asyncio.CancelledError:
-            partial = "".join(chunks)
+            # Interrupted output is persisted canonically: tags never entered
+            # the text channel, and a still-buffered partial tag is dropped.
+            partial = (
+                normalize_response_text(parser.text, layout)
+                if parser is not None
+                else "".join(chunks)
+            )
             await self._persist_partial(
                 event=event,
                 analysis=analysis,
@@ -2323,7 +2394,11 @@ class Orchestrator:
             stream.cancelled(response_id, partial_text=partial or None)
             raise
         except Exception as exc:
-            partial = "".join(chunks)
+            partial = (
+                normalize_response_text(parser.text, layout)
+                if parser is not None
+                else "".join(chunks)
+            )
             await self._persist_partial(
                 event=event,
                 analysis=analysis,
@@ -2334,29 +2409,42 @@ class Orchestrator:
             )
             stream.failed(response_id, error=str(exc), partial_text=partial or None)
             raise
-        text = "".join(chunks).strip()
-        # Second-layer layout guarantee: for ordinary chat, collapse any stray
-        # paragraph breaks into one natural paragraph so the *persisted* text
-        # matches what the chat surface displays. This operates on the whole
-        # accumulated text (never per-delta) and never runs for structured
-        # requests (code / tutorials / formulas keep their layout verbatim).
-        text = normalize_response_text(text, layout)
+        if parser is not None:
+            tail = parser.finish()
+            tail_text = canonical_trim.feed(tail.text) + canonical_trim.finish()
+            if tail_text or tail.display_text:
+                emitted_chunks.append(tail_text)
+                stream.delta(
+                    response_id, tail_text, display_delta=tail.display_text
+                )
+            # Canonical: whitelist tags and an unfinished trailing tag are gone.
+            # Using the emitted chunks (rather than re-normalising) guarantees
+            # concat(canonical deltas) == completed.text exactly.
+            text = "".join(emitted_chunks)
+            display_text: Optional[str] = parser.display_text
+        else:
+            text = normalize_response_text("".join(chunks).strip(), layout)
+            display_text = None
         status = "TRUNCATED" if finish_reason == "length" else "COMPLETED"
-        # ``emitted_text`` is what the surface has actually displayed. Because
-        # the deltas were normalised incrementally it is exactly ``text`` (the
+        # ``emitted_text`` is the canonical text the surface has received as
+        # ``delta`` (with speech labels separated out when active). Because the
+        # deltas were normalised incrementally it is exactly ``text`` (the
         # trailing held-back whitespace is trimmed by both layouts), so the
         # caller can send only the remaining suffix — an appended confirmation
         # question — without re-printing the reply.
+        meta = {
+            "finish_reason": finish_reason,
+            "usage": usage,
+            "first_token_ms": first_token_ms,
+            "emitted_text": "".join(emitted_chunks),
+        }
+        if parser is not None:
+            meta["display_text"] = display_text
         return (
             text,
             status,
             response_id,
-            {
-                "finish_reason": finish_reason,
-                "usage": usage,
-                "first_token_ms": first_token_ms,
-                "emitted_text": "".join(emitted_chunks),
-            },
+            meta,
         )
 
     async def _persist_partial(

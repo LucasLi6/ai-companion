@@ -60,6 +60,7 @@ from companion.prompts.proactive import (
     PROACTIVE_MODE_BLOCK,
     PROACTIVE_MODE_BLOCK_LONG_IDLE,
 )
+from companion.prompts.speech_expression import SPEECH_EXPRESSION_PROMPT
 from companion.runtime_context.assembler import compile_runtime_context
 
 RESPONSE_PROMPT_VERSION = "response-v19"
@@ -1328,6 +1329,7 @@ def _system_parts(
     *,
     proactive: bool = False,
     proactive_mode: str = "IMMEDIATE",
+    speech_expression: bool = False,
 ) -> list[str]:
     """Trusted system content shared by normal and proactive generation."""
     multi_person = is_multi_person(context)
@@ -1347,11 +1349,19 @@ def _system_parts(
             else PROACTIVE_MODE_BLOCK
         )
         parts.append(block)
+    if speech_expression:
+        # An optional output protocol, never a second persona. The caller
+        # enables it only for ordinary conversational replies; structured output
+        # tasks get no label protocol at all.
+        parts.append(SPEECH_EXPRESSION_PROMPT)
     return parts
 
 
 def build_response_messages(
-    context: CognitiveContext, analysis: CognitiveResult
+    context: CognitiveContext,
+    analysis: CognitiveResult,
+    *,
+    speech_expression: bool = False,
 ) -> list[dict]:
     """Build the trusted system + untrusted data + native conversation request.
 
@@ -1362,7 +1372,9 @@ def build_response_messages(
     multi_person = is_multi_person(context)
     agent_name = _agent_display_name(context)
 
-    system_parts = _system_parts(context)
+    system_parts = _system_parts(
+        context, speech_expression=speech_expression
+    )
 
     messages: list[dict] = [
         {"role": "system", "content": "\n\n".join(system_parts)}
@@ -1397,6 +1409,7 @@ def build_proactive_response_messages(
     analysis: CognitiveResult,
     *,
     mode: str = "IMMEDIATE",
+    speech_expression: bool = False,
 ) -> list[dict]:
     """Build a proactive generation request with no new user message.
 
@@ -1416,7 +1429,12 @@ def build_proactive_response_messages(
         {
             "role": "system",
             "content": "\n\n".join(
-                _system_parts(context, proactive=True, proactive_mode=mode)
+                _system_parts(
+                    context,
+                    proactive=True,
+                    proactive_mode=mode,
+                    speech_expression=speech_expression,
+                )
             ),
         }
     ]

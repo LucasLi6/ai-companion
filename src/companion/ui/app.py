@@ -920,7 +920,12 @@ async def chat_page() -> None:
             if getattr(client, "_deleted", False):
                 return
             with client:
-                add_bubble(ava, event.text, mine=False)
+                text = (
+                    event.display_text
+                    if getattr(event, "display_text", None) is not None
+                    else event.text
+                )
+                add_bubble(ava, text, mine=False)
 
         async def on_proactive(event) -> None:
             if (
@@ -994,13 +999,21 @@ async def chat_page() -> None:
                     event
                 ):
                     if item.type == "response_delta":
-                        shown += item.delta or ""
+                        shown += (
+                            item.display_delta
+                            if item.display_delta is not None
+                            else (item.delta or "")
+                        )
                         live.text = shown
                         ui.update()
                     elif item.type == "response_completed":
                         finished = True
                         completed = item
-                        final = item.text if item.text is not None else shown
+                        final = (
+                            item.display_text
+                            if item.display_text is not None
+                            else (item.text if item.text is not None else shown)
+                        )
                         if final:
                             live.text = final
                             ui.update()

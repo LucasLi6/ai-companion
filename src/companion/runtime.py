@@ -150,6 +150,7 @@ def build_runtime(
     personality_generation_enabled: Optional[bool] = None,
     cognitive_repair_enabled: Optional[bool] = None,
     fast_path_enabled: Optional[bool] = None,
+    speech_expression_enabled: Optional[bool] = None,
     router_mode: Optional[str] = None,
     router_provider=None,
     tool_registry=None,
@@ -611,6 +612,16 @@ def build_runtime(
             )
         except ValueError:
             turn_analysis_delay_seconds = 60.0
+    # Optional voice-expression labels. Off unless explicitly enabled via the
+    # argument or AVA_SPEECH_EXPRESSION_ENABLED. The switch is not persisted in
+    # the database: disabling it restores the previous prompt and text paths
+    # exactly.
+    if speech_expression_enabled is None:
+        speech_expression_enabled = os.environ.get(
+            "AVA_SPEECH_EXPRESSION_ENABLED", "false"
+        ).strip().lower() in ("1", "true", "yes", "on")
+    if hasattr(response, "speech_expression_enabled"):
+        response.speech_expression_enabled = bool(speech_expression_enabled)
 
     # V0.9.9.6: explicit self-reports are detected and written locally in the
     # same turn. There is no confirmation question and no candidate queue, so
@@ -654,6 +665,7 @@ def build_runtime(
         task_service=task_service,
         profile_confirmation=confirmation_service,
         turn_analysis_delay_seconds=float(turn_analysis_delay_seconds),
+        speech_expression_enabled=bool(speech_expression_enabled),
         logger=logger,
     )
 
