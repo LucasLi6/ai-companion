@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from companion.domain.models import utcnow
 
 from .snapshot import RuntimeSnapshot
-from .temporal import humanize_gap
+from .temporal import day_phase, humanize_gap, weekday_label
 
 MAX_RUNTIME_BLOCK_CHARS = 1200
 
@@ -116,9 +116,22 @@ def compile_runtime_context(
         detail = "，".join(
             part for part in (zone_name, source_label) if part
         )
-        lines.append(
-            f"time={_stamp(current)}" + (f"（{detail}）" if detail else "")
+        stamp = (
+            f"{current:%Y-%m-%d %H:%M} {weekday_label(current)}"
+            f"（{day_phase(current)}"
         )
+        if source == "utc" or zone is None:
+            # UTC is a storage fallback, not the person's local time. Say so
+            # instead of presenting server time as their daytime.
+            stamp += "；时区未确定，非用户当地时间"
+        elif source == "system_default":
+            # The host zone is a fallback; on a server it may not be the
+            # person's zone, so it is labelled rather than asserted as local.
+            host = f"{zone_name}，" if zone_name else ""
+            stamp += f"；{host}系统时区，可能非用户当地时间"
+        elif detail:
+            stamp += f"；{detail}"
+        lines.append(f"time={stamp}）")
     elif zone_name or source:
         source_label = _SOURCE_LABEL.get(source)
         detail = "，".join(part for part in (zone_name, source_label) if part)
@@ -141,6 +154,10 @@ def compile_runtime_context(
         )
         suffix = f"（{gap}前）" if gap else ""
         lines.append(f"last_interaction={_stamp(last_interaction)}{suffix}")
+    if _value(snapshot, "previous_turn_departure", False):
+        # Only an explicit previous departure is reported; a long silence is
+        # not evidence that the person left.
+        lines.append("return=上次发言为明确离开，现在是再次出现")
     if mood:
         lines.append(f"mood={mood}")
 

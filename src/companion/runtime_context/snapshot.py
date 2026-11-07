@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import Any, Literal, Optional
 
 from companion.domain.models import DomainModel, utcnow
+from companion.proactive.departure import detect_explicit_departure
 
 from .connection import ConnectionInfo, resolve_client_ip
 from .geolocation import GeoLocation, GeoLocationService
@@ -77,6 +78,9 @@ class RuntimeSnapshot(DomainModel):
     last_meaningful_context_gap_seconds: Optional[int] = None
     reentry: bool = False
     reentry_state: Literal["NEW", "ACTIVE", "CONTINUING", "RETURNING"] = "NEW"
+    # V0.9.9.7: the person's previous turn was a structurally explicit
+    # departure, so this turn is a real return. Silence alone never sets it.
+    previous_turn_departure: bool = False
     ava_emotion: Optional[str] = None
     # V0.6.2: the input modality this turn actually arrived through, and
     # whether trusted acoustic features exist. Text input has no voice
@@ -175,6 +179,7 @@ class RuntimeSnapshotBuilder:
             ),
             reentry=temporal.reentry,
             reentry_state=temporal.reentry_state,
+            previous_turn_departure=temporal.previous_turn_departure,
             ava_emotion=emotion_state,
             location=location,
         )
@@ -227,6 +232,13 @@ class RuntimeSnapshotBuilder:
             before=event.occurred_at,
             exclude_event_id=None,
         )
+        # A return is evidence-backed: the *previous* turn must have been an
+        # explicit departure. A long gap, a quiet period or a WAIT does not
+        # establish that the person left.
+        previous_departure = bool(
+            last_heard is not None
+            and detect_explicit_departure(getattr(last_heard, "text", ""))
+        )
         # ``last_interaction`` means the last time the companion actually
         # replied. A run of WAIT/IGNORE is not an interaction, and mixing them
         # in made the "how long since we talked" fact wrong.
@@ -247,4 +259,5 @@ class RuntimeSnapshotBuilder:
             last_interaction_at=last_action[1] if last_action else None,
             last_meaningful_context_at=last_meaningful[1] if last_meaningful else None,
             reentry_gap_seconds=reentry_gap,
+            previous_turn_departure=previous_departure,
         )

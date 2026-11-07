@@ -31,6 +31,33 @@ REENTRY_ACTIVE = "ACTIVE"
 REENTRY_CONTINUING = "CONTINUING"
 REENTRY_RETURNING = "RETURNING"
 
+WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def weekday_label(moment: datetime) -> str:
+    """Chinese weekday for a local datetime; purely presentational."""
+    return WEEKDAY_LABELS[moment.weekday()]
+
+
+def day_phase(moment: datetime) -> str:
+    """Local daytime phase, computed from the trusted local hour.
+
+    The six labels are deliberately coarse: the model receives a fact about
+    the hour, never an instruction about how to greet someone.
+    """
+    hour = moment.hour
+    if hour < 5:
+        return "凌晨"
+    if hour < 11:
+        return "早晨"
+    if hour < 13:
+        return "中午"
+    if hour < 18:
+        return "下午"
+    if hour < 23:
+        return "晚上"
+    return "深夜"
+
 
 @dataclass(frozen=True)
 class TemporalSignals:
@@ -41,6 +68,9 @@ class TemporalSignals:
     last_interaction_gap_seconds: Optional[int] = None
     last_meaningful_context_gap_seconds: Optional[int] = None
     reentry_state: str = REENTRY_NEW
+    # True only when the person's previous turn was a structurally explicit
+    # departure. A gap alone never means the person left.
+    previous_turn_departure: bool = False
 
     @property
     def reentry(self) -> bool:
@@ -76,6 +106,7 @@ def build_temporal_signals(
     last_meaningful_context_at: Optional[datetime] = None,
     active_gap_seconds: int = DEFAULT_ACTIVE_GAP_SECONDS,
     reentry_gap_seconds: int = DEFAULT_REENTRY_GAP_SECONDS,
+    previous_turn_departure: bool = False,
 ) -> TemporalSignals:
     heard_gap = gap_seconds(now, last_heard_at)
     interaction_gap = gap_seconds(now, last_interaction_at)
@@ -92,6 +123,7 @@ def build_temporal_signals(
             active_gap_seconds=active_gap_seconds,
             reentry_gap_seconds=reentry_gap_seconds,
         ),
+        previous_turn_departure=bool(previous_turn_departure),
     )
 
 
