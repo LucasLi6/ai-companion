@@ -2131,9 +2131,15 @@ async def cmd_repl(args) -> int:
             with contextlib.suppress(Exception):
                 await confirmation.resume_pending()
         try:
+            # Created once for the session: prompt_toolkit owns the live input
+            # line, so a proactive message can be printed above it without any
+            # cross-thread buffer read or restoration.
+            repl_session = _build_prompt_session()
             while True:
                 try:
-                    line = (await _read_line_with_proactive(rt)).strip()
+                    line = (
+                        await _read_line_with_proactive(rt, repl_session)
+                    ).strip()
                 except (EOFError, KeyboardInterrupt):
                     print()
                     break
@@ -2229,79 +2235,135 @@ async def cmd_repl(args) -> int:
     return 0
 
 
-def _readline_buffer() -> str:
-    """Best-effort read of the text a user has typed but not submitted.
+def _build_prompt_session():
+    """Return an interactive prompt_toolkit session, or ``None`` off-TTY.
 
-    Used only to preserve the visible input line when a proactive message is
-    written while ``input()`` is blocked. Any failure degrades to an empty
-    buffer rather than affecting chat.
+    ``prompt_toolkit`` owns the input line for the whole read. That is what
+    makes a proactive message safe to print while the person is typing: the
+    editor buffer is never read or restored from another thread, and the
+    prompt is redrawn by the same component that owns it.
     """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
     try:
-        import readline
-
-        return readline.get_line_buffer() or ""
+        from prompt_toolkit import PromptSession
     except Exception:
-        return ""
+        return None
+    try:
+        return PromptSession()
+    except Exception:
+        return None
 
 
-def _write_proactive_line(text: str) -> None:
-    """Display one delivered proactive message without corrupting input.
-
-    On a TTY the current input line is cleared, the message is written, and
-    the prompt plus any partially typed text is restored. The message itself
-    uses the same ``assistant>`` surface as a normal reply.
-    """
-    is_tty = sys.stdout.isatty()
-    buffered = _readline_buffer() if is_tty else ""
-    if is_tty:
-        sys.stdout.write("\r\033[2K")
+def _print_proactive_line(text: str) -> None:
+    """Write one delivered proactive message on the normal assistant surface."""
     sys.stdout.write("assistant> " + text + "\n")
-    if is_tty:
-        sys.stdout.write("you> " + buffered)
     sys.stdout.flush()
 
 
-def _render_proactive_event(event) -> None:
-    if event.type == "response_completed" and (event.text or "").strip():
-        _write_proactive_line(event.text)
+async def _render_proactive_event(event, session=None) -> None:
+    if event.type != "response_completed" or not (event.text or "").strip():
+        return
+    text = event.text
+    app = getattr(session, "app", None) if session is not None else None
+    if app is not None and getattr(app, "is_running", False):
+        # Print inside prompt_toolkit's terminal, above the live input line.
+        # The buffer and cursor stay owned by the prompt session.
+        from prompt_toolkit.application import run_in_terminal
+
+        try:
+            await run_in_terminal(lambda: _print_proactive_line(text))
+            return
+        except Exception:
+            pass
+    _print_proactive_line(text)
 
 
-async def _read_line_with_proactive(rt) -> str:
-    """Read one line while allowing delivered proactive messages to appear.
-
-    Exactly one ``input()`` thread is started per prompt. The event loop races
-    that thread against the manager's response-event queue, so a proactive
-    reply can be displayed during the wait without spawning a second reader.
-    """
-    manager = getattr(rt, "proactive_manager", None)
+async def _read_line_with_prompt_session(manager, session) -> str:
+    """One async prompt; proactive messages are inserted above it."""
     if manager is None:
-        return await asyncio.to_thread(input, "you> ")
+        return await session.prompt_async("you> ")
 
-    loop = asyncio.get_running_loop()
-    input_future = loop.run_in_executor(None, input, "you> ")
-    while True:
-        if input_future.done():
-            # The user has submitted this turn. Anything still queued belongs
-            # to the previous turn and must not appear after their input; the
-            # caller invalidates the check before processing. Events that were
-            # already displayed below were shown while they were still waiting.
-            return input_future.result()
+    input_future = asyncio.ensure_future(session.prompt_async("you> "))
+    try:
+        while True:
+            if input_future.done():
+                return input_future.result()
 
-        event_future = asyncio.ensure_future(manager.next_event())
-        done, _pending = await asyncio.wait(
-            {input_future, event_future},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if event_future in done:
+            event_future = asyncio.ensure_future(manager.next_event())
+            done, _pending = await asyncio.wait(
+                {input_future, event_future},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if input_future.done():
+                # The submitted line wins every tie. Checking ``done`` rather
+                # than membership in ``done`` covers the case where both
+                # completed before the loop resumed: the proactive event is
+                # stale, and the caller is about to invalidate it.
+                event_future.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await event_future
+                return input_future.result()
+
             event = event_future.result()
             if event is not None:
-                _render_proactive_event(event)
-            continue
+                await _render_proactive_event(event, session)
+    finally:
+        if not input_future.done():
+            input_future.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await input_future
 
-        event_future.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await event_future
-        return input_future.result()
+
+async def _read_line_with_thread(manager) -> str:
+    """Fallback for non-TTY runs; never redraws a Readline buffer.
+
+    ``input()`` runs in one worker thread. A proactive message is printed as
+    plain output; the submitted text already belongs to that thread, so it is
+    never re-read or reprinted here.
+    """
+    loop = asyncio.get_running_loop()
+    input_future = loop.run_in_executor(None, input, "you> ")
+    try:
+        while True:
+            if input_future.done():
+                return input_future.result()
+
+            event_future = asyncio.ensure_future(manager.next_event())
+            done, _pending = await asyncio.wait(
+                {input_future, event_future},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if input_future.done():
+                event_future.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await event_future
+                return input_future.result()
+
+            event = event_future.result()
+            if event is not None:
+                await _render_proactive_event(event, None)
+    finally:
+        if not input_future.done():
+            input_future.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await input_future
+
+
+async def _read_line_with_proactive(rt, session=None) -> str:
+    """Read one line, showing delivered proactive replies without losing input.
+
+    Exactly one input owner exists per prompt: a prompt_toolkit session on a
+    TTY, or a single ``input()`` thread off-TTY. Proactive output is rendered
+    through that owner or as plain lines; the old Readline-buffer redraw is
+    gone, so an already submitted line can never be restored to the terminal.
+    """
+    manager = getattr(rt, "proactive_manager", None)
+    if session is not None:
+        return await _read_line_with_prompt_session(manager, session)
+    if manager is None:
+        return await asyncio.to_thread(input, "you> ")
+    return await _read_line_with_thread(manager)
 
 
 async def _run_streaming_turn(rt, event, *, debug: bool = False) -> dict:

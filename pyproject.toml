@@ -12,6 +12,10 @@ license = { text = "MIT" }
 dependencies = [
     "aiosqlite>=0.19",
     "pydantic>=2.5",
+    # The REPL input line is owned by prompt_toolkit on a TTY, so a proactive
+    # message can be printed above live input without touching a Readline
+    # buffer from another thread. Off-TTY runs fall back to plain input().
+    "prompt-toolkit>=3.0,<4",
 ]
 
 [project.optional-dependencies]
