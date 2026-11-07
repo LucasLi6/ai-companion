@@ -57,6 +57,7 @@ def response_layout_for(text: str) -> str:
 
 
 _WHITESPACE_RUN = re.compile(r"\s+")
+_WHITESPACE_PART = re.compile(r"(\s+)")
 
 
 def normalize_response_text(text: str, layout: str) -> str:
@@ -69,3 +70,70 @@ def normalize_response_text(text: str, layout: str) -> str:
     if layout == RESPONSE_LAYOUT_STRUCTURED:
         return (text or "").strip()
     return _WHITESPACE_RUN.sub(" ", (text or "")).strip()
+
+
+class StreamingTextNormalizer:
+    """Emit chunks whose concatenation equals :func:`normalize_response_text`.
+
+    Normalisation runs on the whole accumulated reply, but a stream surface
+    displays deltas as they arrive. If the surface shows raw chunks while the
+    database stores the normalised text, the two can diverge (for example a
+    ``\\n\\n`` that is later collapsed). This adapter holds back a trailing
+    whitespace run until the next real character, so every emitted chunk is
+    already in its final form:
+
+    - ``chat``: whitespace runs become one space between words; leading and
+      trailing whitespace is dropped (matching ``normalize_response_text``).
+    - ``structured``: internal whitespace and line breaks are preserved
+      verbatim; only leading/trailing whitespace is dropped.
+
+    A chunk that normalises to nothing returns ``""`` and is not emitted.
+    """
+
+    def __init__(self, layout: str) -> None:
+        self.layout = layout
+        self._started = False
+        self._pending = ""
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        if self.layout == RESPONSE_LAYOUT_STRUCTURED:
+            return self._feed_structured(chunk)
+        return self._feed_chat(chunk)
+
+    def _feed_chat(self, chunk: str) -> str:
+        out: list[str] = []
+        for part in _WHITESPACE_PART.split(chunk):
+            if not part:
+                continue
+            if part.isspace():
+                if self._started:
+                    self._pending = " "
+                continue
+            if self._pending:
+                out.append(self._pending)
+                self._pending = ""
+            out.append(part)
+            self._started = True
+        return "".join(out)
+
+    def _feed_structured(self, chunk: str) -> str:
+        out: list[str] = []
+        for part in _WHITESPACE_PART.split(chunk):
+            if not part:
+                continue
+            if part.isspace():
+                self._pending += part
+                continue
+            if self._started and self._pending:
+                out.append(self._pending)
+            self._pending = ""
+            out.append(part)
+            self._started = True
+        return "".join(out)
+
+    def finish(self) -> str:
+        """Trailing whitespace is trimmed by both layouts, so nothing remains."""
+        self._pending = ""
+        return ""

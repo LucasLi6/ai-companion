@@ -78,7 +78,11 @@ from companion.memory.requests import (
 )
 from companion.people.registry import PersonRegistry
 from companion.proactive.departure import detect_explicit_departure
-from companion.prompts.layout import normalize_response_text, response_layout_for
+from companion.prompts.layout import (
+    StreamingTextNormalizer,
+    normalize_response_text,
+    response_layout_for,
+)
 from companion.runtime_context.connection import ConnectionInfo
 from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
 from companion.storage.repositories import Repositories
@@ -2279,10 +2283,17 @@ class Orchestrator:
         """
         response_id = new_id("resp")
         chunks: list[str] = []
+        emitted_chunks: list[str] = []
         finish_reason: Optional[str] = None
         usage: Optional[dict] = None
         first_token = False
         first_token_ms: Optional[float] = None
+        layout = response_layout_for(event.text)
+        # Emit already-normalised deltas so the text a surface displays is the
+        # same string the database stores. A trailing whitespace run is held
+        # back until the next real character, which makes the concatenation of
+        # every emitted delta exactly ``normalize_response_text(raw, layout)``.
+        normalizer = StreamingTextNormalizer(layout)
         stream.started(response_id)
         try:
             async for delta in self.response.generate_stream(
@@ -2293,7 +2304,10 @@ class Orchestrator:
                         first_token = True
                         first_token_ms = (time.monotonic() - started_at) * 1000
                     chunks.append(delta.content)
-                    stream.delta(response_id, delta.content)
+                    visible = normalizer.feed(delta.content)
+                    if visible:
+                        emitted_chunks.append(visible)
+                        stream.delta(response_id, visible)
                 if delta.finish_reason:
                     finish_reason = delta.finish_reason
                 if delta.usage_reported and delta.total_tokens is not None:
@@ -2332,10 +2346,13 @@ class Orchestrator:
         # matches what the chat surface displays. This operates on the whole
         # accumulated text (never per-delta) and never runs for structured
         # requests (code / tutorials / formulas keep their layout verbatim).
-        text = normalize_response_text(
-            text, response_layout_for(event.text)
-        )
+        text = normalize_response_text(text, layout)
         status = "TRUNCATED" if finish_reason == "length" else "COMPLETED"
+        # ``emitted_text`` is what the surface has actually displayed. Because
+        # the deltas were normalised incrementally it is exactly ``text`` (the
+        # trailing held-back whitespace is trimmed by both layouts), so the
+        # caller can send only the remaining suffix — an appended confirmation
+        # question — without re-printing the reply.
         return (
             text,
             status,
@@ -2344,10 +2361,7 @@ class Orchestrator:
                 "finish_reason": finish_reason,
                 "usage": usage,
                 "first_token_ms": first_token_ms,
-                # Raw text already shown through deltas. The caller uses it to
-                # send only the final suffix (e.g. an appended confirmation
-                # question) rather than re-displaying the whole reply.
-                "emitted_text": "".join(chunks),
+                "emitted_text": "".join(emitted_chunks),
             },
         )
 

@@ -1,17 +1,26 @@
 """NiceGUI application for the Visual Memory Manager.
 
-Every page opens its own short-lived SQLite connection through
+Every management page opens its own short-lived SQLite connection through
 :func:`open_runtime`, performs its reads/writes through the ordinary
 repositories and :class:`~companion.memory.service.MemoryService`, and closes
 it again. This keeps the async connection bound to the request's own event
 loop (no cross-loop sharing) and means the UI obeys exactly the same
 visibility, subject-privacy and optimistic-locking rules as the CLI.
+
+``/chat`` is the one exception. Proactive speech has to keep running after the
+reply that triggered it has finished, so the chat surface uses a single
+server-lifetime runtime owned by :class:`~companion.ui.chat_coordinator.ChatCoordinator`
+instead of a request-scoped one. It is the same object graph the CLI builds —
+same orchestrator, persona, memory, proactive manager and judge — and the same
+``proactive_messages`` rows, so a message generated for the web is also visible
+to the CLI and survives a page reload.
 """
 
 from __future__ import annotations
 
 import time
 from contextlib import asynccontextmanager
+from datetime import timezone
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -30,6 +39,7 @@ from companion.domain.models import Consent, make_utterance_event, utcnow
 from companion.memory.models import AccessContext
 from companion.runtime import Runtime, build_runtime
 from companion.storage.database import Database
+from companion.ui.chat_coordinator import ChatCoordinator
 
 # The management UI acts as the trusted local admin, never as a person.
 ADMIN = AccessContext("admin", is_admin=True, role="ui")
@@ -42,6 +52,8 @@ _ROLES = [r.value for r in PersonRole]
 _DB_PATH: Path | None = None
 _PROVIDER = "mock"
 _DEEPSEEK_CLIENT = None
+_COORDINATOR: ChatCoordinator | None = None
+_RETIRED_COORDINATORS: list[ChatCoordinator] = []
 
 NAV = [
     ("/", "Dashboard"),
@@ -95,6 +107,44 @@ async def open_runtime() -> AsyncIterator[Runtime]:
         )
     finally:
         await db.close()
+
+
+def _chat_coordinator() -> ChatCoordinator:
+    """Return the server-lifetime chat runtime, creating it on first use."""
+    global _COORDINATOR
+    if _COORDINATOR is None:
+        _COORDINATOR = ChatCoordinator(
+            _db(),
+            provider=_PROVIDER,
+            deepseek_client_factory=_shared_deepseek_client,
+        )
+    return _COORDINATOR
+
+
+async def _start_chat_coordinator() -> None:
+    """Open the shared chat runtime before the first browser connects.
+
+    Startup only opens the database and starts the proactive dispatcher. It
+    never generates a proactive message: generation is still gated on a real
+    delivered reply and on an attached client.
+    """
+    await _chat_coordinator().start()
+
+
+async def _stop_chat_coordinator() -> None:
+    """Release every timer, task and connection owned by the chat surface."""
+    global _COORDINATOR
+    coordinators = []
+    if _COORDINATOR is not None:
+        coordinators.append(_COORDINATOR)
+        _COORDINATOR = None
+    coordinators.extend(_RETIRED_COORDINATORS)
+    _RETIRED_COORDINATORS.clear()
+    for coordinator in coordinators:
+        try:
+            await coordinator.close()
+        except Exception:  # shutdown must not raise into the server
+            pass
 
 
 class _Activity:
@@ -731,15 +781,98 @@ def _chat_speaker(people, consents: dict):
     return eligible[0] if eligible else None
 
 
+def _history_timestamp(value) -> float:
+    """Comparable timestamp for stored datetimes (naive rows are UTC)."""
+    if value is None:
+        return 0.0
+    if getattr(value, "tzinfo", None) is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
+async def load_chat_history(
+    rt: Runtime, conversation_id: str, *, limit: int = 20
+) -> list[dict]:
+    """Read history from both normal replies and proactive messages.
+
+    Normal replies live in ``agent_actions``; Ava-initiated messages live in
+    ``proactive_messages`` linked by ``source_event_id``. A page reload must
+    merge them in real chronological order, keeping the real message id so a
+    live event that history already rendered can be skipped.
+    """
+    events = await rt.repos.utterance.recent_context(
+        conversation_id, exclude_event_id=None, limit=limit
+    )
+    proactive = await rt.repos.proactive.list_for_conversation(
+        conversation_id, limit=max(limit * 3, limit)
+    )
+
+    entries: list[dict] = []
+    seen_ids: set[str] = set()
+    for event in events:
+        entries.append(
+            {
+                "kind": "user",
+                "message_id": event.event_id,
+                "text": event.text,
+                "order": 0,
+                "proactive": False,
+                "at": _history_timestamp(event.occurred_at),
+            }
+        )
+        seen_ids.add(event.event_id)
+        action = await rt.repos.analysis.get_action(event.event_id)
+        if (
+            action is not None
+            and action.action_type == CognitiveAction.RESPOND
+            and action.response_text
+        ):
+            entries.append(
+                {
+                    "kind": "ava",
+                    "message_id": action.action_id,
+                    "text": action.response_text,
+                    "order": 1,
+                    "proactive": False,
+                    "at": _history_timestamp(action.created_at),
+                }
+            )
+            seen_ids.add(action.action_id)
+    # Proactive rows are read independently of the utterance window: a message
+    # may have been generated from a turn that is no longer among the last
+    # ``limit`` utterances. Their real ``created_at`` puts them back in place.
+    for message in proactive:
+        if message.status != "COMPLETED" or not (message.text or "").strip():
+            continue
+        if message.message_id in seen_ids:
+            continue
+        entries.append(
+            {
+                "kind": "ava",
+                "message_id": message.message_id,
+                "text": message.text,
+                "order": 2,
+                "proactive": True,
+                "at": _history_timestamp(message.created_at),
+            }
+        )
+    entries.sort(key=lambda entry: (entry["at"], entry["order"]))
+    return entries
+
+
 @ui.page("/chat")
 async def chat_page() -> None:
-    async with open_runtime() as rt:
-        people = await rt.registry.list()
-        consents = {
-            person.person_id: await rt.registry.get_consent(person.person_id)
-            for person in people
-        }
-        agent = await rt.agent_service.show()
+    # The chat surface is the one page that must outlive a single request:
+    # the proactive cycles it starts still run while no reply is streaming.
+    coordinator = _chat_coordinator()
+    rt = await coordinator.start()
+
+    people = await rt.registry.list()
+    consents = {
+        person.person_id: await rt.registry.get_consent(person.person_id)
+        for person in people
+    }
+    agent = await rt.agent_service.show()
     ava = _ava_name(agent)
     speaker = _chat_speaker(people, consents)
 
@@ -773,23 +906,52 @@ async def chat_page() -> None:
         with ui.row().classes("w-full justify-end"):
             send = ui.button("发送", icon="send")
 
+        # -- live proactive delivery ------------------------------------
+        # One subscription per browser tab. The coordinator fans a delivered
+        # message out to every tab; none of them consumes the manager's queue
+        # directly, so a second tab cannot steal the message from the first.
+        client = ui.context.client
+        history_proactive_ids: set[str] = set()
+        live_seen: set[str] = set()
+        pending_live: list = []
+        history_ready = False
+
+        def render_proactive(event) -> None:
+            if getattr(client, "_deleted", False):
+                return
+            with client:
+                add_bubble(ava, event.text, mine=False)
+
+        async def on_proactive(event) -> None:
+            if (
+                event.response_id in history_proactive_ids
+                or event.response_id in live_seen
+            ):
+                return
+            live_seen.add(event.response_id)
+            if not history_ready:
+                # A message committed while history was loading is replayed
+                # after it, unless history already contains the same id.
+                pending_live.append(event)
+                return
+            render_proactive(event)
+
+        async def on_disconnect() -> None:
+            await coordinator.unsubscribe(conversation_id, client.id)
+
+        client.on_disconnect(on_disconnect)
+        await coordinator.subscribe(conversation_id, client.id, on_proactive)
+
         async def load_history() -> None:
-            async with open_runtime() as rt:
-                events = await rt.repos.utterance.recent_context(
-                    conversation_id, exclude_event_id=None, limit=20
+            entries = await load_chat_history(rt, conversation_id)
+            for entry in entries:
+                add_bubble(
+                    speaker.display_name if entry["kind"] == "user" else ava,
+                    entry["text"],
+                    mine=entry["kind"] == "user",
                 )
-                rows = [
-                    (event, await rt.repos.analysis.get_action(event.event_id))
-                    for event in events
-                ]
-            for event, action in rows:
-                add_bubble(speaker.display_name, event.text, mine=True)
-                if (
-                    action is not None
-                    and action.action_type == CognitiveAction.RESPOND
-                    and action.response_text
-                ):
-                    add_bubble(ava, action.response_text, mine=False)
+                if entry["proactive"]:
+                    history_proactive_ids.add(entry["message_id"])
 
         async def do_send() -> None:
             value = (box.value or "").strip()
@@ -799,9 +961,9 @@ async def chat_page() -> None:
             add_bubble(speaker.display_name, value, mine=True)
 
             # A live reply bubble, filled from the same ResponseEvent stream
-            # the CLI consumes. The completed event carries the normalised,
-            # persisted text, so what the screen shows and what history stores
-            # are the same string.
+            # the CLI consumes. Emitted deltas are already normalised, and the
+            # completed event carries exactly the persisted text, so what the
+            # screen shows and what history stores are the same string.
             with body:
                 with ui.column().classes("w-full items-start") as reply_row:
                     with ui.card().classes("max-w-[85%] bg-grey-2 shadow-none"):
@@ -812,42 +974,48 @@ async def chat_page() -> None:
 
             shown = ""
             finished = False
+            delivered = False
+            completed = None
+            event = make_utterance_event(
+                conversation_id=conversation_id,
+                text=value,
+                addressee_hint="agent",
+                speaker_person_id=speaker.person_id,
+                source=EventSource.TEXT,
+            )
             _ACTIVITY.begin(
                 conversation_id=conversation_id, person_id=speaker.person_id
             )
             try:
-                async with open_runtime() as rt:
-                    event = make_utterance_event(
-                        conversation_id=conversation_id,
-                        text=value,
-                        addressee_hint="agent",
-                        speaker_person_id=speaker.person_id,
-                        source=EventSource.TEXT,
-                    )
-                    async for item in rt.orchestrator.process_utterance_stream(
-                        event
-                    ):
-                        if item.type == "response_delta":
-                            shown += item.delta or ""
-                            live.text = shown
+                # Before this turn begins: any pending IMMEDIATE/LONG_IDLE
+                # work from the previous turn is stale and must be cancelled.
+                coordinator.note_user_input(conversation_id, event.event_id)
+                async for item in rt.orchestrator.process_utterance_stream(
+                    event
+                ):
+                    if item.type == "response_delta":
+                        shown += item.delta or ""
+                        live.text = shown
+                        ui.update()
+                    elif item.type == "response_completed":
+                        finished = True
+                        completed = item
+                        final = item.text if item.text is not None else shown
+                        if final:
+                            live.text = final
                             ui.update()
-                        elif item.type == "response_completed":
-                            finished = True
-                            final = item.text if item.text is not None else shown
-                            if final:
-                                live.text = final
-                                ui.update()
-                            else:
-                                reply_row.delete()
-                        elif item.type == "response_failed":
-                            finished = True
+                            delivered = bool(final.strip())
+                        else:
+                            reply_row.delete()
+                    elif item.type == "response_failed":
+                        finished = True
+                        live.text = "（这次没有回应，请稍后重试）"
+                        ui.update()
+                    elif item.type == "response_cancelled":
+                        finished = True
+                        if not shown:
                             live.text = "（这次没有回应，请稍后重试）"
                             ui.update()
-                        elif item.type == "response_cancelled":
-                            finished = True
-                            if not shown:
-                                live.text = "（这次没有回应，请稍后重试）"
-                                ui.update()
             except Exception:  # provider/transport failure: neutral, no internals
                 if not finished:
                     live.text = "（这次没有回应，请稍后重试）"
@@ -860,9 +1028,30 @@ async def chat_page() -> None:
                 # WAIT/IGNORE leaves no reply: silence is a valid response and
                 # no internal action label is ever shown on the chat surface.
                 reply_row.delete()
+                return
+
+            if (
+                delivered
+                and completed is not None
+                and completed.status == "COMPLETED"
+                and completed.action == "RESPOND"
+            ):
+                # Only a real user turn that produced a complete, delivered
+                # normal reply starts a proactive cycle. WAIT/IGNORE, failed,
+                # cancelled and truncated output never do.
+                coordinator.on_normal_response_delivered(
+                    conversation_id=conversation_id,
+                    person_id=speaker.person_id,
+                    source_event_id=event.event_id,
+                )
 
         send.on_click(do_send)
         await load_history()
+        history_ready = True
+        for event in pending_live:
+            if event.response_id not in history_proactive_ids:
+                render_proactive(event)
+        pending_live.clear()
 
 
 @ui.page("/monitor")
@@ -931,9 +1120,28 @@ def create_app(db_path: Path, *, provider: str = "mock"):
     Returns the NiceGUI :class:`~nicegui.app.App` so callers (and tests) can
     inspect the registered routes before the server starts.
     """
-    global _DB_PATH, _PROVIDER
-    _DB_PATH = Path(db_path)
-    _PROVIDER = (provider or "mock").lower()
+    global _DB_PATH, _PROVIDER, _COORDINATOR
+    new_db_path = Path(db_path)
+    new_provider = (provider or "mock").lower()
+    if _DB_PATH != new_db_path or _PROVIDER != new_provider:
+        # A different database/provider means the previously built shared
+        # runtime no longer describes this app. Retire it so shutdown still
+        # closes its connection and timers.
+        if _COORDINATOR is not None:
+            _RETIRED_COORDINATORS.append(_COORDINATOR)
+            _COORDINATOR = None
+    _DB_PATH = new_db_path
+    _PROVIDER = new_provider
+
+    # Register once per application instance. NiceGUI's test reset clears the
+    # handler lists, so membership (not a module flag) is what makes this
+    # idempotent across create_app calls.
+    startup_handlers = getattr(app, "_startup_handlers", [])
+    if _start_chat_coordinator not in startup_handlers:
+        app.on_startup(_start_chat_coordinator)
+    shutdown_handlers = getattr(app, "_shutdown_handlers", [])
+    if _stop_chat_coordinator not in shutdown_handlers:
+        app.on_shutdown(_stop_chat_coordinator)
 
     ui.page("/")(dashboard)
     ui.page("/chat")(chat_page)

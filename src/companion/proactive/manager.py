@@ -27,7 +27,7 @@ import contextlib
 import logging
 import secrets
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from companion.core.response_events import ResponseEvent, ResponseEventSink
 from companion.domain.models import new_id, utcnow
@@ -74,6 +74,7 @@ class ProactiveManager:
         orchestrator,
         judge: ProactiveJudge,
         idle_delay_seconds: Optional[float] = None,
+        delivery_available: Optional[Callable[[str], bool]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repos = repos
@@ -84,6 +85,11 @@ class ProactiveManager:
         # ``None`` means the real 120-240 s random wait. An explicit value is
         # only for tests/embedding; production never selects a fixed delay.
         self.idle_delay_seconds = idle_delay_seconds
+        # Optional surface hook (used by the web chat coordinator): when it
+        # returns False, no message may be generated or delivered because no
+        # client could receive it. The CLI leaves it unset, so its behaviour
+        # is unchanged.
+        self.delivery_available = delivery_available
         self.logger = logger or logging.getLogger("companion.proactive")
 
         self._states: dict[str, _ConversationState] = {}
@@ -138,9 +144,28 @@ class ProactiveManager:
         state.latest_user_event_id = source_event_id
         self._cancel_task(state.task)
         state.task = None
-        # Any event still queued belongs to the previous turn and must not be
-        # shown after the user has started a new one.
-        self._discard_pending_events()
+        # Any event still queued for *this* conversation belongs to the
+        # previous turn and must not be shown after the user has started a new
+        # one. Events for other conversations (other web tabs, other people)
+        # stay queued and remain deliverable.
+        self._discard_pending_events(conversation_id)
+
+    def cancel_cycle(self, conversation_id: str) -> None:
+        """Invalidate a conversation's pending/running cycle without a new turn.
+
+        Used when the last web subscriber for that conversation goes away: the
+        cycle has nowhere to deliver, so its timers and judge work are
+        pointless. Other conversations are unaffected.
+        """
+        if self._closed:
+            return
+        state = self._states.get(conversation_id)
+        if state is None:
+            return
+        state.generation += 1
+        self._cancel_task(state.task)
+        state.task = None
+        self._discard_pending_events(conversation_id)
 
     async def shutdown(self) -> None:
         """Cancel every background cycle; no timer is persisted across restart."""
@@ -179,16 +204,31 @@ class ProactiveManager:
         if not self._closed:
             self._events.put_nowait(event)
 
-    def _discard_pending_events(self) -> None:
+    def _discard_pending_events(self, conversation_id: Optional[str] = None) -> None:
+        """Drop queued proactive events, optionally only for one conversation.
+
+        The manager is shared by every conversation in a process when the web
+        UI owns it, so invalidating conversation A must never remove an
+        already-delivered message waiting to be shown in conversation B.
+        """
+        kept: list[ResponseEvent] = []
+        sentinel = False
         while True:
             try:
                 item = self._events.get_nowait()
             except asyncio.QueueEmpty:
-                return
+                break
             if item is None:
-                # Preserve the shutdown sentinel for a waiting consumer.
-                self._events.put_nowait(None)
-                return
+                sentinel = True
+                continue
+            if conversation_id is None or item.conversation_id == conversation_id:
+                continue
+            kept.append(item)
+        for item in kept:
+            self._events.put_nowait(item)
+        if sentinel:
+            # Preserve the shutdown sentinel for a waiting consumer.
+            self._events.put_nowait(None)
 
     # -- the cycle ---------------------------------------------------------
 
@@ -405,6 +445,15 @@ class ProactiveManager:
             return False
         if cycle.source_event_id != state.latest_user_event_id:
             return False
+        if self.delivery_available is not None:
+            # No attached surface means the message would be generated and
+            # saved with nowhere to go. Stop before the judge, before the
+            # Speaker call and again before/after persistence.
+            try:
+                if not self.delivery_available(cycle.conversation_id):
+                    return False
+            except Exception:
+                return False
         conversation = await self.repos.conversation.get(cycle.conversation_id)
         if conversation is None or conversation.quiet_mode:
             return False
