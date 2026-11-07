@@ -957,6 +957,23 @@ class Orchestrator:
                         event, route, consent, routing_view
                     )
                     memory_outcomes = memory_operation.outcomes
+                    if not memory_outcomes:
+                        # A routed SAVE with zero extracted candidates, DENIED
+                        # permission or failed write is a real operation result.
+                        # Pass it to Speaker; otherwise it may infer a false
+                        # lack of write capability from the read-only tool list.
+                        memory_outcomes = [{
+                            "outcome": (
+                                "EXPLICIT_NO_MEMORY"
+                                if memory_operation.status == "NO_MEMORY"
+                                else memory_operation.status
+                            ),
+                            "detail": memory_operation.error_code or (
+                                "no_supported_fact_extracted"
+                                if memory_operation.status == "NO_MEMORY"
+                                else ""
+                            ),
+                        }]
                     steps.append(
                         "[MEMORY_WRITE] "
                         f"intent={memory_operation.intent} "

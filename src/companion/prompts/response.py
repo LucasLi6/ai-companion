@@ -203,7 +203,14 @@ def _outcome_line(outcome: dict) -> str:
         "DENIED": "未保存（无权限）",
         "FAILED": "保存失败",
         "NO_MEMORY": "无需保存",
+        "EXPLICIT_NO_MEMORY": "这次未保存（未找到可确认的事实，请说明要保存的内容）",
     }
+    # SAVED can represent a CANDIDATE row, not an ACTIVE searchable memory.
+    if label == "SAVED":
+        if "status=CANDIDATE" in detail or "status=NEEDS_REVIEW" in detail:
+            return "- 已记录为待确认候选，尚未成为可检索的长期记忆"
+        if "status=ACTIVE" in detail:
+            return "- 已写入可检索的长期记忆"
     text = mapping.get(label, label)
     return f"- {text}" + (f"（{detail}）" if detail and label != "SAVED" else "")
 
@@ -435,6 +442,14 @@ def _trusted_turn_lines(
                 "如果历史对话里出现过“无法联网”“工具没接通”“查不到”的旧说法，"
                 "那是过去几轮的状态；不得在本轮重复这类与实际结果不符的话。"
             )
+
+    # Read-only memory tools do not describe the trusted write service.
+    lines.append(
+        "【记忆权限说明】本轮 Router 工具可能只有只读检索；这不表示 Ava "
+        "没有记忆写入能力。不得由工具列表推断写入权限；只有本轮可信"
+        "【记忆写入结果】明确成功时，才可声称已经保存。若没有写入结果，"
+        "不得声称已经保存或无权保存。"
+    )
 
     if context.memory_retrieval_status == "empty":
         lines.append(
