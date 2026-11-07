@@ -61,7 +61,10 @@ from companion.people.profile_service import (
     ProfileUnauthorized,
     TRUSTED_CONFIRMATION,
 )
-from companion.jobs.profile_review import ProfileReviewScheduler
+from companion.jobs.profile_review import (
+    ProfileReviewScheduler,
+    repair_skipped_reviews,
+)
 from companion.memory.models import (
     AccessContext,
     MemoryNotFoundError,
@@ -245,6 +248,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pp_reject.add_argument("candidate_id")
     pp_reject.set_defaults(func=cmd_profile_reject)
+    pp_repair = p_profile_sub.add_parser(
+        "repair-reviews", parents=[_common_parser()],
+        help=(
+            "Requeue reviews skipped because the profile row was missing"
+            " (dry-run by default)"
+        ),
+    )
+    pp_repair.add_argument("--person", required=True)
+    pp_repair_mode = pp_repair.add_mutually_exclusive_group()
+    pp_repair_mode.add_argument(
+        "--dry-run", dest="apply", action="store_false",
+        help="Report what would be repaired without writing (default)",
+    )
+    pp_repair_mode.add_argument(
+        "--apply", dest="apply", action="store_true",
+        help="Initialise the profile and requeue matching reviews",
+    )
+    pp_repair.set_defaults(apply=False)
+    pp_repair.add_argument(
+        "--limit", type=int, default=30,
+        help="Maximum reviews to repair in this run (default: 30)",
+    )
+    pp_repair.set_defaults(func=cmd_profile_repair_reviews)
 
     p_say = sub.add_parser("say", parents=[_common_parser()], help="Submit one utterance")
     p_say.add_argument("--person", required=True, help="Registered person id of the speaker")
@@ -968,6 +994,47 @@ async def cmd_profile_review(args) -> int:
                 f" before={change.get('before')!r}"
                 f" after={change.get('after')!r}"
             )
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_profile_repair_reviews(args) -> int:
+    """Repair legacy SKIPPED reviews for one person.
+
+    Default mode is a read-only dry run. ``--apply`` initialises the profile
+    when it is legally missing and requeues the matching reviews through the
+    normal scheduler; the background worker then runs them.
+    """
+    db = await _connect(args.db)
+    try:
+        rt = build_runtime(db)
+        summary = await repair_skipped_reviews(
+            rt.repos,
+            person_id=args.person,
+            dry_run=not args.apply,
+            limit=args.limit,
+        )
+        print(
+            "mode={mode} person={person} scanned={scanned} matched={matched}"
+            " would_retry={would} retried={retried} skipped={skipped}".format(
+                mode="apply" if args.apply else "dry-run",
+                person=args.person,
+                scanned=summary["scanned"],
+                matched=summary["matched"],
+                would=len(summary["would_retry"]),
+                retried=len(summary["retried"]),
+                skipped=len(summary["skipped"]),
+            )
+        )
+        for item in summary["would_retry"]:
+            print(f"  would retry {item['review_id']} event={item['event_id']}")
+        for item in summary["retried"]:
+            print(f"  retried {item['review_id']} event={item['event_id']}")
+        for item in summary["skipped"]:
+            print(f"  skip {item['review_id'] or '-'} reason={item['reason']}")
+        if args.apply and summary["retried"]:
+            print("requeued; the background worker will process these reviews")
     finally:
         await db.close()
     return 0
@@ -3394,3 +3461,7 @@ async def cmd_emotion_simulate(args) -> int:
     finally:
         await db.close()
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

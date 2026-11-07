@@ -9,65 +9,80 @@ from __future__ import annotations
 
 import json
 
-PROFILE_REFINEMENT_PROMPT_VERSION = "profile-refinement-v2"
+PROFILE_REFINEMENT_PROMPT_VERSION = "profile-refinement-v3"
 
 _PROMPT_HEAD = """你是 Ava 的 Personal Profile Refinement 模块。
 
-你的职责不是收集对话中的所有个人信息，
-而是结合一个人的现有完整 Profile 与新对话，
-判断 Ava 对这个人的理解是否有必要改变。
+你的工作方式是一个主动的字段填充者，而不是保守的审核者。
+结合这个人的现有完整 Profile 与新对话，
+只要出现了可靠地归属于本人的个人信息，
+并且它适合 allowed_field_keys 中的某个字段，
+就应该提出变更，让 Profile 更完整、更准确。
 
-工作顺序必须是：
+供你判断的是“这条信息是否可靠地属于本人、是否适合某个字段”，
+不是“它是否重要、是否值得长期记住、是否配得上改变理解”。
+不存在重要性门槛，也不要求 Profile 保持精简。
+不要因为信息看起来日常、普通、暂时或篇幅短就拒绝记录。
 
-第一，阅读并理解现有 Profile。
-理解其中已有的事实、兴趣、性格倾向、项目、
-行为模式、交流偏好，以及各项信息之间的关系。
+工作顺序：
 
-第二，阅读新对话及必要上下文。
-判断新内容是否真正提供了关于这个人的信息。
-区分自述、假设、玩笑、引用、第三方信息、
-临时状态、明确纠正和稳定个人特点。
+第一，阅读现有 Profile。
+关注已有条目、字段、待确认候选及其之间的关系。
 
-第三，比较新旧理解。
-如果现有 Profile 已经足够准确，
-或者新内容没有实质意义，返回 NO_CHANGE。
+第二，逐条检查新对话中的个人信息。
+明确区分：
+- 本人自述（“我喜欢…”“我在做…”“我最近在学…”）；
+- 假设、玩笑、引用、转述、第三方信息；
+- 一次性临时状态，与当前持续状态；
+- 对旧信息的明确纠正。
 
-第四，只有当新证据使人物理解值得改变时，
-才提出最小必要修改。
+第三，把可靠的本人的信息映射到字段。
+至少考虑：
+- 长期属性：性格倾向、价值观、背景、技能、语言、交流偏好；
+- 当前状态：正在进行的项目、短期目标、暂停或完成的项目；
+- 共同上下文：双方共同经历、约定、反复出现的话题和互动模式，
+  写入 interaction.shared_context 时，如有明确时间就带上日期。
+
+第四，比较新旧内容：
+- 已有条目表达同一件事：不要重复 ADD；
+  有新增细节用 UPDATE 或 REFINE，明确纠正用 CORRECT；
+- 同一个人物/项目/实体：优先更新原条目，而不是新建；
+- 不同实体（例如机器狗项目与奶茶机项目）不得合并；
+- 无法确定是否同一件事时，保留原条目，不要做破坏性合并。
 
 可提出：
 ADD、UPDATE、CORRECT、MERGE、REFINE、ARCHIVE。
 
 ADD：增加新的独立信息。
-UPDATE：更新旧信息的状态或内容。
-CORRECT：根据可靠纠正修正错误。
+UPDATE：更新旧信息的状态或内容（例如项目从进行中变为暂停/完成）。
+CORRECT：根据本人的明确纠正修正错误。
 MERGE：将真正重复或高度重叠的描述整合。
-REFINE：在不改变事实的前提下使表达更准确、简洁。
-ARCHIVE：标记已经过时或不再适用的内容。
+REFINE：在不改变事实的前提下使表达更准确、完整。
+ARCHIVE：标记本人明确表示已过时或不再适用的内容。
 
-不得为了显示自己完成工作而强行修改。
-不得把整份 Profile 每轮改写一遍。
+只有以下情况才返回 NO_CHANGE：
+1. 新对话中没有任何可归类的个人信息；
+2. 只有一般知识、常识或与本人无关的话题；
+3. 信息已与现有条目完全重复；
+4. 信息是假设、玩笑、引用或第三方转述，不能归为本人事实；
+5. 找不到合适的 allowed_field_keys 字段；
+6. 与现有信息冲突且无法判断哪一方可信。
 
-人物理解应该随着交流逐渐深入，而不是不断膨胀。
+除以上情况外，不要返回 NO_CHANGE。
 
-例如：
-现有信息是“喜欢电子工程，正在开发 Ava”。
-新对话深入讨论 Ava 的长期记忆设计。
-你应该判断是否值得深化对现有项目的描述，
-而不是机械新增一个“喜欢长期记忆”的兴趣。
-
-例如：
-现有信息是“技术决策理性”。
-新对话表现出一次情绪化反应。
-不能因此直接改为“性格冲动”。
-单次表现不一定代表稳定特征。
-
-例如：
-现有信息描述了 STM32、RTOS、机器人控制。
-可以适度精简重复内容，
-但不能把具体能力全部压缩成“喜欢科技”。
-
-必须保留有意义的区别、事实、时间和来源。
+内容要求：
+- proposed_content 必须忠于本人原话表达的事实，
+  可以整理成简洁陈述，但不得添加原话没有的信息，
+  不得把推断写成事实，不得改变程度、时间和对象。
+- 关于性格、长期习惯、心理状态的描述属于推断：
+  只有本人明确自述时才能作为事实提出；
+  仅从单次行为推测时，你仍可提出，但必须设置
+  requires_confirmation=true，并降低 confidence。
+- confidence 只是元数据，供本地程序参考和排序，
+  它不是自动写入的门槛。
+- 证据必须来自 this person 的真实发言：
+  evidence_event_ids 只能取自 new_evidence.allowed_event_ids，
+  evidence_quotes 必须是这些发言中的原文片段。
 
 已确认身份字段不得由你直接修改。
 你只能提出待本人确认的变更。
@@ -78,9 +93,7 @@ ARCHIVE：标记已经过时或不再适用的内容。
 不得虚构人物信息。
 不得自行生成证据 ID。
 不得将模型旧推断当作新的独立证据。
-不得因为新信息与旧信息略有不同就假定旧信息错误。
-
-如果没有必要修改，返回 NO_CHANGE。"""
+不得因为新信息与旧信息略有不同就假定旧信息错误。"""
 
 # Two real, parseable JSON examples. They are built with json.dumps so the
 # prompt can never drift from valid JSON again.
@@ -97,19 +110,52 @@ PROFILE_NO_CHANGE_EXAMPLE = json.dumps(
 PROFILE_PROPOSE_CHANGES_EXAMPLE = json.dumps(
     {
         "decision": "PROPOSE_CHANGES",
-        "reason": "本人明确说明了一个正在进行中的项目",
+        "reason": "本人自述了项目、正在学习的内容、兴趣和回答风格偏好",
         "changes": [
             {
                 "operation": "ADD",
                 "field_key": "projects.active",
                 "target_entry_ids": [],
-                "proposed_content": "正在开发一个以 STM32 为主控的机器狗项目",
+                "proposed_content": "正在做一个机器人项目",
                 "evidence_event_ids": ["evt_example_allowed_event_id"],
-                "evidence_quotes": ["我最近在做一个机器狗项目，用 STM32 做主控。"],
-                "reason": "本人明确自述当前项目，属于稳定信息",
+                "evidence_quotes": ["我最近在学葡萄牙语，也在做一个机器人项目。"],
+                "reason": "本人明确自述当前项目",
                 "confidence": 0.9,
                 "requires_confirmation": False,
-            }
+            },
+            {
+                "operation": "ADD",
+                "field_key": "knowledge.skills",
+                "target_entry_ids": [],
+                "proposed_content": "正在学习葡萄牙语",
+                "evidence_event_ids": ["evt_example_allowed_event_id"],
+                "evidence_quotes": ["我最近在学葡萄牙语，也在做一个机器人项目。"],
+                "reason": "本人明确自述正在学习的技能",
+                "confidence": 0.9,
+                "requires_confirmation": False,
+            },
+            {
+                "operation": "ADD",
+                "field_key": "interests.likes",
+                "target_entry_ids": [],
+                "proposed_content": "喜欢爵士乐",
+                "evidence_event_ids": ["evt_example_allowed_event_id"],
+                "evidence_quotes": ["我喜欢爵士乐，不太喜欢太正式的回答。"],
+                "reason": "本人明确自述兴趣",
+                "confidence": 0.9,
+                "requires_confirmation": False,
+            },
+            {
+                "operation": "ADD",
+                "field_key": "communication.preferred_tone",
+                "target_entry_ids": [],
+                "proposed_content": "偏好不太正式的回答",
+                "evidence_event_ids": ["evt_example_allowed_event_id"],
+                "evidence_quotes": ["我喜欢爵士乐，不太喜欢太正式的回答。"],
+                "reason": "本人明确说明交流风格偏好",
+                "confidence": 0.9,
+                "requires_confirmation": False,
+            },
         ],
     },
     ensure_ascii=False,

@@ -29,13 +29,13 @@ from companion.people.profile_models import (
     ENTRY_FIELD_KEYS,
     ProfileFieldSpec,
     ProfileFieldStorage,
+    ProfileSource,
     profile_field_spec,
 )
 
-MAX_CHANGES_PER_REVIEW = 5
+MAX_CHANGES_PER_REVIEW = 10
 MAX_ENTRY_CHARS = 1200
 MAX_QUOTE_CHARS = 500
-DEFAULT_AUTO_APPLY_CONFIDENCE = 0.7
 DEFAULT_RECENT_TURNS = 8
 DEFAULT_RECENT_CHARS = 2000
 MAX_SNAPSHOT_PENDING = 20
@@ -466,6 +466,79 @@ _SENSITIVE = re.compile(
     r"住址|家庭地址|身份证|护照号)"
 )
 
+# A single observed behaviour is not a stable trait. These fields may still be
+# filled from a direct self-description, but a model inference without a
+# verbatim user quote stays pending instead of being written as fact.
+INFERENCE_ONLY_FIELDS = frozenset(
+    {
+        "personality.traits",
+        "personality.behavior_patterns",
+        "personality.thinking_style",
+        "personality.decision_style",
+        "habits.stable_habits",
+        "habits.working_preferences",
+    }
+)
+
+_ENTRY_PREFIX = re.compile(
+    r"^(?:用户|本人|我|目前|最近|现在|正在|一直|平时|主要|"
+    r"喜欢|不喜欢|不太喜欢|爱好|兴趣|擅长|开始|"
+    r"在做|在学|在|做|学|研究)+"
+)
+_ENTRY_PUNCT = re.compile(r"[\s，。！？、,.!?;；:：·\-—~～\"'“”‘’()（）\[\]【】]+")
+
+
+def _entry_core(text: Any) -> str:
+    """Content with leading subject/filler words removed, for de-duplication."""
+    value = _ENTRY_PUNCT.sub("", _normalise_text(text).casefold())
+    previous = None
+    while value and value != previous:
+        previous = value
+        value = _ENTRY_PREFIX.sub("", value, count=1)
+    return value
+
+
+def _entry_terms(core: str) -> set[str]:
+    terms = set(re.findall(r"[a-z0-9_+\-]{2,}", core))
+    for run in re.findall(r"[一-鿿]{2,}", core):
+        terms.update(run[index : index + 2] for index in range(len(run) - 1))
+    return {term for term in terms if len(term) >= 2}
+
+
+def entries_equivalent(left: Any, right: Any) -> bool:
+    """Conservative local "same item" check (no model call).
+
+    Exact duplicates, one text containing the other's core entity, and very
+    high bigram overlap are treated as the same stored item. Unrelated
+    projects ("机器狗" / "奶茶机") stay distinct; genuinely new details belong
+    in an UPDATE, not a second ADD.
+    """
+    a, b = _entry_core(left), _entry_core(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    shorter, longer = sorted((a, b), key=len)
+    # Containment means "same item with a slightly different prefix/filler",
+    # not "the same entity plus several new facts". The latter is new detail
+    # that belongs in an UPDATE and must not be discarded as a duplicate.
+    if len(shorter) >= 3 and shorter in longer and len(longer) - len(shorter) <= 3:
+        return True
+    terms_a, terms_b = _entry_terms(a), _entry_terms(b)
+    if not terms_a or not terms_b:
+        return False
+    return len(terms_a & terms_b) / len(terms_a | terms_b) >= 0.75
+
+
+def requires_direct_quote(field_key: str) -> bool:
+    """Whether an auto-applied claim from this field needs a verbatim quote."""
+    return str(field_key or "") in INFERENCE_ONLY_FIELDS
+
+
+def is_human_confirmed_source(source: Any) -> bool:
+    """Entries written through the explicit confirmation path."""
+    return str(source or "").upper() == ProfileSource.USER_CORRECTION.value
+
 
 def _effective_content(snapshot: FullProfileSnapshot, entry_ids: list[str]) -> list[str]:
     wanted = set(entry_ids)
@@ -527,8 +600,6 @@ class ProfileRefinementEngine:
         context_source,
         registry: Optional[ProfileFieldRegistry] = None,
         logger: Optional[logging.Logger] = None,
-        *,
-        auto_apply_confidence: float = DEFAULT_AUTO_APPLY_CONFIDENCE,
     ) -> None:
         self.profiles = profiles
         self.repository = repository
@@ -536,19 +607,55 @@ class ProfileRefinementEngine:
         self.context_source = context_source
         self.registry = registry or ProfileFieldRegistry()
         self.logger = logger or logging.getLogger("companion.profile_refinement")
-        self.auto_apply_confidence = max(0.0, min(1.0, float(auto_apply_confidence)))
+
+    async def _read_authorized_snapshot(
+        self, person_id: str
+    ) -> Optional[FullProfileSnapshot]:
+        """Read the snapshot, repairing a legally missing profile row once.
+
+        ``get_full_snapshot`` returns ``None`` for two very different states:
+        no permission at all, and permission granted but the row was never
+        created (accounts registered before the ensure-on-register hook). Only
+        the second is repaired, and only for a person who currently grants
+        processing, persistence, learning and external-AI use.
+        """
+        can_review = getattr(self.profiles, "can_review", None)
+        if can_review is None or not await can_review(person_id):
+            return None
+        existing = await self.profiles.get_full_snapshot(person_id)
+        if existing is not None:
+            return existing
+        created = await self.profiles.ensure_profile(
+            person_id, actor="profile_review_repair"
+        )
+        existing = await self.profiles.get_full_snapshot(person_id)
+        if existing is None:
+            self.logger.warning(
+                "profile_review_profile_repair_failed person_id=%s created=%s",
+                person_id,
+                bool(created),
+            )
+            raise ProfileRefinementError("authorized_profile_initialization_failed")
+        self.logger.info(
+            "profile_review_profile_repaired person_id=%s created=%s revision=%s",
+            person_id,
+            bool(created),
+            existing.revision,
+        )
+        return existing
 
     async def review(self, person_id: str, source_event_id: str) -> ProfileReviewResult:
-        # (1) Existing profile first. A review without a profile is not a
-        # reason to create or guess one.
-        existing = await self.profiles.get_full_snapshot(person_id)
+        # (1) Existing profile first. A legally missing row is created for an
+        # authorized person; no permission means no profile and no review. A
+        # repair that still cannot be read raises — never a fake NO_CHANGE.
+        existing = await self._read_authorized_snapshot(person_id)
         if existing is None:
             return ProfileReviewResult(
                 person_id=person_id,
                 source_event_id=source_event_id,
                 base_revision=0,
-                status="NO_PROFILE",
-                reason="no authorized profile",
+                status="UNAUTHORIZED",
+                reason="missing_consent",
             )
         # (2) Authorized evidence for this person only.
         evidence = await self.context_source.load(
@@ -726,6 +833,14 @@ class ProfileRefinementEngine:
             if content and _FILLER.match(content.strip()):
                 return "lossy_change_rejects_existing_facts", None
 
+        if proposal.operation != "ADD" and any(
+            is_human_confirmed_source(item.get("source")) for item in target_entries
+        ):
+            # A fact the person explicitly corrected or confirmed outranks a
+            # model rewrite. Keep the change visible for review instead of
+            # silently replacing the person's own words.
+            return None, "human_confirmed_target_requires_review"
+
         allowed_event_ids = set(user_texts)
         if proposal.evidence_event_ids and not set(
             proposal.evidence_event_ids
@@ -763,19 +878,22 @@ class ProfileRefinementEngine:
             return None, "confirmed_identity_requires_confirmation"
         if proposal.requires_confirmation:
             return None, "model_requested_confirmation"
-        if proposal.confidence < self.auto_apply_confidence:
-            return None, "low_confidence"
+        if requires_direct_quote(proposal.field_key) and not proposal.evidence_quotes:
+            # A personality-like trait inferred from behaviour is not a fact
+            # about the person. Without a verbatim self-description it stays a
+            # candidate for review; a direct quote may auto-apply.
+            return None, "trait_inference_requires_review"
         return None, None
 
     @staticmethod
     def _add_is_new(
         existing: FullProfileSnapshot, proposal: ProfileChangeProposal
     ) -> bool:
-        content = " ".join((proposal.proposed_content or "").split()).casefold()
-        if not content:
+        content = proposal.proposed_content or ""
+        if not _normalise_text(content):
             return False
         for entry in existing.entries.get(proposal.field_key, []):
-            if " ".join(entry.content.split()).casefold() == content:
+            if entries_equivalent(entry.content, content):
                 return False
         return True
 
@@ -914,8 +1032,8 @@ class ProfileReviewContextSource:
 
 __all__ = [
     "ALLOWED_FIELD_TRANSITIONS",
-    "DEFAULT_AUTO_APPLY_CONFIDENCE",
     "FullProfileSnapshot",
+    "INFERENCE_ONLY_FIELDS",
     "MAX_SNAPSHOT_LEGACY_FIELDS",
     "MAX_SNAPSHOT_PENDING",
     "MAX_CHANGES_PER_REVIEW",
@@ -933,6 +1051,9 @@ __all__ = [
     "ProfileReviewResult",
     "SnapshotEntry",
     "ValidatedChange",
+    "entries_equivalent",
+    "is_human_confirmed_source",
     "is_strict_field",
+    "requires_direct_quote",
     "validate_change_targets",
 ]

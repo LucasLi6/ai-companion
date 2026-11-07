@@ -29,7 +29,11 @@ from typing import Optional
 from companion.domain.enums import JobStatus, JobType
 from companion.domain.models import utcnow
 from companion.people.profile_refinement import ProfileReviewExecution
-from companion.people.profile_service import ProfileUnauthorized, ReviewExecutionLost
+from companion.people.profile_service import (
+    PersonProfileService,
+    ProfileUnauthorized,
+    ReviewExecutionLost,
+)
 from companion.tasks.context import current_task_context
 from companion.tasks.models import TaskPaused
 
@@ -596,11 +600,201 @@ async def reconcile_profile_review_jobs(
     return fixed
 
 
+LEGACY_SKIPPED_REASON = "no authorized profile"
+MAX_REPAIR_SCAN = 500
+MAX_REPAIR_LIMIT = 200
+
+
+async def repair_skipped_reviews(
+    repos,
+    *,
+    person_id: str,
+    dry_run: bool = True,
+    limit: int = 30,
+    log: Optional[logging.Logger] = None,
+) -> dict:
+    """Requeue reviews that were skipped only because the profile row was missing.
+
+    V0.9.9.3 fix: older accounts had no ``person_interaction_profiles`` row, so
+    every review ended ``SKIPPED`` with reason ``no authorized profile``. This
+    repairs exactly those receipts for one person:
+
+    - only ``status=SKIPPED`` with that exact reason (newer skips, such as a
+      withdrawn consent or a deleted source, are never touched);
+    - re-checks every consent and the ACTIVE status before doing anything;
+    - refuses receipts whose source utterance was deleted or whose changes
+      already appear in a revision for that event;
+    - never touches ``PENDING``/``RUNNING`` receipts, other people, or an
+      applied review;
+    - ``dry_run`` (the default) performs no writes at all;
+    - uses :meth:`ProfileReviewScheduler.retry`, so each attempt gets a fresh
+      job key and the receipt is reset through the normal path;
+    - bounded by ``limit`` and by ``MAX_REPAIR_SCAN`` scanned receipts, and
+      idempotent: a requeued receipt is no longer ``SKIPPED``.
+    """
+    logger = log or logging.getLogger("companion.profile_review")
+    limit = max(1, min(int(limit), MAX_REPAIR_LIMIT))
+    summary: dict = {
+        "person_id": person_id,
+        "dry_run": bool(dry_run),
+        "scanned": 0,
+        "matched": 0,
+        "would_retry": [],
+        "retried": [],
+        "skipped": [],
+    }
+    if not person_id:
+        summary["skipped"].append({"review_id": "", "reason": "missing_person_id"})
+        return summary
+
+    # ``repos.profile`` is the repository in the runtime container; the
+    # service owns authorization, snapshot reads and legal-profile repair.
+    service = getattr(repos, "profile_service", None)
+    if service is None:
+        candidate = repos.profile
+        service = (
+            candidate
+            if hasattr(candidate, "can_review")
+            else PersonProfileService(
+                candidate,
+                repos.person,
+                audit=getattr(repos, "audit", None),
+            )
+        )
+    repository = getattr(service, "repo", repos.profile)
+    receipts = await repository.list_review_receipts(
+        person_id, status="SKIPPED", limit=MAX_REPAIR_SCAN
+    )
+    summary["scanned"] = len(receipts)
+    candidates = [
+        receipt
+        for receipt in receipts
+        if str(receipt.get("reason") or "").strip() == LEGACY_SKIPPED_REASON
+    ]
+    summary["matched"] = len(candidates)
+    if not candidates:
+        logger.info(
+            "profile_review_repair person_id=%s dry_run=%s scanned=%d matched=0",
+            person_id,
+            bool(dry_run),
+            len(receipts),
+        )
+        return summary
+
+    if not await service.can_review(person_id):
+        for receipt in candidates[:limit]:
+            summary["skipped"].append(
+                {
+                    "review_id": receipt["review_id"],
+                    "reason": "not_authorized",
+                }
+            )
+        logger.info(
+            "profile_review_repair person_id=%s authorized=0 matched=%d skipped=%d",
+            person_id,
+            len(candidates),
+            len(summary["skipped"]),
+        )
+        return summary
+
+    revisions = await repository.list_revisions(person_id)
+    applied_events = {
+        str(item.get("source_event_id"))
+        for item in revisions
+        if item.get("source_event_id")
+    }
+
+    profile_exists = await repository.get(person_id) is not None
+    summary["profile_exists"] = profile_exists
+
+    if not dry_run:
+        created = await service.ensure_profile(
+            person_id, actor="profile_review_repair"
+        )
+        snapshot = await service.get_full_snapshot(person_id)
+        if snapshot is None:
+            summary["skipped"].append(
+                {"review_id": "", "reason": "profile_unreadable"}
+            )
+            logger.warning(
+                "profile_review_repair_profile_unreadable person_id=%s created=%s",
+                person_id,
+                bool(created),
+            )
+            return summary
+
+    scheduler = ProfileReviewScheduler(
+        repository, repos.job, persons=repos.person
+    )
+    attempts = 0
+    for receipt in candidates:
+        if attempts >= limit:
+            break
+        review_id = receipt["review_id"]
+        event_id = receipt["source_event_id"]
+        if event_id in applied_events:
+            summary["skipped"].append(
+                {"review_id": review_id, "reason": "already_applied"}
+            )
+            continue
+        source = await repos.utterance.get(event_id)
+        if source is None:
+            summary["skipped"].append(
+                {"review_id": review_id, "reason": "source_event_deleted"}
+            )
+            continue
+        # Re-read: another process may have retried it since the scan.
+        current = await repository.get_review_receipt_by_id(review_id)
+        if current is None or current["status"] != "SKIPPED":
+            summary["skipped"].append(
+                {"review_id": review_id, "reason": "no_longer_skipped"}
+            )
+            continue
+        if str(current.get("reason") or "").strip() != LEGACY_SKIPPED_REASON:
+            summary["skipped"].append(
+                {"review_id": review_id, "reason": "reason_changed"}
+            )
+            continue
+        attempts += 1
+        if dry_run:
+            summary["would_retry"].append(
+                {"review_id": review_id, "event_id": event_id}
+            )
+            continue
+        result = await scheduler.retry(person_id, event_id)
+        if result is None:
+            summary["skipped"].append(
+                {"review_id": review_id, "reason": "retry_not_scheduled"}
+            )
+            continue
+        summary["retried"].append(
+            {"review_id": review_id, "event_id": event_id}
+        )
+
+    logger.info(
+        "profile_review_repair person_id=%s dry_run=%s scanned=%d matched=%d"
+        " would_retry=%d retried=%d skipped=%d profile_exists=%s",
+        person_id,
+        bool(dry_run),
+        summary["scanned"],
+        summary["matched"],
+        len(summary["would_retry"]),
+        len(summary["retried"]),
+        len(summary["skipped"]),
+        profile_exists,
+    )
+    return summary
+
+
 __all__ = [
     "JobError",
+    "LEGACY_SKIPPED_REASON",
     "MAX_RECEIPTS_PER_JOB",
+    "MAX_REPAIR_LIMIT",
+    "MAX_REPAIR_SCAN",
     "ProfileReviewScheduler",
     "build_profile_review_handler",
     "profile_review_job_key",
     "reconcile_profile_review_jobs",
+    "repair_skipped_reviews",
 ]

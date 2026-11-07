@@ -21,6 +21,7 @@ Rules enforced here (V0.7):
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -53,13 +54,17 @@ from companion.people.profile_refinement import (
     ProfileReviewResult,
     SnapshotEntry,
     ValidatedChange,
+    entries_equivalent,
+    is_human_confirmed_source,
     is_strict_field,
+    requires_direct_quote,
     validate_change_targets,
 )
 from companion.people.profile_repository import PersonProfileRepository
 from companion.storage.repositories import AuditRepository, PersonRepository
 
-MAX_REFINEMENT_CHANGES = 5
+MAX_REFINEMENT_CHANGES = 10
+_LOGGER = logging.getLogger("companion.profile_service")
 _IDENTITY_LABELS = {
     "identity.name": "name",
     "identity.preferred_name": "preferred_name",
@@ -211,6 +216,26 @@ class PersonProfileService:
             return False
         consent = await self.persons.get_consent(person_id)
         return bool(consent and consent.allow_external_ai)
+
+    async def can_review(self, person_id: str) -> bool:
+        """Whether a background review may run and may initialise a profile.
+
+        All four grants are required: processing the turn, persisting the
+        profile, learning from it, and sending it to the configured model.
+        A missing profile row for such a person is a legal-init repair; a
+        missing grant is not.
+        """
+        person = await self.persons.get(person_id)
+        if person is None or person.registration_status != RegistrationStatus.ACTIVE:
+            return False
+        consent = await self.persons.get_consent(person_id)
+        return bool(
+            consent
+            and consent.allow_processing
+            and consent.allow_persistence
+            and consent.allow_memory_learning
+            and consent.allow_external_ai
+        )
 
     # -- reads -------------------------------------------------------------
 
@@ -1741,15 +1766,74 @@ class PersonProfileService:
                     )
                 )
                 continue
-            if proposal.confidence < 0.7:
+            if requires_direct_quote(proposal.field_key) and not proposal.evidence_quotes:
+                # Same rule as the engine: an inferred trait stays a candidate
+                # until the person's own words support it.
                 pending.append(
                     change.model_copy(
-                        update={"auto_apply": False, "pending_reason": "low_confidence"}
+                        update={
+                            "auto_apply": False,
+                            "pending_reason": "trait_inference_requires_review",
+                        }
                     )
                 )
                 continue
+            if proposal.operation != "ADD" and any(
+                is_human_confirmed_source(item.get("source"))
+                for item in found
+                if item is not None
+            ):
+                pending.append(
+                    change.model_copy(
+                        update={
+                            "auto_apply": False,
+                            "pending_reason": "human_confirmed_target_requires_review",
+                        }
+                    )
+                )
+                continue
+            if proposal.operation == "ADD" and (
+                any(
+                    entries_equivalent(
+                        item["content"], proposal.proposed_content or ""
+                    )
+                    for item in entries.values()
+                    if item["field_key"] == proposal.field_key
+                )
+                or any(
+                    item.proposal.field_key == proposal.field_key
+                    and entries_equivalent(
+                        item.proposal.proposed_content,
+                        proposal.proposed_content or "",
+                    )
+                    for item in accepted
+                )
+            ):
+                # Defence in depth for the exact/entity-level duplicate rule:
+                # an already stored item (or the same item twice in one
+                # batch) is not added twice.
+                rejected.append(
+                    {
+                        "operation": proposal.operation,
+                        "field_key": proposal.field_key,
+                        "reason": "already_present",
+                    }
+                )
+                continue
             accepted.append(change)
-        for change in changes[MAX_REFINEMENT_CHANGES:]:
+        omitted = changes[MAX_REFINEMENT_CHANGES:]
+        if omitted:
+            _LOGGER.warning(
+                "profile_changes_omitted person_id=%s omitted=%s limit=%s keys=%s",
+                person_id,
+                len(omitted),
+                MAX_REFINEMENT_CHANGES,
+                ",".join(
+                    f"{item.proposal.operation}:{item.proposal.field_key}"
+                    for item in omitted
+                ),
+            )
+        for change in omitted:
             pending.append(
                 change.model_copy(
                     update={"auto_apply": False, "pending_reason": "change_limit_exceeded"}
@@ -1803,7 +1887,12 @@ class PersonProfileService:
                 raise ValueError("target_entry_not_effective")
             targets.append(entry)
         validate_change_targets(proposal.operation, proposal.field_key, targets)
-        if proposal.operation == "ADD" and spec.max_entries:
+        if not confirmed and not trusted:
+            if requires_direct_quote(proposal.field_key) and not proposal.evidence_quotes:
+                raise ValueError("trait_inference_requires_review")
+            if any(is_human_confirmed_source(item.get("source")) for item in targets):
+                raise ValueError("human_confirmed_target_requires_review")
+        if proposal.operation == "ADD":
             existing = await self.repo.list_entries(
                 person_id,
                 statuses=(
@@ -1812,7 +1901,11 @@ class PersonProfileService:
                 ),
                 field_key=proposal.field_key,
             )
-            if len(existing) >= spec.max_entries:
+            if not confirmed and not trusted and any(
+                entries_equivalent(item["content"], content) for item in existing
+            ):
+                raise ValueError("already_present")
+            if spec.max_entries and len(existing) >= spec.max_entries:
                 raise ValueError("field_capacity_reached")
 
         evidence_events = list(

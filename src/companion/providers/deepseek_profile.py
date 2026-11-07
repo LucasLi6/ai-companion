@@ -27,6 +27,7 @@ from typing import Any, Optional
 from pydantic import ValidationError
 
 from companion.people.profile_refinement import (
+    MAX_CHANGES_PER_REVIEW,
     ProfileChangeProposal,
     ProfileRefinementProviderError,
     ProfileRefinementValidationError,
@@ -57,7 +58,7 @@ _PROPOSAL_KEYS = {
     "requires_confirmation",
 }
 
-_MAX_CHANGES = 8
+_MAX_CHANGES = MAX_CHANGES_PER_REVIEW
 
 
 class _OutputProblem(Exception):
@@ -134,6 +135,23 @@ def _normalise_decision(
                 raise _OutputProblem("invalid_change_item")
             changes.append(
                 {key: item[key] for key in _PROPOSAL_KEYS if key in item}
+            )
+        if len(raw_changes) > _MAX_CHANGES:
+            # Record the omission by operation/field only — never content.
+            omitted = [
+                item
+                for item in raw_changes[_MAX_CHANGES:]
+                if isinstance(item, dict)
+            ]
+            _LOGGER.warning(
+                "profile_review_changes_truncated total=%s kept=%s omitted=%s keys=%s",
+                len(raw_changes),
+                len(changes),
+                len(omitted),
+                ",".join(
+                    f"{item.get('operation')}:{item.get('field_key')}"
+                    for item in omitted
+                ),
             )
 
     candidate = {

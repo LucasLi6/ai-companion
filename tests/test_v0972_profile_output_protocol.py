@@ -28,7 +28,7 @@ from companion.providers.deepseek_profile import (
     DeepSeekProfileRefinementProvider,
 )
 
-PROMPT_VERSION = "profile-refinement-v2"
+PROMPT_VERSION = "profile-refinement-v3"
 PAYLOAD = {"person_id": "person_trusted", "profile_revision": 4}
 LOG_NAME = "companion.profile_refinement.provider"
 
