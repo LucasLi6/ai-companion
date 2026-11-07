@@ -963,7 +963,11 @@ class Orchestrator:
                         # Pass it to Speaker; otherwise it may infer a false
                         # lack of write capability from the read-only tool list.
                         memory_outcomes = [{
-                            "outcome": memory_operation.status,
+                            "outcome": (
+                                "EXPLICIT_NO_MEMORY"
+                                if memory_operation.status == "NO_MEMORY"
+                                else memory_operation.status
+                            ),
                             "detail": memory_operation.error_code or (
                                 "no_supported_fact_extracted"
                                 if memory_operation.status == "NO_MEMORY"
