@@ -24,16 +24,20 @@ Design rules:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 from companion.domain.enums import (
     MemoryWriteOutcome,
     RegistrationStatus,
+    MemoryStatus,
 )
 from companion.domain.models import UtteranceEvent
 from companion.memory.candidates import prepare_candidates
 from companion.memory.consolidation import MemoryWriter
+from companion.memory.keys import claim_is_grounded
+from companion.memory.models import AccessContext
 from companion.routing.models import (
     ProcessingIntent,
     RoutingContext,
@@ -128,6 +132,17 @@ class ExplicitMemoryOperationService:
                 error_code=denied,
             )
 
+        # A follow-up such as "你写入记忆库啊" may contain no factual
+        # statement, but can refer to a single earlier name self-report which
+        # was stored as an unsearchable candidate by the older grounding code.
+        # Recheck that original source locally rather than inventing a new
+        # claim from the command sentence.
+        recovered = await self._recover_direct_name(
+            event, intent, routing_context
+        )
+        if recovered is not None:
+            return recovered
+
         try:
             candidates = await self._candidates_for(event, routing_context)
         except Exception as exc:
@@ -179,6 +194,160 @@ class ExplicitMemoryOperationService:
             status=self._aggregate(outcomes),
             outcomes=outcomes,
             candidate_count=len(candidates),
+            completed=True,
+        )
+
+    async def _recover_direct_name(
+        self,
+        event: UtteranceEvent,
+        intent: ProcessingIntent,
+        routing_context: Optional[RoutingContext],
+    ) -> Optional[MemoryOperationResult]:
+        """Promote exactly one legacy name candidate on a referential request.
+
+        This is a narrow repair, not a generic write tool or an inference from
+        chat history: the old candidate, source event and verbatim evidence
+        must all be available and independently validate as a direct self-
+        report. No ambiguous or cross-person candidate is promoted.
+        """
+        if intent != ProcessingIntent.MEMORY_SAVE:
+            return None
+        speaker = event.speaker_person_id
+        if not speaker:
+            return None
+        # A retry of the same event returns its actual, previously committed
+        # promotion, rather than incorrectly claiming that nothing was saved.
+        cur = await self.repos.db.execute(
+            "SELECT p.memory_id FROM memory_provenance_events p "
+            "JOIN memory_subjects s ON s.memory_id = p.memory_id "
+            "WHERE p.source_event_id = ? "
+            "AND p.event_type = 'promoted_by_explicit_recheck' "
+            "AND s.subject_type = 'PERSON' AND s.subject_id = ? LIMIT 1",
+            (event.event_id, speaker),
+        )
+        replay = await cur.fetchone()
+        if replay is not None:
+            memory_id = replay["memory_id"]
+            return MemoryOperationResult(
+                event_id=event.event_id,
+                intent=intent.value,
+                status=MemoryWriteOutcome.UPDATED.value,
+                outcomes=[{
+                    "outcome": MemoryWriteOutcome.UPDATED.value,
+                    "memory_id": memory_id,
+                    "detail": "verified_direct_name_promoted",
+                }],
+                completed=True,
+            )
+
+        text = event.text.strip()
+        if not re.search(r"(记住|记下来|记忆库|保存|写入|存进去)", text):
+            return None
+        if re.search(r"(我叫|我是|我的名字|我名叫)", text):
+            # A concrete, present-turn assertion follows the normal writer.
+            return None
+        if routing_context is None:
+            return None
+        turns = [
+            item for item in (routing_context.recent_turns or [])
+            if item.get("role") in ("human", "user")
+            and item.get("speaker_person_id") == speaker
+        ][-6:]
+        if not any(
+            re.search(r"(我是谁|我的名字|我叫什么|名字|姓名|我叫)", str(item.get("text") or ""))
+            for item in turns
+        ):
+            return None
+
+        repo = self.memory_writer.mem_repo
+        rows = await repo.list_for_subject(
+            speaker,
+            statuses=[MemoryStatus.CANDIDATE.value],
+            kinds=["PERSONAL_FACT"],
+            limit=50,
+        )
+        matches = []
+        for row in rows:
+            if row.get("topic") != "name" or not row.get("self_reported"):
+                continue
+            if row.get("human_confirmed") or row.get("created_by") != speaker:
+                continue
+            provenance = await repo.get_provenance(row["memory_id"])
+            if not provenance or provenance.get("speaker_person_id") != speaker:
+                continue
+            if (
+                provenance.get("assertion_type") != "SELF_REPORT"
+                or provenance.get("certainty_category") != "DIRECT"
+            ):
+                continue
+            source = await self.repos.utterance.get(
+                provenance.get("source_event_id") or ""
+            )
+            if (
+                source is None
+                or source.speaker_person_id != speaker
+                or source.conversation_id != event.conversation_id
+            ):
+                continue
+            candidates = await self.repos.analysis.get_candidates(source.event_id)
+            original = next(
+                (x for x in candidates
+                 if x.candidate_id == provenance.get("candidate_id")),
+                None,
+            )
+            if original is None or not claim_is_grounded(
+                original.content,
+                source.text,
+                evidence_span=original.source_evidence_span,
+            ):
+                continue
+            matches.append(row)
+        if len(matches) != 1:
+            return None
+
+        row = matches[0]
+        access = AccessContext(actor_id=speaker, is_admin=False, role="cognitive")
+        try:
+            async with self.repos.db.transaction():
+                updated = await self.memory_writer.service.update(
+                    row["memory_id"],
+                    access=access,
+                    expected_version=row["version"],
+                    status=MemoryStatus.ACTIVE,
+                    reason="promoted_by_explicit_recheck",
+                )
+                await repo.add_provenance_event(
+                    row["memory_id"],
+                    event_type="promoted_by_explicit_recheck",
+                    source_event_id=event.event_id,
+                    speaker_person_id=speaker,
+                    subject_person_id=speaker,
+                    old_version=row["version"],
+                    new_version=updated.version,
+                    reason="original_source_revalidated",
+                )
+        except Exception as exc:
+            self.logger.error(
+                "direct_name_recheck_failed event_id=%s error=%s",
+                event.event_id,
+                type(exc).__name__,
+            )
+            return MemoryOperationResult(
+                event_id=event.event_id,
+                intent=intent.value,
+                status=MemoryWriteOutcome.FAILED.value,
+                completed=False,
+                error_code="direct_name_recheck_failed",
+            )
+        return MemoryOperationResult(
+            event_id=event.event_id,
+            intent=intent.value,
+            status=MemoryWriteOutcome.UPDATED.value,
+            outcomes=[{
+                "outcome": MemoryWriteOutcome.UPDATED.value,
+                "memory_id": row["memory_id"],
+                "detail": "verified_direct_name_promoted",
+            }],
             completed=True,
         )
 
