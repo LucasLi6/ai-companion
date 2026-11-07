@@ -2076,6 +2076,13 @@ async def cmd_repl(args) -> int:
         if rt.worker is not None:
             await rt.worker.start()
             worker_started = True
+        # The no-reply timer for a delivered identity-confirmation question is
+        # in-memory only. Resume it for any record left AWAITING_REPLY so a
+        # restart cannot leave the confirmation hanging forever.
+        confirmation = getattr(rt, "profile_confirmation", None)
+        if confirmation is not None:
+            with contextlib.suppress(Exception):
+                await confirmation.resume_pending()
         try:
             while True:
                 try:

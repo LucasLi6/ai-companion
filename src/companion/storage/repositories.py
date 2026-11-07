@@ -550,6 +550,22 @@ class ProfileConfirmationRepository:
         rows = await cur.fetchall()
         return [self._to_record(row) for row in rows]
 
+    async def list_by_state(
+        self, state: str
+    ) -> list[ProfileConfirmationRecord]:
+        """Every record in one state, across all people.
+
+        Used at startup to resume no-reply timers that lived only in memory
+        before a restart.
+        """
+        cur = await self.db.execute(
+            "SELECT * FROM profile_confirmations WHERE state = ?"
+            " ORDER BY updated_at ASC",
+            (state,),
+        )
+        rows = await cur.fetchall()
+        return [self._to_record(row) for row in rows]
+
     async def update_state(
         self,
         confirmation_id: str,

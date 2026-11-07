@@ -68,10 +68,20 @@ _THIRD_PERSON_SUBJECT = re.compile(
     r"(?:^|[^你您])(?:他|她|他们|她们|朋友|同事|同学|老师|别人|有人)\s*$"
 )
 
-_CONFIRM_PREFIX = re.compile(
-    r"^(?:嗯+|对|对的|对呀|是|是的|是啊|是呀|没错|确认|确定|好|好的|"
-    r"ok|okay|yes|yeah|yep|sure)",
+_CONFIRM_ONLY = re.compile(
+    r"^(?:(?:嗯+|哦+|噢+|啊+)[，,、]?\s*)?"
+    r"(?:嗯+|对(?:的|呀|啊)?|是(?:的|啊|呀)?|没错|确认|确定|"
+    r"好(?:的|呀)?|可以|没问题|正确|ok|okay|yes|yeah|yep|sure|当然)"
+    r"[。.!！~～\s]*$",
     re.IGNORECASE,
+)
+# A reply that pushes the question aside is not a yes and is not unrelated
+# small talk: the confirmation stays pending instead of being silently
+# accepted. "嗯，先说别的" and "对了，我们聊其他话题" land here.
+_DEFERRAL = re.compile(
+    r"(先说别的|先聊别的|先不说这个|先不说|等会(?:儿)?|待会(?:儿)?|"
+    r"一会儿再说|回头再说|以后再说|换个话题|换话题|聊别的|聊点别的|"
+    r"说点别的|说别的|聊其他|说其他|先这样|现在不方便|不想说)"
 )
 _DENY = re.compile(
     r"(不是|不对|错了|记错|搞错|弄错|不叫|别叫|没有|并没有|否|"
@@ -259,8 +269,13 @@ def interpret_reply(
         return _Interpretation(KIND_CONFIRM)
     if _DENY.search(value):
         return _Interpretation(KIND_DENY)
-    if len(value) <= 12 and _CONFIRM_PREFIX.match(value):
+    # Only a short, whole-message affirmation counts as a yes. A longer reply
+    # that merely starts with "对" / "嗯" ("嗯，先说别的") is a different
+    # message, not agreement.
+    if _CONFIRM_ONLY.fullmatch(value):
         return _Interpretation(KIND_CONFIRM)
+    if _DEFERRAL.search(value):
+        return _Interpretation(KIND_AMBIGUOUS)
     if _MENTIONS_IDENTITY.search(value) or any(
         str(record.value) in value for record in records
     ):
@@ -389,6 +404,33 @@ class ProfileConfirmationService:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+    async def resume_pending(self) -> int:
+        """Restart no-reply timers for questions asked before a restart.
+
+        The timer lives only in memory, so a process restart would otherwise
+        leave a delivered confirmation question in ``AWAITING_REPLY`` forever.
+        Each person/conversation keeps at most one timer; it is based on the
+        most recent pending record so every pending question gets its full
+        window and a long downtime fires promptly.
+        """
+        if self._closed:
+            return 0
+        records = await self.confirmations.list_by_state(STATE_AWAITING_REPLY)
+        latest: dict[tuple[str, str], ProfileConfirmationRecord] = {}
+        for record in records:
+            key = (record.person_id, record.conversation_id)
+            current = latest.get(key)
+            if current is None or _after(record.updated_at, current.updated_at):
+                latest[key] = record
+        for (person_id, conversation_id), record in latest.items():
+            remaining = self.no_reply_timeout_seconds - _elapsed(
+                record.updated_at
+            )
+            self._schedule_no_reply(
+                person_id, conversation_id, delay=max(0.0, remaining)
+            )
+        return len(latest)
 
     # -- internals ---------------------------------------------------------
 
@@ -533,13 +575,19 @@ class ProfileConfirmationService:
             )
         await self.confirmations.update_state(record.confirmation_id, STATE_REJECTED)
 
-    def _schedule_no_reply(self, person_id: str, conversation_id: str) -> None:
+    def _schedule_no_reply(
+        self,
+        person_id: str,
+        conversation_id: str,
+        *,
+        delay: Optional[float] = None,
+    ) -> None:
         key = f"{person_id}:{conversation_id}"
         old = self._timers.get(key)
         if old is not None and not old.done():
             old.cancel()
         task = asyncio.create_task(
-            self._no_reply_cycle(person_id, conversation_id)
+            self._no_reply_cycle(person_id, conversation_id, delay)
         )
         self._timers[key] = task
         task.add_done_callback(
@@ -548,7 +596,12 @@ class ProfileConfirmationService:
             else None
         )
 
-    async def _no_reply_cycle(self, person_id: str, conversation_id: str) -> None:
+    async def _no_reply_cycle(
+        self,
+        person_id: str,
+        conversation_id: str,
+        delay: Optional[float] = None,
+    ) -> None:
         """Silence fallback: only a clear direct self-report may be applied.
 
         This is not an explicit confirmation. The write keeps the real
@@ -556,7 +609,10 @@ class ProfileConfirmationService:
         still refused.
         """
         try:
-            await asyncio.sleep(self.no_reply_timeout_seconds)
+            wait = (
+                self.no_reply_timeout_seconds if delay is None else delay
+            )
+            await asyncio.sleep(max(0.0, wait))
             if self._closed:
                 return
             records = [
@@ -601,6 +657,13 @@ def _after(left: datetime, right: datetime) -> bool:
     if right.tzinfo is None:
         right = right.replace(tzinfo=timezone.utc)
     return left > right
+
+
+def _elapsed(timestamp: datetime) -> float:
+    """Seconds since a stored timestamp, tolerating naive/aware mixing."""
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return max(0.0, (utcnow() - timestamp).total_seconds())
 
 
 __all__ = [

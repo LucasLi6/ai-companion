@@ -29,20 +29,21 @@ _FIRST_PERSON_DEPARTURE = re.compile(
     r"(?:走|撤|下线|离开|去睡|睡了|去休息|休息|去忙|忙去了|不聊了)"
 )
 _FAREWELL = re.compile(r"(晚安|再见|拜拜|回头见|改天聊|下次聊)")
+# An explicit refusal to keep talking is as final as leaving, and must not be
+# left to the model to notice.
+_REFUSAL = re.compile(
+    r"(?:不想|不愿意|不要再?|别)(?:再)?(?:跟|和|同)?(?:你|我)?"
+    r"(?:聊|说话|说下去)"
+    r"|(?:别|不要)(?:再)?(?:烦我|打扰我|管我)"
+    r"|(?:安静(?:点|一下)?|闭嘴|别吵|别说了|先别说话)"
+)
 
 
 def _normalise(text: str) -> str:
     return " ".join(str(text or "").split())
 
 
-def detect_explicit_departure(text: str) -> bool:
-    """Return True only for a structurally clear departure statement.
-
-    The function is intentionally high precision / low recall: a false
-    negative is handled by the semantic judge, while a false positive would
-    wrongly silence Ava.
-    """
-    value = _normalise(text)
+def _is_structural_stop(value: str) -> bool:
     if not value:
         return False
     if _QUESTION_END.search(value) or _QUESTION_PARTICLE.search(value):
@@ -53,9 +54,37 @@ def detect_explicit_departure(text: str) -> bool:
         return False
     if _NEGATED_DEPARTURE.search(value):
         return False
+    return True
+
+
+def detect_explicit_departure(text: str) -> bool:
+    """Return True only for a structurally clear departure statement.
+
+    The function is intentionally high precision / low recall: a false
+    negative is handled by the semantic judge, while a false positive would
+    wrongly silence Ava.
+    """
+    value = _normalise(text)
+    if not _is_structural_stop(value):
+        return False
     return bool(
         _FIRST_PERSON_DEPARTURE.search(value) or _FAREWELL.search(value)
     )
 
 
-__all__ = ["detect_explicit_departure"]
+def detect_explicit_stop(text: str) -> bool:
+    """True for a clear departure *or* an explicit refusal to keep talking.
+
+    This is the local hard floor used by the proactive manager: once the
+    person leaves or asks Ava to stop, no proactive utterance may be
+    generated, regardless of what the semantic judge would answer.
+    """
+    value = _normalise(text)
+    if not _is_structural_stop(value):
+        return False
+    if _FIRST_PERSON_DEPARTURE.search(value) or _FAREWELL.search(value):
+        return True
+    return bool(_REFUSAL.search(value))
+
+
+__all__ = ["detect_explicit_departure", "detect_explicit_stop"]

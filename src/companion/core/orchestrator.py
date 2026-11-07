@@ -1207,6 +1207,27 @@ class Orchestrator:
                 steps.append("[MEMORY_JOB] Queued")
             steps.append("[STATUS] Completed")
             if (
+                question_delivered
+                and existing_action is None
+                and stream is not None
+                and stream_emitted
+            ):
+                # The provider-streamed deltas did not include the appended
+                # confirmation question. Send the exact remaining suffix only
+                # now — after the action and its confirmation state are
+                # committed — so the visible text, the completed event, the
+                # persisted action and the question's state cannot diverge.
+                emitted = str(stream_meta.get("emitted_text") or "")
+                if emitted and response_text.startswith(emitted):
+                    suffix = response_text[len(emitted):]
+                elif confirmation_question in emitted:
+                    # The model already produced the exact question text.
+                    suffix = ""
+                else:
+                    suffix = "\n\n" + confirmation_question
+                if suffix:
+                    stream.delta(response_id, suffix)
+            if (
                 stream is not None
                 and final_action == CognitiveAction.RESPOND
             ):
@@ -2319,7 +2340,15 @@ class Orchestrator:
             text,
             status,
             response_id,
-            {"finish_reason": finish_reason, "usage": usage, "first_token_ms": first_token_ms},
+            {
+                "finish_reason": finish_reason,
+                "usage": usage,
+                "first_token_ms": first_token_ms,
+                # Raw text already shown through deltas. The caller uses it to
+                # send only the final suffix (e.g. an appended confirmation
+                # question) rather than re-displaying the whole reply.
+                "emitted_text": "".join(chunks),
+            },
         )
 
     async def _persist_partial(

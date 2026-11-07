@@ -31,6 +31,7 @@ from typing import Optional
 
 from companion.core.response_events import ResponseEvent, ResponseEventSink
 from companion.domain.models import new_id, utcnow
+from companion.proactive.departure import detect_explicit_stop
 from companion.proactive.judge import (
     ProactiveJudge,
     ProactiveJudgeContext,
@@ -195,12 +196,22 @@ class ProactiveManager:
         self, cycle: _Cycle, state: _ConversationState
     ) -> None:
         try:
+            if not await self._still_valid(cycle):
+                return
+            # Local hard floor: an explicit departure or refusal to continue
+            # blocks both stages, independently of the judge's answer.
+            if await self._explicit_stop(cycle):
+                self.logger.info(
+                    "proactive_blocked_explicit_stop conversation_id=%s"
+                    " source_event_id=%s",
+                    cycle.conversation_id,
+                    cycle.source_event_id,
+                )
+                return
             # Stage 1: right after the delivered normal reply. If Ava has just
             # asked an identity-confirmation question, the immediate judge must
             # not interject or urge; the long-idle stage may still start a
             # different topic later.
-            if not await self._still_valid(cycle):
-                return
             if not await self._confirmation_pending(cycle):
                 await self._attempt(cycle, state, MODE_IMMEDIATE)
 
@@ -354,6 +365,14 @@ class ProactiveManager:
             mode,
             message.message_id,
             len(text),
+        )
+
+    async def _explicit_stop(self, cycle: _Cycle) -> bool:
+        """Local departure/refusal floor read from the triggering turn."""
+        event = await self.repos.utterance.get(cycle.source_event_id)
+        return bool(
+            event is not None
+            and detect_explicit_stop(getattr(event, "text", ""))
         )
 
     async def _confirmation_pending(self, cycle: _Cycle) -> bool:

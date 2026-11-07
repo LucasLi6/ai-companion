@@ -29,22 +29,29 @@ from companion.people.profile_confirmation import (    KIND_AMBIGUOUS,
     detect_self_reports,
     interpret_reply,
 )
-from companion.proactive.departure import detect_explicit_departure
+from companion.proactive.departure import (
+    detect_explicit_departure,
+    detect_explicit_stop,
+)
 from companion.proactive.judge import ProactiveJudge
-from companion.providers.deepseek_client import ChatResponse
+from companion.providers.deepseek_client import ChatResponse, StreamDelta
 from companion.providers.deepseek_proactive import ScriptedProactiveJudgeProvider
 from companion.runtime import build_runtime
 from companion.storage.repositories import ProfileConfirmationRecord
 
 
 class _FakeClient:
-    """Offline client: judge JSON for analysis calls, plain text for replies."""
+    """Offline client: judge JSON for analysis calls, text for replies."""
+
+    def __init__(self, *, response_text="好的。", chunks=None):
+        self.response_text = response_text
+        self.chunks = list(chunks) if chunks is not None else [response_text]
 
     async def complete(
         self, messages, *, request_type, event_id=None, json_mode=None, **kwargs
     ):
         content = (
-            "好的。"
+            self.response_text
             if request_type == "response"
             else json.dumps(
                 {"should_initiate": False, "reason": "scripted"}, ensure_ascii=False
@@ -57,6 +64,19 @@ class _FakeClient:
             prompt_tokens=1,
             completion_tokens=1,
             total_tokens=2,
+        )
+
+    async def stream_completion(
+        self, messages, *, request_type="response", **kwargs
+    ):
+        for chunk in self.chunks:
+            yield StreamDelta(content=chunk)
+        yield StreamDelta(
+            finish_reason="stop",
+            prompt_tokens=1,
+            completion_tokens=1,
+            total_tokens=2,
+            usage_reported=True,
         )
 
 
@@ -166,6 +186,10 @@ def test_reply_interpretation_is_conservative():
     assert corrected.detected[0].value == "李明"
     assert interpret_reply("李约是谁？", records).kind == KIND_AMBIGUOUS
     assert interpret_reply("今天天气不错", records).kind == KIND_IGNORED
+    # A reply that merely starts with an affirmation token is not agreement.
+    assert interpret_reply("嗯，先说别的", records).kind == KIND_AMBIGUOUS
+    assert interpret_reply("对了，我们聊其他话题", records).kind == KIND_AMBIGUOUS
+    assert interpret_reply("好的，谢谢", records).kind == KIND_IGNORED
 
 
 # -- confirmation state machine -------------------------------------------
@@ -374,6 +398,13 @@ def test_clear_departure_is_structural_not_keyword_matching():
         assert detect_explicit_departure(text) is False, text
 
 
+def test_explicit_refusal_is_a_local_stop():
+    for text in ("我不想聊了", "别跟我说话", "安静点", "闭嘴", "别烦我"):
+        assert detect_explicit_stop(text) is True, text
+    for text in ("真的不聊了？", "假如我不想聊了呢", "我们聊点别的吧"):
+        assert detect_explicit_stop(text) is False, text
+
+
 async def test_long_idle_judge_context_carries_departure_and_mode(db):
     rt = build_runtime(
         db,
@@ -431,4 +462,114 @@ async def test_immediate_judge_does_not_interject_while_confirming(db):
     # long-idle stage is judged.
     assert [payload.mode for payload in judge.payloads] == ["LONG_IDLE"]
     await manager.shutdown()
+    await rt.profile_confirmation.shutdown()
+
+
+async def test_explicit_refusal_blocks_both_proactive_stages(db):
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=_FakeClient(),
+        with_worker=False,
+        router_mode="legacy",
+    )
+    person = await _person(rt)
+    await rt.conversations.get_or_create("c1")
+    event = await _event(rt, person, "我不想聊了", save=False)
+    report = await rt.orchestrator.process_utterance(event)
+    assert report.status == "COMPLETED"
+
+    manager = rt.proactive_manager
+    manager.idle_delay_seconds = 0.01
+    judge = ScriptedProactiveJudgeProvider([True, True])
+    manager.judge = ProactiveJudge(judge)
+    manager.on_response_delivered(
+        conversation_id="c1",
+        person_id=person.person_id,
+        source_event_id=event.event_id,
+    )
+    await asyncio.sleep(0.15)
+
+    # The local floor blocks both stages; the judge is never even consulted.
+    assert judge.payloads == []
+    assert await rt.repos.proactive.get_for_source_event(event.event_id) is None
+    await manager.shutdown()
+    await rt.profile_confirmation.shutdown()
+
+
+async def test_confirmation_timeout_resumes_after_restart(rt):
+    person = await _person(rt)
+    first = await _event(rt, person, "我叫李约")
+    before = _service(rt)
+    await before.begin_turn(event=first, person_id=person.person_id)
+    await before.mark_question_delivered(
+        person_id=person.person_id, conversation_id="c1", question_message_id="act-1"
+    )
+    # Simulate a process exit: the in-memory timer is gone.
+    await before.shutdown()
+    assert await _active_name(rt, person) == []
+
+    after = _service(rt, no_reply_timeout_seconds=0.02)
+    assert await after.resume_pending() == 1
+    await asyncio.sleep(0.15)
+    assert [entry["content"] for entry in await _active_name(rt, person)] == ["李约"]
+    record = (
+        await rt.repos.profile_confirmation.list_for_person(person.person_id)
+    )[0]
+    assert record.state == STATE_ACCEPTED_SELF_REPORT
+    await after.shutdown()
+
+
+# -- real streaming path ---------------------------------------------------
+
+
+async def _stream_events(rt, event):
+    return [
+        item async for item in rt.orchestrator.process_utterance_stream(event)
+    ]
+
+
+async def test_confirmation_question_is_delivered_through_stream_deltas(db):
+    client = _FakeClient(response_text="好的。", chunks=["好", "的。"])
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        with_worker=False,
+        router_mode="legacy",
+    )
+    person = await _person(rt)
+    await rt.conversations.get_or_create("c1")
+
+    first = await _event(rt, person, "我叫李约", save=False)
+    events = await _stream_events(rt, first)
+    deltas = "".join(
+        item.delta or "" for item in events if item.type == "response_delta"
+    )
+    completed = next(
+        item for item in events if item.type == "response_completed"
+    )
+    assert "确认一下，你的中文名是李约，对吗？" in deltas
+    # What the chat surface showed, the terminal event and the persisted
+    # action are the same full reply.
+    assert deltas == completed.text
+    action = await rt.repos.analysis.get_action(first.event_id)
+    assert action.response_text == completed.text
+    record = await rt.repos.profile_confirmation.get_active(person.person_id)
+    assert record.state == STATE_AWAITING_REPLY
+    assert record.question_message_id == action.action_id
+
+    second = await _event(rt, person, "对", save=False)
+    events = await _stream_events(rt, second)
+    deltas = "".join(
+        item.delta or "" for item in events if item.type == "response_delta"
+    )
+    completed = next(
+        item for item in events if item.type == "response_completed"
+    )
+    assert "确认一下" not in deltas
+    assert deltas == completed.text
+    assert [entry["content"] for entry in await _active_name(rt, person)] == ["李约"]
+    stored = await rt.repos.profile_confirmation.get(record.confirmation_id)
+    assert stored.state == STATE_CONFIRMED
     await rt.profile_confirmation.shutdown()
