@@ -55,6 +55,19 @@ tts = [
     "dashscope>=2.0.1",
     "pyaudio>=0.2.14",
 ]
+# asr: optional independent real-time recognition demo. Nothing in the core
+#   or in TTS imports these packages; `python -m companion.asr.demo` needs
+#   them only when it actually runs. Silero VAD runs on CPU through ONNX
+#   Runtime and the silero-vad package ships the model file; audio is resampled
+#   with the standard library (audioop on Python <=3.12, a stateful linear
+#   fallback on 3.13+).
+asr = [
+    "dashscope>=2.0.1",
+    "pyaudio>=0.2.14",
+    "numpy>=1.26",
+    "onnxruntime>=1.17",
+    "silero-vad>=5.1",
+]
 
 [project.scripts]
 companion = "companion.cli:main"
