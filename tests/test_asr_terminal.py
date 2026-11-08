@@ -73,6 +73,35 @@ def test_long_partial_is_truncated_to_terminal_width() -> None:
     assert display_width(last) <= 10
 
 
+def test_final_is_never_truncated_even_when_wider_than_terminal() -> None:
+    renderer, out, _ = make_renderer(width=10)
+    text = "一二三四五六七八九十十一十二"
+    renderer.partial(1, "一二三四五")
+    renderer.final(1, text)
+    raw = out.getvalue()
+    assert out.getvalue().split(CLEAR_LINE)[-1] == text + "\n"
+    assert "…" not in raw.split(CLEAR_LINE)[-1]
+    assert renderer.confirmed == [text]
+
+
+def test_older_partial_cannot_overwrite_a_newer_partial() -> None:
+    renderer, out, _ = make_renderer(width=40)
+    renderer.partial(2, "新的内容")
+    before = out.getvalue()
+    renderer.partial(1, "旧的内容")
+    assert renderer.partial_text == "新的内容"
+    assert renderer._current_uid == 2
+    assert out.getvalue() == before
+
+
+def test_newer_partial_replaces_older_partial() -> None:
+    renderer, out, _ = make_renderer(width=40)
+    renderer.partial(1, "旧")
+    renderer.partial(2, "新")
+    assert renderer.partial_text == "新"
+    assert out.getvalue().endswith(CLEAR_LINE + "新")
+
+
 def test_final_replaces_partial_and_adds_one_newline() -> None:
     renderer, out, _ = make_renderer(width=40)
     renderer.final(1, "你好世界")

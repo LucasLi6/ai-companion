@@ -135,6 +135,10 @@ class TerminalRenderer:
             if self._show_partials:
                 self._write_status(f"[partial] {text}\n")
             return
+        if self._partial_active and utterance_id < (self._current_uid or 0):
+            # A late partial from an older utterance must never overwrite the
+            # newer utterance's provisional text.
+            return
         self._current_uid = utterance_id
         self._partial_text = text
         self._write_stream(CLEAR_LINE + self._fit(text))
@@ -161,7 +165,9 @@ class TerminalRenderer:
             pending = (self._current_uid or 0, self._partial_text)
             self._write_stream(CLEAR_LINE)
             self._partial_active = False
-        self._write_stream(self._fit(text) + "\n")
+        # A final transcript is never truncated: the terminal may soft-wrap
+        # it, but every character is written.
+        self._write_stream(text + "\n")
         self.confirmed.append(text)
         if pending is not None and (pending[0] > utterance_id or not replace_partial):
             # A newer sentence/utterance's provisional line was on screen;

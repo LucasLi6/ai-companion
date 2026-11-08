@@ -92,6 +92,11 @@ def resolve_vad_model_path(explicit: str = "") -> Path:
 class SileroVAD:
     """Minimal stateful Silero VAD ONNX wrapper (v4 and v5 layouts)."""
 
+    # Silero v5 carries 64 samples of the previous 16 kHz window as context and
+    # the ONNX graph consumes context+window (576 samples). Without it the
+    # model returns near-zero speech probability even on clear speech.
+    CONTEXT_SAMPLES = 64
+
     def __init__(
         self,
         config: ASRConfig,
@@ -109,6 +114,8 @@ class SileroVAD:
         self._input_names: dict[str, str] = {}
         self._output_names: dict[str, str] = {}
         self._state: Any = None
+        self._context: Any = None
+        self._use_context = False
         self._h: Any = None
         self._c: Any = None
         self._input_shapes: dict[str, tuple[int, ...]] = {}
@@ -159,10 +166,11 @@ class SileroVAD:
         }
         self._input_shapes = {
             item.name.lower(): tuple(
-                dim for dim in item.shape if isinstance(dim, int)
+                int(dim) if isinstance(dim, int) else 1 for dim in item.shape
             )
             for item in session.get_inputs()
         }
+        self._use_context = "staten" in self._output_names
         self._reset_state()
         self._preloaded = True
 
@@ -174,6 +182,7 @@ class SileroVAD:
         h_shape = self._input_shapes.get("h") or (2, 1, 64)
         c_shape = self._input_shapes.get("c") or (2, 1, 64)
         self._state = np.zeros(state_shape, dtype=np.float32)
+        self._context = np.zeros((1, self.CONTEXT_SAMPLES), dtype=np.float32)
         self._h = np.zeros(h_shape, dtype=np.float32)
         self._c = np.zeros(c_shape, dtype=np.float32)
 
@@ -194,8 +203,18 @@ class SileroVAD:
         audio = np.frombuffer(window, dtype=np.int16).astype(np.float32)
         audio = audio / 32768.0
         audio = audio.reshape(1, -1)
+        model_input = audio
+        if self._use_context:
+            if (
+                self._context is None
+                or self._context.shape != (1, self.CONTEXT_SAMPLES)
+            ):
+                self._context = np.zeros(
+                    (1, self.CONTEXT_SAMPLES), dtype=np.float32
+                )
+            model_input = np.concatenate([self._context, audio], axis=1)
         feed: dict[str, Any] = {
-            self._input_names.get("input", "input"): audio
+            self._input_names.get("input", "input"): model_input
         }
         if "state" in self._input_names:
             feed[self._input_names["state"]] = self._state
@@ -221,12 +240,17 @@ class SileroVAD:
         probability = result.get("output")
         if probability is None and outputs:
             probability = outputs[0]
-        if "stateN" in result:
-            self._state = result["stateN"]
+        # ``result`` is keyed by the lower-cased ONNX output names, so the v5
+        # recurrent state output ``stateN`` is stored as ``"staten"``. Looking
+        # up the original casing silently missed it and froze the state.
+        if "staten" in result:
+            self._state = result["staten"]
         elif "hn" in result:
             self._h = result["hn"]
             if "cn" in result:
                 self._c = result["cn"]
+        if self._use_context:
+            self._context = audio[:, -self.CONTEXT_SAMPLES:].copy()
         value = float(np.asarray(probability).reshape(-1)[0])
         return max(0.0, min(1.0, value))
 

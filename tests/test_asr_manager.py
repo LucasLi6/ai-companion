@@ -22,8 +22,14 @@ from companion.asr.client import (
     ASRSession,
     parse_event,
 )
-from companion.asr.config import ASRConfig
-from companion.asr.manager import ASRManager, _Sentence, _Utterance
+from companion.asr.config import ASRConfig, VAD_WINDOW_SAMPLES
+from companion.asr.manager import (
+    ASRManager,
+    _FinalTimeout,
+    _Sentence,
+    _SessionDone,
+    _Utterance,
+)
 from companion.asr.microphone import (
     AudioChunk,
     AudioDevice,
@@ -133,6 +139,8 @@ class SessionScript:
     fail_events: bool = False
     finals_before_stop: bool = False
     never_finish: bool = False
+    finish_immediately: bool = False
+    send_delay: float = 0.0
 
 
 class FakeSession:
@@ -152,6 +160,8 @@ class FakeSession:
         self.opened = True
 
     def send_audio(self, pcm: bytes) -> None:
+        if self.script.send_delay:
+            time.sleep(self.script.send_delay)
         with self._lock:
             self.sent.append(bytes(pcm))
 
@@ -164,6 +174,12 @@ class FakeSession:
             raise ASRClientError("模拟接收失败")
         for text, sentence_id in self.script.partials:
             yield ASREvent("sentence", text, sentence_id, False)
+        if self.script.finish_immediately:
+            # The server task ends on its own while the local VAD is still
+            # active (no stop() call).
+            for text, sentence_id in self.script.finals:
+                yield ASREvent("sentence", text, sentence_id, True)
+            return
         if self.script.finals_before_stop:
             for text, sentence_id in self.script.finals:
                 yield ASREvent("sentence", text, sentence_id, True)
@@ -460,7 +476,7 @@ def test_microphone_interrupt_aborts_partial_and_recovers() -> None:
 
 
 def test_asr_sentence_end_does_not_stop_the_vad_utterance() -> None:
-    renderer, _out, status = make_renderer()
+    renderer, out, status = make_renderer(is_tty=True, width=200)
     running = start(
         [start_group(), audio_group(), audio_group(), end_group()],
         [
@@ -475,14 +491,213 @@ def test_asr_sentence_end_does_not_stop_the_vad_utterance() -> None:
     )
     try:
         running.feed(3)
-        assert wait_for(lambda: renderer.confirmed == ["先确认"])
+        assert wait_for(lambda: len(running.factory.created) == 1)
         session = running.factory.created[0]
         assert wait_for(lambda: session.sent_bytes > 0)
-        assert session.stop_calls == 0  # VAD has not ended the utterance
+        # sentence_end confirms a fragment but neither stops audio nor prints
+        # a newline before the local VAD ends.
+        assert session.stop_calls == 0
+        assert renderer.confirmed == []
+        assert out.getvalue().count("\n") == 0
         running.feed(1)
         assert wait_for(lambda: session.stop_calls == 1)
-        assert wait_for(lambda: running.manager.stats.finalized == 1)
-        assert renderer.confirmed == ["先确认"]
+        assert wait_for(lambda: renderer.confirmed == ["先确认"])
+        # Duplicate sentence_end events and the partial must not add lines.
+        assert out.getvalue().count("先确认\n") == 1
+        assert out.getvalue().count("\n") == 1
+        assert running.manager.stats.finalized == 1
+    finally:
+        running.stop()
+
+
+def test_one_turn_with_two_server_sentences_merges_into_one_line() -> None:
+    renderer, out, status = make_renderer(is_tty=False)
+    running = start(
+        [start_group(), audio_group(), end_group()],
+        [
+            SessionScript(
+                partials=[("你可能", "s1"), ("你可能", "s1")],
+                finals=[("你好，", "s1"), ("世界。", "s2")],
+                finals_before_stop=True,
+            )
+        ],
+        renderer=renderer,
+        status=status,
+    )
+    try:
+        running.feed(3)
+        assert wait_for(lambda: renderer.confirmed == ["你好，世界。"])
+        assert out.getvalue() == "你好，世界。\n"
+    finally:
+        running.stop()
+
+
+def test_english_sentences_keep_single_space_when_merged() -> None:
+    from companion.asr.manager import _merge_turn_text
+
+    assert _merge_turn_text(["Hello.", "World."]) == "Hello. World."
+    assert _merge_turn_text(["你好，", "世界。"]) == "你好，世界。"
+    assert _merge_turn_text(["Olá.", "Tudo bem?"]) == "Olá. Tudo bem?"
+    assert _merge_turn_text(["你好", "world"]) == "你好world"
+    assert _merge_turn_text(["", "  ", None]) == ""
+    assert _merge_turn_text(["第一段。", "Second."]) == "第一段。Second."
+
+
+def test_session_done_before_vad_end_waits_for_the_turn_to_finish() -> None:
+    renderer, out, status = make_renderer(is_tty=False)
+    running = start(
+        [start_group(), audio_group(), end_group()],
+        [
+            SessionScript(
+                partials=[("你好", "s1")],
+                finals=[("你好。", "s1")],
+                finish_immediately=True,
+            )
+        ],
+        renderer=renderer,
+        status=status,
+    )
+    try:
+        running.feed(2)
+        assert wait_for(lambda: len(running.factory.created) == 1)
+        session = running.factory.created[0]
+        assert wait_for(lambda: session.close_calls >= 1)
+        # The server session is done, but the user is still speaking: no
+        # final line may be printed yet.
+        time.sleep(0.2)
+        assert renderer.confirmed == []
+        assert out.getvalue() == ""
+        running.feed(1)
+        assert wait_for(lambda: renderer.confirmed == ["你好。"])
+        assert out.getvalue() == "你好。\n"
+    finally:
+        running.stop()
+
+
+def test_two_sessions_finishing_out_of_order_keep_partials_intact() -> None:
+    renderer, out, status = make_renderer(is_tty=True, width=200)
+    running = start(
+        [start_group(), end_group(), start_group(), end_group()],
+        [
+            SessionScript(
+                partials=[("第一临时", "s1")],
+                finals=[("第一最终", "s1")],
+                finals_before_stop=True,
+                never_finish=True,
+            ),
+            SessionScript(
+                partials=[("第二临时", "s1")],
+                finals=[("第二最终", "s1")],
+                finals_before_stop=True,
+            ),
+        ],
+        renderer=renderer,
+        status=status,
+    )
+    try:
+        running.feed(1)  # start utterance #1 (slow)
+        assert wait_for(lambda: len(running.factory.created) == 1)
+        slow = running.factory.created[0]
+        running.feed(1)  # end #1: its session stays open for now
+        assert wait_for(lambda: slow.stop_calls == 1)
+        running.feed(1)  # start utterance #2 while #1 is still open
+        assert wait_for(lambda: len(running.factory.created) == 2)
+        fast = running.factory.created[1]
+        assert wait_for(lambda: renderer.partial_text == "第二临时")
+        running.feed(1)  # end #2: it completes first
+        assert wait_for(lambda: fast.stop_calls == 1)
+        assert wait_for(lambda: renderer.confirmed == ["第二最终"])
+        # Utterance #1 is still open; its late completion must not clobber
+        # anything already printed for #2.
+        slow._release.set()
+        assert wait_for(lambda: renderer.confirmed == ["第二最终", "第一最终"])
+        assert out.getvalue().count("第二最终\n") == 1
+        assert out.getvalue().count("第一最终\n") == 1
+    finally:
+        running.stop()
+
+
+def test_final_timeout_starts_only_after_audio_upload_finishes() -> None:
+    """A queued or still-uploading session must never trip the final timer.
+
+    The sender is made slow on purpose: the old code armed the timer at local
+    VAD end, so the timeout fired while audio was still being uploaded and
+    while the second utterance was still queued.
+    """
+    renderer, _out, status = make_renderer()
+    big_audio = b"\x01\x00" * (VAD_WINDOW_SAMPLES * 20)
+    groups = [
+        [VADEvent(SPEECH_STARTED, big_audio)],
+        [VADEvent(SPEECH_ENDED)],
+        [VADEvent(SPEECH_STARTED, b"\x01\x00" * VAD_WINDOW_SAMPLES)],
+        [VADEvent(SPEECH_ENDED)],
+    ]
+    running = start(
+        groups,
+        [
+            SessionScript(finals=[("第一最终", "s1")], send_delay=0.05),
+            SessionScript(finals=[("第二最终", "s1")], send_delay=0.05),
+        ],
+        renderer=renderer,
+        cfg=config(
+            max_concurrent_sessions=1,
+            final_timeout_seconds=0.2,
+            timeout_seconds=3.0,
+        ),
+        status=status,
+    )
+    try:
+        running.feed(4)
+        assert wait_for(
+            lambda: renderer.confirmed == ["第一最终", "第二最终"],
+            timeout=10.0,
+        )
+        assert "超时" not in status.getvalue()
+        assert running.manager.stats.errors == 0
+        assert running.manager.stats.finalized == 2
+        sessions = running.factory.created
+        assert len(sessions) == 2
+        assert all(session.stop_calls == 1 for session in sessions)
+    finally:
+        running.stop()
+
+
+def test_one_thousand_consecutive_turns_clean_up_state() -> None:
+    renderer, out, status = make_renderer()
+    scripts = [
+        SessionScript(finals=[(f"第{index}段", "s1")])
+        for index in range(1, 1001)
+    ]
+    groups: list[list[VADEvent]] = []
+    for _ in range(1000):
+        groups.append(start_group())
+        groups.append(end_group())
+    running = start(
+        groups,
+        scripts,
+        renderer=renderer,
+        cfg=config(final_timeout_seconds=2.0, max_concurrent_sessions=4),
+        status=status,
+    )
+    try:
+        running.feed(2000)
+        assert wait_for(
+            lambda: len(renderer.confirmed) == 1000, timeout=30.0,
+            interval=0.02,
+        )
+        assert wait_for(
+            lambda: not running.manager._utterances
+            and not running.manager._open_order
+            and not running.manager._threads,
+            timeout=10.0,
+            interval=0.02,
+        )
+        assert renderer.confirmed[0] == "第1段"
+        assert renderer.confirmed[-1] == "第1000段"
+        assert len(set(renderer.confirmed)) == 1000
+        assert running.manager.stats.utterances == 1000
+        assert running.manager.stats.finalized == 1000
+        assert out.getvalue().count("\n") == 1000
     finally:
         running.stop()
 
@@ -501,6 +716,32 @@ def test_late_result_for_finalized_utterance_is_ignored() -> None:
     manager._handle(_Sentence(1, "迟到文本", "s1", True, time.monotonic()))
     assert renderer.confirmed == []
     assert out.getvalue() == ""
+
+
+def test_late_events_after_cleanup_are_safely_ignored() -> None:
+    renderer, out, status = make_renderer()
+    running = start(
+        [start_group(), end_group()],
+        [SessionScript(finals=[("完成", "s1")])],
+        renderer=renderer,
+        status=status,
+    )
+    try:
+        running.feed(2)
+        assert wait_for(lambda: renderer.confirmed == ["完成"])
+        manager = running.manager
+        assert wait_for(lambda: manager._utterances == {})
+        manager._handle(_Sentence(1, "迟到文本", "s9", True, time.monotonic()))
+        manager._handle(_Sentence(1, "迟到部分", "s9", False, time.monotonic()))
+        manager._handle(_SessionDone(1, "迟到错误", time.monotonic()))
+        manager._handle(_FinalTimeout(1))
+        assert renderer.confirmed == ["完成"]
+        assert "迟到" not in out.getvalue()
+        assert "迟到" not in status.getvalue()
+        assert manager._utterances == {}
+        assert manager._open_order == []
+    finally:
+        running.stop()
 
 
 def test_shutdown_aborts_unfinished_utterance_without_commit() -> None:

@@ -227,3 +227,128 @@ def test_resolve_vad_model_path_reports_missing(
         assert "silero_vad.onnx" in str(exc)
     else:  # pragma: no cover - only when silero-vad is installed
         assert resolved.name == "silero_vad.onnx"
+
+
+def test_real_silero_onnx_state_updates_across_windows() -> None:
+    """Regression: ``stateN`` is lower-cased to ``staten`` in the result map.
+
+    Uses the real bundled Silero ONNX model when the optional ``asr`` extra is
+    installed. Consecutive windows must change the recurrent state, and the
+    same sequence replayed after a reset must reproduce the same outputs.
+    """
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("onnxruntime")
+    from companion.asr.vad import SileroVAD
+
+    try:
+        resolve_vad_model_path("")
+    except VADError:
+        pytest.skip("Silero VAD ONNX model is not installed")
+    vad = SileroVAD(config())
+    try:
+        vad.preload()
+    except VADError as exc:  # pragma: no cover - broken optional install
+        pytest.skip(f"Silero VAD unavailable: {exc}")
+
+    assert "staten" in vad._output_names
+    assert vad._input_names.get("state") == "state"
+    assert vad._state.shape == (2, 1, 128)
+
+    rng = np.random.default_rng(7)
+    windows = [
+        rng.integers(-3000, 3000, VAD_WINDOW_SAMPLES, dtype=np.int16).tobytes()
+        for _ in range(3)
+    ]
+    initial = vad._state.copy()
+    assert not initial.any()
+
+    first = vad.probability(windows[0])
+    state_after_first = vad._state.copy()
+    second = vad.probability(windows[1])
+    state_after_second = vad._state.copy()
+
+    assert 0.0 <= first <= 1.0
+    assert 0.0 <= second <= 1.0
+    # With the bug (looking up "stateN" in a lower-cased map) the state stayed
+    # all zeros and the model was stateless window by window.
+    assert not np.allclose(state_after_first, initial)
+    assert not np.allclose(state_after_second, state_after_first)
+
+    vad.reset()
+    assert np.allclose(vad._state, initial)
+    replay_first = vad.probability(windows[0])
+    replay_second = vad.probability(windows[1])
+    assert replay_first == pytest.approx(first)
+    assert replay_second == pytest.approx(second)
+
+
+class _FakeInput:
+    def __init__(self, name: str, shape) -> None:
+        self.name = name
+        self.shape = shape
+
+
+class _FakeSession:
+    """Records ONNX feeds and returns zero probability/state."""
+
+    def __init__(self) -> None:
+        import numpy as np
+
+        self.np = np
+        self.feeds: list[dict] = []
+
+    def get_inputs(self):
+        return [
+            _FakeInput("input", [None, None]),
+            _FakeInput("state", [2, None, 128]),
+            _FakeInput("sr", []),
+        ]
+
+    def get_outputs(self):
+        return [
+            _FakeInput("output", [None, 1]),
+            _FakeInput("stateN", [None, None, None]),
+        ]
+
+    def run(self, _outputs, feed):
+        self.feeds.append({key: value.copy() for key, value in feed.items()})
+        return [
+            self.np.zeros((1, 1), dtype=self.np.float32),
+            self.np.zeros((2, 1, 128), dtype=self.np.float32),
+        ]
+
+
+def test_v5_onnx_input_is_context_plus_window(tmp_path: Path) -> None:
+    """Silero v5 consumes 64 previous samples + the current 512 samples."""
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("onnxruntime")
+    from companion.asr.vad import SileroVAD
+
+    session = _FakeSession()
+    model = tmp_path / "silero_vad.onnx"
+    model.write_bytes(b"fake")
+    vad = SileroVAD(
+        config(),
+        model_path=str(model),
+        session_factory=lambda _path: session,
+    )
+    vad.preload()
+    assert vad._use_context is True
+
+    first = np.arange(512, dtype=np.int16)
+    second = np.full(512, 1234, dtype=np.int16)
+    vad.probability(first.tobytes())
+    vad.probability(second.tobytes())
+
+    assert session.feeds[0]["input"].shape == (1, 576)
+    assert np.allclose(session.feeds[0]["input"][0, :64], 0.0)
+    expected = first.astype(np.float32) / 32768.0
+    assert np.allclose(session.feeds[0]["input"][0, 64:], expected)
+    # The next window's context is the last 64 samples of the previous one.
+    assert np.allclose(
+        session.feeds[1]["input"][0, :64], expected[-64:]
+    )
+    assert np.allclose(
+        session.feeds[1]["input"][0, 64:],
+        second.astype(np.float32) / 32768.0,
+    )

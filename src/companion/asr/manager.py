@@ -15,6 +15,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -42,6 +43,44 @@ SEND_FRAME_SECONDS = 0.1
 
 _STOP = object()
 _ABORT = object()
+
+# Joining server sentences into one turn line. No spaces around CJK/full-width
+# text or before closing punctuation; a space between Latin sentences/words.
+_NO_SPACE_BEFORE = set(",.;:!?%)]}、。，！？；：")
+_NO_SPACE_AFTER = set("([{《「“‘")
+
+
+def _is_wide(char: str) -> bool:
+    return unicodedata.east_asian_width(char) in ("W", "F")
+
+
+def _needs_space(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if left[-1].isspace() or right[0].isspace():
+        return False
+    if _is_wide(left[-1]) or _is_wide(right[0]):
+        return False
+    if left[-1] in _NO_SPACE_AFTER or right[0] in _NO_SPACE_BEFORE:
+        return False
+    return True
+
+
+def _merge_turn_text(texts: Any) -> str:
+    """Join confirmed sentence fragments of one speaking turn.
+
+    The server may emit several ``sentence_end`` fragments for one VAD turn;
+    the demo prints them as a single line. CJK fragments join directly, Latin
+    fragments keep a single space, and closing punctuation never hugs a space.
+    """
+    parts = [str(text or "").strip() for text in texts]
+    parts = [text for text in parts if text]
+    if not parts:
+        return ""
+    merged = parts[0]
+    for part in parts[1:]:
+        merged += (" " if _needs_space(merged, part) else "") + part
+    return merged
 
 
 @dataclass
@@ -108,6 +147,19 @@ class _FinalTimeout:
     uid: int
 
 
+@dataclass(frozen=True)
+class _InputClosed:
+    """The sender finished flushing audio and called ``recognize.stop()``.
+
+    Only from this point on may the final-result timeout start: while a
+    session is still queued or still uploading audio, waiting is expected and
+    must not be reported as a timeout.
+    """
+
+    uid: int
+    at: float
+
+
 class _Utterance:
     """Mutable state for one VAD-bounded utterance."""
 
@@ -124,15 +176,17 @@ class _Utterance:
         self.sender: Optional[threading.Thread] = None
         self.receiver: Optional[threading.Thread] = None
         self.vad_end_at: Optional[float] = None
-        self.final_sentence_at: Optional[float] = None
         self.finals: list[tuple[str, str]] = []
         self.final_ids: set[str] = set()
         self.partial = ""
         self.partial_id = ""
+        self.session_done = False
+        self.session_error: Optional[str] = None
+        self.session_done_at: Optional[float] = None
         self.finalized = False
         self.aborted = False
         self.stop_sent = False
-        self.timer: Optional[threading.Timer] = None
+        self.final_timer: Optional[threading.Timer] = None
         self.final_latency_ms: Optional[float] = None
 
 
@@ -175,6 +229,7 @@ class ASRManager:
         self._vad_thread: Optional[threading.Thread] = None
         self._render_thread: Optional[threading.Thread] = None
         self._threads: list[threading.Thread] = []
+        self._threads_lock = threading.Lock()
         self._utterances: dict[int, _Utterance] = {}
         self._open_order: list[_Utterance] = []
         self._current: Optional[_Utterance] = None
@@ -274,7 +329,9 @@ class ASRManager:
                     report=False,
                     promote=False,
                 )
-        for thread in self._threads:
+        with self._threads_lock:
+            threads = list(self._threads)
+        for thread in threads:
             thread.join(timeout=2.0)
         try:
             self._render_queue.put_nowait(None)
@@ -372,6 +429,10 @@ class ASRManager:
                         self._flush_audio(session, buffer)
                         buffer.clear()
                     session.stop()
+                    self._put_control(
+                        _InputClosed(utterance.uid, time.monotonic()),
+                        critical=True,
+                    )
                     return
                 elif item is _ABORT:
                     return
@@ -400,60 +461,67 @@ class ASRManager:
         finally:
             utterance.opened.set()
             utterance.sender_done.set()
+            self._unregister_thread(threading.current_thread())
 
     def _receiver_loop(self, utterance: _Utterance) -> None:
-        timeout = self.config.timeout_seconds + 2.0
-        if not utterance.opened.wait(timeout=timeout):
-            self._put_control(
-                _SessionDone(
-                    utterance.uid, "ASR 连接超时。", time.monotonic()
-                ),
-                critical=True,
-            )
-            return
-        session = utterance.session
-        if session is None or utterance.open_error:
-            return
         try:
-            for event in session.events():
-                now = time.monotonic()
-                if event.kind == "error":
-                    self._put_control(
-                        _SessionDone(utterance.uid, event.error, now),
-                        critical=True,
-                    )
-                    return
-                if event.kind == "sentence":
-                    self._put_control(
-                        _Sentence(
-                            utterance.uid,
-                            event.text,
-                            event.sentence_id,
-                            event.is_final,
-                            now,
-                        ),
-                        critical=True,
-                    )
-            self._put_control(
-                _SessionDone(utterance.uid, None, time.monotonic()),
-                critical=True,
-            )
-        except ASRClientError as exc:
-            self._put_control(
-                _SessionDone(utterance.uid, str(exc), time.monotonic()),
-                critical=True,
-            )
-        except Exception as exc:  # noqa: BLE001 - sanitized
-            self._put_control(
-                _SessionDone(
-                    utterance.uid,
-                    f"ASR 接收失败（{type(exc).__name__}）。",
-                    time.monotonic(),
-                ),
-                critical=True,
-            )
+            timeout = self.config.timeout_seconds + 2.0
+            if not utterance.opened.wait(timeout=timeout):
+                self._put_control(
+                    _SessionDone(
+                        utterance.uid, "ASR 连接超时。", time.monotonic()
+                    ),
+                    critical=True,
+                )
+                return
+            session = utterance.session
+            if session is None or utterance.open_error:
+                return
+            try:
+                for event in session.events():
+                    now = time.monotonic()
+                    if event.kind == "error":
+                        self._put_control(
+                            _SessionDone(utterance.uid, event.error, now),
+                            critical=True,
+                        )
+                        return
+                    if event.kind == "sentence":
+                        self._put_control(
+                            _Sentence(
+                                utterance.uid,
+                                event.text,
+                                event.sentence_id,
+                                event.is_final,
+                                now,
+                            ),
+                            critical=True,
+                        )
+                self._put_control(
+                    _SessionDone(utterance.uid, None, time.monotonic()),
+                    critical=True,
+                )
+            except ASRClientError as exc:
+                self._put_control(
+                    _SessionDone(utterance.uid, str(exc), time.monotonic()),
+                    critical=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - sanitized
+                self._put_control(
+                    _SessionDone(
+                        utterance.uid,
+                        f"ASR 接收失败（{type(exc).__name__}）。",
+                        time.monotonic(),
+                    ),
+                    critical=True,
+                )
+            finally:
+                try:
+                    session.close()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
         finally:
-            session.close()
+            self._unregister_thread(threading.current_thread())
 
     def _flush_audio(
         self, session: ASRSession, buffer: bytearray
@@ -475,6 +543,8 @@ class ASRManager:
             self._handle_sentence(event)
         elif isinstance(event, _SessionDone):
             self._handle_session_done(event)
+        elif isinstance(event, _InputClosed):
+            self._handle_input_closed(event)
         elif isinstance(event, _FinalTimeout):
             self._handle_final_timeout(event)
         elif isinstance(event, _Interrupted):
@@ -518,24 +588,21 @@ class ASRManager:
         if utterance is None or utterance.finalized:
             return
         utterance.vad_end_at = event.at
-        if utterance.stop_sent:
-            return
-        utterance.stop_sent = True
-        if not self._enqueue_sentinel(utterance, _STOP):
-            self._abort_utterance(
-                utterance,
-                "ASR 发送队列已满，网络可能过慢；已中止当前识别。",
-            )
-            return
-        timeout = max(0.1, self.config.final_timeout_seconds)
-        timer = threading.Timer(
-            timeout, self._enqueue_final_timeout, args=(utterance.uid,)
-        )
-        timer.daemon = True
-        utterance.timer = timer
-        timer.start()
-        if self.config.debug:
-            self._render_status(f"#{utterance.uid} 语音结束，等待最终识别…")
+        if not utterance.stop_sent:
+            utterance.stop_sent = True
+            if not self._enqueue_sentinel(utterance, _STOP):
+                self._abort_utterance(
+                    utterance,
+                    "ASR 发送队列已满，网络可能过慢；已中止当前识别。",
+                )
+                return
+            if self.config.debug:
+                self._render_status(
+                    f"#{utterance.uid} 语音结束，等待发送完成后收尾…"
+                )
+        # The session may already have ended while the user was still
+        # speaking; only now are both conditions of a turn complete.
+        self._maybe_finish(utterance)
 
     def _handle_sentence(self, event: _Sentence) -> None:
         utterance = self._utterances.get(event.uid)
@@ -545,41 +612,32 @@ class ASRManager:
             or utterance.aborted
         ):
             return
+        text = str(event.text or "").strip()
+        if not text:
+            return
         if event.is_final:
-            if (
-                utterance.vad_end_at is not None
-                and utterance.final_sentence_at is None
-            ):
-                utterance.final_sentence_at = event.at
             sentence_id = event.sentence_id
             if sentence_id and sentence_id in utterance.final_ids:
                 return
             if (
                 not sentence_id
                 and utterance.finals
-                and event.text == utterance.finals[-1][1]
+                and text == utterance.finals[-1][1]
             ):
                 return
             if sentence_id:
                 utterance.final_ids.add(sentence_id)
             key = sentence_id or f"#{len(utterance.finals)}"
-            utterance.finals.append((key, event.text))
-            replace = (
-                not utterance.partial
-                or utterance.partial_id == sentence_id
-                or (not sentence_id and utterance.partial == event.text)
-            )
-            if replace:
+            utterance.finals.append((key, text))
+            # A confirmed fragment is only accumulated. It is never printed
+            # as its own line; the whole turn is merged and rendered once by
+            # ``_finish`` after VAD end and session completion.
+            if utterance.partial and (
+                utterance.partial_id == sentence_id
+                or (not sentence_id and utterance.partial == text)
+            ):
                 utterance.partial = ""
                 utterance.partial_id = ""
-            self._render(
-                RenderEvent(
-                    kind="final",
-                    utterance_id=event.uid,
-                    text=event.text,
-                    replace_partial=replace,
-                )
-            )
             return
 
         if (
@@ -587,23 +645,56 @@ class ASRManager:
             and event.sentence_id in utterance.final_ids
         ):
             return
-        if event.text == utterance.partial:
+        if text == utterance.partial:
             return
-        utterance.partial = event.text
+        utterance.partial = text
         utterance.partial_id = event.sentence_id
-        self._render(
-            RenderEvent(
-                kind="partial",
-                utterance_id=event.uid,
-                text=event.text,
-            )
+        preview = _merge_turn_text(
+            [fragment for _, fragment in utterance.finals]
+            + ([utterance.partial] if utterance.partial else [])
         )
+        if preview:
+            self._render(
+                RenderEvent(
+                    kind="partial",
+                    utterance_id=event.uid,
+                    text=preview,
+                )
+            )
 
     def _handle_session_done(self, event: _SessionDone) -> None:
         utterance = self._utterances.get(event.uid)
         if utterance is None or utterance.finalized:
             return
-        self._finish(utterance, event.error, event.at)
+        if utterance.session_done:
+            return
+        utterance.session_done = True
+        utterance.session_error = event.error
+        utterance.session_done_at = event.at
+        self._maybe_finish(utterance)
+
+    def _handle_input_closed(self, event: _InputClosed) -> None:
+        """All audio was sent and ``stop()`` was called: start final timing."""
+        utterance = self._utterances.get(event.uid)
+        if (
+            utterance is None
+            or utterance.finalized
+            or utterance.session_done
+        ):
+            return
+        if utterance.final_timer is not None:
+            return
+        timeout = max(0.1, self.config.final_timeout_seconds)
+        timer = threading.Timer(
+            timeout, self._enqueue_final_timeout, args=(utterance.uid,)
+        )
+        timer.daemon = True
+        utterance.final_timer = timer
+        timer.start()
+        if self.config.debug:
+            self._render_status(
+                f"#{utterance.uid} 音频发送完成，等待最终识别…"
+            )
 
     def _handle_final_timeout(self, event: _FinalTimeout) -> None:
         utterance = self._utterances.get(event.uid)
@@ -644,7 +735,8 @@ class ASRManager:
             name=f"asr-recv-{utterance.uid}",
             daemon=True,
         )
-        self._threads.extend([utterance.sender, utterance.receiver])
+        self._register_thread(utterance.sender)
+        self._register_thread(utterance.receiver)
         utterance.sender.start()
         utterance.receiver.start()
 
@@ -657,18 +749,25 @@ class ASRManager:
         if utterance.finalized:
             return
         utterance.finalized = True
-        if utterance.timer is not None:
-            utterance.timer.cancel()
+        if utterance.final_timer is not None:
+            utterance.final_timer.cancel()
         if utterance.started:
             self._active_sessions = max(0, self._active_sessions - 1)
         self._close_session(utterance)
+        # The session is over; late events for this id are now safely ignored
+        # and no longer need to be kept in the open/known collections. The
+        # session threads unregister themselves when they exit.
+        self._remove_utterance(utterance)
 
-        if utterance.partial:
+        if not utterance.finals and utterance.partial:
             utterance.partial = ""
             utterance.partial_id = ""
             self._render(
                 RenderEvent(kind="clear_partial", utterance_id=utterance.uid)
             )
+        else:
+            utterance.partial = ""
+            utterance.partial_id = ""
 
         if error:
             self.stats.errors += 1
@@ -676,11 +775,22 @@ class ASRManager:
                 f"识别 #{utterance.uid} 失败：{error}", is_error=True
             )
 
-        if utterance.finals:
+        merged = _merge_turn_text(
+            [fragment for _, fragment in utterance.finals]
+        )
+        if merged:
             self.stats.finalized += 1
+            self._render(
+                RenderEvent(
+                    kind="final",
+                    utterance_id=utterance.uid,
+                    text=merged,
+                )
+            )
             if utterance.vad_end_at is not None:
-                base = utterance.final_sentence_at or at
-                latency = max(0.0, (base - utterance.vad_end_at) * 1000.0)
+                latency = max(
+                    0.0, (at - utterance.vad_end_at) * 1000.0
+                )
                 utterance.final_latency_ms = latency
                 self.stats.final_latencies_ms.append(latency)
                 if self.config.debug:
@@ -696,6 +806,18 @@ class ASRManager:
                 )
         self._promote_pending()
 
+    def _maybe_finish(self, utterance: _Utterance) -> None:
+        """Finish only once BOTH local VAD ended and the ASR session ended."""
+        if utterance.finalized or not utterance.session_done:
+            return
+        if utterance.vad_end_at is None:
+            return
+        self._finish(
+            utterance,
+            utterance.session_error,
+            utterance.session_done_at or time.monotonic(),
+        )
+
     def _abort_utterance(
         self,
         utterance: _Utterance,
@@ -708,12 +830,13 @@ class ASRManager:
             return
         utterance.aborted = True
         utterance.finalized = True
-        if utterance.timer is not None:
-            utterance.timer.cancel()
+        if utterance.final_timer is not None:
+            utterance.final_timer.cancel()
         if utterance.started:
             self._active_sessions = max(0, self._active_sessions - 1)
         self._close_session(utterance)
         self._enqueue_sentinel(utterance, _ABORT)
+        self._remove_utterance(utterance)
         if utterance.partial:
             utterance.partial = ""
             utterance.partial_id = ""
@@ -724,8 +847,6 @@ class ASRManager:
             self.stats.aborted += 1
         if report:
             self._render_status(reason, is_error=True)
-        if self._current is utterance:
-            self._current = None
         if promote:
             self._promote_pending()
 
@@ -736,6 +857,28 @@ class ASRManager:
             if utterance.finalized or utterance.started:
                 continue
             self._start_session(utterance)
+
+    def _remove_utterance(self, utterance: _Utterance) -> None:
+        """Drop all manager-side references to a finished utterance."""
+        if self._utterances.get(utterance.uid) is utterance:
+            self._utterances.pop(utterance.uid, None)
+        try:
+            self._open_order.remove(utterance)
+        except ValueError:
+            pass
+        if self._current is utterance:
+            self._current = None
+
+    def _register_thread(self, thread: threading.Thread) -> None:
+        with self._threads_lock:
+            self._threads.append(thread)
+
+    def _unregister_thread(self, thread: threading.Thread) -> None:
+        with self._threads_lock:
+            try:
+                self._threads.remove(thread)
+            except ValueError:
+                pass
 
     # ----------------------------------------------------------------- helpers
     def _enqueue_audio(self, utterance: _Utterance, data: bytes) -> bool:
