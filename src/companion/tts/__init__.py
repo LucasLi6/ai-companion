@@ -10,10 +10,17 @@ Both paths share one generation token, one bounded audio queue and one player.
 """
 
 from companion.tts.manager import (
+    PlaybackEvent,
     SpeechJob,
     TTSManager,
     TTSStatus,
     TTSStream,
 )
 
-__all__ = ["SpeechJob", "TTSManager", "TTSStatus", "TTSStream"]
+__all__ = [
+    "PlaybackEvent",
+    "SpeechJob",
+    "TTSManager",
+    "TTSStatus",
+    "TTSStream",
+]

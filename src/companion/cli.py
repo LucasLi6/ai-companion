@@ -519,6 +519,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_repl = sub.add_parser("repl", parents=[_common_parser()], help="Start an interactive text session")
     p_repl.add_argument("--conversation", default=DEFAULT_CONVERSATION)
     p_repl.add_argument("--person", default=None, help="Registered person id of the speaker")
+    p_repl.add_argument(
+        "--voice",
+        action="store_true",
+        default=False,
+        help="Enable microphone listening at startup (VAD + Qwen ASR)",
+    )
     _add_provider_arg(p_repl)
     p_repl.set_defaults(func=cmd_repl)
 
@@ -2149,127 +2155,332 @@ async def cmd_repl(args) -> int:
             print("tts: off (AVA_TTS_ENABLED=false)")
         try:
             # Created once for the session: prompt_toolkit owns the live input
-            # line, so a proactive message can be printed above it without any
-            # cross-thread buffer read or restoration.
+            # line, so proactive / voice output can be printed above it
+            # without ever reading or restoring the typed buffer.
             repl_session = _build_prompt_session()
-            while True:
-                try:
-                    line = (
-                        await _read_line_with_proactive(rt, repl_session)
-                    ).strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    break
-                if not line:
-                    continue
-                if line.startswith("/"):
-                    parts = line.split()
-                    cmd = parts[0].lower()
-                    if cmd == "/quit" or cmd == "/exit":
-                        break
-                    elif cmd == "/quiet" and len(parts) == 2:
-                        await rt.conversations.set_quiet_mode(
-                            args.conversation, parts[1] == "on"
+            voice_mode = bool(getattr(args, "voice", False))
+            coordinator = None
+            voice_output = (
+                _PromptTurnOutput(repl_session)
+                if repl_session is not None
+                else _DirectTurnOutput()
+            )
+            proactive = getattr(rt, "proactive_manager", None)
+
+            if voice_mode:
+                # Imported lazily: text-only sessions must keep working even
+                # when the optional ASR dependencies are not installed.
+                from companion.asr.config import load_asr_config
+                from companion.asr.manager import ASRManager
+                from companion.voice import VoiceCoordinator
+
+                def _make_asr_manager():
+                    return ASRManager(
+                        load_asr_config(
+                            debug=bool(getattr(args, "debug", False))
                         )
-                        print(f"quiet_mode={'on' if parts[1] == 'on' else 'off'}")
-                    elif cmd == "/to" and len(parts) == 2 and parts[1] in ("agent", "human", "unknown"):
-                        addressee = parts[1]
-                        print(f"addressee -> {addressee}")
-                    elif cmd == "/speech" and len(parts) == 2 and parts[1] in ("on", "off"):
-                        enabled = parts[1] == "on"
-                        rt.orchestrator.speech_expression_enabled = enabled
-                        provider_obj = getattr(rt.orchestrator, "response", None)
-                        if hasattr(provider_obj, "speech_expression_enabled"):
-                            provider_obj.speech_expression_enabled = enabled
-                        print(
-                            f"speech expression: {'on' if enabled else 'off'}"
-                        )
-                    elif cmd == "/tts":
-                        for output in _handle_tts_command(tts_manager, parts):
-                            print(output)
-                    elif cmd == "/history":
-                        for e in await rt.repos.utterance.list_events(None, 20):
-                            print(f"  {e.event_id} to={e.addressee_hint.value} {e.text}")
-                    elif cmd == "/status":
-                        ctx = await rt.repos.conversation.get(args.conversation)
-                        print(f"provider: {rt.provider}")
-                        print(f"router mode: {rt.router_mode}")
-                        print(f"person: {person.person_id} ({person.display_name})")
-                        print(f"conversation: {args.conversation}")
-                        print(f"addressee: {addressee}")
-                        print(f"quiet_mode: {'on' if ctx and ctx.quiet_mode else 'off'}")
-                        print(
-                            "speech expression: "
-                            f"{'on' if getattr(rt.orchestrator, 'speech_expression_enabled', False) else 'off'}"
-                        )
-                        print(
-                            f"tts: {'on' if tts_manager.enabled else 'off'}"
-                            f" ({tts_manager.status().state})"
-                        )
-                        try:
-                            web_enabled = await rt.repos.settings.get_bool(
-                                "web_search.enabled", False
-                            )
-                            web_provider = (
-                                await rt.repos.settings.get("web_search.provider") or ""
-                            ).strip().lower() or "brave"
-                        except Exception:
-                            web_enabled, web_provider = False, "unknown"
-                        print(
-                            f"web search: {'on' if web_enabled else 'off'}"
-                            f" (provider={web_provider},"
-                            f" brave_key={'configured' if _brave_key_configured() else 'missing'})"
-                        )
-                    elif cmd == "/help":
-                        print(
-                            "commands: /to agent|human|unknown  /quiet on|off"
-                            "  /speech on|off  /tts on|off|stop|status"
-                            "  /history  /status  /quit"
-                        )
-                    else:
-                        print("unknown command (see /help)")
-                    continue
-                submitted_at = time.monotonic()
-                event = make_utterance_event(
-                    conversation_id=args.conversation,
-                    text=line,
-                    addressee_hint=addressee,
-                    speaker_person_id=person.person_id,
-                    source=EventSource.CLI,
-                )
-                manager = getattr(rt, "proactive_manager", None)
-                if manager is not None:
-                    # Invalidate any pending check before the turn begins.
-                    manager.note_user_input(
-                        event.conversation_id, event.event_id
                     )
-                # A new ordinary chat input interrupts unfinished speech from
-                # the previous reply. This never cancels text generation.
-                tts_manager.stop()
-                delivery = await _run_streaming_turn(
-                    rt,
-                    event,
-                    debug=bool(getattr(args, "debug", False)),
+
+                def _pause_proactive() -> None:
+                    if proactive is not None:
+                        with contextlib.suppress(Exception):
+                            # Cancel, do not merely delay: an already generated
+                            # proactive line must not preempt the user.
+                            proactive.cancel_cycle(args.conversation)
+
+                def _cooldown_seconds() -> float:
+                    raw = os.environ.get(
+                        "AVA_VOICE_COOLDOWN_SECONDS", "0.3"
+                    )
+                    try:
+                        value = float(raw)
+                    except (TypeError, ValueError):
+                        return 0.3
+                    return max(0.0, min(2.0, value))
+
+                def _voice_notice(text: str) -> None:
+                    try:
+                        asyncio.create_task(voice_output.write(text + "\n"))
+                    except RuntimeError:  # loop shutting down
+                        pass
+
+                coordinator = VoiceCoordinator(
+                    manager_factory=_make_asr_manager,
                     tts_manager=tts_manager,
-                    submitted_at=submitted_at,
+                    cooldown_seconds=_cooldown_seconds(),
+                    on_speech_started=_pause_proactive,
+                    on_notice=_voice_notice,
                 )
-                if (
-                    manager is not None
-                    and delivery.get("delivered")
-                    and delivery.get("status") == "COMPLETED"
-                    and delivery.get("action") == "RESPOND"
-                ):
-                    # Only a real-user-triggered, complete, delivered normal
-                    # reply schedules a check. WAIT/IGNORE, failures,
-                    # cancellations and truncated output never do.
-                    manager.on_response_delivered(
-                        conversation_id=event.conversation_id,
-                        person_id=person.person_id,
-                        source_event_id=event.event_id,
+                # ``--voice`` means persistent listening from startup. A
+                # missing key or device is reported once and text chat
+                # continues; it never aborts the REPL.
+                _mic_ok, _mic_message = await coordinator.enable()
+                print(_mic_message)
+
+            async def _prompt_once():
+                if repl_session is not None:
+                    return await repl_session.prompt_async("you> ")
+                return await asyncio.to_thread(input, "you> ")
+
+            async def _handle_command(line: str) -> bool:
+                """Handle one slash command; return True to quit the REPL."""
+                nonlocal addressee
+                parts = line.split()
+                cmd = parts[0].lower()
+                if cmd == "/quit" or cmd == "/exit":
+                    return True
+                if cmd == "/quiet" and len(parts) == 2:
+                    await rt.conversations.set_quiet_mode(
+                        args.conversation, parts[1] == "on"
                     )
+                    print(f"quiet_mode={'on' if parts[1] == 'on' else 'off'}")
+                elif cmd == "/to" and len(parts) == 2 and parts[1] in ("agent", "human", "unknown"):
+                    addressee = parts[1]
+                    print(f"addressee -> {addressee}")
+                elif cmd == "/speech" and len(parts) == 2 and parts[1] in ("on", "off"):
+                    enabled = parts[1] == "on"
+                    rt.orchestrator.speech_expression_enabled = enabled
+                    provider_obj = getattr(rt.orchestrator, "response", None)
+                    if hasattr(provider_obj, "speech_expression_enabled"):
+                        provider_obj.speech_expression_enabled = enabled
+                    print(
+                        f"speech expression: {'on' if enabled else 'off'}"
+                    )
+                elif cmd == "/tts":
+                    for output in _handle_tts_command(tts_manager, parts):
+                        print(output)
+                elif cmd == "/mic":
+                    await _handle_mic_command(parts, voice_mode, coordinator)
+                elif cmd == "/history":
+                    for e in await rt.repos.utterance.list_events(None, 20):
+                        print(f"  {e.event_id} to={e.addressee_hint.value} {e.text}")
+                elif cmd == "/status":
+                    ctx = await rt.repos.conversation.get(args.conversation)
+                    print(f"provider: {rt.provider}")
+                    print(f"router mode: {rt.router_mode}")
+                    print(f"person: {person.person_id} ({person.display_name})")
+                    print(f"conversation: {args.conversation}")
+                    print(f"addressee: {addressee}")
+                    print(f"quiet_mode: {'on' if ctx and ctx.quiet_mode else 'off'}")
+                    print(
+                        "speech expression: "
+                        f"{'on' if getattr(rt.orchestrator, 'speech_expression_enabled', False) else 'off'}"
+                    )
+                    print(
+                        f"tts: {'on' if tts_manager.enabled else 'off'}"
+                        f" ({tts_manager.status().state})"
+                    )
+                    if coordinator is not None:
+                        print(coordinator.description())
+                    try:
+                        web_enabled = await rt.repos.settings.get_bool(
+                            "web_search.enabled", False
+                        )
+                        web_provider = (
+                            await rt.repos.settings.get("web_search.provider") or ""
+                        ).strip().lower() or "brave"
+                    except Exception:
+                        web_enabled, web_provider = False, "unknown"
+                    print(
+                        f"web search: {'on' if web_enabled else 'off'}"
+                        f" (provider={web_provider},"
+                        f" brave_key={'configured' if _brave_key_configured() else 'missing'})"
+                    )
+                elif cmd == "/help":
+                    voice_help = (
+                        "  /mic on|off|status|devices"
+                        if voice_mode
+                        else ""
+                    )
+                    print(
+                        "commands: /to agent|human|unknown  /quiet on|off"
+                        "  /speech on|off  /tts on|off|stop|status"
+                        f"{voice_help}  /history  /status  /quit"
+                    )
+                else:
+                    print("unknown command (see /help)")
+                return False
+
+            async def _voice_tts_started(generation: int) -> None:
+                if coordinator is not None:
+                    coordinator.on_reply_started(generation)
+                await voice_output.write("[tts] Speaking...\n")
+
+            async def _run_turn(
+                text: str,
+                source: EventSource,
+                submitted_at: float,
+                *,
+                output=None,
+                on_tts_started=None,
+            ) -> dict:
+                # Keyboard and voice both go through this one call path.
+                if coordinator is not None:
+                    coordinator.begin_turn()
+                delivery = {"delivered": False}
+                try:
+                    delivery = await handle_user_message(
+                        rt,
+                        text=text,
+                        source=source,
+                        submitted_at=submitted_at,
+                        conversation_id=args.conversation,
+                        person_id=person.person_id,
+                        addressee=addressee,
+                        debug=bool(getattr(args, "debug", False)),
+                        tts_manager=tts_manager,
+                        output=output,
+                        on_tts_started=on_tts_started,
+                    )
+                except Exception as exc:  # noqa: BLE001 - keep the REPL alive
+                    message = f"[failed] {type(exc).__name__}: {exc}\n"
+                    if output is not None:
+                        await output.write(message)
+                    else:
+                        sys.stdout.write(message)
+                        sys.stdout.flush()
+                finally:
+                    if coordinator is not None:
+                        # Resume only after real playback completion (or
+                        # immediately when no speech was produced).
+                        coordinator.on_turn_finished(delivery)
+                    if output is not None:
+                        with contextlib.suppress(Exception):
+                            await output.flush()
+                return delivery
+
+            if not voice_mode:
+                # Legacy keyboard-only loop. With no microphone configured the
+                # prompt is the only input owner and behaviour is unchanged.
+                while True:
+                    try:
+                        line = (
+                            await _read_line_with_proactive(rt, repl_session)
+                        ).strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        break
+                    if not line:
+                        continue
+                    if line.startswith("/"):
+                        if await _handle_command(line):
+                            break
+                        continue
+                    await _run_turn(
+                        line, EventSource.CLI, time.monotonic()
+                    )
+            else:
+                # Unified input scheduler: one long-lived prompt task plus the
+                # ASR-final and proactive waiters. A submitted keyboard line is
+                # never cancelled or re-submitted; a voice turn may run while
+                # the prompt stays active (output goes above the input line),
+                # and an Enter pressed during that turn is processed next.
+                prompt_task = asyncio.create_task(_prompt_once())
+                quit_requested = False
+                try:
+                    while not quit_requested:
+                        final_future = asyncio.ensure_future(
+                            coordinator.next_final()
+                        )
+                        event_future = (
+                            asyncio.ensure_future(proactive.next_event())
+                            if proactive is not None
+                            else None
+                        )
+                        waiters = {prompt_task, final_future}
+                        if event_future is not None:
+                            waiters.add(event_future)
+                        done, _pending = await asyncio.wait(
+                            waiters, return_when=asyncio.FIRST_COMPLETED
+                        )
+
+                        if prompt_task.done():
+                            # A pressed Enter is already an accepted input.
+                            _discard_future(final_future)
+                            _discard_future(event_future)
+                            try:
+                                line = prompt_task.result()
+                            except (EOFError, KeyboardInterrupt):
+                                print()
+                                break
+                            prompt_task = None
+                            line = (line or "").strip()
+                            if not line:
+                                prompt_task = asyncio.create_task(
+                                    _prompt_once()
+                                )
+                                continue
+                            if line.startswith("/"):
+                                quit_requested = await _handle_command(line)
+                                if not quit_requested:
+                                    prompt_task = asyncio.create_task(
+                                        _prompt_once()
+                                    )
+                                continue
+                            await _run_turn(
+                                line,
+                                EventSource.CLI,
+                                time.monotonic(),
+                                output=voice_output,
+                                on_tts_started=_voice_tts_started,
+                            )
+                            prompt_task = asyncio.create_task(
+                                _prompt_once()
+                            )
+                            continue
+
+                        if final_future in done:
+                            _discard_future(event_future)
+                            final = final_future.result()
+                            # The ASR renderer does not print finals in the
+                            # formal REPL; echo the accepted text exactly once,
+                            # above the live input line. Partials are never
+                            # echoed or persisted.
+                            await voice_output.write(
+                                f"you 🎤> {final.text}\n"
+                            )
+                            # The prompt (and its typed buffer) stays alive;
+                            # output is drawn above the input line.
+                            await _run_turn(
+                                final.text,
+                                EventSource.VOICE,
+                                time.monotonic(),
+                                output=voice_output,
+                                on_tts_started=_voice_tts_started,
+                            )
+                            continue
+
+                        if event_future is not None and event_future in done:
+                            _discard_future(final_future)
+                            event = event_future.result()
+                            if (
+                                event is not None
+                                and coordinator.should_deliver_proactive()
+                            ):
+                                await _render_proactive_event(
+                                    event, repl_session
+                                )
+                            # Otherwise a recording/reply owns the user's
+                            # attention: the proactive line is dropped.
+                            continue
+
+                        # Defensive: a waiter vanished without an item.
+                        _discard_future(final_future)
+                        _discard_future(event_future)
+                finally:
+                    if prompt_task is not None and not prompt_task.done():
+                        prompt_task.cancel()
+                        with contextlib.suppress(
+                            asyncio.CancelledError, Exception
+                        ):
+                            await prompt_task
         finally:
-            # Stop speech/audio threads before the event loop closes; the REPL
-            # must exit without a playing stream or a leftover worker.
+            # Stop voice input, then speech/audio threads, before the event
+            # loop closes; the REPL must exit without a recording, a playing
+            # stream or a leftover worker.
+            if coordinator is not None:
+                with contextlib.suppress(Exception):
+                    await coordinator.shutdown()
             await asyncio.to_thread(tts_manager.shutdown)
             confirmation = getattr(rt, "profile_confirmation", None)
             if confirmation is not None:
@@ -2282,6 +2493,58 @@ async def cmd_repl(args) -> int:
     finally:
         await db.close()
     return 0
+
+
+def _discard_future(future) -> None:
+    """Cancel a pending waiter without consuming or re-submitting its data."""
+    if future is not None and not future.done():
+        future.cancel()
+
+
+async def _handle_mic_command(parts: list[str], voice_mode: bool, coordinator) -> None:
+    """Handle ``/mic ...``; device switching stays env/config driven."""
+    if not voice_mode or coordinator is None:
+        print("/mic 需要在启动时加 --voice：python -m companion repl --voice")
+        return
+    action = parts[1].lower() if len(parts) == 2 else ""
+    if action == "on":
+        _ok, message = await coordinator.enable()
+        print(message)
+    elif action == "off":
+        print(await coordinator.disable())
+    elif action == "status":
+        print(coordinator.description())
+        stats = coordinator.stats
+        print(
+            "mic events: "
+            f"accepted={stats.finals_accepted}"
+            f"  stale={stats.stale_finals}"
+            f"  errors={stats.turn_errors}"
+        )
+        if coordinator.last_error:
+            print(f"last_error: {coordinator.last_error}")
+    elif action == "devices":
+        try:
+            from companion.asr.microphone import list_input_devices
+
+            devices = await asyncio.to_thread(list_input_devices)
+        except Exception as exc:  # noqa: BLE001 - dependency/device failure
+            print(f"error: {exc}")
+            return
+        if not devices:
+            print("没有找到音频输入设备。")
+            return
+        for device in devices:
+            flags = ["系统默认输入"] if device.is_default_input else []
+            suffix = f"  [{', '.join(flags)}]" if flags else ""
+            print(
+                f"{device.index:>2}  {device.name}  "
+                f"默认采样率 {device.default_sample_rate} Hz  "
+                f"输入 {device.max_input_channels}{suffix}"
+            )
+        print("选择设备：设置 AVA_ASR_DEVICE（索引或名称片段）后重新开启监听。")
+    else:
+        print("usage: /mic on|off|status|devices")
 
 
 def _handle_tts_command(manager, parts: list[str]) -> list[str]:
@@ -2524,6 +2787,70 @@ async def _read_line_with_proactive(rt, session=None) -> str:
     return await _read_line_with_thread(manager)
 
 
+class _DirectTurnOutput:
+    """Legacy output: write straight to stdout (prompt is not active)."""
+
+    async def write(self, text: str) -> None:
+        if not text:
+            return
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    async def flush(self) -> None:
+        return None
+
+
+class _PromptTurnOutput:
+    """Write reply output above a live prompt_toolkit input line.
+
+    While the prompt owns the terminal, raw writes would corrupt the line.
+    Text is therefore buffered into complete lines and each line is printed
+    through ``run_in_terminal``, which redraws the prompt (and keeps whatever
+    the user has typed) underneath. When the prompt is not running, output is
+    written directly so streaming stays immediate.
+    """
+
+    def __init__(self, session) -> None:
+        self._session = session
+        self._buffer = ""
+        self._lock = asyncio.Lock()
+
+    def _prompt_running(self) -> bool:
+        app = getattr(self._session, "app", None)
+        return app is not None and bool(getattr(app, "is_running", False))
+
+    async def write(self, text: str) -> None:
+        if not text:
+            return
+        async with self._lock:
+            if not self._prompt_running():
+                _raw_stdout(text)
+                return
+            self._buffer += text
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                await self._emit(line + "\n")
+
+    async def flush(self) -> None:
+        async with self._lock:
+            if self._buffer:
+                line, self._buffer = self._buffer, ""
+                await self._emit(line + "\n")
+
+    async def _emit(self, line: str) -> None:
+        from prompt_toolkit.application import run_in_terminal
+
+        try:
+            await run_in_terminal(lambda: _raw_stdout(line))
+        except Exception:  # noqa: BLE001 - fall back to plain output
+            _raw_stdout(line)
+
+
+def _raw_stdout(text: str) -> None:
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
 async def _run_streaming_turn(
     rt,
     event,
@@ -2531,6 +2858,8 @@ async def _run_streaming_turn(
     debug: bool = False,
     tts_manager=None,
     submitted_at: float | None = None,
+    output=None,
+    on_tts_started=None,
 ) -> dict:
     """Render one turn from the real streaming API.
 
@@ -2562,8 +2891,15 @@ async def _run_streaming_turn(
     completed_at = None
     tts_on = bool(tts_manager is not None and getattr(tts_manager, "enabled", False))
     timing_printed = False
+    sink = output if output is not None else _DirectTurnOutput()
 
-    def _print_timing() -> None:
+    async def _write(text: str) -> None:
+        await sink.write(text)
+
+    async def _line(text: str) -> None:
+        await sink.write(text + "\n")
+
+    async def _print_timing() -> None:
         nonlocal timing_printed
         if timing_printed or completed_at is None:
             return
@@ -2590,7 +2926,7 @@ async def _run_streaming_turn(
                 )
                 if first_audio_ms is not None:
                     audio = f"{first_audio_ms / 1000:.1f}s"
-        print(
+        await _line(
             f"[timing] first_text={first} | text_done={done}"
             f" | first_audio={audio}"
         )
@@ -2610,8 +2946,7 @@ async def _run_streaming_turn(
         async for item in stream:
             if item.type == "response_started":
                 saw_started = True
-                sys.stdout.write("assistant> ")
-                sys.stdout.flush()
+                await _write("assistant> ")
                 if tts_manager is not None:
                     tts_stream = tts_manager.start_stream(
                         item.response_id,
@@ -2626,6 +2961,8 @@ async def _run_streaming_turn(
                         if tts_stream is not None
                         else None
                     )
+                    if tts_generation is not None and on_tts_started is not None:
+                        await on_tts_started(tts_generation)
             elif item.type == "response_delta":
                 saw_delta = True
                 # The display channel keeps voice labels inline; the canonical
@@ -2635,8 +2972,7 @@ async def _run_streaming_turn(
                     if item.display_delta is not None
                     else (item.delta or "")
                 )
-                sys.stdout.write(delta)
-                sys.stdout.flush()
+                await _write(delta)
                 if first_text_at is None and (item.delta or "").strip():
                     # The canonical channel proves this is real reply text,
                     # not a voice-expression tag split across deltas.
@@ -2655,17 +2991,16 @@ async def _run_streaming_turn(
                 completed_status = item.status
                 completed_action = item.action
                 if not saw_started:
-                    sys.stdout.write("assistant> ")
+                    await _write("assistant> ")
                     saw_started = True
                 if not saw_delta and (item.display_text or item.text):
                     # A provider without incremental chunks still produces a
                     # real reply; show it once, here, not twice.
-                    sys.stdout.write(item.display_text or item.text)
+                    await _write(item.display_text or item.text)
                 if item.status == "TRUNCATED":
-                    sys.stdout.write("\n[truncated: token limit]\n")
+                    await _write("\n[truncated: token limit]\n")
                 else:
-                    sys.stdout.write("\n")
-                sys.stdout.flush()
+                    await _write("\n")
                 if tts_stream is not None:
                     if item.status == "COMPLETED":
                         if not tts_fed:
@@ -2702,26 +3037,28 @@ async def _run_streaming_turn(
                             )
                         ):
                             tts_generation = tts_manager.generation
+                            if on_tts_started is not None:
+                                await on_tts_started(tts_generation)
                 if not saw_delta and (
                     item.text or item.display_text or ""
                 ).strip():
                     # No incremental deltas: the text became visible now.
                     first_text_at = completed_at
-                _print_timing()
+                await _print_timing()
             elif item.type == "response_failed":
                 saw_terminal = True
                 _cancel_tts()
                 if not saw_delta and item.text:
-                    sys.stdout.write(item.text)
+                    await _write(item.text)
                 if saw_started:
-                    sys.stdout.write("\n")
-                print(f"[failed] {item.error or ''}".rstrip())
+                    await _write("\n")
+                await _line(f"[failed] {item.error or ''}".rstrip())
             elif item.type == "response_cancelled":
                 saw_terminal = True
                 _cancel_tts()
                 if saw_started:
-                    sys.stdout.write("\n")
-                print("[cancelled]")
+                    await _write("\n")
+                await _line("[cancelled]")
     except KeyboardInterrupt:
         # Let the orchestrator persist the partial reply as CANCELLED and
         # release its conversation lock before returning to the prompt.
@@ -2729,14 +3066,14 @@ async def _run_streaming_turn(
         with contextlib.suppress(Exception):
             await stream.aclose()
         if saw_started:
-            sys.stdout.write("\n")
-        print("[cancelled]")
+            await _write("\n")
+        await _line("[cancelled]")
         return {"delivered": False}
     except Exception as exc:  # provider/validation failure is shown truthfully
         _cancel_tts()
         if saw_started:
-            sys.stdout.write("\n")
-        print(f"[failed] {type(exc).__name__}: {exc}")
+            await _write("\n")
+        await _line(f"[failed] {type(exc).__name__}: {exc}")
         return {"delivered": False}
 
     if saw_terminal:
@@ -2756,11 +3093,75 @@ async def _run_streaming_turn(
     with contextlib.suppress(Exception):
         action = await rt.repos.analysis.get_action(event.event_id)
     if action is None:
-        print("[no action]")
+        await _line("[no action]")
         return {"delivered": False}
     reason = f" ({action.reason_code.value})" if action.reason_code else ""
-    print(f"[{action.action_type.value}{reason}]")
+    await _line(f"[{action.action_type.value}{reason}]")
     return {"delivered": False}
+
+
+async def handle_user_message(
+    rt,
+    *,
+    text: str,
+    source: EventSource,
+    submitted_at: float,
+    conversation_id: str,
+    person_id: str,
+    addressee: str,
+    debug: bool = False,
+    tts_manager=None,
+    output=None,
+    on_tts_started=None,
+    turn_runner=None,
+) -> dict:
+    """The only path from accepted user text to Ava's reply.
+
+    Keyboard (``EventSource.CLI``) and voice (``EventSource.VOICE``) both call
+    this, so proactive invalidation, speaking interruption, streaming,
+    persistence and the post-reply proactive schedule are identical. It never
+    creates a second Router/Speaker flow.
+    """
+    runner = turn_runner or _run_streaming_turn
+    event = make_utterance_event(
+        conversation_id=conversation_id,
+        text=text,
+        addressee_hint=addressee,
+        speaker_person_id=person_id,
+        source=source,
+    )
+    manager = getattr(rt, "proactive_manager", None)
+    if manager is not None:
+        # Invalidate any pending check before the turn begins.
+        manager.note_user_input(event.conversation_id, event.event_id)
+    # A new ordinary chat or voice input interrupts unfinished speech from
+    # the previous reply. This never cancels text generation.
+    if tts_manager is not None:
+        tts_manager.stop()
+    delivery = await runner(
+        rt,
+        event,
+        debug=debug,
+        tts_manager=tts_manager,
+        submitted_at=submitted_at,
+        output=output,
+        on_tts_started=on_tts_started,
+    )
+    if (
+        manager is not None
+        and delivery.get("delivered")
+        and delivery.get("status") == "COMPLETED"
+        and delivery.get("action") == "RESPOND"
+    ):
+        # Only a real-user-triggered, complete, delivered normal reply
+        # schedules a check. WAIT/IGNORE, failures, cancellations and
+        # truncated output never do.
+        manager.on_response_delivered(
+            conversation_id=event.conversation_id,
+            person_id=person_id,
+            source_event_id=event.event_id,
+        )
+    return delivery
 
 
 def _brave_key_configured() -> bool:

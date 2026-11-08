@@ -160,6 +160,41 @@ class _InputClosed:
     at: float
 
 
+@dataclass(frozen=True)
+class _Mute:
+    """Stop feeding microphone audio to the VAD and drop the open turn."""
+
+
+# ------------------------------------------------------- external integrations
+@dataclass(frozen=True)
+class FinalUtterance:
+    """One completed user turn delivered to an embedding application.
+
+    Emitted at most once per utterance, only after the local VAD ended *and*
+    the ASR session finished successfully with at least one confirmed
+    fragment. Empty, cancelled, aborted and failed recognitions never produce
+    one. It carries no identity or audio metadata: the embedding conversation
+    decides who is speaking.
+    """
+
+    utterance_id: int
+    text: str
+    completed_at: float
+
+
+@dataclass(frozen=True)
+class SpeechActivity:
+    """VAD speech start/end notice for half-duplex orchestration.
+
+    ``kind`` is ``"started"`` or ``"ended"``. The manager owns the boundary;
+    consumers must not treat this as a transcript.
+    """
+
+    kind: str
+    utterance_id: int
+    at: float
+
+
 class _Utterance:
     """Mutable state for one VAD-bounded utterance."""
 
@@ -202,6 +237,10 @@ class ASRManager:
         session_factory: Optional[Callable[[], ASRSession]] = None,
         renderer: Optional[TerminalRenderer] = None,
         audio_queue: Optional["queue.Queue[Any]"] = None,
+        on_final: Optional[Callable[[FinalUtterance], None]] = None,
+        on_speech: Optional[Callable[[SpeechActivity], None]] = None,
+        on_turn_closed: Optional[Callable[[int, bool], None]] = None,
+        render_finals: bool = True,
     ) -> None:
         self.config = config
         self.audio_queue: "queue.Queue[Any]" = (
@@ -219,6 +258,15 @@ class ASRManager:
         self._renderer = renderer or TerminalRenderer()
         self.stats = ASRStats()
 
+        # Optional embedding hooks. They are called from the thread that runs
+        # the control loop (``run``), never from a sender/receiver worker, and
+        # must return quickly: a slow callback would delay utterance
+        # bookkeeping. No Ava core module is imported here.
+        self._on_final = on_final
+        self._on_speech = on_speech
+        self._on_turn_closed = on_turn_closed
+        self.render_finals = render_finals
+
         self._control: "queue.Queue[Any]" = queue.Queue(maxsize=2048)
         self._render_queue: "queue.Queue[Any]" = queue.Queue(
             maxsize=config.render_queue_events
@@ -235,6 +283,12 @@ class ASRManager:
         self._current: Optional[_Utterance] = None
         self._active_sessions = 0
         self._next_uid = 0
+        # Microphone audio is only segmented while input is enabled. The VAD
+        # thread resets the segmenter on every transition, so audio captured
+        # before a pause can never become an utterance after resume.
+        self._input_enabled = threading.Event()
+        self._input_enabled.set()
+        self._vad_input_enabled = True
 
     # ------------------------------------------------------------------ public
     @property
@@ -244,6 +298,41 @@ class ASRManager:
     @property
     def dropped_audio_chunks(self) -> int:
         return int(getattr(self._microphone, "dropped_chunks", 0) or 0)
+
+    def set_listeners(
+        self,
+        *,
+        on_final: Optional[Callable[[FinalUtterance], None]] = None,
+        on_speech: Optional[Callable[[SpeechActivity], None]] = None,
+        on_turn_closed: Optional[Callable[[int, bool], None]] = None,
+        render_finals: Optional[bool] = None,
+    ) -> None:
+        """Attach or replace the embedding hooks after construction.
+
+        Used by the voice bridge, which is created before the manager. The
+        callbacks may be invoked from the ASR control thread and must not
+        block; a callback exception is swallowed so recognition keeps running.
+        """
+        self._on_final = on_final
+        self._on_speech = on_speech
+        self._on_turn_closed = on_turn_closed
+        if render_finals is not None:
+            self.render_finals = bool(render_finals)
+
+    def set_input_enabled(self, enabled: bool) -> None:
+        """Pause/resume feeding microphone audio into the VAD.
+
+        Safe from any thread. While paused the VAD thread drains and discards
+        captured chunks and resets the segmentation state; the control loop
+        aborts any turn that is still open, so no provisional partial can be
+        submitted after the application decided the mic is no longer
+        listening. ``/mic off`` uses :meth:`shutdown` instead.
+        """
+        if enabled:
+            self._input_enabled.set()
+        else:
+            self._input_enabled.clear()
+            self._put_control(_Mute(), critical=True)
 
     def start(self) -> None:
         if self._started:
@@ -345,6 +434,16 @@ class ASRManager:
     def _vad_loop(self) -> None:
         segmenter = self._vad_segmenter
         while not self._stop.is_set():
+            enabled = self._input_enabled.is_set()
+            if enabled != self._vad_input_enabled:
+                self._vad_input_enabled = enabled
+                # Reset on both edges: the pre-roll and the model's recurrent
+                # state from before the pause must not leak into what is
+                # recognized after it.
+                try:
+                    segmenter.reset()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
             try:
                 item = self.audio_queue.get(timeout=0.1)
             except queue.Empty:
@@ -360,6 +459,10 @@ class ASRManager:
                     _Notice(item.text, item.is_error), critical=False
                 )
             elif isinstance(item, AudioChunk):
+                if not self._input_enabled.is_set():
+                    # Paused: keep draining so the bounded capture queue never
+                    # wedges the microphone thread, but never segment.
+                    continue
                 try:
                     events = segmenter.process(item.pcm)
                 except Exception as exc:  # noqa: BLE001 - keep listening
@@ -404,10 +507,12 @@ class ASRManager:
     # ------------------------------------------------------------- ASR threads
     def _sender_loop(self, utterance: _Utterance) -> None:
         session: Optional[ASRSession] = None
+        opened_ok = False
         try:
             session = self._session_factory()
             utterance.session = session
             session.open()
+            opened_ok = True
             utterance.opened.set()
             buffer = bytearray()
             first_buffered_at: Optional[float] = None
@@ -446,6 +551,17 @@ class ASRManager:
             if buffer and not utterance.aborted:
                 self._flush_audio(session, buffer)
         except ASRClientError as exc:
+            if (
+                opened_ok
+                and session is not None
+                and getattr(session, "closed", False)
+            ):
+                # The session was closed underneath us: either the receiver
+                # saw the server finish the task (it already reports the real
+                # outcome) or the control loop finalized/aborted this turn.
+                # Remaining buffered audio is moot; a closed-socket error is
+                # not a recognition failure and must not overwrite a result.
+                return
             utterance.open_error = str(exc)
             self._put_control(
                 _SessionDone(utterance.uid, str(exc), time.monotonic()),
@@ -547,6 +663,8 @@ class ASRManager:
             self._handle_input_closed(event)
         elif isinstance(event, _FinalTimeout):
             self._handle_final_timeout(event)
+        elif isinstance(event, _Mute):
+            self._handle_mute()
         elif isinstance(event, _Interrupted):
             self._handle_interrupted(event)
         elif isinstance(event, _Notice):
@@ -561,6 +679,7 @@ class ASRManager:
         self._open_order.append(utterance)
         self._current = utterance
         self.stats.utterances += 1
+        self._emit_speech("started", utterance.uid, event.at)
         if not self._enqueue_audio(utterance, event.audio):
             return
         if utterance.finalized:
@@ -588,6 +707,7 @@ class ASRManager:
         if utterance is None or utterance.finalized:
             return
         utterance.vad_end_at = event.at
+        self._emit_speech("ended", utterance.uid, event.at)
         if not utterance.stop_sent:
             utterance.stop_sent = True
             if not self._enqueue_sentinel(utterance, _STOP):
@@ -717,6 +837,22 @@ class ASRManager:
                 "录音中断，已中止当前识别；临时文本不会作为最终结果。",
             )
 
+    def _handle_mute(self) -> None:
+        """Drop every turn still open when the application stops listening.
+
+        The audio pipeline is already discarding chunks; this removes turns
+        whose control events were queued before the pause took effect. Their
+        provisional partials are never submitted as user messages.
+        """
+        for utterance in list(self._utterances.values()):
+            if not utterance.finalized:
+                self._abort_utterance(
+                    utterance,
+                    "已暂停监听，当前录音已丢弃。",
+                    report=False,
+                    promote=False,
+                )
+
     # ------------------------------------------------------------- transitions
     def _start_session(self, utterance: _Utterance) -> None:
         if utterance.started or utterance.finalized:
@@ -778,15 +914,17 @@ class ASRManager:
         merged = _merge_turn_text(
             [fragment for _, fragment in utterance.finals]
         )
+        ok = merged != "" and not error
         if merged:
             self.stats.finalized += 1
-            self._render(
-                RenderEvent(
-                    kind="final",
-                    utterance_id=utterance.uid,
-                    text=merged,
+            if self.render_finals:
+                self._render(
+                    RenderEvent(
+                        kind="final",
+                        utterance_id=utterance.uid,
+                        text=merged,
+                    )
                 )
-            )
             if utterance.vad_end_at is not None:
                 latency = max(
                     0.0, (at - utterance.vad_end_at) * 1000.0
@@ -798,12 +936,23 @@ class ASRManager:
                         f"#{utterance.uid} VAD 结束 → 最终结果 "
                         f"{latency:.0f} ms"
                     )
+            if not error:
+                # A failed recognition with confirmed fragments is never a
+                # normal user message: the application must not answer it.
+                self._emit_final(
+                    FinalUtterance(
+                        utterance_id=utterance.uid,
+                        text=merged,
+                        completed_at=time.monotonic(),
+                    )
+                )
         else:
             self.stats.empty += 1
             if not error:
                 self._render_status(
                     f"#{utterance.uid} 没有可确认的最终文本，临时文本已丢弃。"
                 )
+        self._emit_turn_closed(utterance.uid, ok)
         self._promote_pending()
 
     def _maybe_finish(self, utterance: _Utterance) -> None:
@@ -847,6 +996,7 @@ class ASRManager:
             self.stats.aborted += 1
         if report:
             self._render_status(reason, is_error=True)
+        self._emit_turn_closed(utterance.uid, False)
         if promote:
             self._promote_pending()
 
@@ -948,5 +1098,38 @@ class ASRManager:
             )
         )
 
+    # ---------------------------------------------------------- external hooks
+    def _emit_final(self, final: FinalUtterance) -> None:
+        callback = self._on_final
+        if callback is None:
+            return
+        try:
+            callback(final)
+        except Exception:  # noqa: BLE001 - recognition must keep running
+            pass
 
-__all__ = ["ASRManager", "ASRStats"]
+    def _emit_speech(self, kind: str, uid: int, at: float) -> None:
+        callback = self._on_speech
+        if callback is None:
+            return
+        try:
+            callback(SpeechActivity(kind, uid, at))
+        except Exception:  # noqa: BLE001 - recognition must keep running
+            pass
+
+    def _emit_turn_closed(self, uid: int, ok: bool) -> None:
+        callback = self._on_turn_closed
+        if callback is None:
+            return
+        try:
+            callback(uid, ok)
+        except Exception:  # noqa: BLE001 - recognition must keep running
+            pass
+
+
+__all__ = [
+    "ASRManager",
+    "ASRStats",
+    "FinalUtterance",
+    "SpeechActivity",
+]

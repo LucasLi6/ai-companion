@@ -57,6 +57,25 @@ class SpeechJob:
 
 
 @dataclass(frozen=True)
+class PlaybackEvent:
+    """Read-only notice about the end of one speech generation.
+
+    ``kind`` is ``"finished"`` (the player reached the end of this reply's
+    audio), ``"failed"`` (synthesis or the audio device failed) or
+    ``"cancelled"`` (a newer reply, an explicit stop or disabling TTS
+    invalidated it). The listener must not call back into the manager and must
+    return immediately; playback threads invoke it.
+    """
+
+    kind: str
+    generation: int
+    response_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    at: float = 0.0
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class TTSStatus:
     enabled: bool
     state: str
@@ -403,6 +422,9 @@ class TTSManager:
         self._timings: dict[int, dict[str, float]] = {}
         self._last_finished_generation: Optional[int] = None
         self._active_stream: Optional[TTSStream] = None
+        # generation -> (response_id, conversation_id) for playback notices.
+        self._playback_info: dict[int, tuple[str, str]] = {}
+        self._playback_listeners: list[Callable[[PlaybackEvent], None]] = []
         # Every stream that has not finished yet. Superseded streams are
         # cancelled without joining on the chat path; this set lets explicit
         # teardown join them within one bounded deadline.
@@ -424,6 +446,56 @@ class TTSManager:
     def last_error(self) -> Optional[str]:
         with self._lock:
             return self._last_error
+
+    # -------------------------------------------------------------- listeners
+    def add_playback_listener(
+        self, listener: Callable[[PlaybackEvent], None]
+    ) -> None:
+        """Subscribe to playback end notices (read-only, non-blocking).
+
+        The callback may run on the TTS/player thread and must not block or
+        call back into this manager. It carries the generation so a consumer
+        can ignore a stale reply.
+        """
+        with self._lock:
+            if listener not in self._playback_listeners:
+                self._playback_listeners.append(listener)
+
+    def remove_playback_listener(
+        self, listener: Callable[[PlaybackEvent], None]
+    ) -> None:
+        with self._lock:
+            try:
+                self._playback_listeners.remove(listener)
+            except ValueError:
+                pass
+
+    def _notify_playback(
+        self,
+        kind: str,
+        generation: int,
+        *,
+        error: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            listeners = list(self._playback_listeners)
+            info = self._playback_info.get(generation)
+        if not listeners:
+            return
+        response_id, conversation_id = info if info else (None, None)
+        event = PlaybackEvent(
+            kind=kind,
+            generation=generation,
+            response_id=response_id,
+            conversation_id=conversation_id,
+            at=time.monotonic(),
+            error=error,
+        )
+        for listener in listeners:
+            try:
+                listener(event)
+            except Exception:  # noqa: BLE001 - playback must not fail
+                pass
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -504,6 +576,12 @@ class TTSManager:
         input. ``wait=True`` is for explicit teardown (``/tts off``/exit).
         """
         with self._lock:
+            previous_generation = self._generation
+            was_active = self._status in (
+                "playing",
+                "streaming",
+                "synthesizing",
+            )
             self._generation += 1
             self._queued_generation = None
             player = self._player
@@ -512,6 +590,11 @@ class TTSManager:
             if self._enabled:
                 self._status = "idle"
             self._last_finished_generation = None
+        if was_active:
+            # A stopped reply never reaches its natural end marker, so it must
+            # announce cancellation explicitly or a half-duplex listener would
+            # wait for a completion that can never arrive.
+            self._notify_playback("cancelled", previous_generation)
         if stream is not None:
             stream.cancel()
             if wait:
@@ -577,10 +660,17 @@ class TTSManager:
             if router_completed_at is not None:
                 timings["router_completed_at"] = router_completed_at
             self._timings[generation] = timings
+            self._playback_info[generation] = (
+                response_id,
+                conversation_id,
+            )
             self._prune_timings()
             config = self._config
             client = self._client
             player = self._player
+
+        if previous is not None:
+            self._notify_playback("cancelled", previous.generation)
 
         # Bluetooth/speaker switch: re-open the audio device for the new reply
         # (before any of its audio exists) instead of staying on the device
@@ -654,6 +744,7 @@ class TTSManager:
         stream.cancel()
         if not active:
             return
+        self._notify_playback("cancelled", stream.generation)
         self._drain(self._audio_queue)
         interrupt = getattr(player, "interrupt", None)
         if callable(interrupt):
@@ -707,8 +798,13 @@ class TTSManager:
                 "reply_completed_at": queued.reply_completed_at or now,
                 "tts_queued_at": now,
             }
+            self._playback_info[generation] = (
+                job.response_id,
+                job.conversation_id,
+            )
             self._prune_timings()
         if previous is not None:
+            self._notify_playback("cancelled", previous.generation)
             # Never join here: submit() is on the reply path. The cancelled
             # stream closes its own session asynchronously.
             previous.cancel()
@@ -814,10 +910,12 @@ class TTSManager:
         with self._lock:
             if generation != self._generation:
                 return
-            self._last_error = _safe_error(exc)
+            message = _safe_error(exc)
+            self._last_error = message
             self._status = "error"
             self._invalidate_locked(generation)
         self._discard_audio_generation(generation)
+        self._notify_playback("failed", generation, error=message)
 
     def _invalidate_locked(self, generation: int) -> None:
         """Invalidate ``generation`` without cancelling a newer queued reply."""
@@ -862,6 +960,7 @@ class TTSManager:
                 continue
             if data is _STOP:
                 return
+            finished = False
             with self._lock:
                 if (
                     not self._started
@@ -874,7 +973,12 @@ class TTSManager:
                     timings["playback_finished_at"] = time.monotonic()
                     self._last_finished_generation = generation
                     self._status = "idle"
-                    continue
+                    finished = True
+            if finished:
+                # Listeners run outside the lock: they only marshal the notice
+                # onto their own event loop.
+                self._notify_playback("finished", generation)
+                continue
 
             with self._lock:
                 if generation == self._generation:
@@ -885,12 +989,19 @@ class TTSManager:
             try:
                 player.write(data)
             except Exception as exc:  # noqa: BLE001 - TTS-isolated
+                failed = False
                 with self._lock:
                     if generation == self._generation:
-                        self._last_error = _safe_error(exc)
+                        message = _safe_error(exc)
+                        self._last_error = message
                         self._status = "error"
                         self._invalidate_locked(generation)
+                        failed = True
                 self._discard_audio_generation(generation)
+                if failed:
+                    self._notify_playback(
+                        "failed", generation, error=message
+                    )
                 continue
 
             with self._lock:
@@ -1073,6 +1184,9 @@ class TTSManager:
             return
         for key in sorted(self._timings)[:-20]:
             self._timings.pop(key, None)
+        for key in list(self._playback_info):
+            if key not in self._timings:
+                self._playback_info.pop(key, None)
 
     # --------------------------------------------------------------- cleanup
     def _teardown_threads(self) -> None:
