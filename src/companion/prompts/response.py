@@ -60,7 +60,10 @@ from companion.prompts.proactive import (
     PROACTIVE_MODE_BLOCK,
     PROACTIVE_MODE_BLOCK_LONG_IDLE,
 )
-from companion.prompts.speech_expression import SPEECH_EXPRESSION_PROMPT
+from companion.prompts.speech_expression import (
+    SPEECH_EXPRESSION_PROMPT,
+    SPEECH_EXPRESSION_REMINDER,
+)
 from companion.runtime_context.assembler import compile_runtime_context
 
 RESPONSE_PROMPT_VERSION = "response-v19"
@@ -716,7 +719,11 @@ def _background_payload(
 
     route = _route_payload(context.route_context)
     if route:
-        data["route"] = _bounded_value(route, MAX_ROUTE_CONTEXT_CHARS)
+        # The route projection has a fixed, small field set (including the
+        # tone suggestion); bound whitespace without dropping later fields.
+        data["route"] = _bounded_value(
+            route, MAX_ROUTE_CONTEXT_CHARS, max_fields=12
+        )
 
     tools = _tool_payload(context.tool_results)
     if tools:
@@ -737,12 +744,17 @@ def _route_payload(route: Mapping[str, Any] | None) -> dict | None:
     if not isinstance(route, Mapping):
         return None
     intents = [str(item)[:32] for item in (route.get("processing_intents") or [])][:4]
+    tone = route.get("tone_direction")
     return {
         "kind": "MODEL_JUDGMENT",
         "action": str(route.get("action") or "")[:16],
         "reply_necessity": str(route.get("reply_necessity") or "")[:16],
         "addressee_assessment": str(route.get("addressee_assessment") or "")[:16],
         "turn_state": str(route.get("turn_state") or "")[:16],
+        # A suggestion only. The Speaker prompt says it may adopt, adjust or
+        # ignore it, and no local code enforces it.
+        "tone_direction": (str(tone)[:32] if tone else None),
+        "tone_direction_is_suggestion": True,
         "processing_intents": intents,
         "tools_requested": [
             _clip(item.get("tool_name"), 64)
@@ -1120,7 +1132,9 @@ def _bounded_strings(value: Any, limit: int, chars: int) -> list[str]:
     return result
 
 
-def _bounded_value(value: Any, limit: int) -> Any:
+def _bounded_value(
+    value: Any, limit: int, *, max_fields: int = MAX_TOOL_LIST_FIELDS
+) -> Any:
     """Bound a JSON-able value by clipping strings/keys/lists, never by slicing
     its serialized form."""
     if isinstance(value, str):
@@ -1128,10 +1142,12 @@ def _bounded_value(value: Any, limit: int) -> Any:
     if isinstance(value, Mapping):
         rendered: dict[str, Any] = {}
         used = 0
-        for key in list(value.keys())[:MAX_TOOL_LIST_FIELDS]:
+        for key in list(value.keys())[:max_fields]:
             clipped_key = str(key)[:64]
             item = _bounded_value(
-                value[key], max(80, min(MAX_TOOL_FIELD_CHARS, limit - used))
+                value[key],
+                max(80, min(MAX_TOOL_FIELD_CHARS, limit - used)),
+                max_fields=max_fields,
             )
             rendered[clipped_key] = item
             used += _serialized_len(item) + len(clipped_key) + 4
@@ -1142,7 +1158,9 @@ def _bounded_value(value: Any, limit: int) -> Any:
         rendered_list: list[Any] = []
         used = 2
         for item in list(value)[:MAX_TOOL_LIST_FIELDS]:
-            bounded = _bounded_value(item, max(80, MAX_TOOL_FIELD_CHARS))
+            bounded = _bounded_value(
+                item, max(80, MAX_TOOL_FIELD_CHARS), max_fields=max_fields
+            )
             size = _serialized_len(bounded) + 2
             if rendered_list and used + size > limit:
                 break
@@ -1354,6 +1372,9 @@ def _system_parts(
         # enables it only for ordinary conversational replies; structured output
         # tasks get no label protocol at all.
         parts.append(SPEECH_EXPRESSION_PROMPT)
+        if proactive and SPEECH_EXPRESSION_REMINDER:
+            # Proactive requests have no new user turn to carry the reminder.
+            parts.append(SPEECH_EXPRESSION_REMINDER)
     return parts
 
 
@@ -1393,6 +1414,13 @@ def build_response_messages(
     )
     if background:
         messages.append(_background_message(background))
+    if speech_expression and SPEECH_EXPRESSION_REMINDER:
+        # Fresh, trusted reinforcement for this turn. Without it the model
+        # often copies the canonical (header-less) assistant turns in history
+        # after the first exchange, even though the system protocol is present.
+        messages.append(
+            {"role": "system", "content": SPEECH_EXPRESSION_REMINDER}
+        )
     messages.append(
         {
             "role": "user",

@@ -48,6 +48,7 @@ ROUTER_SYSTEM_PROMPT = """你是 Ava 的语义路由器（router）。你的唯�
   "addressee_assessment": "AGENT | HUMAN | UNKNOWN",
   "input_semantics": "COMMUNICATIVE | NON_COMMUNICATIVE | UNCERTAIN",
   "turn_state": "NEW_TOPIC | CONTINUING | FOLLOW_UP | CLOSING | PAUSED | UNKNOWN",
+  "tone_direction": "PLAYFUL | CURIOUS | SURPRISED | CONCERNED | SKEPTICAL | SERIOUS | NATURAL | null",
   "processing_intents": ["NONE | MEMORY_SAVE | MEMORY_CORRECTION | PRIVACY_REQUEST"],
   "tool_requests": [{"tool_name": "来自 available_tools", "arguments": {},
                      "purpose": "一句为什么需要", "required": true}],
@@ -95,6 +96,13 @@ NON_COMMUNICATIVE 且无内部任务和安全处理时，推荐 IGNORE + UNNECES
 
 turn_state：NEW_TOPIC 新话题；CONTINUING 延续；FOLLOW_UP 追问/补充；
 CLOSING 收尾；PAUSED 暂停；UNKNOWN 无法判断。
+
+tone_direction：对当前交流适合的声音表达方向的可选建议，不是 Ava 的情绪状态，
+也不是最终回复指令。结合真实对话与交流氛围判断，不要直接复制用户情绪，不要
+决定 Ava 的实际态度或最终语气；不确定时填 null。该字段不影响是否回复、工具
+选择、记忆操作或任何内部处理。不要按固定关键词映射，例如用户提到“升职”不
+必然 SURPRISED，用户表达不满也不必然 CONCERNED。Speaker 可以采纳、调整或
+忽略它。
 
 processing_intents：除回复外的内部操作，可多个或为空。MEMORY_SAVE 明确要求
 记住/确认长期信息；MEMORY_CORRECTION 明确修正已记住信息；PRIVACY_REQUEST

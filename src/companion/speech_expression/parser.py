@@ -40,7 +40,10 @@ from .catalog import (
     KIND_CONTROL,
     KIND_NONVERBAL,
     MAX_BRACKET_CANDIDATE_LENGTH,
+    NATURAL_VOICE,
     TAG_KINDS,
+    VOICE_NAME_SET,
+    is_empty_bracket_markup,
     is_invalid_speech_tag,
     is_invalid_tag_prefix,
     is_tag_prefix,
@@ -100,7 +103,7 @@ class SpeechExpressionResult:
 class SpeechMarkupParser:
     """Incremental parser for the speech-expression whitelist."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, remove_empty_brackets: bool = False) -> None:
         self._pending = ""
         self._finished = False
         self._just_removed = False
@@ -110,8 +113,15 @@ class SpeechMarkupParser:
         self._segments: list[SpeechExpressionSegment] = []
         self._invalid_tags: list[str] = []
         self._invalid_tag_count = 0
+        self._empty_markup_count = 0
         self._valid_control_count = 0
         self._valid_nonverbal_count = 0
+        # V1.2: empty ``[]`` is model markup in ordinary conversation, but a
+        # legitimate empty array/list inside backticks or a fenced code block
+        # must survive. This state is only tracked by the speech path.
+        self._remove_empty_brackets = bool(remove_empty_brackets)
+        self._code_state = "text"  # text | inline | fence
+        self._backtick_run = 0
 
     # -- diagnostics -------------------------------------------------------
 
@@ -122,6 +132,10 @@ class SpeechMarkupParser:
     @property
     def invalid_tag_samples(self) -> tuple[str, ...]:
         return tuple(self._invalid_tags)
+
+    @property
+    def empty_markup_count(self) -> int:
+        return self._empty_markup_count
 
     @property
     def valid_control_count(self) -> int:
@@ -244,12 +258,26 @@ class SpeechMarkupParser:
         out_text: list[str],
         out_display: list[str],
     ) -> None:
+        self._flush_backticks()
         candidate = buffer[start : close + 1]
         if candidate in TAG_KINDS:
             self._append_tag(candidate, out_display)
             return
         preceded_by = buffer[start - 1] if start > 0 else self._last_display_char()
         followed_by = buffer[close + 1] if close + 1 < len(buffer) else ""
+        if (
+            self._remove_empty_brackets
+            and self._code_state == "text"
+            and is_empty_bracket_markup(candidate[1:-1])
+            and self._is_standalone_empty_markup(preceded_by, followed_by)
+        ):
+            # The model's V1.1 habit of emitting a bare ``[]`` (or ``[  ]``)
+            # must never reach display, history or memory. Backticked and
+            # fenced code is excluded above; identifiers/arrays/Markdown links
+            # are excluded by context so legitimate ``[]`` survives.
+            self._remove_invalid(candidate)
+            self._empty_markup_count += 1
+            return
         if is_invalid_speech_tag(
             candidate[1:-1],
             preceded_by=preceded_by,
@@ -258,6 +286,20 @@ class SpeechMarkupParser:
             self._remove_invalid(candidate)
             return
         self._append_text(candidate, out_text, out_display)
+
+    @staticmethod
+    def _is_standalone_empty_markup(preceded_by: str, followed_by: str) -> bool:
+        """Keep brackets that are part of code/array/Markdown syntax."""
+        if followed_by in ("(", "[", ".", ":", "\\"):
+            return False
+        if preceded_by and (
+            (preceded_by.isascii() and (preceded_by.isalnum() or preceded_by in "_'"))
+            or preceded_by in ")]\\"
+        ):
+            return False
+        if followed_by and followed_by in "\"'":
+            return False
+        return True
 
     def _last_display_char(self) -> str:
         if not self._display_parts:
@@ -273,6 +315,7 @@ class SpeechMarkupParser:
     ) -> None:
         if not piece:
             return
+        self._track_code(piece)
         canonical = piece
         if self._just_removed and (
             not self._text_parts
@@ -313,6 +356,38 @@ class SpeechMarkupParser:
             self._display_parts.append(display_piece)
             out_display.append(display_piece)
 
+    def _track_code(self, piece: str) -> None:
+        """Track backticked/fenced code so empty ``[]`` inside it survives."""
+        index = 0
+        length = len(piece)
+        while index < length:
+            if piece[index] != "`":
+                self._flush_backticks()
+                index += 1
+                continue
+            end = index
+            while end < length and piece[end] == "`":
+                end += 1
+            self._backtick_run += end - index
+            index = end
+
+    def _flush_backticks(self) -> None:
+        run = self._backtick_run
+        if not run:
+            return
+        self._backtick_run = 0
+        if self._code_state == "text":
+            if run >= 3:
+                self._code_state = "fence"
+            else:
+                self._code_state = "inline"
+        elif self._code_state == "inline":
+            # Any backtick closes an inline code span.
+            self._code_state = "text"
+        elif self._code_state == "fence":
+            if run >= 3:
+                self._code_state = "text"
+
     def _append_tag(self, tag: str, out_display: list[str]) -> None:
         self._display_parts.append(tag)
         out_display.append(tag)
@@ -332,9 +407,285 @@ class SpeechMarkupParser:
             self._invalid_tags.append(candidate)
 
 
-def parse_speech_expressions(text: str) -> SpeechExpressionResult:
+def parse_speech_expressions(
+    text: str, *, remove_empty_brackets: bool = True
+) -> SpeechExpressionResult:
     """Parse a complete reply (non-streaming and proactive paths)."""
-    parser = SpeechMarkupParser()
+    parser = SpeechMarkupParser(remove_empty_brackets=remove_empty_brackets)
+    parser.feed(text)
+    parser.finish()
+    return parser.result()
+
+
+@dataclass(frozen=True)
+class VoiceResponseChunk:
+    """Text confirmed by one ``VoiceResponseParser`` call."""
+
+    text: str = ""
+    display_text: str = ""
+
+
+@dataclass(frozen=True)
+class VoiceResponseResult:
+    """A parsed VOICE/TEXT reply.
+
+    ``voice`` is the canonical internal name of the initial control tag, or
+    ``None`` for natural/empty/invalid/legacy output. It is runtime-only and is
+    never persisted as a label. ``protocol_valid`` describes the header format,
+    not whether the reply is usable.
+    """
+
+    text: str
+    display_text: str
+    voice: str | None
+    segments: tuple[SpeechExpressionSegment, ...]
+    invalid_tags: tuple[str, ...]
+    protocol_valid: bool
+    invalid_voice: str | None = None
+    protocol_error: str | None = None
+
+    @property
+    def has_valid_text(self) -> bool:
+        return bool(self.text and self.text.strip())
+
+
+MAX_VOICE_HEADER_CHARS = 512
+
+
+class VoiceResponseParser:
+    """Streaming parser for the V1.2 ``VOICE=... / TEXT=...`` protocol.
+
+    The parser buffers only the short header, then streams the body through the
+    existing :class:`SpeechMarkupParser`. If the output does not start with the
+    header it falls back to the V1.1/plain-text parser, so recovery, old-model
+    output and normal prose remain usable. An invalid ``VOICE`` never produces
+    a tag; it is recorded as a diagnostic only.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._mode = "header"  # header | await_text | body | legacy
+        self._voice: str | None = None
+        self._invalid_voice: str | None = None
+        self._protocol_error: str | None = None
+        self._protocol_valid = False
+        self._voice_valid = False
+        self._display_prefix = ""
+        self._prefix_emitted = False
+        self._body = SpeechMarkupParser(remove_empty_brackets=True)
+        self._body_started = False
+        self._finished = False
+
+    # -- diagnostics -------------------------------------------------------
+
+    @property
+    def voice(self) -> str | None:
+        return self._voice
+
+    @property
+    def invalid_voice(self) -> str | None:
+        return self._invalid_voice
+
+    @property
+    def protocol_valid(self) -> bool:
+        return self._protocol_valid
+
+    @property
+    def protocol_error(self) -> str | None:
+        return self._protocol_error
+
+    @property
+    def invalid_tag_count(self) -> int:
+        return self._body.invalid_tag_count
+
+    @property
+    def invalid_tag_samples(self) -> tuple[str, ...]:
+        return self._body.invalid_tag_samples
+
+    @property
+    def empty_markup_count(self) -> int:
+        return self._body.empty_markup_count
+
+    # -- confirmed output --------------------------------------------------
+
+    @property
+    def text(self) -> str:
+        return self._body.text
+
+    @property
+    def display_text(self) -> str:
+        return self._display_prefix + self._body.display_text
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    def result(self) -> VoiceResponseResult:
+        body = self._body.result()
+        return VoiceResponseResult(
+            text=body.text,
+            display_text=self._display_prefix + body.display_text,
+            voice=self._voice,
+            segments=body.segments,
+            invalid_tags=body.invalid_tags,
+            protocol_valid=self._protocol_valid,
+            invalid_voice=self._invalid_voice,
+            protocol_error=self._protocol_error,
+        )
+
+    # -- streaming ---------------------------------------------------------
+
+    def feed(self, chunk: str) -> VoiceResponseChunk:
+        if self._finished:
+            raise RuntimeError("feed() called after finish()")
+        out_text: list[str] = []
+        out_display: list[str] = []
+        self._buffer += chunk
+        self._drain(out_text, out_display, final=False)
+        return VoiceResponseChunk(
+            text="".join(out_text), display_text="".join(out_display)
+        )
+
+    def finish(self) -> VoiceResponseChunk:
+        if self._finished:
+            return VoiceResponseChunk()
+        out_text: list[str] = []
+        out_display: list[str] = []
+        self._drain(out_text, out_display, final=True)
+        tail = self._body.finish()
+        if tail.text:
+            out_text.append(tail.text)
+        if tail.display_text:
+            out_display.append(tail.display_text)
+        self._finished = True
+        return VoiceResponseChunk(
+            text="".join(out_text), display_text="".join(out_display)
+        )
+
+    # -- internals ---------------------------------------------------------
+
+    def _drain(self, out_text, out_display, *, final: bool) -> None:
+        while self._buffer or (final and self._mode in ("header", "await_text")):
+            if self._mode in ("body", "legacy"):
+                text = self._buffer
+                self._buffer = ""
+                self._feed_body(text, out_text, out_display)
+                return
+
+            if self._mode == "header":
+                self._buffer = self._buffer.lstrip()
+                if not self._buffer:
+                    return
+                upper = self._buffer.upper()
+                if not upper.startswith("VOICE="):
+                    if not final and "VOICE=".startswith(upper):
+                        return
+                    self._mode = "legacy"
+                    self._protocol_error = "MISSING_HEADER"
+                    self._protocol_valid = False
+                    continue
+                if len(self._buffer) < len("VOICE="):
+                    return
+                newline = self._buffer.find("\n")
+                if newline < 0:
+                    if not final and len(self._buffer) <= MAX_VOICE_HEADER_CHARS:
+                        return
+                    line = self._buffer.rstrip("\r")
+                    self._buffer = ""
+                else:
+                    line = self._buffer[:newline].rstrip("\r")
+                    self._buffer = self._buffer[newline + 1 :]
+                self._parse_voice_line(line, out_display)
+                continue
+
+            # await_text
+            self._buffer = self._buffer.lstrip()
+            if not self._buffer:
+                if final:
+                    self._protocol_error = self._protocol_error or "MISSING_TEXT"
+                    self._protocol_valid = False
+                return
+            upper = self._buffer.upper()
+            if upper.startswith("TEXT="):
+                body = self._buffer[len("TEXT=") :]
+                self._buffer = ""
+                self._mode = "body"
+                if self._voice_valid:
+                    self._protocol_valid = True
+                self._emit_prefix(out_display)
+                self._feed_body(body, out_text, out_display)
+                continue
+            if not final and "TEXT=".startswith(upper):
+                return
+            # A VOICE header followed by ordinary text: compatibility mode.
+            self._protocol_error = self._protocol_error or "MISSING_TEXT"
+            self._protocol_valid = False
+            self._mode = "body"
+            self._emit_prefix(out_display)
+            continue
+
+    def _parse_voice_line(self, line: str, out_display: list[str]) -> None:
+        content = line.strip()
+        rest = content[len("VOICE=") :] if content.upper().startswith("VOICE=") else content
+        upper = rest.upper()
+        marker = upper.find("TEXT=")
+        if marker >= 0:
+            voice_raw = rest[:marker].strip()
+            body = rest[marker + len("TEXT=") :]
+            self._set_voice(voice_raw)
+            self._mode = "body"
+            if self._voice_valid:
+                self._protocol_valid = True
+            self._emit_prefix(out_display)
+            self._buffer = body
+        else:
+            self._set_voice(rest.strip())
+            self._mode = "await_text"
+            self._protocol_valid = False
+
+    def _set_voice(self, raw: str) -> None:
+        value = raw.strip()
+        lowered = value.lower()
+        if not value or lowered == NATURAL_VOICE:
+            self._voice = None
+            self._voice_valid = True
+            self._display_prefix = ""
+            return
+        if lowered in VOICE_NAME_SET:
+            self._voice = lowered
+            self._voice_valid = True
+            self._display_prefix = f"[{lowered}]"
+            return
+        # Never guess a replacement tag for an invalid VOICE.
+        self._voice = None
+        self._voice_valid = False
+        self._invalid_voice = value[:64]
+        self._display_prefix = ""
+        self._protocol_error = "INVALID_VOICE"
+
+    def _emit_prefix(self, out_display: list[str]) -> None:
+        if self._display_prefix and not self._prefix_emitted:
+            out_display.append(self._display_prefix)
+            self._prefix_emitted = True
+
+    def _feed_body(self, text: str, out_text, out_display) -> None:
+        if not text:
+            return
+        if not self._body_started:
+            text = text.lstrip()
+            if not text:
+                return
+            self._body_started = True
+        chunk = self._body.feed(text)
+        if chunk.text:
+            out_text.append(chunk.text)
+        if chunk.display_text:
+            out_display.append(chunk.display_text)
+
+
+def parse_voice_response(text: str) -> VoiceResponseResult:
+    """Parse one complete VOICE/TEXT (or legacy) reply."""
+    parser = VoiceResponseParser()
     parser.feed(text)
     parser.finish()
     return parser.result()
@@ -353,6 +704,10 @@ __all__ = [
     "SpeechExpressionResult",
     "SpeechExpressionSegment",
     "SpeechMarkupParser",
+    "VoiceResponseChunk",
+    "VoiceResponseParser",
+    "VoiceResponseResult",
     "has_valid_reply_text",
     "parse_speech_expressions",
+    "parse_voice_response",
 ]

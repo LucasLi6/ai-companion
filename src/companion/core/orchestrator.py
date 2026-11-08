@@ -92,9 +92,9 @@ from companion.prompts.layout import (
     response_layout_for,
 )
 from companion.speech_expression.parser import (
-    SpeechMarkupParser,
+    VoiceResponseParser,
     has_valid_reply_text,
-    parse_speech_expressions,
+    parse_voice_response,
 )
 from companion.runtime_context.connection import ConnectionInfo
 from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
@@ -1198,7 +1198,7 @@ class Orchestrator:
                                 # Same parser as the streaming path: only the
                                 # canonical text may continue to the action,
                                 # history, memory and profile code.
-                                parsed = parse_speech_expressions(response_text)
+                                parsed = parse_voice_response(response_text)
                                 response_text = parsed.text.strip()
                                 stream_meta["display_text"] = parsed.display_text
                                 if not has_valid_reply_text(response_text):
@@ -1960,7 +1960,7 @@ class Orchestrator:
             )
             return None
         raw = str(generated or "")
-        parsed = parse_speech_expressions(raw)
+        parsed = parse_voice_response(raw)
         text = parsed.text.strip()
         if not has_valid_reply_text(text):
             return None
@@ -2001,7 +2001,7 @@ class Orchestrator:
             # Proactive generation is always ordinary conversation, so the same
             # parser and canonical/display split applies. ProactiveMessageRecord
             # stores only ``text``.
-            parsed = parse_speech_expressions(text)
+            parsed = parse_voice_response(text)
             text = parsed.text.strip()
             display_text = parsed.display_text
             if not has_valid_reply_text(text):
@@ -2431,7 +2431,7 @@ class Orchestrator:
         speech_active = (
             self.speech_expression_enabled and layout == RESPONSE_LAYOUT_CHAT
         )
-        parser = SpeechMarkupParser() if speech_active else None
+        parser = VoiceResponseParser() if speech_active else None
         # The parser can expose leading/trailing whitespace after a tag is
         # removed (e.g. "[giggles] 你好" or "你好 [giggles]"). A structured-layout
         # normalizer is exactly a streaming trimmer: it drops leading whitespace

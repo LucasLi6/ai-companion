@@ -336,12 +336,14 @@ def _route_payload(route) -> dict:
     the ``route_decisions`` audit row, via ``audit_dict``) but must not reach
     the Speaker, where it would read as advice about what to say.
     """
+    tone = getattr(route, "tone_direction", None)
     return {
         "source": "semantic_router",
         "action": route.action.value,
         "reply_necessity": route.reply_necessity.value,
         "addressee_assessment": route.addressee_assessment.value,
         "turn_state": route.turn_state.value,
+        "tone_direction": getattr(tone, "value", tone) if tone is not None else None,
         "processing_intents": [item.value for item in route.processing_intents],
         "tool_requests": [
             {

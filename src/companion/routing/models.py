@@ -29,7 +29,7 @@ from companion.domain.enums import ReplyNecessity
 from companion.domain.models import AffectiveSignal, PragmaticAnalysis, SceneProposal
 
 ROUTER_SCHEMA_VERSION = 1
-ROUTER_PROMPT_VERSION = "router-v3"
+ROUTER_PROMPT_VERSION = "router-v4"
 
 MAX_TOOL_REQUESTS = 8
 MAX_TOOL_CALLS = 4
@@ -92,6 +92,40 @@ class TurnState(str, Enum):
     CLOSING = "CLOSING"
     PAUSED = "PAUSED"
     UNKNOWN = "UNKNOWN"
+
+
+class ToneDirection(str, Enum):
+    """An optional suggestion for the Speaker's delivery, never an order.
+
+    This is deliberately not an emotion state and carries no permission or
+    action control. The Speaker may adopt, adjust or ignore it.
+    """
+
+    NATURAL = "NATURAL"
+    PLAYFUL = "PLAYFUL"
+    CURIOUS = "CURIOUS"
+    SURPRISED = "SURPRISED"
+    CONCERNED = "CONCERNED"
+    SKEPTICAL = "SKEPTICAL"
+    SERIOUS = "SERIOUS"
+
+
+def _coerce_tone_direction(value: Any) -> Optional[ToneDirection]:
+    """Unknown or malformed suggestions degrade to ``None``.
+
+    A tone hint must never invalidate the whole route decision. Older payloads
+    simply omit the field; hostile or sloppy values are dropped here.
+    """
+
+    if value is None or isinstance(value, ToneDirection):
+        return value if isinstance(value, ToneDirection) else None
+    text = str(value).strip().upper()
+    if not text:
+        return None
+    try:
+        return ToneDirection(text)
+    except ValueError:
+        return None
 
 
 class EvidenceReference(BaseModel):
@@ -188,6 +222,10 @@ class RawRouteDecision(BaseModel):
     # at all. An absent field is a schema error, never an implicit IGNORE.
     input_semantics: InputSemanticStatus
     turn_state: TurnState = TurnState.UNKNOWN
+    # Optional delivery suggestion for the Speaker. It never changes action,
+    # tools, memory or any other routing judgement, and an unknown value is
+    # dropped rather than rejecting the whole decision.
+    tone_direction: Optional[ToneDirection] = None
     processing_intents: list[ProcessingIntent] = Field(default_factory=list)
     tool_requests: list[ToolRequest] = Field(default_factory=list)
     needs_followup_planning: bool = False
@@ -235,6 +273,11 @@ class RawRouteDecision(BaseModel):
                 out.append(intent)
         return out[:4]
 
+    @field_validator("tone_direction", mode="before")
+    @classmethod
+    def _clean_tone_direction(cls, value: Any) -> Optional[ToneDirection]:
+        return _coerce_tone_direction(value)
+
     @field_validator("reason", mode="before")
     @classmethod
     def _clean_reason(cls, value: Any) -> str:
@@ -254,6 +297,9 @@ class ValidatedRouteDecision(BaseModel):
     # it into NON_COMMUNICATIVE, so the compatible default is UNCERTAIN.
     input_semantics: InputSemanticStatus = InputSemanticStatus.UNCERTAIN
     turn_state: TurnState = TurnState.UNKNOWN
+    # Read-only suggestion carried for the Speaker. Older persisted decisions
+    # omit it and deserialize with ``None``.
+    tone_direction: Optional[ToneDirection] = None
     processing_intents: list[ProcessingIntent] = Field(default_factory=list)
     tool_requests: list[ToolRequest] = Field(default_factory=list)
     needs_followup_planning: bool = False
@@ -268,6 +314,11 @@ class ValidatedRouteDecision(BaseModel):
     router_version: str = ROUTER_PROMPT_VERSION
     provider: str = "deepseek"
     model: str = ""
+
+    @field_validator("tone_direction", mode="before")
+    @classmethod
+    def _clean_tone_direction(cls, value: Any) -> Optional[ToneDirection]:
+        return _coerce_tone_direction(value)
 
     @field_validator("tool_requests")
     @classmethod

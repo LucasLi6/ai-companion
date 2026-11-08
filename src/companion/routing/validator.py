@@ -107,6 +107,7 @@ class RoutingValidator:
             addressee_assessment=raw.addressee_assessment,
             input_semantics=raw.input_semantics,
             turn_state=raw.turn_state,
+            tone_direction=raw.tone_direction,
             processing_intents=list(raw.processing_intents),
             tool_requests=requests,
             needs_followup_planning=bool(raw.needs_followup_planning),

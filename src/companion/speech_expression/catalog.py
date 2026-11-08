@@ -132,8 +132,29 @@ _SOUND_STEMS = frozenset(
 MAX_INVALID_TAG_LENGTH = max(len(tag) + 2 for tag in INVALID_SPEECH_TAGS)
 MAX_BRACKET_CANDIDATE_LENGTH = max(MAX_TAG_LENGTH, MAX_INVALID_TAG_LENGTH) + 8
 
+# V1.2 VOICE= protocol: the internal name is exactly the official control tag
+# without its brackets. One list, generated from CONTROL_TAGS, so prompt and
+# parser cannot drift apart. ``natural`` and the empty value mean "no tag".
+VOICE_NAMES: tuple[str, ...] = tuple(tag[1:-1] for tag in CONTROL_TAGS)
+VOICE_NAME_SET: frozenset[str] = frozenset(VOICE_NAMES)
+NATURAL_VOICE = "natural"
+
 _INVALID_TAG_FORMS = tuple(f"[{tag}]" for tag in INVALID_SPEECH_TAGS)
 _VOICE_WORD_SHAPE = re.compile(r"^[a-z][a-z '\-]{0,30}$")
+
+
+def is_valid_voice_name(name: str) -> bool:
+    """Whether ``name`` is an official control tag without brackets."""
+    return name.strip().lower() in VOICE_NAME_SET
+
+
+def is_empty_bracket_markup(inner: str) -> bool:
+    """``[]`` or ``[   ]``: model markup with no usable instruction.
+
+    This is checked only in the ordinary-conversation speech path; callers keep
+    genuine code/array/Markdown brackets intact through context rules.
+    """
+    return not inner.strip()
 
 
 def is_invalid_speech_tag(
@@ -244,6 +265,11 @@ def render_tag_catalog() -> str:
     )
 
 
+def render_voice_catalog() -> str:
+    """The VOICE= value list, generated from the same control whitelist."""
+    return " ".join(VOICE_NAMES)
+
+
 __all__ = [
     "ALL_TAGS",
     "CONTROL_TAGS",
@@ -255,15 +281,21 @@ __all__ = [
     "MAX_INVALID_TAG_LENGTH",
     "MAX_TAG_LENGTH",
     "NONVERBAL_TAGS",
+    "NATURAL_VOICE",
     "ORDINARY_BRACKET_WORDS",
     "SpeechTag",
     "TAG_KINDS",
+    "VOICE_NAMES",
+    "VOICE_NAME_SET",
     "is_control_tag",
+    "is_empty_bracket_markup",
     "is_invalid_speech_tag",
     "is_invalid_tag_prefix",
     "is_known_tag",
     "is_nonverbal_tag",
     "is_tag_prefix",
+    "is_valid_voice_name",
     "render_tag_catalog",
+    "render_voice_catalog",
     "tag_spec",
 ]

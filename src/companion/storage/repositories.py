@@ -57,6 +57,7 @@ from companion.research.state import ResearchStateRepository
 from companion.goals.state import GoalRepository
 from companion.routing.repository import RoutingRepository
 from companion.runtime_context.repository import RuntimeSnapshotRepository
+from companion.speech_expression.history import strip_leading_empty_bracket_markup
 
 from .database import Database
 
@@ -1522,7 +1523,11 @@ class AnalysisRepository:
             action_id=row["action_id"],
             event_id=row["event_id"],
             action_type=CognitiveAction(row["action_type"]),
-            response_text=row["response_text"],
+            response_text=(
+                strip_leading_empty_bracket_markup(row["response_text"])
+                if row["response_text"]
+                else row["response_text"]
+            ),
             reason_code=ReasonCode(row["reason_code"]),
             status=row["status"],
             created_at=_dt(row["created_at"]),

@@ -48,6 +48,7 @@ from companion.speech_expression.catalog import (
     KIND_NONVERBAL,
     NONVERBAL_TAGS,
     TAG_KINDS,
+    VOICE_NAMES,
     render_tag_catalog,
 )
 from companion.speech_expression.parser import (
@@ -1131,19 +1132,23 @@ def test_prompt_block_is_off_by_default_and_preserves_the_persona():
     assert "你是 Ava。" in system
     for tag in ALL_TAGS:
         assert tag in system
+    for voice in VOICE_NAMES:
+        assert voice in system
     for rule in (
-        "多数适合语音表达的回复可以主动考虑",
-        "不需要每一轮都使用标签",
-        "语气表达不是情绪状态分类",
-        "正常说话不一定需要特殊语气",
-        "疑问句不一定用 [curious]",
-        "技术或严肃话题不一定用 [serious]",
-        "开心不一定用 [excited]",
+        "VOICE=<初始语气>",
+        "TEXT=<真正的回复内容>",
+        "VOICE=natural",
+        "不要输出 ``[]``",
+        "疑问句不一定用 curious",
+        "技术或严肃话题不一定用 serious",
+        "开心不一定用 excited",
+        "tone_direction",
+        "你可以采纳、调整或忽略它",
         "代码、表格、Markdown",
-        "任何正常回复都必须包含实际的文字内容",
+        "任何正常回复都必须包含实际文字",
     ):
         assert rule in system
-    assert SPEECH_EXPRESSION_PROMPT_VERSION == "speech-expression-v1.1"
+    assert SPEECH_EXPRESSION_PROMPT_VERSION == "speech-expression-v1.2"
 
 
 def test_proactive_prompt_uses_the_same_optional_block():
@@ -1540,4 +1545,137 @@ async def test_emotion_tables_never_receive_speech_labels(db):
     # observe the label even if it inspects the action.
     action = await rt.repos.analysis.get_action(event.event_id)
     assert action.response_text == "好呀！"
+    assert await _db_text_with_tags(db) == []
+
+
+# -- V1.2 VOICE/TEXT protocol through the real paths -------------------------
+
+
+async def test_v12_streaming_voice_header_persists_canonical_only(db):
+    response = _StreamingResponse(
+        ["VOICE=sarc", "astic\nTE", "XT=你今天", "倒是挺忙", "的。"]
+    )
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+
+    completed = events[-1]
+    assert completed.type == RESPONSE_COMPLETED
+    assert completed.text == "你今天倒是挺忙的。"
+    assert completed.display_text == "[sarcastic]你今天倒是挺忙的。"
+    assert _joined(events, "delta") == completed.text
+    assert _joined(events, "display_delta") == completed.display_text
+    for item in events:
+        if item.type == RESPONSE_DELTA:
+            assert "VOICE=" not in (item.display_delta or "")
+            assert "[sarcastic]" not in (item.delta or "")
+
+    action = await rt.repos.analysis.get_action(event.event_id)
+    assert action.response_text == "你今天倒是挺忙的。"
+
+
+async def test_v12_natural_voice_has_identical_channels(db):
+    response = _StreamingResponse(["VOICE=natural\nTEXT=今天天气不错。"])
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    completed = events[-1]
+    assert completed.text == "今天天气不错。"
+    assert completed.display_text == "今天天气不错。"
+    action = await rt.repos.analysis.get_action(event.event_id)
+    assert action.response_text == "今天天气不错。"
+
+
+async def test_v12_non_streaming_voice_protocol_is_parsed(db):
+    response = _BlockingResponse(
+        "VOICE=curious\nTEXT=[giggles] 你在做什么？"
+    )
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    report = await rt.orchestrator.process_utterance(event)
+    assert report.status == "COMPLETED"
+    action = await rt.repos.analysis.get_action(event.event_id)
+    assert action.response_text == "你在做什么？"
+    assert await _db_text_with_tags(db) == []
+
+
+async def test_v12_invalid_voice_never_reaches_stored_or_display(db):
+    response = _StreamingResponse(
+        ["VOICE=happy\nTEXT=[] 好呀。"]
+    )
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    completed = events[-1]
+    assert completed.text == "好呀。"
+    assert completed.display_text == "好呀。"
+    action = await rt.repos.analysis.get_action(event.event_id)
+    assert action.response_text == "好呀。"
+    assert "[]" not in action.response_text
+    assert "[]" not in completed.display_text
+
+
+async def test_v12_proactive_stores_canonical_and_shows_voice(db):
+    client = _ProactiveClient()
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        with_worker=False,
+        router_mode="legacy",
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    first = _event("我在研究机器人控制", person_id=person.person_id)
+    await rt.orchestrator.process_utterance(first)
+
+    client.response_text = (
+        "VOICE=empathetic\nTEXT=[] 听起来你今天很累。"
+    )
+    manager = rt.proactive_manager
+    manager.idle_delay_seconds = 0.01
+    manager.judge = ProactiveJudge(ScriptedProactiveJudgeProvider([True]))
+    manager.on_response_delivered(
+        conversation_id="c1",
+        person_id=person.person_id,
+        source_event_id=first.event_id,
+    )
+    delivered = await asyncio.wait_for(manager.next_event(), 2)
+    await manager.shutdown()
+
+    rows = await rt.repos.proactive.list_for_conversation("c1")
+    assert rows[0].text == "听起来你今天很累。"
+    assert delivered.display_text == "[empathetic]听起来你今天很累。"
     assert await _db_text_with_tags(db) == []
