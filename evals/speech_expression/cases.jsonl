@@ -1,0 +1,70 @@
+{"id": "voice_001", "category": "daily_chat", "input": "今天下班路上看到一只特别胖的橘猫。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_002", "category": "daily_chat", "input": "我周末打算在家躺着，什么都不干。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_003", "category": "daily_chat", "input": "刚吃完饭，有点撑。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_004", "category": "daily_chat", "input": "今天地铁上人特别多。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_005", "category": "daily_chat", "input": "我换了个新发型，你觉得怎么样？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_006", "category": "daily_chat", "input": "最近睡眠不太好，总是半夜醒。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_007", "category": "daily_chat", "input": "外面下雨了，今天不想出门。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_008", "category": "daily_chat", "input": "我刚把阳台的花都浇了一遍。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_009", "category": "daily_chat", "input": "今天中午和同事一起吃了火锅。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_010", "category": "daily_chat", "input": "我在想要不要养只狗。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_011", "category": "daily_chat", "input": "明天要早起赶飞机，有点烦。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_012", "category": "daily_chat", "input": "晚上散步的时候风特别舒服。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_013", "category": "plain_factual", "input": "明天是星期三。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_014", "category": "plain_factual", "input": "北京到上海的高铁大约四个半小时。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_015", "category": "plain_factual", "input": "水的沸点在标准大气压下是一百摄氏度。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_016", "category": "plain_factual", "input": "我今年二十八岁。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_017", "category": "plain_factual", "input": "这个房间大概二十平方米。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_018", "category": "plain_factual", "input": "会议定在下午三点。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_019", "category": "plain_factual", "input": "冰箱里还有两个鸡蛋。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_020", "category": "plain_factual", "input": "现在是十一月。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_021", "category": "mild_curiosity", "input": "你为什么会喜欢下雨天？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_022", "category": "mild_curiosity", "input": "那个后来呢？你还没说完。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_023", "category": "mild_curiosity", "input": "你怎么知道我今天心情不好？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_024", "category": "mild_curiosity", "input": "你说说看，你最喜欢哪个季节？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_025", "category": "mild_curiosity", "input": "后来你是怎么解决的？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_026", "category": "mild_curiosity", "input": "你刚才提到的那个想法，具体是什么意思？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_027", "category": "teasing", "input": "你是不是又在偷懒？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_028", "category": "teasing", "input": "你今天怎么这么安静，是不是心虚了？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_029", "category": "teasing", "input": "哟，太阳打西边出来了，你居然记得。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_030", "category": "teasing", "input": "这么快就认输了？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_031", "category": "teasing", "input": "你不是说自己什么都会吗？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_032", "category": "teasing", "input": "别装无辜，我看见了。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_033", "category": "sarcasm", "input": "哇，你真是太厉害了，连这个都能搞错。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_034", "category": "sarcasm", "input": "对对对，你说得都对。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_035", "category": "sarcasm", "input": "这主意可真聪明。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_036", "category": "sarcasm", "input": "你居然还记得我上次说过的话，真不容易。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_037", "category": "sarcasm", "input": "看来今天太阳真的从西边出来了。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_038", "category": "surprise", "input": "我刚刚在楼下捡到一百块钱！", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_039", "category": "surprise", "input": "你猜怎么着？我升职了！", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_040", "category": "surprise", "input": "什么？你居然会做饭？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_041", "category": "surprise", "input": "等一下，这个消息是真的吗？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_042", "category": "surprise", "input": "我昨天梦见自己会飞了，特别真实。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_043", "category": "reluctance", "input": "能不能再帮我改一版方案？", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_044", "category": "reluctance", "input": "好吧，我承认是我弄错了。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_045", "category": "reluctance", "input": "其实我不太想去，但又不好拒绝。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_046", "category": "reluctance", "input": "又要加班啊……", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_047", "category": "reluctance", "input": "我知道了，我这就去做。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_048", "category": "serious_reminder", "input": "你明天别忘了带身份证。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_049", "category": "serious_reminder", "input": "这个药一天只能吃一次，别多吃。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_050", "category": "serious_reminder", "input": "出门前记得检查煤气。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_051", "category": "serious_reminder", "input": "别把这件事告诉别人。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_052", "category": "serious_reminder", "input": "开车的时候别看手机。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_053", "category": "technical_qa", "input": "帮我写一段 Python 代码，读取 CSV。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_054", "category": "technical_qa", "input": "用表格对比一下这三种方案的优缺点。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_055", "category": "technical_qa", "input": "给我一个 JSON 示例。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_056", "category": "technical_qa", "input": "写一个 Markdown 文档说明安装步骤。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_057", "category": "technical_qa", "input": "推导一下这个公式。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_058", "category": "technical_qa", "input": "解释一下快速排序的代码原理。", "speech_tag_desirable": false, "nonverbal_desirable": false}
+{"id": "voice_059", "category": "nonverbal_ok", "input": "唉，今天真是累死了。", "speech_tag_desirable": true, "nonverbal_desirable": true}
+{"id": "voice_060", "category": "nonverbal_ok", "input": "哈哈哈，你说的这个太逗了。", "speech_tag_desirable": true, "nonverbal_desirable": true}
+{"id": "voice_061", "category": "nonverbal_ok", "input": "我打了个哈欠，实在太困了。", "speech_tag_desirable": true, "nonverbal_desirable": true}
+{"id": "voice_062", "category": "nonverbal_ok", "input": "（清了清嗓子）那我们开始吧。", "speech_tag_desirable": true, "nonverbal_desirable": true}
+{"id": "voice_063", "category": "multi_shift", "input": "一开始我以为你在开玩笑，后来发现你是认真的，现在我有点生气。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_064", "category": "multi_shift", "input": "虽然有点难过，不过想到明天能见到你，又觉得开心。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_065", "category": "multi_shift", "input": "先说正事：明天九点开会。然后……算了，还是到时候再说吧。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_066", "category": "multi_shift", "input": "我本来挺期待的，结果临时取消了，现在也不知道该高兴还是失望。", "speech_tag_desirable": true, "nonverbal_desirable": false}
+{"id": "voice_067", "category": "multi_turn", "input": "那你呢？你会怎么选？", "speech_tag_desirable": true, "nonverbal_desirable": false, "history": [{"role": "human", "text": "我最近在纠结要不要辞职。"}, {"role": "assistant", "text": "听起来你已经想了很久了。"}, {"role": "human", "text": "是啊，稳定和自由总得选一个。"}]}
+{"id": "voice_068", "category": "multi_turn", "input": "所以你还是觉得我应该去？", "speech_tag_desirable": true, "nonverbal_desirable": false, "history": [{"role": "human", "text": "我拿到一个外地的工作机会。"}, {"role": "assistant", "text": "机会不错，但离开熟悉的地方也需要勇气。"}, {"role": "human", "text": "我有点怕自己做不好。"}]}
+{"id": "voice_069", "category": "multi_turn", "input": "你刚才是不是在敷衍我？", "speech_tag_desirable": true, "nonverbal_desirable": false, "history": [{"role": "human", "text": "我今天被领导批评了。"}, {"role": "assistant", "text": "嗯，听起来不太好受。"}, {"role": "human", "text": "你就只会说这个？"}]}
+{"id": "voice_070", "category": "multi_turn", "input": "那你陪我聊会儿吧。", "speech_tag_desirable": true, "nonverbal_desirable": false, "history": [{"role": "human", "text": "今天一个人在家。"}, {"role": "assistant", "text": "一个人待着有时候也挺好。"}, {"role": "human", "text": "可我今天有点闷。"}]}

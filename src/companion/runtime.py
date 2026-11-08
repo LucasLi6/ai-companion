@@ -622,6 +622,9 @@ def build_runtime(
         ).strip().lower() in ("1", "true", "yes", "on")
     if hasattr(response, "speech_expression_enabled"):
         response.speech_expression_enabled = bool(speech_expression_enabled)
+    (logger or logging.getLogger("companion.runtime")).info(
+        "speech_expression enabled=%s", bool(speech_expression_enabled)
+    )
 
     # V0.9.9.6: explicit self-reports are detected and written locally in the
     # same turn. There is no confirmation question and no candidate queue, so

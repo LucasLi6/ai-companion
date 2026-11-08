@@ -217,8 +217,12 @@ def test_layout_decision_uses_the_current_explicit_request():
     assert response_layout_for("我回来啦") == RESPONSE_LAYOUT_CHAT
     assert response_layout_for("现在几点") == RESPONSE_LAYOUT_CHAT
     assert response_layout_for("帮我写一个 Python 教程") == RESPONSE_LAYOUT_STRUCTURED
-    assert response_layout_for("解释一下原理") == RESPONSE_LAYOUT_STRUCTURED
+    # V1.1: ordinary asks are conversation, not structured deliverables.
+    assert response_layout_for("解释一下原理") == RESPONSE_LAYOUT_CHAT
+    assert response_layout_for("你举个示例说明一下？") == RESPONSE_LAYOUT_CHAT
+    assert response_layout_for("能分步骤说说吗") == RESPONSE_LAYOUT_CHAT
     assert response_layout_for("写一段代码") == RESPONSE_LAYOUT_STRUCTURED
+    assert response_layout_for("输出一个表格") == RESPONSE_LAYOUT_STRUCTURED
 
 
 def test_chat_layout_collapses_newlines_across_chunk_boundaries():

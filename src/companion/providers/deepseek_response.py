@@ -154,6 +154,45 @@ class DeepSeekResponseProvider:
         ):
             yield delta
 
+    async def generate_plain_recovery(
+        self,
+        event: UtteranceEvent,
+        analysis: CognitiveResult,
+        context,
+        *,
+        mode: Optional[str] = None,
+    ) -> str:
+        """One constrained retry without the voice-expression protocol.
+
+        Used only when a reply contained nothing but labels/sound actions. It
+        reuses the already-authorized Speaker context and does not re-run the
+        router, tools, memory, emotion or scene code. ``mode`` keeps the
+        proactive IMMEDIATE/LONG_IDLE distinction when recovering a proactive
+        utterance. This never changes the provider/global speech switch, so
+        concurrent conversations are unaffected.
+        """
+        await self._authorize(event)
+        ctx = self._as_context(event, context, analysis)
+        if mode is not None:
+            messages = build_proactive_response_messages(
+                ctx, analysis, mode=mode, speech_expression=False
+            )
+        else:
+            messages = build_response_messages(
+                ctx, analysis, speech_expression=False
+            )
+        response = await self.client.complete(
+            messages,
+            request_type="response",
+            event_id=event.event_id,
+            json_mode=False,
+        )
+        if mode is not None:
+            self.last_model = getattr(response, "model", "") or self.last_model
+        return ResponseText(
+            response.content.strip(), getattr(response, "finish_reason", None)
+        )
+
     async def _authorize(self, event: UtteranceEvent) -> None:
         if self.privacy_gateway is None:
             return

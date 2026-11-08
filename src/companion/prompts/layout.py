@@ -26,21 +26,21 @@ RESPONSE_LAYOUT_STRUCTURED = "structured"
 
 # Explicit structured-output signals. These are requests for a deliverable that
 # needs layout, not ordinary conversation, so they justify keeping newlines.
+# V1.1: words such as 示例 / 步骤 / 写一个 / 解释一下原理 were removed because
+# they also appear in ordinary conversation ("你举个示例说明一下？"). They no
+# longer suppress the voice-expression protocol by themselves.
 _STRUCTURED_MARKERS = (
     "代码",
+    "代码块",
     "code",
+    "json",
     "教程",
     "推导",
     "公式",
-    "步骤",
     "列表",
     "markdown",
     "文档",
     "表格",
-    "示例",
-    "example",
-    "写一个",
-    "解释一下原理",
 )
 
 

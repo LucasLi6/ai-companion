@@ -23,12 +23,19 @@ from companion.core.response_events import (
 from companion.domain.enums import EventSource
 from companion.domain.models import make_utterance_event
 from companion.proactive.judge import ProactiveJudge
+from companion.prompts.proactive import (
+    PROACTIVE_MODE_BLOCK,
+    PROACTIVE_MODE_BLOCK_LONG_IDLE,
+)
 from companion.prompts.response import (
     BASE_RESPONSE_PROMPT,
     build_proactive_response_messages,
     build_response_messages,
 )
-from companion.prompts.speech_expression import SPEECH_EXPRESSION_PROMPT
+from companion.prompts.speech_expression import (
+    SPEECH_EXPRESSION_PROMPT,
+    SPEECH_EXPRESSION_PROMPT_VERSION,
+)
 from companion.providers.deepseek_client import ChatResponse, StreamDelta
 from companion.providers.deepseek_response import DeepSeekResponseProvider
 from companion.providers.deepseek_proactive import ScriptedProactiveJudgeProvider
@@ -36,6 +43,7 @@ from companion.runtime import build_runtime
 from companion.speech_expression.catalog import (
     ALL_TAGS,
     CONTROL_TAGS,
+    INVALID_SPEECH_TAGS,
     KIND_CONTROL,
     KIND_NONVERBAL,
     NONVERBAL_TAGS,
@@ -111,6 +119,11 @@ def test_catalog_has_no_aliases_and_keeps_two_kinds_apart():
         assert alias not in TAG_KINDS
     assert all(TAG_KINDS[tag] == KIND_CONTROL for tag in CONTROL_TAGS)
     assert all(TAG_KINDS[tag] == KIND_NONVERBAL for tag in NONVERBAL_TAGS)
+
+
+def test_invalid_vocabulary_never_overlaps_the_official_whitelist():
+    official_inner = {tag[1:-1] for tag in ALL_TAGS}
+    assert official_inner.isdisjoint(INVALID_SPEECH_TAGS)
 
 
 def test_prompt_tag_list_is_generated_from_the_same_whitelist():
@@ -198,6 +211,23 @@ def test_parser_never_leaks_a_whitelist_tag_into_canonical_text(text):
         assert tag not in parsed.text
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[happy]",
+        "[playful][neutral]",
+        "a[softly]b",
+        "[giggling]",
+        "[happy]你好[playful]再见",
+    ],
+)
+def test_parser_never_leaks_invalid_voice_markup(text):
+    parsed = parse_speech_expressions(text)
+    for sample in parsed.invalid_tags:
+        assert sample not in parsed.text
+        assert sample not in parsed.display_text
+
+
 def test_parser_handles_partial_tags_across_chunks():
     parser = SpeechMarkupParser()
     assert parser.feed("[mis").text == ""
@@ -214,16 +244,74 @@ def test_parser_handles_partial_tags_across_chunks():
 
 def test_unknown_tags_and_ordinary_brackets_are_protected_literally():
     for text in (
-        "[happy]不在白名单",
         "数组 a[i] 和 b[0]",
         "看看 [草稿] 这段",
-        "literal [sadness] not a tag",
+        "[1] 第一项",
         "Markdown [link](https://example.com)",
+        "标识符 a[happy] 不是标签",
+        "Markdown [happy](https://example.com)",
     ):
         parsed = parse_speech_expressions(text)
         assert parsed.text == text
         assert parsed.display_text == text
         assert parsed.has_tags is False
+        assert parsed.invalid_tags == ()
+
+
+@pytest.mark.parametrize(
+    "text,expected_text,expected_display",
+    [
+        ("[happy]你好", "你好", "你好"),
+        ("[playful]你怎么又来了", "你怎么又来了", "你怎么又来了"),
+        ("[neutral]我知道了", "我知道了", "我知道了"),
+        ("[softly]嗯", "嗯", "嗯"),
+        ("[giggling]哈哈", "哈哈", "哈哈"),
+        ("你好[neutral]", "你好", "你好"),
+        ("我 [happy] 好", "我 好", "我 好"),
+        ("[happy] [playful] 你好", "你好", "你好"),
+    ],
+)
+def test_invalid_voice_markup_is_removed_from_both_channels(
+    text, expected_text, expected_display
+):
+    parsed = parse_speech_expressions(text)
+    assert parsed.text == expected_text
+    assert parsed.display_text == expected_display
+    assert parsed.invalid_tags
+    assert parsed.has_tags is False
+
+
+def test_invalid_voice_markup_streaming_is_correct_for_every_split():
+    text = "[playful]你怎么又来了[neutral]"
+    expected = parse_speech_expressions(text)
+    assert expected.text == "你怎么又来了"
+    assert expected.display_text == "你怎么又来了"
+    for split in range(len(text) + 1):
+        parser = SpeechMarkupParser()
+        chunks = [
+            parser.feed(text[:split]),
+            parser.feed(text[split:]),
+            parser.finish(),
+        ]
+        assert "".join(chunk.text for chunk in chunks) == expected.text
+        assert (
+            "".join(chunk.display_text for chunk in chunks)
+            == expected.display_text
+        )
+        assert parser.result() == expected
+    assert parser.invalid_tag_count == 2
+    assert parser.invalid_tag_samples == ("[playful]", "[neutral]")
+
+
+def test_invalid_tags_do_not_become_segments():
+    parsed = parse_speech_expressions("[happy]你好[giggles]呀")
+    assert [segment.kind for segment in parsed.segments] == [
+        "text",
+        KIND_NONVERBAL,
+        "text",
+    ]
+    assert all(segment.tag != "[happy]" for segment in parsed.segments)
+    assert parsed.invalid_tags == ("[happy]",)
 
 
 def test_code_and_markdown_brackets_survive_verbatim():
@@ -341,10 +429,22 @@ async def _person(rt, name="Alice"):
 
 
 class _StreamingResponse:
-    def __init__(self, chunks, *, fail_after=None):
+    def __init__(
+        self,
+        chunks,
+        *,
+        fail_after=None,
+        recovery_text=None,
+        recovery_error=None,
+        finish_reason="stop",
+    ):
         self.chunks = list(chunks)
         self.fail_after = fail_after
         self.contexts = []
+        self.recovery_text = recovery_text
+        self.recovery_error = recovery_error
+        self.recovery_calls = 0
+        self.finish_reason = finish_reason
 
     async def generate_stream(self, event, analysis, context):
         self.contexts.append(context)
@@ -352,17 +452,60 @@ class _StreamingResponse:
             if self.fail_after is not None and index == self.fail_after:
                 raise RuntimeError("stream interrupted")
             yield StreamDelta(content=chunk)
-        yield StreamDelta(finish_reason="stop")
+        yield StreamDelta(finish_reason=self.finish_reason)
+
+    async def generate_plain_recovery(
+        self, event, analysis, context, *, mode=None
+    ):
+        self.recovery_calls += 1
+        if self.recovery_error is not None:
+            raise self.recovery_error
+        return self.recovery_text
+
+
+class _NoRecoveryStreamingResponse(_StreamingResponse):
+    generate_plain_recovery = None
 
 
 class _BlockingResponse:
-    def __init__(self, text):
+    def __init__(self, text, *, recovery_text=None, recovery_error=None):
         self.text = text
         self.contexts = []
+        self.recovery_text = recovery_text
+        self.recovery_error = recovery_error
+        self.recovery_calls = 0
 
     async def generate(self, event, analysis, context):
         self.contexts.append(context)
         return self.text
+
+    async def generate_plain_recovery(
+        self, event, analysis, context, *, mode=None
+    ):
+        self.recovery_calls += 1
+        if self.recovery_error is not None:
+            raise self.recovery_error
+        return self.recovery_text
+
+
+class _SplitStreamingResponse:
+    """One tag-only reply and one normal reply, for the concurrency test."""
+
+    def __init__(self):
+        self.recovery_calls = 0
+
+    async def generate_stream(self, event, analysis, context):
+        if event.text == "只有标签":
+            yield StreamDelta(content="[sad]")
+        else:
+            yield StreamDelta(content="[sad]正常回复")
+        yield StreamDelta(finish_reason="stop")
+
+    async def generate_plain_recovery(
+        self, event, analysis, context, *, mode=None
+    ):
+        self.recovery_calls += 1
+        return "补上一句。"
 
 
 async def _stream_events(rt, event):
@@ -375,8 +518,9 @@ def _joined(events, name):
     return "".join(getattr(item, name) or "" for item in events)
 
 
-async def _db_text_with_tags(db):
+async def _db_text_with_tags(db, needles=None):
     """Every text cell in every user table, for the isolation assertion."""
+    needles = tuple(ALL_TAGS) if needles is None else tuple(needles)
     rows = await (
         await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
     ).fetchall()
@@ -399,7 +543,7 @@ async def _db_text_with_tags(db):
                     cell = cell.decode("utf-8", "ignore")
                 if not isinstance(cell, str):
                     continue
-                for tag in ALL_TAGS:
+                for tag in needles:
                     if tag in cell:
                         found.append((table, name, tag, cell[:80]))
     return found
@@ -522,7 +666,6 @@ async def test_history_given_to_the_next_speaker_call_is_canonical(db):
         ["你好 [gig", "gles]呀"],
         ["  [sad]你好"],
         ["你好 [sighing] 呀"],
-        ["[sad]", "[giggles]"],
     ],
 )
 async def test_streaming_invariants_hold_at_tag_whitespace_edges(db, chunks):
@@ -604,8 +747,8 @@ async def test_non_streaming_generate_is_split_by_the_same_parser(db):
     assert await _db_text_with_tags(db) == []
 
 
-async def test_tag_only_streaming_reply_persists_no_tag(db):
-    response = _StreamingResponse(["[sad]", "[giggles]"])
+async def test_non_streaming_empty_reply_recovers_once(db):
+    response = _BlockingResponse("[sad]", recovery_text="我没事。")
     rt = build_runtime(
         db,
         provider="mock",
@@ -618,10 +761,307 @@ async def test_tag_only_streaming_reply_persists_no_tag(db):
 
     events = await _stream_events(rt, event)
     completed = events[-1]
-    assert completed.text == ""
-    assert completed.display_text == "[sad][giggles]"
-    assert _joined(events, "display_delta") == "[sad][giggles]"
+    assert completed.type == "response_completed"
+    assert completed.text == "我没事。"
+    assert response.recovery_calls == 1
+    action = await rt.repos.analysis.get_action(event.event_id)
+    assert action.status == "COMPLETED"
+    assert action.response_text == "我没事。"
+
+
+async def test_non_streaming_empty_recovery_failure_is_failed(db):
+    response = _BlockingResponse("[happy]", recovery_text="[neutral]")
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    assert events[-1].type == "response_failed"
+    assert response.recovery_calls == 1
+    assert await rt.repos.analysis.get_action(event.event_id) is None
+
+
+async def test_tag_only_streaming_reply_is_not_completed(db):
+    response = _StreamingResponse(["[sad]", "[giggles]"])
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    assert events[-1].type == "response_failed"
+    assert events[-1].text in (None, "")
+    assert "EMPTY_SPEECH_OUTPUT" in (events[-1].error or "")
+    # No empty bubble: leading labels are never published without prose.
+    assert [item for item in events if item.type == RESPONSE_DELTA] == []
+    assert response.recovery_calls == 1
+    assert await rt.repos.analysis.get_action(event.event_id) is None
     assert await _db_text_with_tags(db) == []
+
+
+async def test_invalid_tag_only_streaming_reply_is_not_completed(db):
+    response = _StreamingResponse(["[happy]"])
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    assert events[-1].type == "response_failed"
+    assert response.recovery_calls == 1
+    assert await _db_text_with_tags(db) == []
+
+
+async def test_empty_streaming_reply_recovers_once_in_plain_text(db):
+    response = _StreamingResponse(
+        ["[sad]"], recovery_text="其实今天还不错，只是有点累。"
+    )
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    completed = events[-1]
+    assert completed.type == "response_completed"
+    assert completed.text == "其实今天还不错，只是有点累。"
+    assert completed.display_text == "其实今天还不错，只是有点累。"
+    assert _joined(events, "delta") == completed.text
+    assert _joined(events, "display_delta") == completed.display_text
+    assert all(item.delta for item in events if item.type == RESPONSE_DELTA)
+    assert response.recovery_calls == 1
+    action = await rt.repos.analysis.get_action(event.event_id)
+    assert action.status == "COMPLETED"
+    assert action.response_text == completed.text
+    assert await _db_text_with_tags(db) == []
+
+
+async def test_empty_recovery_that_is_also_empty_fails(db):
+    response = _StreamingResponse(["[gasp]"], recovery_text="[happy]")
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    assert events[-1].type == "response_failed"
+    assert response.recovery_calls == 1
+    assert await rt.repos.analysis.get_action(event.event_id) is None
+
+
+async def test_provider_without_recovery_fails_cleanly(db):
+    response = _NoRecoveryStreamingResponse(["[sad]"])
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    assert events[-1].type == "response_failed"
+    assert "EMPTY_SPEECH_OUTPUT" in (events[-1].error or "")
+    assert await rt.repos.analysis.get_action(event.event_id) is None
+
+
+async def test_recovery_exception_fails_without_double_terminal_event(db):
+    response = _StreamingResponse(
+        ["[sad]"], recovery_error=RuntimeError("recovery boom")
+    )
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    assert [item.type for item in events].count("response_failed") == 1
+    assert response.recovery_calls == 1
+
+
+async def test_plain_reply_without_tags_is_accepted(db):
+    response = _StreamingResponse(["你好"])
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    assert events[-1].type == "response_completed"
+    assert events[-1].text == "你好"
+    assert response.recovery_calls == 0
+
+
+async def test_leading_labels_are_held_until_the_first_prose(db):
+    response = _StreamingResponse(["[sad]", "[giggles]", "你好呀"])
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    deltas = [item for item in events if item.type == RESPONSE_DELTA]
+    assert len(deltas) == 1
+    assert deltas[0].delta == "你好呀"
+    assert deltas[0].display_delta == "[sad][giggles]你好呀"
+    assert events[-1].display_text == "[sad][giggles]你好呀"
+    assert _joined(events, "delta") == events[-1].text
+    assert _joined(events, "display_delta") == events[-1].display_text
+
+
+async def test_recovery_does_not_change_the_shared_speech_switch(db):
+    response = _StreamingResponse(["[sad]"], recovery_text="好。")
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    await _stream_events(rt, event)
+    assert rt.orchestrator.speech_expression_enabled is True
+    if hasattr(response, "speech_expression_enabled"):
+        assert response.speech_expression_enabled is True
+
+    # The next turn still gets the protocol and the display/canonical split.
+    response.chunks = ["[sad]第二次"]
+    response.recovery_text = None
+    second = _event("再聊聊", person_id=person.person_id)
+    events = await _stream_events(rt, second)
+    assert events[-1].type == "response_completed"
+    assert events[-1].text == "第二次"
+    assert events[-1].display_text == "[sad]第二次"
+    assert response.recovery_calls == 1
+
+
+async def test_concurrent_conversations_keep_recovery_isolated(db):
+    response = _SplitStreamingResponse()
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    await rt.conversations.get_or_create("c2")
+    empty_event = make_utterance_event(
+        conversation_id="c1",
+        text="只有标签",
+        addressee_hint="agent",
+        speaker_person_id=person.person_id,
+        source=EventSource.TEST,
+        event_id="evt_empty",
+    )
+    normal_event = make_utterance_event(
+        conversation_id="c2",
+        text="正常一轮",
+        addressee_hint="agent",
+        speaker_person_id=person.person_id,
+        source=EventSource.TEST,
+        event_id="evt_normal",
+    )
+
+    empty_items, normal_items = await asyncio.gather(
+        _stream_events(rt, empty_event),
+        _stream_events(rt, normal_event),
+    )
+
+    assert empty_items[-1].type == RESPONSE_COMPLETED
+    assert empty_items[-1].text == "补上一句。"
+    assert normal_items[-1].type == RESPONSE_COMPLETED
+    assert normal_items[-1].text == "正常回复"
+    assert normal_items[-1].display_text == "[sad]正常回复"
+    assert response.recovery_calls == 1
+    assert rt.orchestrator.speech_expression_enabled is True
+    assert _joined(empty_items, "delta") == empty_items[-1].text
+    assert _joined(normal_items, "display_delta") == normal_items[-1].display_text
+
+
+async def test_tag_only_truncated_stream_is_truncated_not_recovered(db):
+    response = _StreamingResponse(["[sad]"], finish_reason="length")
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    completed = events[-1]
+    assert completed.type == "response_completed"
+    assert completed.status == "TRUNCATED"
+    assert completed.text == ""
+    assert completed.display_text is None
+    assert response.recovery_calls == 0
+    assert [item for item in events if item.type == RESPONSE_DELTA] == []
+
+
+async def test_truncated_stream_with_text_stays_truncated(db):
+    response = _StreamingResponse(["说到一半"], finish_reason="length")
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    assert events[-1].status == "TRUNCATED"
+    assert events[-1].text == "说到一半"
+    assert response.recovery_calls == 0
 
 
 async def test_failed_partial_is_persisted_canonically(db):
@@ -692,13 +1132,18 @@ def test_prompt_block_is_off_by_default_and_preserves_the_persona():
     for tag in ALL_TAGS:
         assert tag in system
     for rule in (
-        "不要机械地给每句话加标签",
+        "多数适合语音表达的回复可以主动考虑",
+        "不需要每一轮都使用标签",
+        "语气表达不是情绪状态分类",
+        "正常说话不一定需要特殊语气",
         "疑问句不一定用 [curious]",
         "技术或严肃话题不一定用 [serious]",
         "开心不一定用 [excited]",
         "代码、表格、Markdown",
+        "任何正常回复都必须包含实际的文字内容",
     ):
         assert rule in system
+    assert SPEECH_EXPRESSION_PROMPT_VERSION == "speech-expression-v1.1"
 
 
 def test_proactive_prompt_uses_the_same_optional_block():
@@ -761,7 +1206,7 @@ async def test_provider_stream_injects_the_block_for_chat_only():
     assert SPEECH_EXPRESSION_PROMPT in client.messages[0]["content"]
 
     async for _ in provider.generate_stream(
-        _event("列出步骤"), None, None
+        _event("输出一段代码"), None, None
     ):
         pass
     assert "【语音表达】" not in client.messages[0]["content"]
@@ -773,18 +1218,24 @@ async def test_provider_stream_injects_the_block_for_chat_only():
 class _ProactiveClient:
     def __init__(self):
         self.response_text = "正常回复。"
+        self.recovery_text = None
         self.calls = []
 
     async def complete(self, messages, *, request_type, event_id=None, **kwargs):
         self.calls.append({"request_type": request_type, "messages": messages})
-        content = (
-            self.response_text
-            if request_type == "response"
-            else json.dumps(
+        if request_type == "response":
+            system = messages[0]["content"] if messages else ""
+            if SPEECH_EXPRESSION_PROMPT in system:
+                content = self.response_text
+            elif self.recovery_text is not None:
+                content = self.recovery_text
+            else:
+                content = self.response_text
+        else:
+            content = json.dumps(
                 {"should_initiate": False, "reason": "不需要"},
                 ensure_ascii=False,
             )
-        )
         return ChatResponse(
             content=content,
             model="fake-model",
@@ -793,6 +1244,11 @@ class _ProactiveClient:
             completion_tokens=1,
             total_tokens=2,
         )
+
+    def response_calls(self):
+        return [
+            call for call in self.calls if call["request_type"] == "response"
+        ]
 
 
 async def test_proactive_message_record_and_event_use_both_views(db):
@@ -860,6 +1316,84 @@ async def test_disabled_proactive_path_stores_and_shows_the_same_text(db):
     rows = await rt.repos.proactive.list_for_conversation("c1")
     assert rows[0].text == "[sad]原样保留。"
     assert delivered.display_text is None
+
+
+async def test_empty_proactive_reply_recovers_once_and_keeps_mode(db):
+    client = _ProactiveClient()
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        with_worker=False,
+        router_mode="legacy",
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    first = _event("我在研究机器人控制", person_id=person.person_id)
+    await rt.orchestrator.process_utterance(first)
+
+    client.response_text = "[sad]"
+    client.recovery_text = "我正好想到你刚才说的控制问题。"
+    manager = rt.proactive_manager
+    manager.idle_delay_seconds = 0.01
+    manager.judge = ProactiveJudge(ScriptedProactiveJudgeProvider([True]))
+    manager.on_response_delivered(
+        conversation_id="c1",
+        person_id=person.person_id,
+        source_event_id=first.event_id,
+    )
+    delivered = await asyncio.wait_for(manager.next_event(), 2)
+    await manager.shutdown()
+
+    assert delivered.text == "我正好想到你刚才说的控制问题。"
+    assert delivered.display_text == "我正好想到你刚才说的控制问题。"
+    rows = await rt.repos.proactive.list_for_conversation("c1")
+    assert len(rows) == 1
+    assert rows[0].text == delivered.text
+
+    response_calls = client.response_calls()
+    # Initial normal turn + proactive attempt + one plain-text recovery.
+    proactive_calls = response_calls[-2:]
+    assert len(proactive_calls) == 2
+    assert SPEECH_EXPRESSION_PROMPT in proactive_calls[0]["messages"][0]["content"]
+    assert SPEECH_EXPRESSION_PROMPT not in proactive_calls[1]["messages"][0]["content"]
+    # Recovery preserved IMMEDIATE rather than switching modes.
+    assert PROACTIVE_MODE_BLOCK in proactive_calls[1]["messages"][0]["content"]
+    assert (
+        PROACTIVE_MODE_BLOCK_LONG_IDLE
+        not in proactive_calls[1]["messages"][0]["content"]
+    )
+
+
+async def test_empty_proactive_reply_that_cannot_recover_is_discarded(db):
+    client = _ProactiveClient()
+    rt = build_runtime(
+        db,
+        provider="deepseek",
+        deepseek_client=client,
+        with_worker=False,
+        router_mode="legacy",
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    first = _event("我在研究机器人控制", person_id=person.person_id)
+    await rt.orchestrator.process_utterance(first)
+
+    client.response_text = "[sad]"
+    client.recovery_text = "[happy]"
+    manager = rt.proactive_manager
+    manager.idle_delay_seconds = 0.01
+    manager.judge = ProactiveJudge(ScriptedProactiveJudgeProvider([True]))
+    manager.on_response_delivered(
+        conversation_id="c1",
+        person_id=person.person_id,
+        source_event_id=first.event_id,
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(manager.next_event(), 0.3)
+    await manager.shutdown()
+
+    assert await rt.repos.proactive.list_for_conversation("c1") == []
 
 
 # -- CLI display -------------------------------------------------------------
@@ -955,6 +1489,27 @@ async def test_cli_uses_display_text_for_a_non_streaming_completion(capsys):
 
 
 # -- emotion isolation -------------------------------------------------------
+
+
+async def test_invalid_voice_markup_never_reaches_any_stored_state(db):
+    response = _StreamingResponse(["[happy]你好[playful]呀"])
+    rt = build_runtime(
+        db,
+        provider="mock",
+        response=response,
+        with_worker=False,
+        speech_expression_enabled=True,
+    )
+    person = await _person(rt)
+    event = _event(person_id=person.person_id)
+
+    events = await _stream_events(rt, event)
+    assert events[-1].type == "response_completed"
+    assert events[-1].text == "你好呀"
+    assert events[-1].display_text == "你好呀"
+    invalid_forms = tuple(f"[{word}]" for word in INVALID_SPEECH_TAGS)
+    assert await _db_text_with_tags(db, invalid_forms) == []
+    assert await _db_text_with_tags(db) == []
 
 
 async def test_emotion_tables_never_receive_speech_labels(db):

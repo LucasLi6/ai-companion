@@ -29,6 +29,7 @@ import secrets
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from companion.core.orchestrator import EmptySpeechOutputError
 from companion.core.response_events import ResponseEvent, ResponseEventSink
 from companion.domain.models import new_id, utcnow
 from companion.proactive.departure import detect_explicit_stop
@@ -340,11 +341,31 @@ class ProactiveManager:
         if not await self._still_valid(cycle):
             return
 
-        generated = await self.orchestrator.generate_proactive_reply(
-            source_event=source_event, person_id=cycle.person_id, mode=mode
-        )
+        try:
+            generated = await self.orchestrator.generate_proactive_reply(
+                source_event=source_event, person_id=cycle.person_id, mode=mode
+            )
+        except EmptySpeechOutputError:
+            # One plain-text recovery already ran inside the orchestrator and
+            # still produced no prose. Discard this initiation: no record, no
+            # delivery event, and ``last_delivered_at`` is untouched.
+            self.logger.warning(
+                "proactive_discarded_empty conversation_id=%s"
+                " source_event_id=%s mode=%s",
+                cycle.conversation_id,
+                cycle.source_event_id,
+                mode,
+            )
+            return
         text = str(generated.get("text") or "").strip()
         if not text:
+            self.logger.warning(
+                "proactive_discarded_empty conversation_id=%s"
+                " source_event_id=%s mode=%s",
+                cycle.conversation_id,
+                cycle.source_event_id,
+                mode,
+            )
             return
         display_text = generated.get("display_text")
         if display_text is not None:

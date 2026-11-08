@@ -13,6 +13,7 @@ from a tag.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 KIND_CONTROL = "control"
@@ -63,6 +64,127 @@ TAG_KINDS: dict[str, str] = {
     **{tag: KIND_NONVERBAL for tag in NONVERBAL_TAGS},
 }
 MAX_TAG_LENGTH = max(len(tag) for tag in ALL_TAGS)
+
+# Markup that clearly *tries* to be a voice instruction (emotion words, delivery
+# adverbs and sound actions the model invented or borrowed from other TTS
+# systems) but is not in the official whitelist. These are removed from both
+# channels: they must never reach TTS, persistence or memory. This is a
+# high-confidence vocabulary, not a general "remove English brackets" rule.
+INVALID_SPEECH_TAGS: frozenset[str] = frozenset(
+    {
+        # emotion / attitude aliases
+        "happy", "joy", "joyful", "cheerful", "glad", "delighted", "pleased",
+        "excitedly", "sadness", "unhappy", "sorrowful", "depressed", "upset",
+        "annoyed", "frustrated", "irritated", "mad", "furious", "calm",
+        "relaxed", "peaceful", "neutral", "flat", "monotone", "deadpan",
+        "robotic", "playful", "teasing", "confused", "confusion", "thinking",
+        "thoughtful", "surprised", "surprise", "shocked", "astonished",
+        "worried", "anxious", "nervous", "afraid", "scared", "fearful",
+        "terrified", "hopeful", "optimistic", "desperate", "disappointed",
+        "proud", "embarrassed", "shy", "awkward", "apologetic", "guilty",
+        "ashamed", "disgusted", "contemptuous", "mocking", "ironic", "cynical",
+        "dismissive", "smug", "affectionate", "loving", "caring", "sweet",
+        "cute", "flirty", "seductive", "mysterious", "dramatic",
+        "enthusiastic", "energetic", "lively", "gentle", "softly", "quietly",
+        "loudly", "warmly", "coldly", "stern", "firm", "determined",
+        "confident", "sleepy", "exhausted", "weary", "hesitant",
+        "hesitantly",
+        # delivery / pacing modifiers
+        "whisper", "whispering", "murmur", "mumbling", "mutter", "muttering",
+        "shout", "yelling", "yell", "scream", "screaming", "loud", "soft",
+        "slowly", "quickly", "fast", "pause", "silence",
+        # sound actions
+        "sigh", "sighs", "laugh", "laughs", "chuckle", "chuckles", "giggle",
+        "giggling", "snort", "sniff", "sniffle", "sob", "sobbing", "cry",
+        "cries", "weep", "weeping", "coughing", "sneeze", "sneezing", "yawn",
+        "yawning", "hum", "humming", "sing", "singing", "whistle", "breath",
+        "breathe", "breathing", "pant", "panting", "groan", "groans", "moan",
+        "moans", "wail", "cheer", "cheering", "clap", "applause", "music",
+        "noise", "beep", "static", "gulp", "burp", "hiccup",
+    }
+)
+
+# Lower-case English words that are ordinary bracket content rather than a
+# generated voice tag. Context rules (array subscripts, Markdown links) add
+# further protection; this list keeps common prose brackets untouched.
+ORDINARY_BRACKET_WORDS: frozenset[str] = frozenset(
+    {
+        "a", "b", "c", "i", "j", "k", "n", "x", "y", "z", "id", "key", "name",
+        "link", "url", "uri", "img", "image", "note", "todo", "draft", "ref",
+        "citation", "source", "figure", "table", "json", "markdown", "html",
+        "css", "code", "text", "example", "http", "https", "email", "info",
+        "tip", "warning", "important", "optional", "default", "main", "test",
+        "tests", "args", "kwargs", "value", "values", "item", "items",
+        "index", "string", "object", "list", "detail", "details", "see",
+        "also", "more", "less", "appendix", "chapter", "section", "part",
+    }
+)
+
+_SOUND_STEMS = frozenset(
+    {
+        "giggl", "laugh", "sigh", "sob", "cry", "scream", "shout", "whisper",
+        "sniffl", "cough", "sneez", "yawn", "hum", "sing", "mutter",
+        "stutter", "breath", "pant", "chuckl", "groan", "moan", "wail",
+        "cheer", "clap", "mumbl",
+    }
+)
+
+MAX_INVALID_TAG_LENGTH = max(len(tag) + 2 for tag in INVALID_SPEECH_TAGS)
+MAX_BRACKET_CANDIDATE_LENGTH = max(MAX_TAG_LENGTH, MAX_INVALID_TAG_LENGTH) + 8
+
+_INVALID_TAG_FORMS = tuple(f"[{tag}]" for tag in INVALID_SPEECH_TAGS)
+_VOICE_WORD_SHAPE = re.compile(r"^[a-z][a-z '\-]{0,30}$")
+
+
+def is_invalid_speech_tag(
+    inner: str,
+    *,
+    preceded_by: str = "",
+    followed_by: str = "",
+) -> bool:
+    """Whether a bracketed English phrase is clearly generated voice markup.
+
+    ``inner`` is the text between ``[`` and ``]``. The classifier is
+    intentionally conservative: an unknown bracket is removed only when the
+    content is a known voice/emotion/sound word or a sound-action gerund, was
+    not written as an array subscript or a Markdown link, and looks like a
+    model-generated tag rather than prose.
+    """
+    if not inner or inner != inner.strip():
+        return False
+    if followed_by in ("(", "[", ":"):
+        # Markdown link / nested bracket / label: ordinary text.
+        return False
+    if (
+        preceded_by
+        and preceded_by.isascii()
+        and (preceded_by.isalnum() or preceded_by in "_'")
+    ):
+        # ``a[happy]`` / ``f'[x]'``: ASCII identifier or quoted text, not a
+        # tag. CJK prose before a bracket is ordinary sentence text.
+        return False
+    lowered = inner.lower()
+    if lowered in INVALID_SPEECH_TAGS:
+        return True
+    if lowered in ORDINARY_BRACKET_WORDS:
+        return False
+    if not _VOICE_WORD_SHAPE.match(lowered):
+        return False
+    words = lowered.replace("-", " ").split()
+    if not 1 <= len(words) <= 3:
+        return False
+    # Unknown gerund built from a known sound stem ("giggling", "sighing").
+    if len(words) == 1 and lowered.endswith("ing"):
+        stem = lowered[:-3]
+        if stem in _SOUND_STEMS or (stem + "e") in _SOUND_STEMS:
+            return True
+    return False
+
+
+def is_invalid_tag_prefix(partial: str) -> bool:
+    """Whether ``partial`` (starting with ``[``) could become an invalid tag."""
+    return any(form.startswith(partial) for form in _INVALID_TAG_FORMS)
+
 
 KIND_SEMANTICS = {
     KIND_CONTROL: (
@@ -125,14 +247,20 @@ def render_tag_catalog() -> str:
 __all__ = [
     "ALL_TAGS",
     "CONTROL_TAGS",
+    "INVALID_SPEECH_TAGS",
     "KIND_CONTROL",
     "KIND_NONVERBAL",
     "KIND_SEMANTICS",
+    "MAX_BRACKET_CANDIDATE_LENGTH",
+    "MAX_INVALID_TAG_LENGTH",
     "MAX_TAG_LENGTH",
     "NONVERBAL_TAGS",
+    "ORDINARY_BRACKET_WORDS",
     "SpeechTag",
     "TAG_KINDS",
     "is_control_tag",
+    "is_invalid_speech_tag",
+    "is_invalid_tag_prefix",
     "is_known_tag",
     "is_nonverbal_tag",
     "is_tag_prefix",

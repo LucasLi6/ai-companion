@@ -93,6 +93,7 @@ from companion.prompts.layout import (
 )
 from companion.speech_expression.parser import (
     SpeechMarkupParser,
+    has_valid_reply_text,
     parse_speech_expressions,
 )
 from companion.runtime_context.connection import ConnectionInfo
@@ -115,6 +116,12 @@ from companion.routing.context_adapter import (
 from companion.routing.errors import RouterError, RouterUnavailable
 from companion.routing.models import InputSemanticStatus, ProcessingIntent, RouteAction
 from companion.tools.models import ToolExecutionContext
+
+
+class EmptySpeechOutputError(Exception):
+    """A RESPOND generation produced only labels/sound actions, even after one
+    plain-text recovery. The turn must not be committed as a completed reply.
+    """
 
 
 class PersonaRevisionConflict(Exception):
@@ -1173,6 +1180,12 @@ class Orchestrator:
                             )
                             stream_emitted = True
                         else:
+                            if stream is not None:
+                                # Open the stream surface before generation so
+                                # a provider/empty-output failure can still
+                                # deliver one terminal ``response_failed``.
+                                stream.started(response_id)
+                                stream_emitted = True
                             generated = await self.response.generate(
                                 event, analysis, response_context
                             )
@@ -1188,6 +1201,38 @@ class Orchestrator:
                                 parsed = parse_speech_expressions(response_text)
                                 response_text = parsed.text.strip()
                                 stream_meta["display_text"] = parsed.display_text
+                                if not has_valid_reply_text(response_text):
+                                    if (
+                                        getattr(generated, "finish_reason", None)
+                                        == "length"
+                                    ):
+                                        # Truncated empty output is TRUNCATED,
+                                        # not a successful empty reply.
+                                        action_status = "TRUNCATED"
+                                        stream_meta.pop("display_text", None)
+                                    else:
+                                        recovered = (
+                                            await self._recover_plain_reply(
+                                                event,
+                                                analysis,
+                                                response_context,
+                                            )
+                                        )
+                                        if recovered is None:
+                                            raise EmptySpeechOutputError(
+                                                "EMPTY_SPEECH_OUTPUT"
+                                            )
+                                        (
+                                            response_text,
+                                            stream_meta["display_text"],
+                                            recovery_finish,
+                                        ) = recovered
+                                        stream_meta["recovered"] = True
+                                        steps.append(
+                                            "[RESPONSE][RECOVERY] plain-text retry"
+                                        )
+                                        if recovery_finish == "length":
+                                            action_status = "TRUNCATED"
                             # A provider may report that it stopped at the
                             # token limit; the reply is real but incomplete, so
                             # it must not be persisted as COMPLETED.
@@ -1879,6 +1924,52 @@ class Orchestrator:
             )
             return context
 
+    async def _recover_plain_reply(
+        self,
+        event,
+        analysis,
+        response_context,
+        *,
+        mode: Optional[str] = None,
+    ):
+        """One constrained Speaker retry with voice labels switched off.
+
+        Returns ``(canonical_text, display_text, finish_reason)`` or ``None``.
+        It reuses the prepared/authorized context and never re-runs routing,
+        tools, memory, emotion or scene code. The global provider switch is
+        never touched, so concurrent conversations keep their own state.
+        """
+        recovery = getattr(self.response, "generate_plain_recovery", None)
+        if recovery is None:
+            self.logger.warning(
+                "speech_recovery_unavailable event_id=%s", event.event_id
+            )
+            return None
+        try:
+            if mode is None:
+                generated = await recovery(event, analysis, response_context)
+            else:
+                generated = await recovery(
+                    event, analysis, response_context, mode=mode
+                )
+        except Exception as exc:
+            self.logger.warning(
+                "speech_recovery_failed event_id=%s error=%s",
+                event.event_id,
+                exc,
+            )
+            return None
+        raw = str(generated or "")
+        parsed = parse_speech_expressions(raw)
+        text = parsed.text.strip()
+        if not has_valid_reply_text(text):
+            return None
+        return (
+            text,
+            parsed.display_text,
+            getattr(generated, "finish_reason", None),
+        )
+
     async def generate_proactive_reply(
         self, *, source_event, person_id: str, mode: str = "IMMEDIATE"
     ) -> dict:
@@ -1905,6 +1996,7 @@ class Orchestrator:
         )
         text = str(generated).strip()
         display_text: Optional[str] = None
+        finish_reason = getattr(generated, "finish_reason", None)
         if self.speech_expression_enabled:
             # Proactive generation is always ordinary conversation, so the same
             # parser and canonical/display split applies. ProactiveMessageRecord
@@ -1912,10 +2004,29 @@ class Orchestrator:
             parsed = parse_speech_expressions(text)
             text = parsed.text.strip()
             display_text = parsed.display_text
+            if not has_valid_reply_text(text):
+                if finish_reason == "length":
+                    # Existing proactive policy discards truncated output; do
+                    # not turn it into a second full generation.
+                    return {
+                        "text": "",
+                        "display_text": None,
+                        "finish_reason": finish_reason,
+                        "model": getattr(self.response, "last_model", "") or "",
+                        "context": context,
+                    }
+                # A tag-only proactive utterance is not a valid initiation.
+                # Retry once in plain text with the same mode and context.
+                recovered = await self._recover_plain_reply(
+                    source_event, analysis, context, mode=mode
+                )
+                if recovered is None:
+                    raise EmptySpeechOutputError("EMPTY_SPEECH_OUTPUT")
+                text, display_text, finish_reason = recovered
         return {
             "text": text,
             "display_text": display_text,
-            "finish_reason": getattr(generated, "finish_reason", None),
+            "finish_reason": finish_reason,
             "model": getattr(self.response, "last_model", "") or "",
             "context": context,
         }
@@ -2336,6 +2447,11 @@ class Orchestrator:
         # back until the next real character, which makes the concatenation of
         # every emitted delta exactly ``normalize_response_text(raw, layout)``.
         normalizer = StreamingTextNormalizer(layout)
+        # V1.1: hold leading labels until the first real text arrives. A reply
+        # that never gets past its labels must not flash an empty bubble in the
+        # UI before it is treated as EMPTY_SPEECH_OUTPUT.
+        held_display = ""
+        first_text_emitted = False
         stream.started(response_id)
         try:
             async for delta in self.response.generate_stream(
@@ -2351,18 +2467,23 @@ class Orchestrator:
                         if parser is not None:
                             parsed = parser.feed(visible)
                             emitted_text = canonical_trim.feed(parsed.text)
-                            if not emitted_text and not parsed.display_text:
-                                # The parser is still holding a possible tag;
-                                # nothing is confirmed yet, so emit no event.
+                            display_piece = parsed.display_text
+                            if not first_text_emitted:
+                                held_display += display_piece
+                                if not emitted_text:
+                                    # Only labels confirmed so far; publish
+                                    # nothing until real prose appears.
+                                    continue
+                                display_piece = held_display
+                                held_display = ""
+                                first_text_emitted = True
+                            elif not emitted_text and not display_piece:
                                 continue
                             emitted_chunks.append(emitted_text)
-                            # Emit even when only a tag was confirmed: the
-                            # surface must see it, while ``delta`` stays
-                            # canonical (possibly empty).
                             stream.delta(
                                 response_id,
                                 emitted_text,
-                                display_delta=parsed.display_text,
+                                display_delta=display_piece or None,
                             )
                         else:
                             emitted_chunks.append(visible)
@@ -2412,16 +2533,57 @@ class Orchestrator:
         if parser is not None:
             tail = parser.finish()
             tail_text = canonical_trim.feed(tail.text) + canonical_trim.finish()
-            if tail_text or tail.display_text:
+            tail_display = tail.display_text
+            if not first_text_emitted:
+                held_display += tail_display
+                if tail_text:
+                    display_piece = held_display
+                    held_display = ""
+                    first_text_emitted = True
+                    emitted_chunks.append(tail_text)
+                    stream.delta(
+                        response_id,
+                        tail_text,
+                        display_delta=display_piece or None,
+                    )
+            elif tail_text or tail_display:
                 emitted_chunks.append(tail_text)
                 stream.delta(
-                    response_id, tail_text, display_delta=tail.display_text
+                    response_id,
+                    tail_text,
+                    display_delta=tail_display or None,
                 )
-            # Canonical: whitelist tags and an unfinished trailing tag are gone.
-            # Using the emitted chunks (rather than re-normalising) guarantees
-            # concat(canonical deltas) == completed.text exactly.
+            # Canonical: whitelist tags, invalid voice markup and an unfinished
+            # trailing tag are gone. Using the emitted chunks (rather than
+            # re-normalising) guarantees concat(canonical deltas) == text.
             text = "".join(emitted_chunks)
-            display_text: Optional[str] = parser.display_text
+            if not has_valid_reply_text(text):
+                if finish_reason == "length":
+                    # A truncated reply keeps the existing TRUNCATED mechanism;
+                    # it is not a successful empty reply and no second full
+                    # generation is started for it.
+                    display_text = None
+                else:
+                    # A tag-only reply is a generation failure, not a success.
+                    # Retry once in plain text through the same prepared
+                    # context; any label never published is discarded.
+                    recovered = await self._recover_plain_reply(
+                        event, analysis, response_context
+                    )
+                    if recovered is None:
+                        stream.failed(
+                            response_id, error="EMPTY_SPEECH_OUTPUT"
+                        )
+                        raise EmptySpeechOutputError("EMPTY_SPEECH_OUTPUT")
+                    text, display_text, recovery_finish = recovered
+                    emitted_chunks = [text]
+                    stream.delta(
+                        response_id, text, display_delta=display_text or None
+                    )
+                    if recovery_finish == "length":
+                        finish_reason = "length"
+            else:
+                display_text = parser.display_text
         else:
             text = normalize_response_text("".join(chunks).strip(), layout)
             display_text = None
