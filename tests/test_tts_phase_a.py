@@ -118,6 +118,17 @@ def test_config_defaults_and_overrides():
     assert config.sample_rate == 16000
 
 
+def test_config_default_voice_is_xuyanchu():
+    config = load_tts_config(
+        {
+            "DASHSCOPE_API_KEY": "k",
+            "DASHSCOPE_WORKSPACE_ID": "w",
+        }
+    )
+    assert config.voice == "xuyanchu_v3.1"
+    assert config.model == "qwen-audio-3.1-tts-flash"
+
+
 def test_enable_without_credentials_stays_disabled_and_never_connects():
     manager = TTSManager(
         config_loader=lambda: load_tts_config({}),
@@ -585,6 +596,36 @@ def test_player_open_failure_is_a_tts_error_and_terminates():
     assert fake.terminated == 1
 
 
+# ---------------------------------------------------------------------- demo
+def test_demo_prints_last_error_when_playback_fails(monkeypatch, capsys):
+    import companion.tts.demo as demo
+
+    class StubManager:
+        generation = 1
+        last_error = "TTS 请求失败: TTSClientError"
+
+        def enable(self):
+            return True, "tts: on"
+
+        def submit(self, job):
+            return True
+
+        def status(self):
+            return SimpleNamespace(state="error")
+
+        def metrics(self):
+            return None
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(demo, "TTSManager", StubManager)
+    assert demo.main(["你好"]) == 0
+    output = capsys.readouterr().out
+    assert "finished=False" in output
+    assert "last_error: TTS 请求失败" in output
+
+
 # ----------------------------------------------------------------------- CLI
 class FakeStreamingOrchestrator:
     def __init__(self, events):
@@ -750,7 +791,7 @@ def test_tts_status_never_contains_credentials():
         enabled=True,
         state="idle",
         model="qwen-audio-3.1-tts-flash",
-        voice="longanhuan_v3.1",
+        voice="xuyanchu_v3.1",
         region="cn-beijing",
         sample_rate=24000,
         waiting_jobs=0,

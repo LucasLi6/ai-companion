@@ -24,6 +24,7 @@ import dataclasses
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
@@ -35,6 +36,7 @@ from companion.tts.config import (
 )
 from companion.tts.errors import TTSError
 from companion.tts.player import PyAudioPlayer
+from companion.tts.segmenter import TextSegmenter
 
 _STOP = object()
 _END_OF_AUDIO = None
@@ -82,6 +84,245 @@ def _ms(start: Optional[float], end: Optional[float]) -> Optional[float]:
     return round((end - start) * 1000.0, 1)
 
 
+class TTSStream:
+    """One bidirectional TTS session for one streaming reply.
+
+    Text deltas are buffered non-blockingly by :meth:`feed` (called on the chat
+    thread), segmented by a dedicated sender thread, and sent through
+    ``session.send_text``. A separate receiver thread drains
+    ``session.audio_chunks`` into the manager's shared bounded audio queue, so
+    sending and receiving are truly concurrent and playback can start before
+    the reply ends.
+    """
+
+    def __init__(
+        self,
+        manager: "TTSManager",
+        config: TTSConfig,
+        client: Any,
+        generation: int,
+        response_id: str,
+        conversation_id: str,
+    ) -> None:
+        self._manager = manager
+        self._config = config
+        self._client = client
+        self.generation = generation
+        self.response_id = response_id
+        self.conversation_id = conversation_id
+
+        self._segmenter = TextSegmenter(
+            config.segment_min_chars, config.segment_max_chars
+        )
+        self._condition = threading.Condition()
+        self._pending: deque[str] = deque()
+        self._input_closed = False
+        self._cancelled = False
+        self._failed = threading.Event()
+        self._done = threading.Event()
+        self._session: Any = None
+        self._sender: Optional[threading.Thread] = None
+        self._receiver: Optional[threading.Thread] = None
+        self._closer: Optional[threading.Thread] = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def start(self) -> None:
+        self._sender = threading.Thread(
+            target=self._send_loop,
+            name="ava-tts-sender",
+            daemon=True,
+        )
+        self._sender.start()
+
+    def feed(self, display_delta: str) -> None:
+        """Accept already-validated display text without blocking the caller."""
+        if not display_delta:
+            return
+        with self._condition:
+            if self._cancelled or self._input_closed:
+                return
+            self._pending.append(display_delta)
+            self._condition.notify_all()
+        self._manager._record(self.generation, "first_display_delta_at")
+
+    def finish(self) -> None:
+        """No more text for this reply; the sender flushes the tail."""
+        with self._condition:
+            if self._cancelled:
+                return
+            self._input_closed = True
+            self._condition.notify_all()
+        self._manager._record(self.generation, "response_completed_at")
+
+    def cancel(self) -> None:
+        """Invalidate this reply and close its session without blocking."""
+        with self._condition:
+            if self._cancelled:
+                return
+            self._cancelled = True
+            self._pending.clear()
+            self._condition.notify_all()
+            session = self._session
+        self._failed.set()
+        if session is not None:
+            self._closer = threading.Thread(
+                target=self._close_session,
+                args=(session,),
+                name="ava-tts-closer",
+                daemon=True,
+            )
+            self._closer.start()
+        elif self._receiver is None:
+            self._done.set()
+
+    def join(self, timeout: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        for thread in (self._sender, self._receiver, self._closer):
+            if thread is None or not thread.is_alive():
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    # --------------------------------------------------------------- sender
+    def _send_loop(self) -> None:
+        session = None
+        try:
+            session = self._client.open_stream()
+            with self._condition:
+                self._session = session
+                cancelled = self._cancelled
+            if cancelled:
+                self._close_session(session)
+                return
+            self._manager._record(
+                self.generation, "tts_session_started_at"
+            )
+            self._receiver = threading.Thread(
+                target=self._receive_loop,
+                args=(session,),
+                name="ava-tts-receiver",
+                daemon=True,
+            )
+            self._receiver.start()
+
+            while True:
+                with self._condition:
+                    while (
+                        not self._pending
+                        and not self._input_closed
+                        and not self._cancelled
+                    ):
+                        self._condition.wait(0.1)
+                    if self._cancelled:
+                        break
+                    if not self._pending and self._input_closed:
+                        break
+                    delta = self._pending.popleft()
+                if not self._manager._is_current(self.generation):
+                    break
+                for segment in self._segmenter.feed(delta):
+                    if not self._send_segment(session, segment):
+                        return
+
+            if (
+                not self._cancelled
+                and not self._failed.is_set()
+                and self._manager._is_current(self.generation)
+            ):
+                for segment in self._segmenter.finish():
+                    if not self._send_segment(session, segment):
+                        return
+                self._stop_session(session)
+        except Exception as exc:  # noqa: BLE001 - TTS-isolated
+            if not self._cancelled:
+                self._manager._fail(self.generation, exc)
+            self._failed.set()
+            if session is not None:
+                self._close_session(session)
+        finally:
+            if self._receiver is None:
+                self._done.set()
+
+    def _send_segment(self, session: Any, segment: str) -> bool:
+        if not segment or not self._manager._is_current(self.generation):
+            return False
+        self._manager._record(
+            self.generation, "first_segment_ready_at"
+        )
+        session.send_text(segment)
+        self._manager._record(
+            self.generation, "first_segment_sent_at"
+        )
+        flush = getattr(session, "flush", None)
+        if callable(flush):
+            # Once per segment, never once per token.
+            flush()
+        return True
+
+    # ------------------------------------------------------------- receiver
+    def _receive_loop(self, session: Any) -> None:
+        try:
+            for chunk in session.audio_chunks():
+                if (
+                    self._cancelled
+                    or self._failed.is_set()
+                    or not self._manager._is_current(self.generation)
+                ):
+                    break
+                data = bytes(chunk) if isinstance(
+                    chunk, (bytes, bytearray, memoryview)
+                ) else b""
+                if not data:
+                    continue
+                self._manager._record(
+                    self.generation, "first_audio_received_at"
+                )
+                if not self._manager._put_audio(
+                    self.generation, data
+                ):
+                    break
+        except Exception as exc:  # noqa: BLE001 - TTS-isolated
+            if not self._cancelled:
+                self._manager._fail(self.generation, exc)
+            self._failed.set()
+        finally:
+            if (
+                not self._cancelled
+                and not self._failed.is_set()
+                and self._manager._is_current(self.generation)
+            ):
+                self._manager._put_audio(
+                    self.generation, _END_OF_AUDIO
+                )
+            self._close_session(session)
+            self._done.set()
+
+    # --------------------------------------------------------------- session
+    def _stop_session(self, session: Any) -> None:
+        stop = getattr(session, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+
+    def _close_session(self, session: Any) -> None:
+        for name in ("stop", "close"):
+            method = getattr(session, name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:  # noqa: BLE001 - cleanup
+                    pass
+
+
 class TTSManager:
     """Owns the TTS worker, audio queue, player and generation state."""
 
@@ -121,6 +362,7 @@ class TTSManager:
         self._last_error: Optional[str] = None
         self._timings: dict[int, dict[str, float]] = {}
         self._last_finished_generation: Optional[int] = None
+        self._active_stream: Optional[TTSStream] = None
 
     # ------------------------------------------------------------------ state
     @property
@@ -217,9 +459,14 @@ class TTSManager:
             self._generation += 1
             self._queued_generation = None
             player = self._player
+            stream = self._active_stream
+            self._active_stream = None
             if self._enabled:
                 self._status = "idle"
             self._last_finished_generation = None
+        if stream is not None:
+            stream.cancel()
+            stream.join(min(self._join_timeout, 1.0))
         self._drain(self._text_queue)
         self._drain(self._audio_queue)
         interrupt = getattr(player, "interrupt", None)
@@ -246,6 +493,100 @@ class TTSManager:
             self._started = False
             self._status = "disabled"
 
+    # -------------------------------------------------------------- streaming
+    def start_stream(
+        self, response_id: str, conversation_id: str
+    ) -> Optional[TTSStream]:
+        """Begin one streaming TTS session for a reply (Phase B).
+
+        Called on the chat thread when ``response_started`` arrives. Never
+        performs network I/O here; the sender thread opens the session, so a
+        slow provider cannot delay text generation. Returns ``None`` when TTS
+        is disabled or not initialized.
+        """
+        with self._lock:
+            if not self._enabled or not self._started or self._config is None:
+                return None
+            previous = self._active_stream
+            self._active_stream = None
+            self._generation += 1
+            generation = self._generation
+            self._queued_generation = None
+            self._status = "streaming"
+            now = time.monotonic()
+            self._timings[generation] = {
+                "response_started_at": now,
+                "tts_queued_at": now,
+            }
+            self._prune_timings()
+            config = self._config
+            client = self._client
+
+        if previous is not None:
+            previous.cancel()
+            previous.join(min(self._join_timeout, 1.0))
+        # Any queued chunk belongs to an older reply: the new generation has
+        # not produced any audio yet, so nothing valid can be discarded.
+        self._drain(self._audio_queue)
+
+        stream = TTSStream(
+            self, config, client, generation, response_id, conversation_id
+        )
+        with self._lock:
+            if generation != self._generation or not self._started:
+                return None
+            self._active_stream = stream
+        stream.start()
+        return stream
+
+    def _record(self, generation: int, name: str) -> None:
+        """Record the first occurrence of one latency mark."""
+        with self._lock:
+            if generation != self._generation:
+                return
+            timings = self._timings.get(generation)
+            if timings is None:
+                return
+            timings.setdefault(name, time.monotonic())
+
+    def _is_current(self, generation: int) -> bool:
+        with self._lock:
+            return (
+                self._started
+                and not self._stop_event.is_set()
+                and generation == self._generation
+            )
+
+    def cancel_stream(self, stream: Optional[TTSStream]) -> None:
+        """Cancel one streaming reply without waiting for provider I/O.
+
+        Safe to call from the chat event loop: it only flips state, drains
+        queued audio for that reply and interrupts the device. A stream that
+        was already superseded is closed locally without touching the newer
+        reply.
+        """
+        if stream is None:
+            return
+        with self._lock:
+            active = stream is self._active_stream
+            if active:
+                self._active_stream = None
+                self._generation += 1
+                self._queued_generation = None
+                if self._enabled:
+                    self._status = "idle"
+            player = self._player
+        stream.cancel()
+        if not active:
+            return
+        self._drain(self._audio_queue)
+        interrupt = getattr(player, "interrupt", None)
+        if callable(interrupt):
+            try:
+                interrupt()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+
     # ---------------------------------------------------------------- submit
     def submit(self, job: SpeechJob) -> bool:
         """Queue one complete reply. Non-blocking; the newest job wins."""
@@ -270,6 +611,8 @@ class TTSManager:
                 self._last_error = "TTS_PROTOCOL_HEADER"
                 return False
 
+            previous = self._active_stream
+            self._active_stream = None
             generation = self._generation + 1
             now = time.monotonic()
             queued = dataclasses.replace(
@@ -290,6 +633,9 @@ class TTSManager:
                 "tts_queued_at": now,
             }
             self._prune_timings()
+        if previous is not None:
+            previous.cancel()
+            previous.join(min(self._join_timeout, 1.0))
         return True
 
     def _enqueue_newest(self, job: SpeechJob) -> bool:
@@ -507,6 +853,41 @@ class TTSManager:
             return None
         return {
             "generation": generation,
+            # Phase B: streaming latencies (None until each mark exists).
+            "response_to_first_display_ms": _ms(
+                timings.get("response_started_at"),
+                timings.get("first_display_delta_at"),
+            ),
+            "response_to_first_segment_ms": _ms(
+                timings.get("response_started_at"),
+                timings.get("first_segment_ready_at"),
+            ),
+            "response_to_session_ms": _ms(
+                timings.get("response_started_at"),
+                timings.get("tts_session_started_at"),
+            ),
+            "first_segment_to_first_audio_played_ms": _ms(
+                timings.get("first_segment_ready_at"),
+                timings.get("first_audio_played_at"),
+            ),
+            "first_segment_sent_to_first_audio_played_ms": _ms(
+                timings.get("first_segment_sent_at"),
+                timings.get("first_audio_played_at"),
+            ),
+            "first_display_delta_to_first_audio_played_ms": _ms(
+                timings.get("first_display_delta_at"),
+                timings.get("first_audio_played_at"),
+            ),
+            "response_started_to_first_audio_played_ms": _ms(
+                timings.get("response_started_at"),
+                timings.get("first_audio_played_at"),
+            ),
+            "response_to_playback_done_ms": _ms(
+                timings.get("response_completed_at")
+                or timings.get("reply_completed_at"),
+                timings.get("playback_finished_at"),
+            ),
+            # Phase A: complete-reply latencies.
             "reply_to_speech_start_ms": _ms(
                 timings.get("reply_completed_at"),
                 timings.get("first_audio_played_at"),
@@ -546,12 +927,17 @@ class TTSManager:
             self._started = False
             self._stop_event.set()
             self._queued_generation = None
+            stream = self._active_stream
+            self._active_stream = None
             worker, player_thread = self._worker, self._player_thread
             player, client = self._player, self._client
             self._worker = None
             self._player_thread = None
             self._player = None
             self._client = None
+        if stream is not None:
+            stream.cancel()
+            stream.join(min(self._join_timeout, 1.0))
         self._drain(self._text_queue)
         self._drain(self._audio_queue)
         self._put_control(self._text_queue, _STOP)
@@ -602,4 +988,4 @@ def _safe_error(exc: Exception) -> str:
     return f"TTS 内部错误: {type(exc).__name__}"
 
 
-__all__ = ["SpeechJob", "TTSManager", "TTSStatus"]
+__all__ = ["SpeechJob", "TTSManager", "TTSStatus", "TTSStream"]

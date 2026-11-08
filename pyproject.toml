@@ -46,11 +46,13 @@ embedding = [
 vec = [
     "sqlite-vec>=0.1",
 ]
-# tts: optional independent speech output (Phase A). Nothing in the core
-#   imports dashscope/pyaudio until /tts on is enabled, so a default install
-#   never connects to Alibaba Cloud or needs an audio device.
+# tts: optional independent speech output (Phase A/B). Nothing in the core
+#   imports dashscope/pyaudio until TTS is enabled. Speech is on by default in
+#   the REPL (AVA_TTS_ENABLED=false disables it); no Alibaba connection is made
+#   until the first reply that actually produces speech, and a missing
+#   dependency or audio device degrades to text-only.
 tts = [
-    "dashscope>=1.20",
+    "dashscope>=2.0.1",
     "pyaudio>=0.2.14",
 ]
 

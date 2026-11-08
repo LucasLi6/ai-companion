@@ -79,6 +79,8 @@ def main(argv: list[str]) -> int:
                 f"finished={finished} state={manager.status().state} "
                 f"metrics={metrics}"
             )
+            if not finished:
+                print("last_error:", manager.last_error)
     finally:
         manager.shutdown()
     return 0

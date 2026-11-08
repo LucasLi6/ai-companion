@@ -198,6 +198,33 @@ class TTSClient:
         if not produced:
             raise TTSEmptyAudioError("TTS 返回空音频")
 
+    def open_stream(self) -> Any:
+        """Open one bidirectional TTS session for a single reply (Phase B).
+
+        The caller must run ``send_text`` and ``audio_chunks`` concurrently;
+        this method only establishes the session. It never touches the chat
+        event loop by itself.
+        """
+        client = self._sdk()
+        method = getattr(
+            getattr(getattr(client, "audio", None), "tts", None),
+            "connect",
+            None,
+        )
+        if not callable(method):
+            raise TTSClientError("DashScope SDK 不支持 audio.tts.connect")
+        try:
+            return method(
+                model=self._config.model,
+                voice=self._config.voice,
+                format=self._config.audio_format,
+                sample_rate=self._config.sample_rate,
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitized
+            raise TTSClientError(
+                f"TTS 会话建立失败: {type(exc).__name__}"
+            ) from exc
+
     def close(self) -> None:
         client, self._client = self._client, None
         closer = getattr(client, "close", None)

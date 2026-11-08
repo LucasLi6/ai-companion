@@ -17,14 +17,23 @@ DASHSCOPE_KEY_ENV = "DASHSCOPE_API_KEY"
 DASHSCOPE_WORKSPACE_ENV = "DASHSCOPE_WORKSPACE_ID"
 
 DEFAULT_MODEL = "qwen-audio-3.1-tts-flash"
-DEFAULT_VOICE = "longanhuan_v3.1"
+DEFAULT_VOICE = "xuyanchu_v3.1"
 DEFAULT_REGION = "cn-beijing"
 DEFAULT_SAMPLE_RATE = 24000
 DEFAULT_FORMAT = "pcm"
 
+# Phase B splits the display stream into speakable chunks. These are initial
+# values; adjust them from real latency/quality measurements, not in the
+# segmentation logic itself.
+DEFAULT_SEGMENT_MIN_CHARS = 10
+DEFAULT_SEGMENT_MAX_CHARS = 60
+
+# Phase B: speech output is on by default for the REPL. ``AVA_TTS_ENABLED``
+# only controls the session default, not a persisted setting.
+DEFAULT_ENABLED = True
+
 # Phase A submits one complete reply per request. A reply longer than this is
-# refused explicitly (never silently truncated); sentence-level streaming is a
-# later phase.
+# refused explicitly (never silently truncated).
 MAX_TEXT_CHARS = 2000
 
 
@@ -42,6 +51,8 @@ class TTSConfig:
     sample_rate: int = DEFAULT_SAMPLE_RATE
     audio_format: str = DEFAULT_FORMAT
     max_text_chars: int = MAX_TEXT_CHARS
+    segment_min_chars: int = DEFAULT_SEGMENT_MIN_CHARS
+    segment_max_chars: int = DEFAULT_SEGMENT_MAX_CHARS
 
     @property
     def channels(self) -> int:
@@ -107,6 +118,25 @@ def load_tts_config(
     if sample_rate <= 0:
         raise TTSConfigError("AVA_TTS_SAMPLE_RATE 必须是正整数。")
 
+    raw_min = _env(
+        env, "AVA_TTS_SEGMENT_MIN_CHARS", str(DEFAULT_SEGMENT_MIN_CHARS)
+    )
+    raw_max = _env(
+        env, "AVA_TTS_SEGMENT_MAX_CHARS", str(DEFAULT_SEGMENT_MAX_CHARS)
+    )
+    try:
+        segment_min = int(raw_min)
+        segment_max = int(raw_max)
+    except (TypeError, ValueError) as exc:
+        raise TTSConfigError(
+            "AVA_TTS_SEGMENT_MIN_CHARS / AVA_TTS_SEGMENT_MAX_CHARS 必须是整数。"
+        ) from exc
+    if segment_min < 1 or segment_max < segment_min:
+        raise TTSConfigError(
+            "分段长度无效：需要 1 <= AVA_TTS_SEGMENT_MIN_CHARS"
+            " <= AVA_TTS_SEGMENT_MAX_CHARS。"
+        )
+
     return TTSConfig(
         api_key=_env(env, DASHSCOPE_KEY_ENV),
         workspace_id=_env(env, DASHSCOPE_WORKSPACE_ENV),
@@ -115,7 +145,18 @@ def load_tts_config(
         region=described["region"],
         sample_rate=sample_rate,
         audio_format=DEFAULT_FORMAT,
+        segment_min_chars=segment_min,
+        segment_max_chars=segment_max,
     )
+
+
+def tts_enabled_by_default(
+    env: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Phase B default: ON unless ``AVA_TTS_ENABLED`` is explicitly false."""
+    env = os.environ if env is None else env
+    raw = _env(env, "AVA_TTS_ENABLED", "true").lower()
+    return raw not in ("0", "false", "off", "no", "disabled")
 
 
 __all__ = [
@@ -125,10 +166,13 @@ __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_REGION",
     "DEFAULT_SAMPLE_RATE",
+    "DEFAULT_SEGMENT_MAX_CHARS",
+    "DEFAULT_SEGMENT_MIN_CHARS",
     "DEFAULT_VOICE",
     "MAX_TEXT_CHARS",
     "TTSConfig",
     "TTSConfigError",
     "describe_tts_config",
     "load_tts_config",
+    "tts_enabled_by_default",
 ]

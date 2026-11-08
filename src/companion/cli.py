@@ -93,6 +93,7 @@ from companion.runtime_context.timezone import TimeZoneService, valid_zone
 from companion.storage.database import Database
 from companion.storage.repositories import make_repositories
 from companion.tts import SpeechJob, TTSManager
+from companion.tts.config import tts_enabled_by_default
 
 DEFAULT_CONVERSATION = "default"
 
@@ -2132,9 +2133,20 @@ async def cmd_repl(args) -> int:
         if confirmation is not None:
             with contextlib.suppress(Exception):
                 await confirmation.resume_pending()
-        # TTS is an independent output side channel and starts disabled: no
-        # Alibaba connection, audio device or cost until ``/tts on``.
+        # TTS is an independent output side channel. Phase B defaults it on
+        # (AVA_TTS_ENABLED=false disables it), but enabling only opens the
+        # local audio device: no Alibaba connection or cost happens until the
+        # first reply that actually produces speech.
         tts_manager = TTSManager()
+        if tts_enabled_by_default():
+            ok, message = tts_manager.enable()
+            if ok:
+                print(message)
+            else:
+                # One clear line, then normal text-only chat continues.
+                print(f"tts: off ({message}) — 继续文字聊天")
+        else:
+            print("tts: off (AVA_TTS_ENABLED=false)")
         try:
             # Created once for the session: prompt_toolkit owns the live input
             # line, so a proactive message can be printed above it without any
@@ -2279,7 +2291,7 @@ def _handle_tts_command(manager, parts: list[str]) -> list[str]:
     action = parts[1].lower() if len(parts) == 2 else ""
     if action == "on":
         lines = [
-            "注意：开启 TTS 后，Ava 的完整回复文本会发送到阿里云百炼"
+            "注意：开启 TTS 后，Ava 的回复文本会按句流式发送到阿里云百炼"
             "（DashScope）进行语音合成，音频只在本机播放。"
         ]
         ok, message = manager.enable()
@@ -2308,6 +2320,21 @@ def _format_tts_metrics(metrics: dict) -> str:
         number = metrics.get(key)
         return "-" if number is None else f"{number:.0f}ms"
 
+    if metrics.get("response_started_to_first_audio_played_ms") is not None:
+        # Phase B: how soon speech starts relative to the reply and its first
+        # visible text, not relative to a finished reply.
+        return (
+            "last latency: response→first_audio "
+            f"{value('response_started_to_first_audio_played_ms')}"
+            "  first_text→first_audio "
+            f"{value('first_display_delta_to_first_audio_played_ms')}"
+            "  segment→first_audio "
+            f"{value('first_segment_sent_to_first_audio_played_ms')}"
+            "  first_audio→played "
+            f"{value('first_audio_received_to_played_ms')}"
+            "  playback "
+            f"{value('response_to_playback_done_ms')}"
+        )
     return (
         "last latency: reply→speech "
         f"{value('reply_to_speech_start_ms')}"
@@ -2477,6 +2504,22 @@ async def _run_streaming_turn(
     saw_terminal = False
     completed_status = None
     completed_action = None
+    # Phase B: one bidirectional TTS session per reply. ``feed``/``finish``/
+    # ``cancel_stream`` never block the event loop; sender and receiver run on
+    # their own threads.
+    tts_stream = None
+    tts_fed = False
+
+    def _cancel_tts() -> None:
+        nonlocal tts_stream
+        if tts_stream is None:
+            return
+        if tts_manager is not None:
+            tts_manager.cancel_stream(tts_stream)
+        else:
+            tts_stream.cancel()
+        tts_stream = None
+
     stream = rt.orchestrator.process_utterance_stream(event)
     try:
         async for item in stream:
@@ -2484,16 +2527,27 @@ async def _run_streaming_turn(
                 saw_started = True
                 sys.stdout.write("assistant> ")
                 sys.stdout.flush()
+                if tts_manager is not None:
+                    tts_stream = tts_manager.start_stream(
+                        item.response_id, item.conversation_id
+                    )
             elif item.type == "response_delta":
                 saw_delta = True
                 # The display channel keeps voice labels inline; the canonical
                 # ``delta`` remains the persisted text.
-                sys.stdout.write(
+                delta = (
                     item.display_delta
                     if item.display_delta is not None
                     else (item.delta or "")
                 )
+                sys.stdout.write(delta)
                 sys.stdout.flush()
+                if tts_stream is not None and delta:
+                    # Never ``display_delta or delta``: an empty display delta
+                    # is valid (e.g. a stripped header) and must not fall back
+                    # to text that was already synthesised.
+                    tts_stream.feed(delta)
+                    tts_fed = True
             elif item.type == "response_completed":
                 saw_terminal = True
                 completed_at = time.monotonic()
@@ -2511,15 +2565,30 @@ async def _run_streaming_turn(
                 else:
                     sys.stdout.write("\n")
                 sys.stdout.flush()
-                # Speech is submitted only after the complete text is on
-                # screen, and only for a successful COMPLETED reply. The
-                # display channel is used verbatim so legal [tags] reach the
-                # TTS voice; VOICE=/TEXT= headers are already removed.
-                if (
+                if tts_stream is not None:
+                    if item.status == "COMPLETED":
+                        if not tts_fed:
+                            # No delta reached TTS (non-streaming provider):
+                            # hand over the complete display text once.
+                            tail = item.display_text or item.text
+                            if tail and tail.strip():
+                                tts_stream.feed(tail)
+                        # Only the buffered tail is flushed here; deltas that
+                        # were already sent are never re-sent.
+                        tts_stream.finish()
+                    else:
+                        # TRUNCATED / any non-success end: stop speaking the
+                        # unplayed remainder instead of synthesising a partial
+                        # reply to the end.
+                        _cancel_tts()
+                elif (
                     tts_manager is not None
                     and getattr(tts_manager, "enabled", False)
                     and item.status == "COMPLETED"
                 ):
+                    # Phase A fallback (stream unavailable). The display
+                    # channel is used verbatim so legal [tags] reach the TTS
+                    # voice; VOICE=/TEXT= headers are already removed.
                     speech_text = item.display_text or item.text
                     if speech_text and speech_text.strip():
                         tts_manager.submit(
@@ -2533,6 +2602,7 @@ async def _run_streaming_turn(
                         )
             elif item.type == "response_failed":
                 saw_terminal = True
+                _cancel_tts()
                 if not saw_delta and item.text:
                     sys.stdout.write(item.text)
                 if saw_started:
@@ -2540,12 +2610,14 @@ async def _run_streaming_turn(
                 print(f"[failed] {item.error or ''}".rstrip())
             elif item.type == "response_cancelled":
                 saw_terminal = True
+                _cancel_tts()
                 if saw_started:
                     sys.stdout.write("\n")
                 print("[cancelled]")
     except KeyboardInterrupt:
         # Let the orchestrator persist the partial reply as CANCELLED and
         # release its conversation lock before returning to the prompt.
+        _cancel_tts()
         with contextlib.suppress(Exception):
             await stream.aclose()
         if saw_started:
@@ -2553,6 +2625,7 @@ async def _run_streaming_turn(
         print("[cancelled]")
         return {"delivered": False}
     except Exception as exc:  # provider/validation failure is shown truthfully
+        _cancel_tts()
         if saw_started:
             sys.stdout.write("\n")
         print(f"[failed] {type(exc).__name__}: {exc}")
@@ -2564,6 +2637,8 @@ async def _run_streaming_turn(
             "status": completed_status,
             "action": completed_action,
         }
+    # No terminal event: nothing is allowed to keep speaking.
+    _cancel_tts()
     # No response event was emitted: the local policy chose WAIT or IGNORE.
     # In the ordinary chat surface this is intentional silence, so nothing is
     # printed. Diagnostics remain available behind ``--debug``.
