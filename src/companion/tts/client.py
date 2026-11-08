@@ -178,8 +178,13 @@ class TTSClient:
         produced = False
         try:
             for response in responses:
-                _raise_for_provider_error(response)
-                chunk = extract_audio_bytes(response)
+                # The official DashScope SDK yields raw PCM bytes directly.
+                # Handle that shape before looking for response fields.
+                if isinstance(response, (bytes, bytearray, memoryview)):
+                    chunk = bytes(response)
+                else:
+                    _raise_for_provider_error(response)
+                    chunk = extract_audio_bytes(response)
                 if chunk:
                     produced = True
                     yield chunk

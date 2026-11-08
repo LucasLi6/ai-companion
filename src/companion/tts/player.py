@@ -46,8 +46,13 @@ class PyAudioPlayer:
                 ) from exc
             self._pyaudio = pyaudio.PyAudio()
         try:
+            # ``paInt16`` is a module-level constant, not an attribute of a
+            # PyAudio() instance; the instance method also works with test
+            # doubles. Width 2 == 16-bit PCM.
             self._stream = self._pyaudio.open(
-                format=self._pyaudio.paInt16,
+                format=self._pyaudio.get_format_from_width(
+                    self._config.sample_width
+                ),
                 channels=self._config.channels,
                 rate=self._config.sample_rate,
                 output=True,

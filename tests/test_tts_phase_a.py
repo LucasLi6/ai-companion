@@ -29,6 +29,7 @@ from companion.tts.config import (
     TTSConfigError,
     load_tts_config,
 )
+from companion.tts.player import PyAudioPlayer
 
 CONFIG = TTSConfig(api_key="unit-test-key", workspace_id="unit-test-workspace")
 
@@ -199,6 +200,41 @@ def test_client_passes_configured_voice_and_settings_lazily():
         "sample_rate": 24000,
     }
     assert created == [True]
+
+
+def test_client_accepts_top_level_bytes_chunks():
+    """The official SDK yields raw PCM bytes, not response objects."""
+    calls = []
+    sdk = _fake_sdk([b"pcm-1", b"pcm-2"], calls)
+    client = TTSClient(CONFIG, client_factory=lambda: sdk)
+    assert list(client.stream_pcm("你好")) == [b"pcm-1", b"pcm-2"]
+
+
+def test_manager_plays_top_level_bytes_without_empty_audio_error():
+    calls = []
+    sdk = _fake_sdk([b"pcm-1", b"pcm-2"], calls)
+    player = FakePlayer()
+    manager = TTSManager(
+        config_loader=lambda: CONFIG,
+        client_factory=lambda cfg: TTSClient(
+            cfg, client_factory=lambda: sdk
+        ),
+        player_factory=lambda cfg: player,
+        join_timeout=2.0,
+    )
+    try:
+        ok, _ = manager.enable()
+        assert ok is True
+        assert manager.submit(SpeechJob("r", "c", "你好"))
+        assert wait_for(lambda: len(player.writes) == 2)
+        assert player.writes == [b"pcm-1", b"pcm-2"]
+        assert wait_for(
+            lambda: manager.metrics() is not None
+            and manager.metrics()["playback_finished"]
+        )
+        assert manager.last_error is None
+    finally:
+        manager.shutdown()
 
 
 def test_extract_audio_supports_base64_and_dict_shapes():
@@ -464,6 +500,89 @@ def test_speech_package_has_no_router_speaker_memory_or_emotion_imports():
             "companion.people",
         ):
             assert forbidden not in source
+
+
+# -------------------------------------------------------------------- player
+class _FakeAudioStream:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+        self.stopped = 0
+        self.started = 0
+        self.closed = 0
+
+    def write(self, pcm: bytes) -> None:
+        self.writes.append(pcm)
+
+    def stop_stream(self) -> None:
+        self.stopped += 1
+
+    def start_stream(self) -> None:
+        self.started += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class _FakePyAudio:
+    """Deliberately has no ``paInt16`` attribute, like a real instance."""
+
+    def __init__(self) -> None:
+        self.stream = _FakeAudioStream()
+        self.format_widths: list[int] = []
+        self.open_kwargs: dict | None = None
+        self.terminated = 0
+
+    def get_format_from_width(self, width: int) -> int:
+        self.format_widths.append(width)
+        return 8  # a sentinel for paInt16
+
+    def open(self, **kwargs):
+        self.open_kwargs = kwargs
+        return self.stream
+
+    def terminate(self) -> None:
+        self.terminated += 1
+
+
+def test_player_uses_instance_format_method_not_module_constant():
+    fake = _FakePyAudio()
+    player = PyAudioPlayer(CONFIG, pyaudio_factory=lambda: fake)
+
+    player.open()
+    assert fake.format_widths == [2]  # 16-bit PCM
+    assert fake.open_kwargs == {
+        "format": 8,
+        "channels": 1,
+        "rate": 24000,
+        "output": True,
+    }
+
+    player.open()  # idempotent: one stream for the whole session
+    assert fake.format_widths == [2]
+
+    player.write(b"pcm")
+    assert fake.stream.writes == [b"pcm"]
+
+    player.interrupt()
+    assert (fake.stream.stopped, fake.stream.started) == (1, 1)
+
+    player.close()
+    assert (fake.stream.closed, fake.terminated) == (1, 1)
+
+
+def test_player_open_failure_is_a_tts_error_and_terminates():
+    from companion.tts.errors import TTSPlayerError
+
+    class BrokenPyAudio(_FakePyAudio):
+        def open(self, **kwargs):
+            raise OSError("no output device")
+
+    fake = BrokenPyAudio()
+    player = PyAudioPlayer(CONFIG, pyaudio_factory=lambda: fake)
+    with pytest.raises(TTSPlayerError) as excinfo:
+        player.open()
+    assert "OSError" in str(excinfo.value)
+    assert fake.terminated == 1
 
 
 # ----------------------------------------------------------------------- CLI
