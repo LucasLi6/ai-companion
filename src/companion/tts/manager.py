@@ -30,6 +30,8 @@ from typing import Any, Callable, Mapping, Optional
 
 from companion.tts.client import TTSClient
 from companion.tts.config import (
+    DEFAULT_FLUSH_STRATEGY,
+    DEFAULT_SPEECH_RATE,
     TTSConfig,
     describe_tts_config,
     load_tts_config,
@@ -66,13 +68,20 @@ class TTSStatus:
     queued_audio_chunks: int
     generation: int
     last_error: Optional[str]
+    speech_rate: float = DEFAULT_SPEECH_RATE
+    flush_strategy: str = DEFAULT_FLUSH_STRATEGY
+    output_device: str = "system default"
 
     def lines(self) -> list[str]:
         """Display lines for ``/tts status``; contains no credentials."""
         return [
             f"tts: {'on' if self.enabled else 'off'} ({self.state})",
-            f"model: {self.model}  voice: {self.voice}  region: {self.region}",
-            f"sample_rate: {self.sample_rate} Hz  waiting_jobs: {self.waiting_jobs}"
+            f"model: {self.model}  voice: {self.voice}"
+            f"  rate: {self.speech_rate}  flush: {self.flush_strategy}"
+            f"  region: {self.region}",
+            f"output: {self.output_device}"
+            f"  sample_rate: {self.sample_rate} Hz"
+            f"  waiting_jobs: {self.waiting_jobs}"
             f"  queued_audio_chunks: {self.queued_audio_chunks}",
             f"last_error: {self.last_error or '-'}",
         ]
@@ -112,10 +121,13 @@ class TTSStream:
         self.conversation_id = conversation_id
 
         self._segmenter = TextSegmenter(
-            config.segment_min_chars, config.segment_max_chars
+            config.segment_min_chars,
+            config.segment_max_chars,
+            long_fallback_chars=config.long_fallback_chars,
         )
         self._condition = threading.Condition()
         self._pending: deque[str] = deque()
+        self._pending_chars = 0
         self._input_closed = False
         self._cancelled = False
         self._failed = threading.Event()
@@ -144,9 +156,25 @@ class TTSStream:
         with self._condition:
             if self._cancelled or self._input_closed:
                 return
+            if (
+                self._pending_chars + len(display_delta)
+                > self._config.max_text_chars
+            ):
+                # The provider is far enough behind that the backlog would
+                # exceed one reply's allowance. Stop accepting new text and
+                # let the sender speak what it already buffered; memory stays
+                # bounded and the displayed reply is unaffected.
+                self._input_closed = True
+                self._condition.notify_all()
+                return
             self._pending.append(display_delta)
+            self._pending_chars += len(display_delta)
             self._condition.notify_all()
         self._manager._record(self.generation, "first_display_delta_at")
+
+    def note_first_text(self) -> None:
+        """Record the first *visible* reply text (tags do not count)."""
+        self._manager._record(self.generation, "first_text_at")
 
     def finish(self) -> None:
         """No more text for this reply; the sender flushes the tail."""
@@ -164,6 +192,7 @@ class TTSStream:
                 return
             self._cancelled = True
             self._pending.clear()
+            self._pending_chars = 0
             self._condition.notify_all()
             session = self._session
         self._failed.set()
@@ -194,7 +223,13 @@ class TTSStream:
     def _send_loop(self) -> None:
         session = None
         try:
+            self._manager._record(
+                self.generation, "tts_connect_started_at"
+            )
             session = self._client.open_stream()
+            self._manager._record(
+                self.generation, "tts_connect_finished_at"
+            )
             with self._condition:
                 self._session = session
                 cancelled = self._cancelled
@@ -225,6 +260,7 @@ class TTSStream:
                     if not self._pending and self._input_closed:
                         break
                     delta = self._pending.popleft()
+                    self._pending_chars -= len(delta)
                 if not self._manager._is_current(self.generation):
                     break
                 for segment in self._segmenter.feed(delta):
@@ -260,10 +296,14 @@ class TTSStream:
         self._manager._record(
             self.generation, "first_segment_sent_at"
         )
-        flush = getattr(session, "flush", None)
-        if callable(flush):
-            # Once per segment, never once per token.
-            flush()
+        if self._config.flush_strategy == "sentence_flush":
+            # Comparison strategy only: flush at a complete sentence (or a
+            # long-fallback boundary), never after a plain comma.
+            flush = getattr(session, "flush", None)
+            if callable(flush):
+                flush()
+        # ``auto`` (default): no flush — the server detects the sentence end
+        # and starts synthesis on its own.
         return True
 
     # ------------------------------------------------------------- receiver
@@ -363,6 +403,10 @@ class TTSManager:
         self._timings: dict[int, dict[str, float]] = {}
         self._last_finished_generation: Optional[int] = None
         self._active_stream: Optional[TTSStream] = None
+        # Every stream that has not finished yet. Superseded streams are
+        # cancelled without joining on the chat path; this set lets explicit
+        # teardown join them within one bounded deadline.
+        self._streams: set[TTSStream] = set()
 
     # ------------------------------------------------------------------ state
     @property
@@ -446,14 +490,18 @@ class TTSManager:
         return True, (
             "tts: on  "
             f"model={described['model']}  voice={described['voice']}  "
-            f"region={described['region']}  {described['sample_rate']} Hz"
+            f"rate={described['rate']}x  region={described['region']}  "
+            f"output={described['output_device']}  "
+            f"{described['sample_rate']} Hz"
         )
 
-    def stop(self) -> None:
+    def stop(self, *, wait: bool = False) -> None:
         """Stop current playback and drop queued speech; stay enabled.
 
         Invalidates the running synthesis task as well as queued audio. Text
-        generation and the REPL are never touched.
+        generation and the REPL are never touched. By default this never waits
+        for provider I/O: it is called on the chat thread for every new user
+        input. ``wait=True`` is for explicit teardown (``/tts off``/exit).
         """
         with self._lock:
             self._generation += 1
@@ -466,7 +514,8 @@ class TTSManager:
             self._last_finished_generation = None
         if stream is not None:
             stream.cancel()
-            stream.join(min(self._join_timeout, 1.0))
+            if wait:
+                stream.join(min(self._join_timeout, 1.0))
         self._drain(self._text_queue)
         self._drain(self._audio_queue)
         interrupt = getattr(player, "interrupt", None)
@@ -478,7 +527,7 @@ class TTSManager:
 
     def disable(self) -> None:
         """``/tts off``: stop playback, release threads and the audio device."""
-        self.stop()
+        self.stop(wait=True)
         self._teardown_threads()
         with self._lock:
             self._enabled = False
@@ -486,7 +535,7 @@ class TTSManager:
 
     def shutdown(self) -> None:
         """Release threads, audio device and network objects for process exit."""
-        self.stop()
+        self.stop(wait=True)
         self._teardown_threads()
         with self._lock:
             self._enabled = False
@@ -495,7 +544,12 @@ class TTSManager:
 
     # -------------------------------------------------------------- streaming
     def start_stream(
-        self, response_id: str, conversation_id: str
+        self,
+        response_id: str,
+        conversation_id: str,
+        *,
+        submitted_at: Optional[float] = None,
+        router_completed_at: Optional[float] = None,
     ) -> Optional[TTSStream]:
         """Begin one streaming TTS session for a reply (Phase B).
 
@@ -514,17 +568,36 @@ class TTSManager:
             self._queued_generation = None
             self._status = "streaming"
             now = time.monotonic()
-            self._timings[generation] = {
+            timings = {
                 "response_started_at": now,
                 "tts_queued_at": now,
             }
+            if submitted_at is not None:
+                timings["user_submitted_at"] = submitted_at
+            if router_completed_at is not None:
+                timings["router_completed_at"] = router_completed_at
+            self._timings[generation] = timings
             self._prune_timings()
             config = self._config
             client = self._client
+            player = self._player
+
+        # Bluetooth/speaker switch: re-open the audio device for the new reply
+        # (before any of its audio exists) instead of staying on the device
+        # that was default when TTS was enabled. Never blocks on the network.
+        refresh = getattr(player, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:  # noqa: BLE001 - playback is best effort
+                pass
 
         if previous is not None:
+            # No join: this runs on the chat thread at response_started.
+            # cancel() is non-blocking and hands session teardown to a
+            # closer/sender thread; a stale reply can never mix audio into
+            # the new generation because audio is generation-tagged.
             previous.cancel()
-            previous.join(min(self._join_timeout, 1.0))
         # Any queued chunk belongs to an older reply: the new generation has
         # not produced any audio yet, so nothing valid can be discarded.
         self._drain(self._audio_queue)
@@ -535,7 +608,9 @@ class TTSManager:
         with self._lock:
             if generation != self._generation or not self._started:
                 return None
+            self._streams = {item for item in self._streams if not item.done}
             self._active_stream = stream
+            self._streams.add(stream)
         stream.start()
         return stream
 
@@ -634,8 +709,9 @@ class TTSManager:
             }
             self._prune_timings()
         if previous is not None:
+            # Never join here: submit() is on the reply path. The cancelled
+            # stream closes its own session asynchronously.
             previous.cancel()
-            previous.join(min(self._join_timeout, 1.0))
         return True
 
     def _enqueue_newest(self, job: SpeechJob) -> bool:
@@ -685,6 +761,14 @@ class TTSManager:
             timings = self._timings.setdefault(job.generation, {})
             timings["tts_request_started_at"] = time.monotonic()
             client = self._client
+            player = self._player
+
+        refresh = getattr(player, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:  # noqa: BLE001 - playback is best effort
+                pass
 
         try:
             first_chunk = True
@@ -792,6 +876,12 @@ class TTSManager:
                     self._status = "idle"
                     continue
 
+            with self._lock:
+                if generation == self._generation:
+                    timings = self._timings.setdefault(generation, {})
+                    timings.setdefault(
+                        "first_audio_write_started_at", time.monotonic()
+                    )
             try:
                 player.write(data)
             except Exception as exc:  # noqa: BLE001 - TTS-isolated
@@ -826,7 +916,16 @@ class TTSManager:
                 queued_audio_chunks=self._audio_queue.qsize(),
                 generation=self._generation,
                 last_error=self._last_error,
+                speech_rate=described["rate"],
+                flush_strategy=described["flush_strategy"],
+                output_device=described["output_device"],
             )
+
+    def _output_device_name(self) -> str:
+        with self._lock:
+            player = self._player
+        name = getattr(player, "device_name", None)
+        return str(name) if name else "system default"
 
     def _description(self) -> dict:
         with self._lock:
@@ -837,22 +936,76 @@ class TTSManager:
                 "voice": config.voice,
                 "region": config.region,
                 "sample_rate": config.sample_rate,
+                "rate": config.speech_rate,
+                "flush_strategy": config.flush_strategy,
+                "output_device": self._output_device_name(),
             }
-        return describe_tts_config(self._status_env)
+        described = describe_tts_config(self._status_env)
+        described["output_device"] = (
+            described.get("output_device") or "system default"
+        )
+        return described
 
-    def metrics(self) -> Optional[dict]:
-        """Timing report for the most recently finished reply, in ms."""
+    def metrics(self, generation: Optional[int] = None) -> Optional[dict]:
+        """Timing report for one reply, in ms.
+
+        Without an explicit ``generation`` this reports the most recently
+        finished reply; the CLI passes the reply's generation so text that
+        completed while audio is still pending is never confused with it.
+        """
         with self._lock:
-            generation = self._last_finished_generation
             if generation is None:
-                if not self._timings:
-                    return None
-                generation = max(self._timings)
+                generation = self._last_finished_generation
+                if generation is None:
+                    if not self._timings:
+                        return None
+                    generation = max(self._timings)
             timings = dict(self._timings.get(generation, {}))
         if not timings:
             return None
+        user = timings.get("user_submitted_at")
         return {
             "generation": generation,
+            # Unified user-submit-relative marks (Phase B / CLI report).
+            "user_to_router_ms": _ms(
+                user, timings.get("router_completed_at")
+            ),
+            "user_to_response_started_ms": _ms(
+                user, timings.get("response_started_at")
+            ),
+            "router_to_response_ms": _ms(
+                timings.get("router_completed_at"),
+                timings.get("response_started_at"),
+            ),
+            "user_to_first_text_ms": _ms(
+                user, timings.get("first_text_at")
+            ),
+            "user_to_first_audio_ms": _ms(
+                user, timings.get("first_audio_write_started_at")
+            ),
+            "user_to_text_done_ms": _ms(
+                user, timings.get("response_completed_at")
+            ),
+            "response_to_first_text_ms": _ms(
+                timings.get("response_started_at"),
+                timings.get("first_text_at"),
+            ),
+            "first_text_to_first_segment_ms": _ms(
+                timings.get("first_text_at"),
+                timings.get("first_segment_ready_at"),
+            ),
+            "tts_connect_ms": _ms(
+                timings.get("tts_connect_started_at"),
+                timings.get("tts_connect_finished_at"),
+            ),
+            "first_segment_to_first_pcm_ms": _ms(
+                timings.get("first_segment_sent_at"),
+                timings.get("first_audio_received_at"),
+            ),
+            "first_pcm_to_write_ms": _ms(
+                timings.get("first_audio_received_at"),
+                timings.get("first_audio_write_started_at"),
+            ),
             # Phase B: streaming latencies (None until each mark exists).
             "response_to_first_display_ms": _ms(
                 timings.get("response_started_at"),
@@ -929,6 +1082,8 @@ class TTSManager:
             self._queued_generation = None
             stream = self._active_stream
             self._active_stream = None
+            streams = list(self._streams)
+            self._streams.clear()
             worker, player_thread = self._worker, self._player_thread
             player, client = self._player, self._client
             self._worker = None
@@ -938,6 +1093,14 @@ class TTSManager:
         if stream is not None:
             stream.cancel()
             stream.join(min(self._join_timeout, 1.0))
+        # Superseded streams were cancelled without blocking the chat thread.
+        # Process exit still gets one bounded deadline to join them.
+        deadline = time.monotonic() + self._join_timeout
+        for extra in streams:
+            if extra is stream:
+                continue
+            extra.cancel()
+            extra.join(max(0.0, deadline - time.monotonic()))
         self._drain(self._text_queue)
         self._drain(self._audio_queue)
         self._put_control(self._text_queue, _STOP)

@@ -1465,7 +1465,10 @@ async def test_cli_prints_the_display_channel_inline(capsys):
     )
     await _run_streaming_turn(runtime, _event())
     out = capsys.readouterr().out
-    assert out == "assistant> [giggles] 你好\n"
+    lines = out.splitlines()
+    assert lines[0] == "assistant> [giggles] 你好"
+    assert lines[1].startswith("[timing] first_text=")
+    assert "first_audio=off" in lines[1]
     assert out.count("你好") == 1
 
 
@@ -1490,7 +1493,10 @@ async def test_cli_uses_display_text_for_a_non_streaming_completion(capsys):
     )
     await _run_streaming_turn(runtime, _event())
     out = capsys.readouterr().out
-    assert out == "assistant> [sad]你好\n"
+    lines = out.splitlines()
+    assert lines[0] == "assistant> [sad]你好"
+    assert lines[1].startswith("[timing] first_text=")
+    assert "first_audio=off" in lines[1]
 
 
 # -- emotion isolation -------------------------------------------------------

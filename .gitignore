@@ -21,6 +21,11 @@ logs/
 *.log
 *.log.*
 
+# Local secrets and machine-specific settings (never commit API keys)
+.env
+.env.*
+!.env.example
+
 # Local database and WAL/SHM sidecar files
 data/*.db
 data/*.db-wal

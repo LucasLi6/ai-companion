@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import inspect
 import threading
 import time
@@ -31,7 +32,11 @@ from companion.tts.config import (
 )
 from companion.tts.player import PyAudioPlayer
 
-CONFIG = TTSConfig(api_key="unit-test-key", workspace_id="unit-test-workspace")
+CONFIG = TTSConfig(
+    api_key="unit-test-key",
+    workspace_id="unit-test-workspace",
+    instruction="test-instruction",
+)
 
 
 # --------------------------------------------------------------------- fakes
@@ -209,6 +214,8 @@ def test_client_passes_configured_voice_and_settings_lazily():
         "voice": CONFIG.voice,
         "format": "pcm",
         "sample_rate": 24000,
+        "rate": 1.07,
+        "parameters": {"instruction": "test-instruction"},
     }
     assert created == [True]
 
@@ -542,10 +549,34 @@ class _FakePyAudio:
         self.format_widths: list[int] = []
         self.open_kwargs: dict | None = None
         self.terminated = 0
+        self.default_index = 0
+        self.devices = [
+            {
+                "index": 0,
+                "name": "MacBook Air Speakers",
+                "maxOutputChannels": 2,
+                "defaultSampleRate": 48000.0,
+            },
+            {
+                "index": 1,
+                "name": "WH-1000XM6",
+                "maxOutputChannels": 2,
+                "defaultSampleRate": 44100.0,
+            },
+        ]
 
     def get_format_from_width(self, width: int) -> int:
         self.format_widths.append(width)
         return 8  # a sentinel for paInt16
+
+    def get_default_output_device_info(self) -> dict:
+        return self.devices[self.default_index]
+
+    def get_device_count(self) -> int:
+        return len(self.devices)
+
+    def get_device_info_by_index(self, index: int) -> dict:
+        return self.devices[index]
 
     def open(self, **kwargs):
         self.open_kwargs = kwargs
@@ -566,7 +597,9 @@ def test_player_uses_instance_format_method_not_module_constant():
         "channels": 1,
         "rate": 24000,
         "output": True,
+        "output_device_index": 0,
     }
+    assert player.device_name == "MacBook Air Speakers"
 
     player.open()  # idempotent: one stream for the whole session
     assert fake.format_widths == [2]
@@ -593,6 +626,45 @@ def test_player_open_failure_is_a_tts_error_and_terminates():
     with pytest.raises(TTSPlayerError) as excinfo:
         player.open()
     assert "OSError" in str(excinfo.value)
+    assert fake.terminated == 1
+
+
+def test_player_follows_default_output_and_refreshes_on_change():
+    fake = _FakePyAudio()
+    player = PyAudioPlayer(CONFIG, pyaudio_factory=lambda: fake)
+    player.open()
+    assert fake.open_kwargs["output_device_index"] == 0
+    assert player.device_name == "MacBook Air Speakers"
+
+    # Bluetooth connected and selected as the system default.
+    fake.default_index = 1
+    player.refresh()
+    assert fake.open_kwargs["output_device_index"] == 1
+    assert player.device_name == "WH-1000XM6"
+
+    # A refresh with no device change must not reopen anything.
+    player.refresh()
+    assert fake.open_kwargs["output_device_index"] == 1
+    player.close()
+
+
+def test_player_can_pin_a_device_by_name_or_index():
+    for spec in ("WH-1000", "1"):
+        fake = _FakePyAudio()
+        config = dataclasses.replace(CONFIG, output_device=spec)
+        player = PyAudioPlayer(config, pyaudio_factory=lambda: fake)
+        player.open()
+        assert fake.open_kwargs["output_device_index"] == 1
+        assert player.device_name == "WH-1000XM6"
+        player.close()
+
+    fake = _FakePyAudio()
+    config = dataclasses.replace(CONFIG, output_device="Nonexistent")
+    player = PyAudioPlayer(config, pyaudio_factory=lambda: fake)
+    from companion.tts.errors import TTSPlayerError
+
+    with pytest.raises(TTSPlayerError):
+        player.open()
     assert fake.terminated == 1
 
 

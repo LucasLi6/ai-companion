@@ -2229,6 +2229,7 @@ async def cmd_repl(args) -> int:
                     else:
                         print("unknown command (see /help)")
                     continue
+                submitted_at = time.monotonic()
                 event = make_utterance_event(
                     conversation_id=args.conversation,
                     text=line,
@@ -2250,6 +2251,7 @@ async def cmd_repl(args) -> int:
                     event,
                     debug=bool(getattr(args, "debug", False)),
                     tts_manager=tts_manager,
+                    submitted_at=submitted_at,
                 )
                 if (
                     manager is not None
@@ -2319,6 +2321,44 @@ def _format_tts_metrics(metrics: dict) -> str:
     def value(key: str) -> str:
         number = metrics.get(key)
         return "-" if number is None else f"{number:.0f}ms"
+
+    if metrics.get("user_to_first_text_ms") is not None:
+        # Detailed Phase B report, all relative to the user's submission.
+        # Concurrent phases overlap, so these rows must not be summed.
+        rows: list[tuple[str, str]] = []
+
+        def row(label: str, key: str) -> None:
+            number = metrics.get(key)
+            if number is not None:
+                rows.append((label, f"{number:.0f} ms"))
+
+        row("Router", "user_to_router_ms")
+        row("Preparation", "router_to_response_ms")
+        row("Speaker first text", "response_to_first_text_ms")
+        row("First segment wait", "first_text_to_first_segment_ms")
+        row("WebSocket handshake", "tts_connect_ms")
+        row("TTS first PCM", "first_segment_to_first_pcm_ms")
+        row("Audio queue/playback", "first_pcm_to_write_ms")
+        if not rows:
+            # Router/preparation are absent (legacy path): show the combined
+            # user→response_started phase instead of a blank section.
+            row("Router/preparation", "user_to_response_started_ms")
+        totals = [
+            ("User → First text", "user_to_first_text_ms"),
+            ("User → First audio", "user_to_first_audio_ms"),
+            ("User → Text complete", "user_to_text_done_ms"),
+        ]
+        lines = ["Last response timing:"]
+        for label, text in rows:
+            lines.append(f"  {label + ':':<24}{text:>8}")
+        lines.append("")
+        for label, key in totals:
+            number = metrics.get(key)
+            lines.append(
+                f"  {label + ':':<24}"
+                f"{'-' if number is None else f'{number:.0f} ms':>8}"
+            )
+        return "\n".join(lines)
 
     if metrics.get("response_started_to_first_audio_played_ms") is not None:
         # Phase B: how soon speech starts relative to the reply and its first
@@ -2485,7 +2525,12 @@ async def _read_line_with_proactive(rt, session=None) -> str:
 
 
 async def _run_streaming_turn(
-    rt, event, *, debug: bool = False, tts_manager=None
+    rt,
+    event,
+    *,
+    debug: bool = False,
+    tts_manager=None,
+    submitted_at: float | None = None,
 ) -> dict:
     """Render one turn from the real streaming API.
 
@@ -2509,6 +2554,46 @@ async def _run_streaming_turn(
     # their own threads.
     tts_stream = None
     tts_fed = False
+    tts_generation = None
+    # One monotonic origin for the whole turn: the moment the user's message
+    # was accepted (fallback: this function's start for non-REPL callers).
+    origin = submitted_at if submitted_at is not None else time.monotonic()
+    first_text_at = None
+    completed_at = None
+    tts_on = bool(tts_manager is not None and getattr(tts_manager, "enabled", False))
+    timing_printed = False
+
+    def _print_timing() -> None:
+        nonlocal timing_printed
+        if timing_printed or completed_at is None:
+            return
+        timing_printed = True
+        first = (
+            "n/a"
+            if first_text_at is None
+            else f"{(first_text_at - origin):.1f}s"
+        )
+        done = f"{(completed_at - origin):.1f}s"
+        audio = "off"
+        if tts_on:
+            audio = "n/a"
+            if tts_generation is not None:
+                audio = "pending"
+                try:
+                    metrics = tts_manager.metrics(tts_generation)
+                except Exception:  # noqa: BLE001 - timing never breaks text
+                    metrics = None
+                first_audio_ms = (
+                    metrics.get("user_to_first_audio_ms")
+                    if metrics
+                    else None
+                )
+                if first_audio_ms is not None:
+                    audio = f"{first_audio_ms / 1000:.1f}s"
+        print(
+            f"[timing] first_text={first} | text_done={done}"
+            f" | first_audio={audio}"
+        )
 
     def _cancel_tts() -> None:
         nonlocal tts_stream
@@ -2529,7 +2614,17 @@ async def _run_streaming_turn(
                 sys.stdout.flush()
                 if tts_manager is not None:
                     tts_stream = tts_manager.start_stream(
-                        item.response_id, item.conversation_id
+                        item.response_id,
+                        item.conversation_id,
+                        submitted_at=origin,
+                        router_completed_at=getattr(
+                            item, "router_completed_at", None
+                        ),
+                    )
+                    tts_generation = (
+                        tts_stream.generation
+                        if tts_stream is not None
+                        else None
                     )
             elif item.type == "response_delta":
                 saw_delta = True
@@ -2542,6 +2637,12 @@ async def _run_streaming_turn(
                 )
                 sys.stdout.write(delta)
                 sys.stdout.flush()
+                if first_text_at is None and (item.delta or "").strip():
+                    # The canonical channel proves this is real reply text,
+                    # not a voice-expression tag split across deltas.
+                    first_text_at = time.monotonic()
+                    if tts_stream is not None:
+                        tts_stream.note_first_text()
                 if tts_stream is not None and delta:
                     # Never ``display_delta or delta``: an empty display delta
                     # is valid (e.g. a stripped header) and must not fall back
@@ -2591,7 +2692,7 @@ async def _run_streaming_turn(
                     # voice; VOICE=/TEXT= headers are already removed.
                     speech_text = item.display_text or item.text
                     if speech_text and speech_text.strip():
-                        tts_manager.submit(
+                        if tts_manager.submit(
                             SpeechJob(
                                 response_id=item.response_id,
                                 conversation_id=item.conversation_id,
@@ -2599,7 +2700,14 @@ async def _run_streaming_turn(
                                 generation=tts_manager.generation,
                                 reply_completed_at=completed_at,
                             )
-                        )
+                        ):
+                            tts_generation = tts_manager.generation
+                if not saw_delta and (
+                    item.text or item.display_text or ""
+                ).strip():
+                    # No incremental deltas: the text became visible now.
+                    first_text_at = completed_at
+                _print_timing()
             elif item.type == "response_failed":
                 saw_terminal = True
                 _cancel_tts()

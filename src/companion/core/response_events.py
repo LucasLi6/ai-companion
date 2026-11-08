@@ -49,6 +49,9 @@ class ResponseEvent:
     usage: Optional[dict] = None
     report_status: Optional[str] = None
     action: Optional[str] = None
+    # Monotonic clock mark (same process) for the moment routing finished.
+    # It is internal measurement data, not part of the wire payload.
+    router_completed_at: Optional[float] = None
 
     def as_dict(self) -> dict:
         data = {
@@ -104,8 +107,18 @@ class ResponseEventSink:
         self._emit(event)
         return event
 
-    def started(self, response_id: str) -> ResponseEvent:
-        return self._next(RESPONSE_STARTED, response_id, "STREAMING")
+    def started(
+        self,
+        response_id: str,
+        *,
+        router_completed_at: Optional[float] = None,
+    ) -> ResponseEvent:
+        return self._next(
+            RESPONSE_STARTED,
+            response_id,
+            "STREAMING",
+            router_completed_at=router_completed_at,
+        )
 
     def delta(
         self,

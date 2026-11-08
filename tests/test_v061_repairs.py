@@ -127,7 +127,10 @@ async def test_repl_streams_deltas_without_printing_the_text_twice(capsys):
     )
     await _run_streaming_turn(rt, _event())
     out = capsys.readouterr().out
-    assert out == "assistant> 你好\n"
+    lines = out.splitlines()
+    assert lines[0] == "assistant> 你好"
+    assert lines[1].startswith("[timing] first_text=")
+    assert "first_audio=off" in lines[1]
     assert out.count("你好") == 1
 
 

@@ -8,6 +8,7 @@ audio device, no credentials. Real Qwen synthesis is exercised separately by
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import threading
 import time
@@ -19,8 +20,11 @@ from companion.core.response_events import ResponseEvent
 from companion.tts import TTSManager
 from companion.tts.client import TTSClient, TTSClientError
 from companion.tts.config import (
+    DEFAULT_LONG_FALLBACK_CHARS,
+    DEFAULT_TTS_INSTRUCTION,
     TTSConfig,
     TTSConfigError,
+    load_local_env,
     load_tts_config,
     tts_enabled_by_default,
 )
@@ -32,6 +36,7 @@ CONFIG = TTSConfig(
     workspace_id="unit-test-workspace",
     segment_min_chars=10,
     segment_max_chars=60,
+    instruction="test-instruction",
 )
 
 _SESSION_END = object()
@@ -42,6 +47,7 @@ class EchoSession:
     """Bidirectional fake: every sent segment produces two PCM chunks."""
 
     def __init__(self) -> None:
+        self.started = False
         self.sent: list[str] = []
         self.flushes = 0
         self.stop_calls = 0
@@ -49,16 +55,26 @@ class EchoSession:
         self._audio: queue.Queue = queue.Queue()
         self._send_lock = threading.Lock()
 
+    def start(self):
+        # Mirrors dashscope's SynthesisSession: send_text/audio_chunks are
+        # only valid after the handshake has completed.
+        assert not self.started, "session started twice"
+        self.started = True
+        return self
+
     def send_text(self, text: str) -> None:
+        assert self.started, "send_text before start()"
         with self._send_lock:
             self.sent.append(text)
         self._audio.put(b"chunk-1")
         self._audio.put(b"chunk-2")
 
     def flush(self) -> None:
+        assert self.started, "flush before start()"
         self.flushes += 1
 
     def audio_chunks(self):
+        assert self.started, "audio_chunks before start()"
         while True:
             item = self._audio.get(timeout=5)
             if item is _SESSION_END:
@@ -83,18 +99,25 @@ class GatedSession:
     """Audio only appears after the test opens the gate (late audio)."""
 
     def __init__(self) -> None:
+        self.started = False
         self.gate = threading.Event()
         self.sent: list[str] = []
         self.stop_calls = 0
         self.close_calls = 0
 
+    def start(self):
+        self.started = True
+        return self
+
     def send_text(self, text: str) -> None:
+        assert self.started, "send_text before start()"
         self.sent.append(text)
 
     def flush(self) -> None:
-        pass
+        assert self.started, "flush before start()"
 
     def audio_chunks(self):
+        assert self.started, "audio_chunks before start()"
         self.gate.wait(5)
         yield b"late-1"
         yield b"late-2"
@@ -118,6 +141,11 @@ class FakeStreamClient:
         self.open_calls += 1
         session = self._factory()
         self.sessions.append(session)
+        # Real TTSClient.open_stream() performs the start() handshake before
+        # returning; the fake must follow the same contract.
+        starter = getattr(session, "start", None)
+        if callable(starter):
+            starter()
         return session
 
     def stream_pcm(self, text):
@@ -212,6 +240,79 @@ def test_invalid_segment_lengths_are_rejected():
         load_tts_config({**base, "AVA_TTS_SEGMENT_MIN_CHARS": "0"})
 
 
+def test_speech_rate_defaults_to_1_07_and_is_configurable():
+    base = {"DASHSCOPE_API_KEY": "k", "DASHSCOPE_WORKSPACE_ID": "w"}
+    assert load_tts_config(base).speech_rate == 1.07
+    assert load_tts_config({**base, "AVA_TTS_RATE": "1.15"}).speech_rate == 1.15
+    for bad in ("0.4", "2.5", "fast"):
+        with pytest.raises(TTSConfigError):
+            load_tts_config({**base, "AVA_TTS_RATE": bad})
+
+
+def test_instruction_flush_strategy_and_fallback_are_configurable():
+    base = {"DASHSCOPE_API_KEY": "k", "DASHSCOPE_WORKSPACE_ID": "w"}
+    default = load_tts_config(base)
+    assert default.instruction == DEFAULT_TTS_INSTRUCTION
+    assert default.flush_strategy == "auto"
+    assert default.long_fallback_chars == DEFAULT_LONG_FALLBACK_CHARS
+
+    overridden = load_tts_config(
+        {
+            **base,
+            "AVA_TTS_INSTRUCTION": "请更温柔地说话。",
+            "AVA_TTS_FLUSH_STRATEGY": "sentence_flush",
+            "AVA_TTS_LONG_FALLBACK_CHARS": "120",
+        }
+    )
+    assert overridden.instruction == "请更温柔地说话。"
+    assert overridden.flush_strategy == "sentence_flush"
+    assert overridden.long_fallback_chars == 120
+
+    with pytest.raises(TTSConfigError):
+        load_tts_config({**base, "AVA_TTS_FLUSH_STRATEGY": "bogus"})
+    with pytest.raises(TTSConfigError):
+        load_tts_config({**base, "AVA_TTS_LONG_FALLBACK_CHARS": "0"})
+
+
+def test_output_device_defaults_to_system_and_is_configurable():
+    base = {"DASHSCOPE_API_KEY": "k", "DASHSCOPE_WORKSPACE_ID": "w"}
+    assert load_tts_config(base).output_device == ""
+    assert (
+        load_tts_config(
+            {**base, "AVA_TTS_OUTPUT_DEVICE": "WH-1000XM6"}
+        ).output_device
+        == "WH-1000XM6"
+    )
+
+
+def test_empty_instruction_disables_the_prompt():
+    base = {"DASHSCOPE_API_KEY": "k", "DASHSCOPE_WORKSPACE_ID": "w"}
+    # Absent -> default; explicitly empty -> no instruction (for A/B listening).
+    assert load_tts_config(base).instruction == DEFAULT_TTS_INSTRUCTION
+    assert load_tts_config({**base, "AVA_TTS_INSTRUCTION": ""}).instruction == ""
+
+
+def test_local_env_file_supplies_missing_values_only(tmp_path, monkeypatch):
+    env_file = tmp_path / "ava.env"
+    env_file.write_text(
+        "# local settings\n"
+        "DASHSCOPE_API_KEY=from-file\n"
+        "export DASHSCOPE_WORKSPACE_ID='ws-file'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AVA_ENV_FILE", str(env_file))
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.setenv("DASHSCOPE_WORKSPACE_ID", "ws-exported")
+
+    loaded = load_local_env()
+
+    assert "DASHSCOPE_API_KEY" in loaded
+    assert "DASHSCOPE_WORKSPACE_ID" not in loaded
+    assert os.environ["DASHSCOPE_API_KEY"] == "from-file"
+    # An explicitly exported value always wins over the file.
+    assert os.environ["DASHSCOPE_WORKSPACE_ID"] == "ws-exported"
+
+
 # --------------------------------------------------------------- segmenter
 def test_sentence_boundaries_split_without_character_fragments():
     segmenter = TextSegmenter(10, 60)
@@ -221,32 +322,77 @@ def test_sentence_boundaries_split_without_character_fragments():
     assert segmenter.feed("句话也足够长了。") == ["第二句话也足够长了。"]
 
 
-def test_short_fragment_waits_but_a_complete_sentence_speaks():
+def test_commas_are_not_a_synthesis_boundary():
     segmenter = TextSegmenter(10, 60)
-    # No punctuation yet: never synthesise one character at a time.
-    assert segmenter.feed("嗯") == []
-    assert segmenter.feed("，那我们继续聊吧。") == ["嗯，那我们继续聊吧。"]
-    # A complete two-character sentence is speakable on its own.
+    # Three commas but only one period: a single continuous sentence.
+    assert segmenter.feed("第一句，中间，还有，终于说完了。") == [
+        "第一句，中间，还有，终于说完了。"
+    ]
+    # A complete short sentence is still speakable on its own.
     assert segmenter.feed("好。") == ["好。"]
 
 
-def test_comma_cuts_early_only_with_enough_content():
+def test_commas_accumulate_until_a_sentence_end():
     segmenter = TextSegmenter(10, 60)
     assert segmenter.feed("短句，") == []
-    assert segmenter.feed("这是一个比较长的句子，") == [
-        "短句，这是一个比较长的句子，"
+    assert segmenter.feed("好的，") == []
+    assert segmenter.feed("这是一个比较长的句子。") == [
+        "短句，好的，这是一个比较长的句子。"
     ]
 
 
-def test_max_length_split_prefers_whitespace_then_hard_cut():
-    segmenter = TextSegmenter(2, 5)
-    assert segmenter.feed("ab cd ef") == ["ab cd"]
-    assert segmenter.pending == "ef"
-    assert segmenter.feed("ghijkl") == ["efghi"]
-    assert segmenter.finish() == ["jkl"]
+def test_no_sentence_end_means_no_early_cut():
+    segmenter = TextSegmenter(6, 35)
+    # No punctuation yet: never synthesise a fragment. With no sentence end the
+    # text stays buffered instead of being cut at a space or comma.
+    assert segmenter.feed("hello there my friend") == []
+    assert segmenter.pending == "hello there my friend"
+    assert segmenter.finish() == ["hello there my friend"]
 
-    hard = TextSegmenter(2, 4)
-    assert hard.feed("abcdefgh") == ["abcd", "efgh"]
+
+def test_chinese_english_and_portuguese_sentences():
+    segmenter = TextSegmenter(6, 35)
+    pieces = segmenter.feed("你好。Hello world. Olá mundo!") + segmenter.finish()
+    assert pieces == ["你好。", "Hello world.", "Olá mundo!"]
+
+
+def test_newline_is_not_an_unconditional_boundary():
+    segmenter = TextSegmenter(6, 35)
+    assert segmenter.feed("第一行还没结束\n第二行继续。") == [
+        "第一行还没结束\n第二行继续。"
+    ]
+
+
+def test_long_fallback_cuts_at_a_safe_clause_boundary_without_loss():
+    segmenter = TextSegmenter(6, 35, long_fallback_chars=15)
+    head = segmenter.feed("一二三四五六七八九十，甲乙丙丁戊己庚辛壬癸")
+    tail = segmenter.finish()
+    assert head == ["一二三四五六七八九十，"]
+    assert tail == ["甲乙丙丁戊己庚辛壬癸"]
+    assert "".join(head) + "".join(tail) == (
+        "一二三四五六七八九十，甲乙丙丁戊己庚辛壬癸"
+    )
+
+
+def test_long_fallback_preserves_protected_tokens_whole():
+    segmenter = TextSegmenter(6, 35, long_fallback_chars=12)
+    text = (
+        "请看 https://example.com/very/long/path?query=1 和数字 1234567890，"
+        "还有标签 [mischievously] 以及 `code span`，最后结束。"
+    )
+    pieces = segmenter.feed(text) + segmenter.finish()
+    # Fallback cuts may trim a separating space at the cut point, but every
+    # word, number, tag, URL and code span must survive once and in order.
+    joined = "".join(pieces)
+    assert joined.replace(" ", "") == text.replace(" ", "")
+    assert joined.count("[mischievously]") == 1
+    for token in (
+        "https://example.com/very/long/path?query=1",
+        "1234567890",
+        "[mischievously]",
+        "`code span`",
+    ):
+        assert any(token in piece for piece in pieces), token
 
 
 def test_decimals_and_abbreviations_are_not_split():
@@ -254,10 +400,43 @@ def test_decimals_and_abbreviations_are_not_split():
     assert decimal.feed("圆周率约为3.14对吗。") == ["圆周率约为3.14对吗。"]
 
     abbreviation = TextSegmenter(2, 100)
+    # The final "." is deferred: it may be an abbreviation, a decimal point
+    # or a sentence end, so the segmenter waits for the next delta/finish().
     assert abbreviation.feed("Mr. Smith is here. He waits.") == [
-        "Mr. Smith is here.",
-        "He waits.",
+        "Mr. Smith is here."
     ]
+    assert abbreviation.finish() == ["He waits."]
+
+
+def test_decimal_and_thousands_separator_survive_delta_boundaries():
+    decimal = TextSegmenter(2, 100)
+    # "3." at the end of a delta must not be cut: the next delta completes
+    # it as 3.14. The comma no longer cuts, so the whole sentence is emitted
+    # at the "？".
+    assert decimal.feed("圆周率约等于3.") == []
+    assert decimal.feed("14，你知道吗？") == ["圆周率约等于3.14，你知道吗？"]
+
+    thousands = TextSegmenter(1, 100)
+    assert thousands.feed("一共有1000000000,") == []
+    assert thousands.feed("000人。") == ["一共有1000000000,000人。"]
+
+
+def test_character_by_character_feeding_never_loses_text():
+    text = "[giggles]圆周率约等于3.14，一共有1000000000,000人。你记住了吗？"
+    whole = TextSegmenter(2, 100)
+    expected = whole.feed(text) + whole.finish()
+
+    split = TextSegmenter(2, 100)
+    pieces: list[str] = []
+    for char in text:
+        pieces.extend(split.feed(char))
+    pieces.extend(split.finish())
+
+    assert "".join(expected) == text
+    assert "".join(pieces) == text
+    # Decimal/thousands grouping survives every token boundary.
+    assert "3.14" in "".join(pieces)
+    assert "1000000000,000" in "".join(pieces)
 
 
 def test_urls_links_and_code_are_never_split():
@@ -306,23 +485,32 @@ def test_finish_flushes_the_remainder_once():
 # ------------------------------------------------------------------- client
 def test_open_stream_uses_connect_with_voice_and_format():
     calls: list[dict] = []
+    started: list[bool] = []
+
+    class FakeSession:
+        def start(self):
+            started.append(True)
+            return self
 
     def connect(**kwargs):
         calls.append(kwargs)
-        return object()
+        return FakeSession()
 
     sdk = SimpleNamespace(
         audio=SimpleNamespace(tts=SimpleNamespace(connect=connect))
     )
     client = TTSClient(CONFIG, client_factory=lambda: sdk)
     session = client.open_stream()
-    assert session is not None
+    assert isinstance(session, FakeSession)
+    assert started == [True]
     assert calls == [
         {
             "model": "qwen-audio-3.1-tts-flash",
             "voice": "xuyanchu_v3.1",
             "format": "pcm",
             "sample_rate": 24000,
+            "rate": 1.07,
+            "parameters": {"instruction": "test-instruction"},
         }
     ]
 
@@ -344,7 +532,72 @@ def test_open_stream_reports_unsupported_sdk_and_failures():
     assert "RuntimeError" in str(excinfo.value)
 
 
+def test_open_stream_start_failure_closes_the_session():
+    closed: list[bool] = []
+
+    class BrokenSession:
+        def start(self):
+            raise RuntimeError("handshake failed")
+
+        def close(self):
+            closed.append(True)
+
+    sdk = SimpleNamespace(
+        audio=SimpleNamespace(
+            tts=SimpleNamespace(connect=lambda **kwargs: BrokenSession())
+        )
+    )
+    with pytest.raises(TTSClientError) as excinfo:
+        TTSClient(CONFIG, client_factory=lambda: sdk).open_stream()
+    assert "RuntimeError" in str(excinfo.value)
+    assert closed == [True]
+
+
+def test_open_stream_omits_instruction_when_disabled():
+    calls: list[dict] = []
+
+    class FakeSession:
+        def start(self):
+            return self
+
+    def connect(**kwargs):
+        calls.append(kwargs)
+        return FakeSession()
+
+    sdk = SimpleNamespace(
+        audio=SimpleNamespace(tts=SimpleNamespace(connect=connect))
+    )
+    config = TTSConfig(
+        api_key="unit-test-key",
+        workspace_id="unit-test-workspace",
+        instruction="",
+    )
+    TTSClient(config, client_factory=lambda: sdk).open_stream()
+    assert calls == [
+        {
+            "model": "qwen-audio-3.1-tts-flash",
+            "voice": "xuyanchu_v3.1",
+            "format": "pcm",
+            "sample_rate": 24000,
+            "rate": 1.07,
+            "parameters": {},
+        }
+    ]
+
+
 # ------------------------------------------------------------------ manager
+def test_status_reports_rate_without_credentials():
+    manager, _client, _player = make_manager()
+    try:
+        lines = manager.status().lines()
+    finally:
+        manager.shutdown()
+    text = "\n".join(lines)
+    assert "rate: 1.07" in text
+    assert "output: system default" in text
+    assert "unit-test-key" not in text
+
+
 def test_audio_plays_before_the_reply_completes():
     manager, client, player = make_manager()
     try:
@@ -389,6 +642,54 @@ def test_each_segment_is_sent_once_and_in_order():
     assert len(sent) == 3
     assert len(set(sent)) == len(sent)
     assert all(len(segment) > 1 for segment in sent)
+
+
+def test_auto_strategy_never_flushes_within_a_sentence():
+    manager, client, _player = make_manager()
+    text = "这句话里有，逗号，但只到句号才算一句。"
+    try:
+        stream = manager.start_stream("resp-1", "conv-1")
+        stream.feed(text)
+        stream.finish()
+        assert wait_for(lambda: stream.done)
+    finally:
+        manager.shutdown()
+    session = client.sessions[0]
+    assert "".join(session.sent) == text
+    # One sentence -> one send_text, no per-fragment flush.
+    assert len(session.sent) == 1
+    assert session.flushes == 0
+
+
+def test_sentence_flush_strategy_flushes_once_per_sentence():
+    config = TTSConfig(
+        api_key="unit-test-key",
+        workspace_id="unit-test-workspace",
+        segment_min_chars=10,
+        segment_max_chars=60,
+        instruction="test-instruction",
+        flush_strategy="sentence_flush",
+    )
+    client = FakeStreamClient()
+    manager = TTSManager(
+        config_loader=lambda: config,
+        client_factory=lambda cfg: client,
+        player_factory=lambda cfg: FakePlayer(),
+        join_timeout=2.0,
+    )
+    manager.start()
+    text = "第一句话结束了。第二句话也结束了。"
+    try:
+        stream = manager.start_stream("resp-1", "conv-1")
+        stream.feed(text)
+        stream.finish()
+        assert wait_for(lambda: stream.done)
+    finally:
+        manager.shutdown()
+    session = client.sessions[0]
+    assert "".join(session.sent) == text
+    assert len(session.sent) == 2
+    assert session.flushes == 2
 
 
 def test_metrics_expose_streaming_latencies():
@@ -519,6 +820,82 @@ def test_no_tts_threads_are_left_after_shutdown():
     assert wait_for(lambda: not tts_threads(), timeout=3.0)
 
 
+def test_starting_a_new_reply_does_not_wait_for_a_stuck_previous_session():
+    opening = threading.Event()
+    release = threading.Event()
+
+    class SlowClient(FakeStreamClient):
+        def open_stream(self):
+            self.open_calls += 1
+            opening.set()
+            release.wait(2)
+            session = EchoSession()
+            session.start()
+            self.sessions.append(session)
+            return session
+
+    manager, _client, _player = make_manager(client=SlowClient())
+    try:
+        assert manager.start_stream("resp-1", "conv-1") is not None
+        assert wait_for(opening.is_set)
+        started_at = time.monotonic()
+        second = manager.start_stream("resp-2", "conv-1")
+        elapsed = time.monotonic() - started_at
+        assert second is not None
+        # The chat thread must not block on the old session's handshake.
+        assert elapsed < 0.5
+    finally:
+        release.set()
+        manager.shutdown()
+
+
+def test_stream_text_backlog_is_bounded_by_reply_limit():
+    opening = threading.Event()
+    release = threading.Event()
+
+    class SlowClient(FakeStreamClient):
+        def open_stream(self):
+            self.open_calls += 1
+            opening.set()
+            release.wait(2)
+            session = EchoSession()
+            session.start()
+            self.sessions.append(session)
+            return session
+
+    config = TTSConfig(
+        api_key="unit-test-key",
+        workspace_id="unit-test-workspace",
+        max_text_chars=20,
+        segment_min_chars=1,
+        segment_max_chars=60,
+    )
+    client = SlowClient()
+    manager = TTSManager(
+        config_loader=lambda: config,
+        client_factory=lambda cfg: client,
+        player_factory=lambda cfg: FakePlayer(),
+        join_timeout=1.0,
+    )
+    manager.start()
+    try:
+        stream = manager.start_stream("resp-1", "conv-1")
+        assert stream is not None
+        assert wait_for(opening.is_set)
+        stream.feed("a" * 12)
+        # This delta would push the backlog past one reply's allowance: it is
+        # dropped, the already-buffered text is still spoken, and memory is
+        # bounded.
+        stream.feed("b" * 12)
+        release.set()
+        stream.finish()
+        assert wait_for(lambda: stream.done)
+        assert client.sessions[0].sent == ["a" * 12]
+    finally:
+        release.set()
+        manager.shutdown()
+
+
 def _speech_job(text: str):
     from companion.tts import SpeechJob
 
@@ -642,6 +1019,134 @@ def test_cli_falls_back_to_full_text_when_no_delta_arrives(capsys):
         manager.shutdown()
     assert "".join(client.sessions[0].sent) == display
     capsys.readouterr()
+
+
+def test_cli_prints_one_timing_line_per_completed_reply(capsys):
+    manager, _client, _player = make_manager()
+    display = "[softly]第一句话已经足够长了。第二句话也足够长了。"
+    events = [
+        _started(0),
+        _delta("", "[softly]第一句话", 1),
+        _delta("已经足够长了。", "已经足够长了。第二句话", 2),
+        _delta("也足够长了。", "也足够长了。", 3),
+        _completed(display, display, sequence=4),
+    ]
+    try:
+        _run_cli(events, manager)
+    finally:
+        manager.shutdown()
+    output = capsys.readouterr().out
+    lines = [line for line in output.splitlines() if line.startswith("[timing]")]
+    assert len(lines) == 1
+    assert "first_text=" in lines[0]
+    assert "text_done=" in lines[0]
+    assert "first_audio=" in lines[0]
+
+
+def test_cli_reports_first_audio_off_when_tts_is_disabled(capsys):
+    manager, _client, _player = make_manager()
+    manager.disable()
+    events = [
+        _started(0),
+        _delta("你好呀。", "你好呀。", 1),
+        _completed("你好呀。", "你好呀。", sequence=2),
+    ]
+    try:
+        _run_cli(events, manager)
+    finally:
+        manager.shutdown()
+    output = capsys.readouterr().out
+    assert "[timing] first_text=" in output
+    assert "first_audio=off" in output
+
+
+def test_cli_prints_no_timing_for_wait_or_ignore(capsys):
+    manager, _client, _player = make_manager()
+    try:
+        _run_cli([], manager)
+    finally:
+        manager.shutdown()
+    assert "[timing]" not in capsys.readouterr().out
+
+
+def test_metrics_are_relative_to_the_user_submission():
+    manager, _client, _player = make_manager()
+    try:
+        now = time.monotonic()
+        stream = manager.start_stream(
+            "resp-1",
+            "conv-1",
+            submitted_at=now - 2.0,
+            router_completed_at=now - 1.5,
+        )
+        assert stream is not None
+        stream.feed("第一句话已经足够长了。")
+        stream.note_first_text()
+        stream.finish()
+        assert wait_for(
+            lambda: (manager.metrics(stream.generation) or {}).get(
+                "user_to_first_audio_ms"
+            )
+            is not None
+        )
+        metrics = manager.metrics(stream.generation)
+        assert metrics["user_to_response_started_ms"] >= 1900
+        assert metrics["user_to_router_ms"] >= 450
+        assert metrics["user_to_first_text_ms"] is not None
+        assert metrics["user_to_text_done_ms"] is not None
+        assert metrics["tts_connect_ms"] is not None
+        assert metrics["first_segment_to_first_pcm_ms"] is not None
+
+        from companion.cli import _format_tts_metrics
+
+        report = _format_tts_metrics(metrics)
+        assert "Last response timing:" in report
+        assert "WebSocket handshake:" in report
+        assert "User → First text:" in report
+        assert "User → First audio:" in report
+        assert "User → Text complete:" in report
+    finally:
+        manager.shutdown()
+
+
+def test_timing_stays_pending_until_audio_is_written(capsys):
+    manager, client, _player = make_manager(
+        client=FakeStreamClient(session_factory=GatedSession)
+    )
+    events = [
+        _started(0),
+        _delta("你好呀。", "你好呀。", 1),
+        _completed("你好呀。", "你好呀。", sequence=2),
+    ]
+    try:
+        _run_cli(events, manager)
+        output = capsys.readouterr().out
+        timing = [
+            line for line in output.splitlines() if line.startswith("[timing]")
+        ]
+        assert len(timing) == 1
+        assert "first_audio=pending" in timing[0]
+
+        assert wait_for(lambda: bool(client.sessions))
+        client.sessions[0].gate.set()
+        assert wait_for(
+            lambda: (manager.metrics() or {}).get("user_to_first_audio_ms")
+            is not None
+        )
+        # The background audio start never prints into the prompt.
+        assert capsys.readouterr().out == ""
+    finally:
+        manager.shutdown()
+
+
+def test_started_event_carries_the_router_completion_mark():
+    from companion.core.response_events import ResponseEventSink
+
+    emitted = []
+    sink = ResponseEventSink("event-1", "conv-1", emitted.append)
+    sink.started("resp-1", router_completed_at=123.0)
+    assert emitted[0].type == "response_started"
+    assert emitted[0].router_completed_at == 123.0
 
 
 def test_cli_cancels_stream_on_failure(capsys):

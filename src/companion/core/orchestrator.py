@@ -468,6 +468,10 @@ class Orchestrator:
         response_id = new_id("resp")
         response_text: Optional[str] = None
         stream_emitted = False
+        # Absolute monotonic mark for the end of routing/preparation. It lets
+        # the CLI split user→first-text into router/prep and speaker phases
+        # without treating response_started as the user's send time.
+        router_completed_at: Optional[float] = None
 
         try:
             # 4a. Semantic mode: the LLM router runs *before* any long-term
@@ -489,6 +493,7 @@ class Orchestrator:
                     persist=persist,
                     timings=timings,
                 )
+                router_completed_at = time.monotonic()
                 # Long-term memory reaches this turn only through the
                 # read-only tools the router requested. There is deliberately
                 # no unconditional ``memory.retrieve`` in semantic mode.
@@ -847,6 +852,10 @@ class Orchestrator:
                         job_id = job.job_id
                     if str(getattr(analysis, "provider", "")) == LOCAL_PROVIDER:
                         job_id = await self._enqueue_turn_analysis(event) or job_id
+            if router_completed_at is None:
+                # Legacy/mock path: the local route and cognitive analysis are
+                # the routing decision here.
+                router_completed_at = time.monotonic()
             if (
                 semantic_mode
                 and route is not None
@@ -1117,7 +1126,10 @@ class Orchestrator:
                 action_status = existing_action.status
                 trace = self._stored_trace(existing_action)
                 if stream is not None and final_action == CognitiveAction.RESPOND:
-                    stream.started(response_id)
+                    stream.started(
+                        response_id,
+                        router_completed_at=router_completed_at,
+                    )
                     stream_emitted = True
                 steps.append("[ACTION] Reused existing action")
             else:
@@ -1143,7 +1155,10 @@ class Orchestrator:
                             safety.category, detect_language(event.text)
                         )
                         if stream is not None:
-                            stream.started(response_id)
+                            stream.started(
+                                response_id,
+                                router_completed_at=router_completed_at,
+                            )
                             stream_emitted = True
                         steps.append("[RESPONSE][SAFETY] local safety reply")
                     else:
@@ -1177,6 +1192,7 @@ class Orchestrator:
                                 started_at=t_generation,
                                 persist=persist,
                                 trace=trace,
+                                router_completed_at=router_completed_at,
                             )
                             stream_emitted = True
                         else:
@@ -1184,7 +1200,10 @@ class Orchestrator:
                                 # Open the stream surface before generation so
                                 # a provider/empty-output failure can still
                                 # deliver one terminal ``response_failed``.
-                                stream.started(response_id)
+                                stream.started(
+                                    response_id,
+                                    router_completed_at=router_completed_at,
+                                )
                                 stream_emitted = True
                             generated = await self.response.generate(
                                 event, analysis, response_context
@@ -1307,7 +1326,10 @@ class Orchestrator:
                 and final_action == CognitiveAction.RESPOND
             ):
                 if not stream_emitted:
-                    stream.started(response_id)
+                    stream.started(
+                        response_id,
+                        router_completed_at=router_completed_at,
+                    )
                 stream.completed(
                     response_id,
                     text=response_text or "",
@@ -2422,6 +2444,7 @@ class Orchestrator:
         started_at: float,
         persist: bool,
         trace=None,
+        router_completed_at: Optional[float] = None,
     ):
         """Stream a response, yielding deltas through ``stream``.
 
@@ -2452,7 +2475,9 @@ class Orchestrator:
         # back until the next real character, which makes the concatenation of
         # every emitted delta exactly ``normalize_response_text(raw, layout)``.
         normalizer = StreamingTextNormalizer(layout)
-        stream.started(response_id)
+        stream.started(
+            response_id, router_completed_at=router_completed_at
+        )
         try:
             async for delta in self.response.generate_stream(
                 event, analysis, response_context

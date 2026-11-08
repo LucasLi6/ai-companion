@@ -1,13 +1,13 @@
 """Standalone TTS demo: keyboard text -> Qwen TTS -> Mac speaker.
 
 This entry point exercises the TTS package without Router, Speaker, Memory,
-Emotion or the companion database. It reads credentials only from the
-environment and never logs the API key or reply contents.
+Emotion or the companion database. Credentials come from the environment or
+from the git-ignored local ``.env`` file (loaded automatically); the API key
+and reply contents are never logged.
 
 Usage
 -----
-    export DASHSCOPE_API_KEY=...
-    export DASHSCOPE_WORKSPACE_ID=...
+    # either export the variables, or put them in ./.env
     .venv/bin/python -m companion.tts.demo
     .venv/bin/python -m companion.tts.demo "你好，我是 Ava。"
 """

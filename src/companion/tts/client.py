@@ -127,6 +127,16 @@ class TTSClient:
     def config(self) -> TTSConfig:
         return self._config
 
+    def _provider_parameters(self) -> dict:
+        """Provider parameters set once per session.
+
+        Returns an empty dict when ``instruction`` is disabled, so the A/B
+        listening test can compare "with vs without instruction".
+        """
+        if self._config.instruction:
+            return {"instruction": self._config.instruction}
+        return {}
+
     def _sdk(self) -> Any:
         if self._client is not None:
             return self._client
@@ -169,6 +179,8 @@ class TTSClient:
                 voice=self._config.voice,
                 format=self._config.audio_format,
                 sample_rate=self._config.sample_rate,
+                rate=self._config.speech_rate,
+                parameters=self._provider_parameters(),
             )
         except Exception as exc:  # noqa: BLE001 - sanitized
             raise TTSClientError(
@@ -204,6 +216,11 @@ class TTSClient:
         The caller must run ``send_text`` and ``audio_chunks`` concurrently;
         this method only establishes the session. It never touches the chat
         event loop by itself.
+
+        ``audio.tts.connect`` returns an unstarted ``SynthesisSession`` in the
+        DashScope SDK; ``start()`` opens the websocket and waits for the
+        task-started handshake, which ``send_text`` requires. This blocks the
+        calling (TTS) thread only, never the chat loop.
         """
         client = self._sdk()
         method = getattr(
@@ -214,16 +231,34 @@ class TTSClient:
         if not callable(method):
             raise TTSClientError("DashScope SDK 不支持 audio.tts.connect")
         try:
-            return method(
+            session = method(
                 model=self._config.model,
                 voice=self._config.voice,
                 format=self._config.audio_format,
                 sample_rate=self._config.sample_rate,
+                rate=self._config.speech_rate,
+                parameters=self._provider_parameters(),
             )
         except Exception as exc:  # noqa: BLE001 - sanitized
             raise TTSClientError(
                 f"TTS 会话建立失败: {type(exc).__name__}"
             ) from exc
+
+        starter = getattr(session, "start", None)
+        if callable(starter):
+            try:
+                starter()
+            except Exception as exc:  # noqa: BLE001 - sanitized
+                closer = getattr(session, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:  # noqa: BLE001 - cleanup must not raise
+                        pass
+                raise TTSClientError(
+                    f"TTS 会话建立失败: {type(exc).__name__}"
+                ) from exc
+        return session
 
     def close(self) -> None:
         client, self._client = self._client, None
