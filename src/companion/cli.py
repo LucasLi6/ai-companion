@@ -21,6 +21,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -91,6 +92,7 @@ from companion.runtime_context.assembler import compile_runtime_context
 from companion.runtime_context.timezone import TimeZoneService, valid_zone
 from companion.storage.database import Database
 from companion.storage.repositories import make_repositories
+from companion.tts import SpeechJob, TTSManager
 
 DEFAULT_CONVERSATION = "default"
 
@@ -2130,6 +2132,9 @@ async def cmd_repl(args) -> int:
         if confirmation is not None:
             with contextlib.suppress(Exception):
                 await confirmation.resume_pending()
+        # TTS is an independent output side channel and starts disabled: no
+        # Alibaba connection, audio device or cost until ``/tts on``.
+        tts_manager = TTSManager()
         try:
             # Created once for the session: prompt_toolkit owns the live input
             # line, so a proactive message can be printed above it without any
@@ -2167,6 +2172,9 @@ async def cmd_repl(args) -> int:
                         print(
                             f"speech expression: {'on' if enabled else 'off'}"
                         )
+                    elif cmd == "/tts":
+                        for output in _handle_tts_command(tts_manager, parts):
+                            print(output)
                     elif cmd == "/history":
                         for e in await rt.repos.utterance.list_events(None, 20):
                             print(f"  {e.event_id} to={e.addressee_hint.value} {e.text}")
@@ -2181,6 +2189,10 @@ async def cmd_repl(args) -> int:
                         print(
                             "speech expression: "
                             f"{'on' if getattr(rt.orchestrator, 'speech_expression_enabled', False) else 'off'}"
+                        )
+                        print(
+                            f"tts: {'on' if tts_manager.enabled else 'off'}"
+                            f" ({tts_manager.status().state})"
                         )
                         try:
                             web_enabled = await rt.repos.settings.get_bool(
@@ -2199,7 +2211,8 @@ async def cmd_repl(args) -> int:
                     elif cmd == "/help":
                         print(
                             "commands: /to agent|human|unknown  /quiet on|off"
-                            "  /speech on|off  /history  /status  /quit"
+                            "  /speech on|off  /tts on|off|stop|status"
+                            "  /history  /status  /quit"
                         )
                     else:
                         print("unknown command (see /help)")
@@ -2217,8 +2230,14 @@ async def cmd_repl(args) -> int:
                     manager.note_user_input(
                         event.conversation_id, event.event_id
                     )
+                # A new ordinary chat input interrupts unfinished speech from
+                # the previous reply. This never cancels text generation.
+                tts_manager.stop()
                 delivery = await _run_streaming_turn(
-                    rt, event, debug=bool(getattr(args, "debug", False))
+                    rt,
+                    event,
+                    debug=bool(getattr(args, "debug", False)),
+                    tts_manager=tts_manager,
                 )
                 if (
                     manager is not None
@@ -2235,6 +2254,9 @@ async def cmd_repl(args) -> int:
                         source_event_id=event.event_id,
                     )
         finally:
+            # Stop speech/audio threads before the event loop closes; the REPL
+            # must exit without a playing stream or a leftover worker.
+            await asyncio.to_thread(tts_manager.shutdown)
             confirmation = getattr(rt, "profile_confirmation", None)
             if confirmation is not None:
                 await confirmation.shutdown()
@@ -2246,6 +2268,56 @@ async def cmd_repl(args) -> int:
     finally:
         await db.close()
     return 0
+
+
+def _handle_tts_command(manager, parts: list[str]) -> list[str]:
+    """Handle ``/tts ...``; returns lines for the REPL to print.
+
+    Speech expression (``/speech``) and TTS are independent switches: this
+    function never touches the orchestrator or the response provider.
+    """
+    action = parts[1].lower() if len(parts) == 2 else ""
+    if action == "on":
+        lines = [
+            "注意：开启 TTS 后，Ava 的完整回复文本会发送到阿里云百炼"
+            "（DashScope）进行语音合成，音频只在本机播放。"
+        ]
+        ok, message = manager.enable()
+        lines.append(message)
+        if not ok:
+            lines.append("tts: off (未启用)")
+        return lines
+    if action == "off":
+        manager.disable()
+        return ["tts: off"]
+    if action == "stop":
+        manager.stop()
+        suffix = "" if manager.enabled else " (tts off)"
+        return [f"tts: stopped current speech{suffix}"]
+    if action == "status":
+        lines = manager.status().lines()
+        metrics = manager.metrics()
+        if metrics is not None:
+            lines.append(_format_tts_metrics(metrics))
+        return lines
+    return ["usage: /tts on|off|stop|status"]
+
+
+def _format_tts_metrics(metrics: dict) -> str:
+    def value(key: str) -> str:
+        number = metrics.get(key)
+        return "-" if number is None else f"{number:.0f}ms"
+
+    return (
+        "last latency: reply→speech "
+        f"{value('reply_to_speech_start_ms')}"
+        "  request→first_audio "
+        f"{value('request_to_first_audio_ms')}"
+        "  first_audio→played "
+        f"{value('first_audio_received_to_played_ms')}"
+        "  playback "
+        f"{value('first_audio_to_playback_done_ms')}"
+    )
 
 
 def _build_prompt_session():
@@ -2385,7 +2457,9 @@ async def _read_line_with_proactive(rt, session=None) -> str:
     return await _read_line_with_thread(manager)
 
 
-async def _run_streaming_turn(rt, event, *, debug: bool = False) -> dict:
+async def _run_streaming_turn(
+    rt, event, *, debug: bool = False, tts_manager=None
+) -> dict:
     """Render one turn from the real streaming API.
 
     Deltas are written and flushed as they arrive; the full text is never
@@ -2422,6 +2496,7 @@ async def _run_streaming_turn(rt, event, *, debug: bool = False) -> dict:
                 sys.stdout.flush()
             elif item.type == "response_completed":
                 saw_terminal = True
+                completed_at = time.monotonic()
                 completed_status = item.status
                 completed_action = item.action
                 if not saw_started:
@@ -2436,6 +2511,26 @@ async def _run_streaming_turn(rt, event, *, debug: bool = False) -> dict:
                 else:
                     sys.stdout.write("\n")
                 sys.stdout.flush()
+                # Speech is submitted only after the complete text is on
+                # screen, and only for a successful COMPLETED reply. The
+                # display channel is used verbatim so legal [tags] reach the
+                # TTS voice; VOICE=/TEXT= headers are already removed.
+                if (
+                    tts_manager is not None
+                    and getattr(tts_manager, "enabled", False)
+                    and item.status == "COMPLETED"
+                ):
+                    speech_text = item.display_text or item.text
+                    if speech_text and speech_text.strip():
+                        tts_manager.submit(
+                            SpeechJob(
+                                response_id=item.response_id,
+                                conversation_id=item.conversation_id,
+                                text=speech_text,
+                                generation=tts_manager.generation,
+                                reply_completed_at=completed_at,
+                            )
+                        )
             elif item.type == "response_failed":
                 saw_terminal = True
                 if not saw_delta and item.text:
