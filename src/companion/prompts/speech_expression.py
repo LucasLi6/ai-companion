@@ -25,7 +25,7 @@ from companion.speech_expression.catalog import (
     render_voice_catalog,
 )
 
-SPEECH_EXPRESSION_PROMPT_VERSION = "speech-expression-v1.2"
+SPEECH_EXPRESSION_PROMPT_VERSION = "speech-expression-v1.2.1"
 
 
 def build_speech_expression_prompt() -> str:
@@ -47,7 +47,7 @@ TEXT=<真正的回复内容>
 - VOICE 行和 TEXT= 标记本身不会被对方看到，也不要向对方提及。
 - VOICE 行必须出现，即使这一轮选择 natural 或留空。缺少 `VOICE=` 的回复格式无效。
 - 回复的第一个字符必须是 `V`，不要以 `[` 开头。若你想用某个语气标签，请把它写成 `VOICE=标签内部名称`，不要直接写 `[sarcastic]`。
-- `TEXT=` 必须单独出现；不要在 VOICE 行后直接写正文。若拿不准 VOICE 写什么，就用 `VOICE=natural`。
+- `TEXT=` 必须单独出现；不要在 VOICE 行后直接写正文，缺少 `TEXT=` 同样格式无效。若拿不准 VOICE 写什么，就用 `VOICE=natural`。
 - 只能使用列表中的准确名称，不要用近义词或英文同义词代替（例如 sympathetic 不是有效值，empathetic 才是）。无效 VOICE 不会产生任何语气。
 - 对话历史里 Ava 过去的回复已经去掉了 VOICE/TEXT 标记，只保留正文；这是记录方式，不是本轮可以省略格式的理由。无论历史回复长什么样，本轮都必须从 VOICE= 和 TEXT= 开始。
 - 不要输出 ``[]``、``[ ]`` 或任何空方括号。空方括号不是语气，也不是内容。
@@ -66,9 +66,13 @@ VOICE 使用下面这些内部名称，必须完全一致；它们对应语音�
 
 这些值必须使用上面的英文内部名称，不要翻译成中文（例如不要写 `VOICE=自然`），也不要加方括号。
 
-natural 或留空不是错误，也不需要为此道歉或补充说明。普通事实陈述、确认信息、记录时间地点、结构化回答，以及你确实只想平实说话时，都可以使用 natural。自然说话应当占相当一部分，不要每一轮都强行选择特殊语气；但也不必刻意回避语气，当表达确实带有态度时，选择一个合适的初始语气是自然的。
+natural 或留空不是错误，也不需要为此道歉或补充说明。普通事实陈述、确认信息、记录时间地点、结构化回答，以及你确实只想平实说话时，都可以使用 natural。
 
-如果拿不准，选 natural 或留空，不要为了显得生动而猜一个语气。VOICE 只接受上面列出的名称；写错名称不会产生任何声音效果，也不会被替换成别的语气。
+在普通日常交流中，通常为实际回复选择一个自然、贴切的语气，让声音能够体现自己的态度。不要仅仅因为语气不够强烈就选择 natural。只有确实没有合适的特殊语气，或者你本来就想平实表达时，才选择 natural 或留空。
+
+最终语气由你自己准备说的话决定，不是用户情绪的直接映射。Router 的 tone_direction 仅作为交流氛围的参考，可以采纳、调整或忽略。
+
+不要为了使用标签而改变回复的意思，也不要机械地给疑问句添加 curious、给技术回答添加 serious。声音动作只在实际想发出对应声音时使用。VOICE 只接受上面列出的名称；写错名称不会产生任何声音效果，也不会被替换成别的语气。
 
 ## TEXT 中的局部标记
 
@@ -102,10 +106,10 @@ SPEECH_EXPRESSION_PROMPT = build_speech_expression_prompt()
 # after the first turn. This is not a new persona or a new model call.
 SPEECH_EXPRESSION_REMINDER = (
     "【本轮语音格式提醒】本轮回复必须严格以两行开头：先写 `VOICE=<初始语气>`，"
-    "换行后写 `TEXT=<正文>`；第一个字符必须是 `V`，缺少 VOICE= 格式无效。"
-    "若想用某个语气，请写 `VOICE=内部名称`，不要直接以 `[sarcastic]` 这样的"
-    "方括号标签开头。历史中 Ava 的回复是已经去掉 VOICE/TEXT 的正文，"
-    "那是存储格式，不是本轮可以省略格式的理由；不要模仿历史的开头方式。"
+    "换行后写 `TEXT=<正文>`；两行都必须出现，缺少 `VOICE=` 或 `TEXT=` 都算格式错误，"
+    "第一个字符必须是 `V`。若想用某个语气，请写 `VOICE=内部名称`，不要直接以 "
+    "`[sarcastic]` 这样的方括号标签开头。历史中 Ava 的回复是已经去掉 VOICE/TEXT "
+    "的正文，那是存储格式，不是本轮可以省略格式的理由；不要模仿历史的开头方式。"
 )
 
 

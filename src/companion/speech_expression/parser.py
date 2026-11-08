@@ -122,6 +122,10 @@ class SpeechMarkupParser:
         self._remove_empty_brackets = bool(remove_empty_brackets)
         self._code_state = "text"  # text | inline | fence
         self._backtick_run = 0
+        # Last non-whitespace display character across chunks. Used to tell a
+        # prose ``[]`` from a code/array literal with a separating space
+        # (``return []``, ``items = []``) even when the token begins a chunk.
+        self._last_significant = ""
 
     # -- diagnostics -------------------------------------------------------
 
@@ -194,6 +198,17 @@ class SpeechMarkupParser:
 
             close = buffer.find("]", index + 1)
             if close >= 0:
+                if (
+                    close + 1 == length
+                    and close - index + 1 <= MAX_BRACKET_CANDIDATE_LENGTH
+                    and self._needs_follower(buffer, index, close)
+                ):
+                    # The candidate may be Markdown/syntax (``[happy](url)``)
+                    # whose next character decides it. Hold the whole bounded
+                    # candidate until one more character (or finish) arrives.
+                    self._pending = buffer[index:]
+                    index = length
+                    break
                 self._consume_candidate(
                     buffer, index, close, out_text, out_display
                 )
@@ -228,7 +243,13 @@ class SpeechMarkupParser:
         pending = self._pending
         self._pending = ""
         if pending:
-            if is_tag_prefix(pending) or is_invalid_tag_prefix(pending):
+            if pending.endswith("]") and pending.startswith("["):
+                # A complete candidate held back only to inspect its follower.
+                # At end-of-stream there is no follower, so classify it now.
+                self._consume_candidate(
+                    pending, 0, len(pending) - 1, out_text, out_display
+                )
+            elif is_tag_prefix(pending) or is_invalid_tag_prefix(pending):
                 # An unfinished whitelist/invalid tag is model markup, not the
                 # user-visible text. Dropping it is safer than leaking it.
                 pass
@@ -250,6 +271,33 @@ class SpeechMarkupParser:
             return True
         return bool(_CANDIDATE_SHAPE.match(piece[1:]))
 
+    def _needs_follower(self, buffer: str, start: int, close: int) -> bool:
+        """Whether a candidate ending the buffer needs one more character.
+
+        ``[happy](url)`` is Markdown, not a voice tag; the ``(`` only exists in
+        the next chunk. The same is true for ``[](link)``. Hold such a bounded
+        candidate until the follower is known (or the stream ends).
+        """
+        candidate = buffer[start : close + 1]
+        if candidate in TAG_KINDS:
+            return False
+        preceded_by = buffer[start - 1] if start > 0 else self._last_display_char()
+        inner = candidate[1:-1]
+        if (
+            self._remove_empty_brackets
+            and self._code_state == "text"
+            and is_empty_bracket_markup(inner)
+            and self._is_standalone_empty_markup(
+                preceded_by,
+                "",
+                self._previous_significant_char(buffer, start),
+            )
+        ):
+            return True
+        return is_invalid_speech_tag(
+            inner, preceded_by=preceded_by, followed_by=""
+        )
+
     def _consume_candidate(
         self,
         buffer: str,
@@ -260,6 +308,11 @@ class SpeechMarkupParser:
     ) -> None:
         self._flush_backticks()
         candidate = buffer[start : close + 1]
+        if self._code_state != "text":
+            # Inside backticks or a fenced block every bracket is literal
+            # code, even one spelled exactly like an official voice tag.
+            self._append_text(candidate, out_text, out_display)
+            return
         if candidate in TAG_KINDS:
             self._append_tag(candidate, out_display)
             return
@@ -269,7 +322,11 @@ class SpeechMarkupParser:
             self._remove_empty_brackets
             and self._code_state == "text"
             and is_empty_bracket_markup(candidate[1:-1])
-            and self._is_standalone_empty_markup(preceded_by, followed_by)
+            and self._is_standalone_empty_markup(
+                preceded_by,
+                followed_by,
+                self._previous_significant_char(buffer, start),
+            )
         ):
             # The model's V1.1 habit of emitting a bare ``[]`` (or ``[  ]``)
             # must never reach display, history or memory. Backticked and
@@ -288,7 +345,11 @@ class SpeechMarkupParser:
         self._append_text(candidate, out_text, out_display)
 
     @staticmethod
-    def _is_standalone_empty_markup(preceded_by: str, followed_by: str) -> bool:
+    def _is_standalone_empty_markup(
+        preceded_by: str,
+        followed_by: str,
+        previous_significant: str = "",
+    ) -> bool:
         """Keep brackets that are part of code/array/Markdown syntax."""
         if followed_by in ("(", "[", ".", ":", "\\"):
             return False
@@ -299,7 +360,27 @@ class SpeechMarkupParser:
             return False
         if followed_by and followed_by in "\"'":
             return False
+        # A space-separated code context: ``return []``, ``items = []``,
+        # ``f(x, [])``. Only CJK prose or a string start makes a bare ``[]``
+        # the model's empty voice markup.
+        if (
+            previous_significant
+            and previous_significant.isascii()
+            and (
+                previous_significant.isalnum()
+                or previous_significant in "_=([{,;"
+            )
+        ):
+            return False
         return True
+
+    def _previous_significant_char(self, buffer: str, start: int) -> str:
+        probe = start - 1
+        while probe >= 0 and buffer[probe] in " \t\r\n":
+            probe -= 1
+        if probe >= 0:
+            return buffer[probe]
+        return self._last_significant
 
     def _last_display_char(self) -> str:
         if not self._display_parts:
@@ -355,6 +436,10 @@ class SpeechMarkupParser:
         if display_piece:
             self._display_parts.append(display_piece)
             out_display.append(display_piece)
+            for char in reversed(display_piece):
+                if not char.isspace():
+                    self._last_significant = char
+                    break
 
     def _track_code(self, piece: str) -> None:
         """Track backticked/fenced code so empty ``[]`` inside it survives."""
@@ -391,6 +476,7 @@ class SpeechMarkupParser:
     def _append_tag(self, tag: str, out_display: list[str]) -> None:
         self._display_parts.append(tag)
         out_display.append(tag)
+        self._last_significant = "]"
         self._just_removed = True
         kind = TAG_KINDS[tag]
         if kind == KIND_CONTROL:

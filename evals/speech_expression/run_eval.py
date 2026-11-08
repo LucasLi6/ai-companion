@@ -51,9 +51,11 @@ from companion.prompts import response as response_prompts  # noqa: E402
 from companion.prompts.layout import (  # noqa: E402
     RESPONSE_LAYOUT_CHAT,
     RESPONSE_LAYOUT_STRUCTURED,
+    StreamingTextNormalizer,
     response_layout_for,
 )
 from companion.prompts.speech_expression import (  # noqa: E402
+    SPEECH_EXPRESSION_PROMPT_VERSION,
     build_speech_expression_prompt,
 )
 from companion.providers.deepseek_client import (  # noqa: E402
@@ -68,8 +70,10 @@ from companion.speech_expression.catalog import (  # noqa: E402
     render_tag_catalog,
 )
 from companion.speech_expression.parser import (  # noqa: E402
-    VoiceResponseParser,
     parse_voice_response,
+)
+from companion.speech_expression.streaming import (  # noqa: E402
+    VoiceStreamAdapter,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -210,7 +214,15 @@ async def _run_case(
         event = _event(case)
         context = _context(case, history=history)
         analysis = _analysis(case)
-        parser = VoiceResponseParser()
+        layout = response_layout_for(case["input"])
+        speech_active = layout == RESPONSE_LAYOUT_CHAT
+        # Mirror the orchestrator exactly: raw tokens enter the VOICE/TEXT
+        # adapter before any whitespace normalisation. The structured path has
+        # no speech protocol and normalises verbatim layout instead.
+        adapter = VoiceStreamAdapter(layout) if speech_active else None
+        normalizer = None if speech_active else StreamingTextNormalizer(layout)
+        canonical_deltas: list[str] = []
+        display_deltas: list[str] = []
         raw_model_parts: list[str] = []
         t0 = time.monotonic()
         first_token_ms = None
@@ -224,9 +236,24 @@ async def _run_case(
                     raw_model_parts.append(delta.content)
                     if first_token_ms is None:
                         first_token_ms = (time.monotonic() - t0) * 1000
-                    parser.feed(delta.content)
-                    if first_display_ms is None and parser.text.strip():
-                        first_display_ms = (time.monotonic() - t0) * 1000
+                    if adapter is not None:
+                        piece = adapter.feed(delta.content)
+                        if piece.text:
+                            canonical_deltas.append(piece.text)
+                            if first_display_ms is None:
+                                first_display_ms = (
+                                    time.monotonic() - t0
+                                ) * 1000
+                        if piece.display_text:
+                            display_deltas.append(piece.display_text)
+                    else:
+                        visible = normalizer.feed(delta.content)
+                        if visible:
+                            canonical_deltas.append(visible)
+                            if first_display_ms is None:
+                                first_display_ms = (
+                                    time.monotonic() - t0
+                                ) * 1000
                 if delta.finish_reason:
                     finish_reason = delta.finish_reason
                 if delta.usage_reported and delta.total_tokens is not None:
@@ -237,30 +264,65 @@ async def _run_case(
                     }
         except Exception as exc:  # keep the eval running; record the failure
             error = f"{type(exc).__name__}: {exc}"
-        parser.finish()
+        if adapter is not None:
+            tail = adapter.finish()
+            if tail.text:
+                canonical_deltas.append(tail.text)
+            if tail.display_text:
+                display_deltas.append(tail.display_text)
+            result = adapter.parser.result()
+        else:
+            normalizer.finish()
+            result = None
         total_ms = (time.monotonic() - t0) * 1000
-        result = parser.result()
         raw_model_output = "".join(raw_model_parts)
+        canonical = "".join(canonical_deltas)
+        display_text = "".join(display_deltas) if adapter is not None else None
+        delta_join_ok = (
+            adapter is None
+            or (
+                "".join(canonical_deltas) == adapter.text
+                and "".join(display_deltas) == adapter.display_text
+            )
+        )
 
-        valid_tags = [
-            segment.tag
-            for segment in result.segments
-            if segment.tag is not None
-        ]
-        nonverbal_tags = [
-            segment.tag
-            for segment in result.segments
-            if segment.kind == KIND_NONVERBAL and segment.tag is not None
-        ]
-        control_tags = [
-            segment.tag
-            for segment in result.segments
-            if segment.kind == "control" and segment.tag is not None
-        ]
-        effective_controls = ([result.voice] if result.voice else []) + control_tags
-        invalid_tags = list(result.invalid_tags)
-        canonical = result.text.strip()
-        empty = not canonical
+        valid_tags = (
+            [
+                segment.tag
+                for segment in result.segments
+                if segment.tag is not None
+            ]
+            if result is not None
+            else []
+        )
+        nonverbal_tags = (
+            [
+                segment.tag
+                for segment in result.segments
+                if segment.kind == KIND_NONVERBAL and segment.tag is not None
+            ]
+            if result is not None
+            else []
+        )
+        control_tags = (
+            [
+                segment.tag
+                for segment in result.segments
+                if segment.kind == "control" and segment.tag is not None
+            ]
+            if result is not None
+            else []
+        )
+        effective_controls = (
+            ([result.voice] if result.voice else []) + control_tags
+            if result is not None
+            else []
+        )
+        invalid_tags = list(result.invalid_tags) if result is not None else []
+        empty_markup_count = (
+            adapter.empty_markup_count if adapter is not None else 0
+        )
+        empty = not canonical.strip()
 
         recovery_attempted = False
         recovery_succeeded = False
@@ -289,13 +351,20 @@ async def _run_case(
             "layout": response_layout_for(case["input"]),
             "raw_model_output": raw_model_output,
             "raw": raw_model_output,
-            "display_text": result.display_text,
+            "display_text": display_text,
             "canonical_text": canonical,
-            "voice": result.voice,
-            "invalid_voice": result.invalid_voice,
-            "protocol_valid": result.protocol_valid,
-            "protocol_error": result.protocol_error,
-            "empty_markup_count": parser.empty_markup_count,
+            "voice": result.voice if result is not None else None,
+            "invalid_voice": (
+                result.invalid_voice if result is not None else None
+            ),
+            "protocol_valid": (
+                result.protocol_valid if result is not None else None
+            ),
+            "protocol_error": (
+                result.protocol_error if result is not None else None
+            ),
+            "empty_markup_count": empty_markup_count,
+            "delta_join_ok": delta_join_ok,
             "valid_tags": valid_tags,
             "control_tags": control_tags,
             "effective_control_tags": effective_controls,
@@ -366,6 +435,15 @@ def summarize(records: list[dict]) -> dict:
     for record in records:
         for tag in record["nonverbal_tags"]:
             nonverbal_counts[tag] = nonverbal_counts.get(tag, 0) + 1
+    voice_counts: dict[str, int] = {}
+    for record in records:
+        voice = record.get("voice") or "natural"
+        voice_counts[voice] = voice_counts.get(voice, 0) + 1
+    protocol_errors: dict[str, int] = {}
+    for record in records:
+        error_name = record.get("protocol_error")
+        if error_name:
+            protocol_errors[error_name] = protocol_errors.get(error_name, 0) + 1
     with_recovery = [r for r in records if r["recovery_attempted"]]
     tokens = [
         r["usage"]["completion_tokens"]
@@ -386,6 +464,18 @@ def summarize(records: list[dict]) -> dict:
         "valid_tag_rate_after_parser": round(valid / emitted, 4) if emitted else 1.0,
         "empty_replies": sum(1 for r in records if r["empty"]),
         "empty_reply_rate": share(records, lambda r: r["empty"]),
+        "empty_bracket_leaks": sum(
+            1
+            for r in records
+            if (r["canonical_text"] or "").lstrip().startswith("[]")
+            or (r.get("display_text") or "").lstrip().startswith("[]")
+        ),
+        "empty_markup_removed": sum(
+            r.get("empty_markup_count") or 0 for r in records
+        ),
+        "delta_join_failures": sum(
+            1 for r in records if not r.get("delta_join_ok", True)
+        ),
         "coverage_desirable": share(
             desirable, lambda r: bool(r["effective_control_tags"])
         ),
@@ -409,6 +499,12 @@ def summarize(records: list[dict]) -> dict:
             "scored_cases": 0,
             "note": "VOICE choices are judged in the report by a human reviewer.",
         },
+        "voice_counts": dict(
+            sorted(voice_counts.items(), key=lambda item: -item[1])
+        ),
+        "protocol_error_counts": dict(
+            sorted(protocol_errors.items(), key=lambda item: -item[1])
+        ),
         "desirable_cases": len(desirable),
         "unnecessary_tag_rate_plain_chat": share(
             plain_chat, lambda r: bool(r["valid_tags"])
@@ -538,6 +634,7 @@ async def evaluate(
     ]
     report = {
         "prompt_version": version,
+        "speech_prompt_version": SPEECH_EXPRESSION_PROMPT_VERSION,
         "model": config.model,
         "base_url": config.base_url,
         "started_at": datetime.now(timezone.utc).isoformat(),

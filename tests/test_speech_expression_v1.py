@@ -1148,7 +1148,7 @@ def test_prompt_block_is_off_by_default_and_preserves_the_persona():
         "任何正常回复都必须包含实际文字",
     ):
         assert rule in system
-    assert SPEECH_EXPRESSION_PROMPT_VERSION == "speech-expression-v1.2"
+    assert SPEECH_EXPRESSION_PROMPT_VERSION == "speech-expression-v1.2.1"
 
 
 def test_proactive_prompt_uses_the_same_optional_block():

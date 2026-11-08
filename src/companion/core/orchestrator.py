@@ -92,10 +92,10 @@ from companion.prompts.layout import (
     response_layout_for,
 )
 from companion.speech_expression.parser import (
-    VoiceResponseParser,
     has_valid_reply_text,
     parse_voice_response,
 )
+from companion.speech_expression.streaming import VoiceStreamAdapter
 from companion.runtime_context.connection import ConnectionInfo
 from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
 from companion.storage.repositories import Repositories
@@ -1197,10 +1197,19 @@ class Orchestrator:
                             ):
                                 # Same parser as the streaming path: only the
                                 # canonical text may continue to the action,
-                                # history, memory and profile code.
+                                # history, memory and profile code. Both
+                                # channels use the same chat normalisation, so
+                                # streaming and one-shot replies are identical.
                                 parsed = parse_voice_response(response_text)
-                                response_text = parsed.text.strip()
-                                stream_meta["display_text"] = parsed.display_text
+                                response_text = normalize_response_text(
+                                    parsed.text, RESPONSE_LAYOUT_CHAT
+                                )
+                                stream_meta["display_text"] = (
+                                    normalize_response_text(
+                                        parsed.display_text,
+                                        RESPONSE_LAYOUT_CHAT,
+                                    )
+                                )
                                 if not has_valid_reply_text(response_text):
                                     if (
                                         getattr(generated, "finish_reason", None)
@@ -1961,12 +1970,12 @@ class Orchestrator:
             return None
         raw = str(generated or "")
         parsed = parse_voice_response(raw)
-        text = parsed.text.strip()
+        text = normalize_response_text(parsed.text, RESPONSE_LAYOUT_CHAT)
         if not has_valid_reply_text(text):
             return None
         return (
             text,
-            parsed.display_text,
+            normalize_response_text(parsed.display_text, RESPONSE_LAYOUT_CHAT),
             getattr(generated, "finish_reason", None),
         )
 
@@ -2002,8 +2011,10 @@ class Orchestrator:
             # parser and canonical/display split applies. ProactiveMessageRecord
             # stores only ``text``.
             parsed = parse_voice_response(text)
-            text = parsed.text.strip()
-            display_text = parsed.display_text
+            text = normalize_response_text(parsed.text, RESPONSE_LAYOUT_CHAT)
+            display_text = normalize_response_text(
+                parsed.display_text, RESPONSE_LAYOUT_CHAT
+            )
             if not has_valid_reply_text(text):
                 if finish_reason == "length":
                     # Existing proactive policy discards truncated output; do
@@ -2431,27 +2442,16 @@ class Orchestrator:
         speech_active = (
             self.speech_expression_enabled and layout == RESPONSE_LAYOUT_CHAT
         )
-        parser = VoiceResponseParser() if speech_active else None
-        # The parser can expose leading/trailing whitespace after a tag is
-        # removed (e.g. "[giggles] 你好" or "你好 [giggles]"). A structured-layout
-        # normalizer is exactly a streaming trimmer: it drops leading whitespace
-        # and holds trailing whitespace until real text arrives. It runs on the
-        # canonical channel only, so the display keeps every tag untouched.
-        canonical_trim = (
-            StreamingTextNormalizer(RESPONSE_LAYOUT_STRUCTURED)
-            if parser is not None
-            else None
-        )
+        # V1.2.1: the raw provider delta goes to the VOICE/TEXT parser first.
+        # Normalising before parsing turns the header's newline into a space,
+        # so the parser cannot see where ``VOICE=...`` ends. The adapter then
+        # normalises each parsed channel and emits already-final deltas.
+        adapter = VoiceStreamAdapter(layout) if speech_active else None
         # Emit already-normalised deltas so the text a surface displays is the
         # same string the database stores. A trailing whitespace run is held
         # back until the next real character, which makes the concatenation of
         # every emitted delta exactly ``normalize_response_text(raw, layout)``.
         normalizer = StreamingTextNormalizer(layout)
-        # V1.1: hold leading labels until the first real text arrives. A reply
-        # that never gets past its labels must not flash an empty bubble in the
-        # UI before it is treated as EMPTY_SPEECH_OUTPUT.
-        held_display = ""
-        first_text_emitted = False
         stream.started(response_id)
         try:
             async for delta in self.response.generate_stream(
@@ -2462,30 +2462,18 @@ class Orchestrator:
                         first_token = True
                         first_token_ms = (time.monotonic() - started_at) * 1000
                     chunks.append(delta.content)
-                    visible = normalizer.feed(delta.content)
-                    if visible:
-                        if parser is not None:
-                            parsed = parser.feed(visible)
-                            emitted_text = canonical_trim.feed(parsed.text)
-                            display_piece = parsed.display_text
-                            if not first_text_emitted:
-                                held_display += display_piece
-                                if not emitted_text:
-                                    # Only labels confirmed so far; publish
-                                    # nothing until real prose appears.
-                                    continue
-                                display_piece = held_display
-                                held_display = ""
-                                first_text_emitted = True
-                            elif not emitted_text and not display_piece:
-                                continue
-                            emitted_chunks.append(emitted_text)
+                    if adapter is not None:
+                        piece = adapter.feed(delta.content)
+                        if piece.text or piece.display_text:
+                            emitted_chunks.append(piece.text)
                             stream.delta(
                                 response_id,
-                                emitted_text,
-                                display_delta=display_piece or None,
+                                piece.text,
+                                display_delta=piece.display_text or None,
                             )
-                        else:
+                    else:
+                        visible = normalizer.feed(delta.content)
+                        if visible:
                             emitted_chunks.append(visible)
                             stream.delta(response_id, visible)
                 if delta.finish_reason:
@@ -2500,9 +2488,7 @@ class Orchestrator:
             # Interrupted output is persisted canonically: tags never entered
             # the text channel, and a still-buffered partial tag is dropped.
             partial = (
-                normalize_response_text(parser.text, layout)
-                if parser is not None
-                else "".join(chunks)
+                adapter.text if adapter is not None else "".join(chunks)
             )
             await self._persist_partial(
                 event=event,
@@ -2516,9 +2502,7 @@ class Orchestrator:
             raise
         except Exception as exc:
             partial = (
-                normalize_response_text(parser.text, layout)
-                if parser is not None
-                else "".join(chunks)
+                adapter.text if adapter is not None else "".join(chunks)
             )
             await self._persist_partial(
                 event=event,
@@ -2530,32 +2514,19 @@ class Orchestrator:
             )
             stream.failed(response_id, error=str(exc), partial_text=partial or None)
             raise
-        if parser is not None:
-            tail = parser.finish()
-            tail_text = canonical_trim.feed(tail.text) + canonical_trim.finish()
-            tail_display = tail.display_text
-            if not first_text_emitted:
-                held_display += tail_display
-                if tail_text:
-                    display_piece = held_display
-                    held_display = ""
-                    first_text_emitted = True
-                    emitted_chunks.append(tail_text)
-                    stream.delta(
-                        response_id,
-                        tail_text,
-                        display_delta=display_piece or None,
-                    )
-            elif tail_text or tail_display:
-                emitted_chunks.append(tail_text)
+        if adapter is not None:
+            tail = adapter.finish()
+            if tail.text or tail.display_text:
+                emitted_chunks.append(tail.text)
                 stream.delta(
                     response_id,
-                    tail_text,
-                    display_delta=tail_display or None,
+                    tail.text,
+                    display_delta=tail.display_text or None,
                 )
             # Canonical: whitelist tags, invalid voice markup and an unfinished
             # trailing tag are gone. Using the emitted chunks (rather than
-            # re-normalising) guarantees concat(canonical deltas) == text.
+            # re-normalising) guarantees concat(canonical deltas) == text, and
+            # the adapter's display channel guarantees the same for display.
             text = "".join(emitted_chunks)
             if not has_valid_reply_text(text):
                 if finish_reason == "length":
@@ -2583,7 +2554,7 @@ class Orchestrator:
                     if recovery_finish == "length":
                         finish_reason = "length"
             else:
-                display_text = parser.display_text
+                display_text = adapter.display_text
         else:
             text = normalize_response_text("".join(chunks).strip(), layout)
             display_text = None
@@ -2600,7 +2571,7 @@ class Orchestrator:
             "first_token_ms": first_token_ms,
             "emitted_text": "".join(emitted_chunks),
         }
-        if parser is not None:
+        if adapter is not None:
             meta["display_text"] = display_text
         return (
             text,
