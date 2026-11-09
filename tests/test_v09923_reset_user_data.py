@@ -337,6 +337,48 @@ async def test_apply_keeps_persona_and_identity_and_clears_learning(tmp_path):
     assert contents == {"我自己顺其自然", "自己顺其自然"}
 
 
+async def test_reset_keeps_owner_bindings_and_removes_others(tmp_path):
+    """A speaker binding is identity: the owner's survives, others go."""
+    seed = await _seed(tmp_path)
+    db = await Database(seed["path"]).connect()
+    try:
+        rt = build_runtime(db, with_worker=False)
+        guest = await rt.registry.register(
+            "Guest",
+            "guest",
+            allow_processing=True,
+            allow_persistence=True,
+            allow_memory_learning=False,
+            allow_external_ai=False,
+        )
+        await rt.speaker_bindings.bind_speaker(
+            seed["person_id"], "S-OWNER", "owner"
+        )
+        await rt.speaker_bindings.bind_speaker(
+            guest.person_id, "S-GUEST", "owner"
+        )
+    finally:
+        await db.close()
+
+    report = await reset_user_data(
+        seed["path"],
+        apply=True,
+        preserve_identity=True,
+        preserve_persona=True,
+        backup_path=tmp_path / "pre-reset.db",
+        skip_process_check=True,
+    )
+
+    assert report.applied is True
+    counts = report.tables["person_speaker_bindings"]
+    assert counts.kept == 1
+    assert counts.deleted == 1
+    assert _sync_rows(
+        seed["path"],
+        "SELECT speaker_id, person_id FROM person_speaker_bindings",
+    ) == [{"speaker_id": "S-OWNER", "person_id": seed["person_id"]}]
+
+
 async def test_reset_database_starts_and_reads_persona_and_identity(tmp_path):
     seed = await _seed(tmp_path)
     await reset_user_data(

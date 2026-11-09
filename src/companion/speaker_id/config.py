@@ -69,8 +69,28 @@ DEFAULT_NEW_CANDIDATE_THRESHOLD = 0.30
 DEFAULT_MINIMUM_MATCH_MARGIN = 0.06
 DEFAULT_MINIMUM_ENROLLMENT_QUALITY = "MEDIUM"
 
+# Enrolment is a *write* into the long-lived store, so it gets its own,
+# stricter proof than recognition. The default is deliberately not below the
+# known-match threshold; it is a conservative starting point, not a calibrated
+# value. Matching (read-only) may reuse an identity at 0.43, but only a
+# clearly stronger score is allowed to add a permanent reference sample.
+DEFAULT_ENROLLMENT_MATCH_THRESHOLD = 0.55
+DEFAULT_ENROLLMENT_MARGIN = 0.10
+
 DEFAULT_MAX_EMBEDDINGS_PER_SPEAKER = 8
 DEFAULT_MAX_CENTERS_PER_SPEAKER = 2
+
+# A new sample is considered redundant when it is this close to an existing
+# vector of the same identity. Duplicates are only kept if they are better
+# quality, and then replace the closest non-protected sample.
+DEFAULT_DUPLICATE_SAMPLE_SIMILARITY = 0.995
+
+# Bounded gain preprocessing is OFF by default: it changes the waveform that
+# reaches the model and therefore the embedding. Enabling it must go through
+# the versioned model key, so old and new vectors are never compared.
+DEFAULT_GAIN_PREPROCESSING = False
+GAIN_PREPROCESSING_VERSION = "gain-v1"
+DEFAULT_MAX_GAIN_DB = 12.0
 
 
 class SpeakerConfigError(Exception):
@@ -105,6 +125,11 @@ class SpeakerConfig:
     new_candidate_threshold: float = DEFAULT_NEW_CANDIDATE_THRESHOLD
     minimum_match_margin: float = DEFAULT_MINIMUM_MATCH_MARGIN
     minimum_enrollment_quality: str = DEFAULT_MINIMUM_ENROLLMENT_QUALITY
+    enrollment_match_threshold: float = DEFAULT_ENROLLMENT_MATCH_THRESHOLD
+    enrollment_margin: float = DEFAULT_ENROLLMENT_MARGIN
+    duplicate_sample_similarity: float = DEFAULT_DUPLICATE_SAMPLE_SIMILARITY
+    gain_preprocessing: bool = DEFAULT_GAIN_PREPROCESSING
+    max_gain_db: float = DEFAULT_MAX_GAIN_DB
 
     max_embeddings_per_speaker: int = DEFAULT_MAX_EMBEDDINGS_PER_SPEAKER
     max_centers_per_speaker: int = DEFAULT_MAX_CENTERS_PER_SPEAKER
@@ -116,11 +141,16 @@ class SpeakerConfig:
         """Version key stored next to every embedding.
 
         Vectors produced by a different model or preprocessing version are
-        never compared; the key is the single source of that decision.
+        never compared; the key is the single source of that decision. Gain
+        preprocessing (off by default) is part of the key precisely because it
+        changes the waveform the model sees.
         """
+        version = self.embedding_version
+        if self.gain_preprocessing:
+            version = f"{version}+{GAIN_PREPROCESSING_VERSION}"
         return (
             f"{self.model_id}@{self.model_revision}"
-            f"/{self.embedding_version}"
+            f"/{version}"
         )
 
     @property
@@ -156,6 +186,17 @@ def _env_int(
     if value < minimum:
         raise SpeakerConfigError(f"{name} 必须大于等于 {minimum}。")
     return value
+
+
+def _env_bool(
+    env: Mapping[str, str], name: str, default: bool
+) -> bool:
+    raw = _env_str(env, name, "1" if default else "0").lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise SpeakerConfigError(f"{name} 必须是 true/false。")
 
 
 def load_speaker_config(
@@ -252,6 +293,30 @@ def load_speaker_config(
             "阈值必须满足 0 <= new_candidate <= candidate <= known <= 1。"
         )
 
+    enrollment_match = _env_float(
+        env, "AVA_SPEAKER_ENROLLMENT_THRESHOLD",
+        max(DEFAULT_ENROLLMENT_MATCH_THRESHOLD, known), minimum=0.0,
+    )
+    if enrollment_match < known:
+        raise SpeakerConfigError(
+            "AVA_SPEAKER_ENROLLMENT_THRESHOLD 不得低于 known 阈值。"
+        )
+    enrollment_margin = _env_float(
+        env, "AVA_SPEAKER_ENROLLMENT_MARGIN",
+        DEFAULT_ENROLLMENT_MARGIN, minimum=0.0,
+    )
+    duplicate_similarity = _env_float(
+        env, "AVA_SPEAKER_DUPLICATE_SIMILARITY",
+        DEFAULT_DUPLICATE_SAMPLE_SIMILARITY, minimum=0.0,
+    )
+    max_gain_db = _env_float(
+        env, "AVA_SPEAKER_MAX_GAIN_DB",
+        DEFAULT_MAX_GAIN_DB, minimum=0.0,
+    )
+    gain_preprocessing = _env_bool(
+        env, "AVA_SPEAKER_GAIN_PREPROCESSING", DEFAULT_GAIN_PREPROCESSING
+    )
+
     enrollment = _env_str(
         env, "AVA_SPEAKER_MINIMUM_ENROLLMENT_QUALITY",
         DEFAULT_MINIMUM_ENROLLMENT_QUALITY,
@@ -288,6 +353,11 @@ def load_speaker_config(
         new_candidate_threshold=new_candidate,
         minimum_match_margin=margin,
         minimum_enrollment_quality=enrollment,
+        enrollment_match_threshold=enrollment_match,
+        enrollment_margin=enrollment_margin,
+        duplicate_sample_similarity=duplicate_similarity,
+        gain_preprocessing=gain_preprocessing,
+        max_gain_db=max_gain_db,
         max_embeddings_per_speaker=max_embeddings,
         max_centers_per_speaker=max_centers,
         debug=debug,
@@ -296,11 +366,17 @@ def load_speaker_config(
 
 __all__ = [
     "DEFAULT_DB_PATH",
+    "DEFAULT_DUPLICATE_SAMPLE_SIMILARITY",
     "DEFAULT_EMBEDDING_VERSION",
+    "DEFAULT_ENROLLMENT_MARGIN",
+    "DEFAULT_ENROLLMENT_MATCH_THRESHOLD",
+    "DEFAULT_GAIN_PREPROCESSING",
+    "DEFAULT_MAX_GAIN_DB",
     "DEFAULT_MODEL_ID",
     "DEFAULT_MODEL_REVISION",
     "DEVICES",
     "EMBEDDING_DIM",
+    "GAIN_PREPROCESSING_VERSION",
     "SAMPLE_RATE",
     "SpeakerConfig",
     "SpeakerConfigError",

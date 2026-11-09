@@ -1012,7 +1012,7 @@ async def test_e10_an_old_database_upgrades_without_losing_rows(tmp_path):
     try:
         await upgraded.initialize()
         cur = await upgraded.execute("SELECT MAX(version) AS v FROM schema_version")
-        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 31
+        assert (await cur.fetchone())["v"] == SCHEMA_VERSION == 32
         cur = await upgraded.execute(
             "SELECT candidate_id, field_key FROM"
             " person_profile_candidates_legacy WHERE person_id='person_old'"

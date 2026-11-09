@@ -25,7 +25,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from companion.config import configure_logging, default_db_path
 from companion.agent.constants import (
@@ -2077,6 +2077,56 @@ async def cmd_demo(args) -> int:
     return 0
 
 
+VOICE_PERSON_BINDING_ENV = "AVA_VOICE_PERSON_BINDING"
+_DEFAULT_PERSON = object()
+
+
+def voice_person_binding_enabled(env=None) -> bool:
+    """Whether voice turns resolve their speaker through explicit bindings.
+
+    Off by default: the REPL keeps the single startup person for both keyboard
+    and microphone input. When enabled, a microphone turn must resolve through
+    ``person_speaker_bindings`` or stay anonymous; it never falls back to the
+    startup person.
+    """
+    source = os.environ if env is None else env
+    return str(source.get(VOICE_PERSON_BINDING_ENV, "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+async def resolve_voice_person_id(
+    rt,
+    speaker_result,
+    *,
+    default_person_id: Optional[str],
+    enabled: Optional[bool] = None,
+) -> Optional[str]:
+    """Resolve one voice final's speaker snapshot to a person id.
+
+    With the bridge disabled this returns ``default_person_id`` exactly as
+    before. With it enabled the answer comes only from
+    :class:`SpeakerBindingService`: an unbound, ambiguous, provisional or
+    unauthorized speaker resolves to ``None`` (anonymous), never to the
+    startup person. Resolution errors also mean anonymous, so a broken voice
+    print can never attribute speech to someone else.
+    """
+    if enabled is None:
+        enabled = voice_person_binding_enabled()
+    if not enabled:
+        return default_person_id
+    service = getattr(rt, "speaker_bindings", None)
+    if service is None:
+        return None
+    try:
+        return await service.resolve_speaker(speaker_result)
+    except Exception:  # noqa: BLE001 - identity must never break the turn
+        return None
+
+
 async def _select_repl_person(rt, person_id):
     """Choose the REPL speaker without ever implicitly creating a new person.
 
@@ -2165,6 +2215,7 @@ async def cmd_repl(args) -> int:
             # without ever reading or restoring the typed buffer.
             repl_session = _build_prompt_session()
             voice_mode = bool(getattr(args, "voice", False))
+            voice_binding_enabled = voice_mode and voice_person_binding_enabled()
             coordinator = None
             voice_output = (
                 _PromptTurnOutput(repl_session)
@@ -2324,8 +2375,17 @@ async def cmd_repl(args) -> int:
                 *,
                 output=None,
                 on_tts_started=None,
+                person_id: Any = _DEFAULT_PERSON,
             ) -> dict:
                 # Keyboard and voice both go through this one call path.
+                # Keyboard callers omit ``person_id`` and keep the startup
+                # person; a voice caller passes the resolved id (or ``None``
+                # for an anonymous/unbound speaker).
+                speaker_person_id = (
+                    person.person_id
+                    if person_id is _DEFAULT_PERSON
+                    else person_id
+                )
                 if coordinator is not None:
                     coordinator.begin_turn()
                 delivery = {"delivered": False}
@@ -2336,7 +2396,7 @@ async def cmd_repl(args) -> int:
                         source=source,
                         submitted_at=submitted_at,
                         conversation_id=args.conversation,
-                        person_id=person.person_id,
+                        person_id=speaker_person_id,
                         addressee=addressee,
                         debug=bool(getattr(args, "debug", False)),
                         tts_manager=tts_manager,
@@ -2471,6 +2531,21 @@ async def cmd_repl(args) -> int:
                             # formal REPL; echo the accepted text exactly once,
                             # above the live input line. Partials are never
                             # echoed or persisted.
+                            voice_person_id: Optional[str] = person.person_id
+                            if voice_binding_enabled:
+                                voice_person_id = await resolve_voice_person_id(
+                                    rt,
+                                    final.speaker,
+                                    default_person_id=person.person_id,
+                                    enabled=True,
+                                )
+                                if voice_person_id is None:
+                                    # Never substitute the startup person for an
+                                    # unbound speaker: anonymous handling means
+                                    # no private Profile/Memory access.
+                                    await voice_output.write(
+                                        "[id] 当前声音未绑定到已登记的人，本条按匿名处理。\n"
+                                    )
                             await voice_output.write(
                                 f"you 🎤> {final.text}\n"
                             )
@@ -2482,6 +2557,7 @@ async def cmd_repl(args) -> int:
                                 time.monotonic(),
                                 output=voice_output,
                                 on_tts_started=_voice_tts_started,
+                                person_id=voice_person_id,
                             )
                             continue
 
@@ -3351,7 +3427,7 @@ async def handle_user_message(
     source: EventSource,
     submitted_at: float,
     conversation_id: str,
-    person_id: str,
+    person_id: Optional[str],
     addressee: str,
     debug: bool = False,
     tts_manager=None,

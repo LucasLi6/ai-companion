@@ -44,6 +44,11 @@ from companion.people.profile_models import (
 )
 
 MAX_CHANGES_PER_REVIEW = 10
+# The model may return more candidates than one review can apply. This is the
+# transport envelope, not a write limit: the engine marks every change beyond
+# MAX_CHANGES_PER_REVIEW as ``change_limit_exceeded`` and the service records
+# it, so overflow is never silently dropped.
+MAX_MODEL_CHANGES = 60
 MAX_ENTRY_CHARS = 1200
 MAX_QUOTE_CHARS = 500
 DEFAULT_RECENT_TURNS = 8
@@ -1439,6 +1444,7 @@ __all__ = [
     "INFERENCE_ONLY_FIELDS",
     "MAX_SNAPSHOT_LEGACY_FIELDS",
     "MAX_CHANGES_PER_REVIEW",
+    "MAX_MODEL_CHANGES",
     "ProfileApplyResult",
     "ProfileChangeProposal",
     "ProfileEvidenceBundle",

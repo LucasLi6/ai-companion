@@ -196,6 +196,8 @@ class SpeakerObserver(Protocol):
 
     def on_end(self, utterance_id: int) -> None: ...
 
+    def on_finalized(self, utterance_id: int, success: bool) -> None: ...
+
     def on_cancel(self, utterance_id: int) -> None: ...
 
     def snapshot(self, utterance_id: int) -> Any: ...
@@ -1047,6 +1049,11 @@ class ASRManager:
             [fragment for _, fragment in utterance.finals]
         )
         ok = merged != "" and not error
+        # Tell the optional voice-print hook whether this utterance may ever
+        # contribute a sample. This is separate from VAD end: the speaker side
+        # may already have analysed the audio, but learning waits for this
+        # final outcome. The call is non-blocking.
+        self._speaker_finalized(utterance.uid, ok)
         if merged:
             self.stats.finalized += 1
             if self.render_finals:
@@ -1393,6 +1400,16 @@ class ASRManager:
             observer.on_cancel(uid)
         except Exception:  # noqa: BLE001 - voice-print must not stop ASR
             self.logger.debug("speaker_on_cancel_failed uid=%s", uid)
+
+    def _speaker_finalized(self, uid: int, success: bool) -> None:
+        observer = self._speaker_observer
+        callback = getattr(observer, "on_finalized", None) if observer else None
+        if callback is None:
+            return
+        try:
+            callback(uid, bool(success))
+        except Exception:  # noqa: BLE001 - voice-print must not stop ASR
+            self.logger.debug("speaker_on_finalized_failed uid=%s", uid)
 
     def _speaker_snapshot(self, uid: int) -> Any:
         observer = self._speaker_observer

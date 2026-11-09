@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from companion.speaker_id.quality import evaluate_voice_quality
+from companion.speaker_id.quality import (
+    evaluate_voice_quality,
+    inspect_raw_audio,
+    inspect_speaker_audio,
+    prepare_speaker_audio,
+)
 
 
 def tone(seconds: float, *, amplitude: float = 0.25, sample_rate: int = 16000) -> bytes:
@@ -13,6 +18,13 @@ def tone(seconds: float, *, amplitude: float = 0.25, sample_rate: int = 16000) -
         2 * np.pi * 220 * np.arange(n, dtype=np.float32) / sample_rate
     )
     return (samples * 32767).astype("<i2").tobytes()
+
+
+def noise(seconds: float, *, amplitude: float = 0.1, seed: int = 1) -> bytes:
+    rng = np.random.default_rng(seed)
+    n = int(seconds * 16000)
+    samples = rng.normal(0.0, amplitude, n)
+    return np.clip(samples * 32767, -32768, 32767).astype("<i2").tobytes()
 
 
 def test_long_clean_tone_is_high_quality() -> None:
@@ -80,3 +92,48 @@ def test_voiced_seconds_is_frame_based_not_total_length() -> None:
     quality = evaluate_voice_quality(pcm)
     assert 2.8 <= quality.voiced_seconds <= 3.2
     assert quality.quality == "HIGH"
+
+
+def test_loud_but_unclipped_audio_is_usable() -> None:
+    quality = evaluate_voice_quality(tone(2.0, amplitude=0.6))
+    assert quality.usable is True
+    assert quality.quality == "HIGH"
+    assert quality.reason is None
+
+
+def test_noisy_audio_has_an_explicit_verdict() -> None:
+    # The gate cannot separate overlapping voices; it must at least state a
+    # stable verdict instead of treating noise as a clean enrollment sample.
+    quality = evaluate_voice_quality(noise(2.0, amplitude=0.05))
+    assert isinstance(quality.usable, bool)
+    if not quality.usable:
+        assert quality.reason is not None
+
+
+def test_default_path_does_not_change_the_model_waveform() -> None:
+    pcm = tone(2.0, amplitude=0.012)
+    raw = inspect_raw_audio(pcm)
+    prepared = prepare_speaker_audio(pcm, raw)
+    assert prepared is pcm
+
+
+def test_bounded_gain_can_rescue_quiet_audio_for_enrollment() -> None:
+    pcm = tone(2.0, amplitude=0.012)
+    raw = inspect_raw_audio(pcm)
+    prepared = prepare_speaker_audio(pcm, raw, enable_gain=True, max_gain_db=24)
+    assert prepared is not pcm
+    quality = inspect_speaker_audio(prepared, raw, gain_applied=True)
+    assert quality.usable is True
+    assert quality.quality in ("MEDIUM", "HIGH")
+
+
+def test_gain_never_disguises_severe_clipping() -> None:
+    n = 16000 * 2
+    samples = np.where(np.arange(n) % 2 == 0, 0.99, -0.99)
+    pcm = (samples * 32767).astype("<i2").tobytes()
+    raw = inspect_raw_audio(pcm)
+    prepared = prepare_speaker_audio(pcm, raw, enable_gain=True)
+    assert prepared is pcm
+    quality = inspect_speaker_audio(prepared, raw, gain_applied=False)
+    assert quality.usable is False
+    assert quality.reason == "声音明显削波"

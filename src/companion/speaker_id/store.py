@@ -9,11 +9,20 @@ multi-threaded write race cannot corrupt the numbering.
 Privacy rules enforced here:
 
 * raw audio is never stored — only normalized embeddings and diagnostics;
-* a temporary ID is allocated by the database, atomically, never by a Python
-  counter;
-* one utterance can produce at most one observation row;
+* a temporary ID is allocated by a persistent monotonic counter, never by a
+  Python counter and never reused after deletion;
+* one utterance can produce at most one observation row *per session*; the
+  ASR manager restarts utterance numbering from 0, so the identity of an
+  observation is ``(session_id, utterance_id)``;
 * embeddings from an incompatible model version are never compared;
+* a sample records the session/utterance it came from, so a post-commit
+  cancellation can revoke it;
 * every identity can be deleted, and the whole store can be cleared.
+
+V0.9.9.24 migrates old stores in place: legacy observations become
+``session_id='legacy'``, new embedding metadata columns are nullable, and the
+migration runs in one transaction with a row-count check. No table is dropped
+until the copy has been verified.
 """
 
 from __future__ import annotations
@@ -27,6 +36,9 @@ from typing import Any, Iterator, Optional, Sequence
 
 from companion.speaker_id.matcher import SpeakerCandidate
 
+SCHEMA_VERSION = 2
+LEGACY_SESSION_ID = "legacy"
+
 
 class SpeakerStoreError(Exception):
     """Storage failure (message is display-safe)."""
@@ -36,9 +48,7 @@ class IncompatibleModelError(SpeakerStoreError):
     """An embedding cannot be mixed with this profile's model version."""
 
 
-QUALITY_RANK_SQL = (
-    "CASE quality WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 ELSE 1 END"
-)
+_QUALITY_RANK = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
 
 class SpeakerStore:
@@ -47,10 +57,16 @@ class SpeakerStore:
         path: str | Path,
         *,
         max_embeddings_per_speaker: int = 8,
+        duplicate_sample_similarity: float = 0.995,
+        minimum_enrollment_quality: str = "MEDIUM",
         clock=time.time,
     ) -> None:
         self.path = Path(path).expanduser()
         self.max_embeddings_per_speaker = max(1, int(max_embeddings_per_speaker))
+        self.duplicate_sample_similarity = float(duplicate_sample_similarity)
+        self.minimum_enrollment_quality = str(
+            minimum_enrollment_quality or "MEDIUM"
+        ).upper()
         self._clock = clock
         self._lock = threading.RLock()
         self._connection: Optional[sqlite3.Connection] = None
@@ -60,6 +76,7 @@ class SpeakerStore:
         with self._lock:
             if self._connection is not None:
                 return
+            connection: Optional[sqlite3.Connection] = None
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 connection = sqlite3.connect(
@@ -70,11 +87,194 @@ class SpeakerStore:
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.executescript(_SCHEMA)
+                self._migrate(connection)
+            except SpeakerStoreError:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        pass
+                raise
             except (OSError, sqlite3.Error) as exc:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        pass
                 raise SpeakerStoreError(
                     "无法打开声纹数据库（" + type(exc).__name__ + "）。"
                 ) from exc
             self._connection = connection
+
+
+    # -------------------------------------------------------------- migration
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        """Bring an old store to ``SCHEMA_VERSION`` in one verified transaction.
+
+        The version is recorded in ``speaker_meta``; a store created before
+        V0.9.9.24 has no such row, so the shape itself is inspected as well.
+        Columns are only ever added (never dropped), and the observations table
+        is rebuilt only when it lacks ``session_id``. The copy is counted before
+        the old table is dropped; any mismatch rolls the whole transaction back
+        and leaves the original data untouched.
+        """
+        has_meta = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table'"
+            " AND name='speaker_meta'"
+        ).fetchone()
+        if has_meta is None:
+            connection.executescript(_META_SCHEMA)
+
+        embedding_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(speaker_embeddings)"
+            ).fetchall()
+        }
+        observation_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(speaker_observations)"
+            ).fetchall()
+        }
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if "is_verified_reference" not in embedding_columns:
+                connection.execute(
+                    "ALTER TABLE speaker_embeddings ADD COLUMN"
+                    " is_verified_reference INTEGER NOT NULL DEFAULT 0"
+                )
+            if "source_session_id" not in embedding_columns:
+                connection.execute(
+                    "ALTER TABLE speaker_embeddings ADD COLUMN"
+                    " source_session_id TEXT"
+                )
+            if "source_utterance_id" not in embedding_columns:
+                connection.execute(
+                    "ALTER TABLE speaker_embeddings ADD COLUMN"
+                    " source_utterance_id INTEGER"
+                )
+
+            if "session_id" not in observation_columns:
+                self._rebuild_observations(connection)
+
+            # Sentinel samples are not automatically trusted after a version
+            # upgrade: old rows keep ``is_verified_reference = 0``.
+
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS"
+                " idx_speaker_embeddings_source"
+                " ON speaker_embeddings"
+                " (speaker_id, source_session_id, source_utterance_id)"
+                " WHERE source_session_id IS NOT NULL"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_observations_session"
+                " ON speaker_observations(session_id, utterance_id)"
+            )
+            self._seed_sequences(connection)
+            connection.execute(
+                "INSERT INTO speaker_meta(key, value)"
+                " VALUES('schema_version', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(SCHEMA_VERSION),),
+            )
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        else:
+            connection.execute("COMMIT")
+
+        # Never advertise a migrated store that fails SQLite's own checks.
+        check = connection.execute("PRAGMA integrity_check").fetchone()
+        if check is not None and str(check[0]).lower() != "ok":
+            raise SpeakerStoreError(
+                "声纹数据库迁移后完整性检查失败。"
+            )
+
+    @staticmethod
+    def _rebuild_observations(connection: sqlite3.Connection) -> None:
+        before = connection.execute(
+            "SELECT COUNT(*) AS n FROM speaker_observations"
+        ).fetchone()
+        expected = int(before["n"]) if before is not None else 0
+        connection.execute(
+            "CREATE TABLE speaker_observations_v2 ("
+            " observation_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " session_id TEXT NOT NULL DEFAULT 'legacy',"
+            " utterance_id INTEGER NOT NULL,"
+            " speaker_id TEXT,"
+            " match_status TEXT NOT NULL,"
+            " similarity REAL,"
+            " margin REAL,"
+            " created_at REAL NOT NULL,"
+            " UNIQUE(session_id, utterance_id)"
+            ")"
+        )
+        connection.execute(
+            "INSERT INTO speaker_observations_v2"
+            " (session_id, utterance_id, speaker_id, match_status,"
+            "  similarity, margin, created_at)"
+            " SELECT ?, utterance_id, speaker_id, match_status,"
+            "  similarity, margin, created_at"
+            " FROM speaker_observations",
+            (LEGACY_SESSION_ID,),
+        )
+        copied = connection.execute(
+            "SELECT COUNT(*) AS n FROM speaker_observations_v2"
+        ).fetchone()
+        copied_count = int(copied["n"]) if copied is not None else -1
+        if copied_count != expected:
+            raise SpeakerStoreError(
+                "声纹观察记录迁移数量不一致，已回滚。"
+            )
+        connection.execute("DROP TABLE speaker_observations")
+        connection.execute(
+            "ALTER TABLE speaker_observations_v2"
+            " RENAME TO speaker_observations"
+        )
+
+    @staticmethod
+    def _seed_sequences(connection: sqlite3.Connection) -> None:
+        """Persist monotonic counters so a deleted last ID is never reused."""
+        for key, prefix, column in (
+            ("candidate_seq", "TEMP-", "speaker_id"),
+            ("promoted_seq", "S-", "speaker_id"),
+        ):
+            row = connection.execute(
+                "SELECT value FROM speaker_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is not None:
+                continue
+            highest = 0
+            for profile in connection.execute(
+                f"SELECT {column} AS value FROM speaker_profiles"
+                f" WHERE {column} LIKE ?",
+                (prefix + "%",),
+            ).fetchall():
+                suffix = str(profile["value"])[len(prefix):]
+                if suffix.isdigit():
+                    highest = max(highest, int(suffix))
+            connection.execute(
+                "INSERT INTO speaker_meta(key, value) VALUES(?, ?)",
+                (key, str(highest)),
+            )
+
+    @staticmethod
+    def _next_sequence(connection: sqlite3.Connection, key: str) -> int:
+        row = connection.execute(
+            "SELECT value FROM speaker_meta WHERE key = ?", (key,)
+        ).fetchone()
+        value = int(row["value"]) if row is not None else 0
+        value += 1
+        connection.execute(
+            "INSERT INTO speaker_meta(key, value) VALUES(?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        return value
+
 
     def close(self) -> None:
         with self._lock:
@@ -105,18 +305,14 @@ class SpeakerStore:
 
     # ---------------------------------------------------------------- writes
     def create_candidate(self) -> str:
-        """Atomically allocate the next ``TEMP-0001`` style identity."""
+        """Atomically allocate the next ``TEMP-0001`` style identity.
+
+        The counter lives in ``speaker_meta`` and never moves backwards, so
+        deleting ``TEMP-0007`` does not let a later candidate reuse that id.
+        """
         with self._lock, self._transaction() as connection:
-            rows = connection.execute(
-                "SELECT speaker_id FROM speaker_profiles"
-                " WHERE speaker_id LIKE 'TEMP-%'"
-            ).fetchall()
-            highest = 0
-            for row in rows:
-                suffix = str(row["speaker_id"])[len("TEMP-"):]
-                if suffix.isdigit():
-                    highest = max(highest, int(suffix))
-            speaker_id = f"TEMP-{highest + 1:04d}"
+            number = self._next_sequence(connection, "candidate_seq")
+            speaker_id = f"TEMP-{number:04d}"
             now = self._clock()
             connection.execute(
                 "INSERT INTO speaker_profiles"
@@ -136,8 +332,23 @@ class SpeakerStore:
         voiced_seconds: float,
         model_id: str,
         embedding_version: str,
+        source_session_id: Optional[str] = None,
+        source_utterance_id: Optional[int] = None,
+        is_verified_reference: bool = False,
     ) -> Optional[int]:
-        """Store one normalized voice print, keeping the sample count bounded."""
+        """Store one normalized voice print, keeping the sample set useful.
+
+        The write is idempotent per ``(speaker, source session, source
+        utterance)``. A near-duplicate (cosine >= ``duplicate_sample_similarity``)
+        is normally discarded; it may replace the matching sample only when it
+        has strictly better quality, and a verified reference is never
+        replaced. After insertion the set is trimmed to
+        ``max_embeddings_per_speaker`` with verified references protected and
+        the rest chosen by deterministic farthest-first diversity.
+
+        Returns the new (or existing source) embedding id, or ``None`` when
+        the sample added no value.
+        """
         from companion.speaker_id.embedding import validate_embedding
 
         array = validate_embedding(vector)
@@ -165,16 +376,50 @@ class SpeakerStore:
                     " WHERE speaker_id = ?",
                     (model_id, embedding_version, now, speaker_id),
                 )
+
+            if source_session_id is not None and source_utterance_id is not None:
+                existing = connection.execute(
+                    "SELECT embedding_id FROM speaker_embeddings"
+                    " WHERE speaker_id = ? AND source_session_id = ?"
+                    "   AND source_utterance_id = ?",
+                    (speaker_id, str(source_session_id),
+                     int(source_utterance_id)),
+                ).fetchone()
+                if existing is not None:
+                    # A retry after a commit (or an ASR replay) must not add a
+                    # second sample for the same spoken utterance.
+                    return int(existing["embedding_id"])
+
+            duplicate = self._find_duplicate(
+                connection, speaker_id, array
+            )
+            if duplicate is not None:
+                existing_id, existing_vector, existing_rank, protected = duplicate
+                new_rank = _QUALITY_RANK.get(str(quality).upper(), 0)
+                if protected or new_rank <= existing_rank:
+                    return None
+                connection.execute(
+                    "DELETE FROM speaker_embeddings WHERE embedding_id = ?",
+                    (existing_id,),
+                )
+
             cursor = connection.execute(
                 "INSERT INTO speaker_embeddings"
-                " (speaker_id, vector, quality, voiced_seconds, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
+                " (speaker_id, vector, quality, voiced_seconds, created_at,"
+                "  is_verified_reference, source_session_id,"
+                "  source_utterance_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     speaker_id,
                     array.astype("<f4").tobytes(),
                     str(quality),
                     float(voiced_seconds),
                     now,
+                    1 if is_verified_reference else 0,
+                    None if source_session_id is None
+                    else str(source_session_id),
+                    None if source_utterance_id is None
+                    else int(source_utterance_id),
                 ),
             )
             connection.execute(
@@ -184,23 +429,199 @@ class SpeakerStore:
             self._trim_embeddings(connection, speaker_id)
             return int(cursor.lastrowid)
 
+    def _find_duplicate(
+        self,
+        connection: sqlite3.Connection,
+        speaker_id: str,
+        array,
+    ):
+        """Return ``(id, vector, rank, protected)`` for a near-identical sample."""
+        import numpy as np
+
+        rows = connection.execute(
+            "SELECT embedding_id, vector, quality, is_verified_reference"
+            " FROM speaker_embeddings WHERE speaker_id = ?"
+            " ORDER BY embedding_id ASC",
+            (speaker_id,),
+        ).fetchall()
+        best = None
+        best_score = -2.0
+        for row in rows:
+            vector = self._decode_vector(row["vector"])
+            if vector is None:
+                continue
+            score = float(array @ vector)
+            if score > best_score:
+                best_score = score
+                best = (row, vector)
+        if best is None:
+            return None
+        if best_score < self.duplicate_sample_similarity:
+            return None
+        row, vector = best
+        rank = _QUALITY_RANK.get(str(row["quality"]).upper(), 0)
+        return (
+            int(row["embedding_id"]),
+            vector,
+            rank,
+            bool(int(row["is_verified_reference"] or 0)),
+        )
+
     def _trim_embeddings(
         self, connection: sqlite3.Connection, speaker_id: str
     ) -> None:
+        """Keep the best, most diverse bounded sample set for one identity.
+
+        Verified references are protected. If more than the limit exist, the
+        best-quality (then oldest) are kept. Remaining slots are filled by
+        farthest-first diversity over samples that meet the enrollment quality
+        floor, so a low-quality outlier is never admitted merely for being
+        different. Selection is deterministic for the same rows.
+        """
+        limit = self.max_embeddings_per_speaker
         rows = connection.execute(
-            "SELECT embedding_id FROM speaker_embeddings"
-            f" WHERE speaker_id = ? ORDER BY {QUALITY_RANK_SQL} ASC,"
-            " created_at ASC",
+            "SELECT embedding_id, vector, quality, is_verified_reference,"
+            " created_at FROM speaker_embeddings WHERE speaker_id = ?"
+            " ORDER BY embedding_id ASC",
             (speaker_id,),
         ).fetchall()
-        overflow = len(rows) - self.max_embeddings_per_speaker
-        if overflow <= 0:
+        parsed = []
+        for row in rows:
+            vector = self._decode_vector(row["vector"])
+            if vector is None:
+                # Corrupt or legacy-invalid rows are removed, never compared.
+                connection.execute(
+                    "DELETE FROM speaker_embeddings WHERE embedding_id = ?",
+                    (int(row["embedding_id"]),),
+                )
+                continue
+            parsed.append(
+                {
+                    "id": int(row["embedding_id"]),
+                    "vector": vector,
+                    "rank": _QUALITY_RANK.get(
+                        str(row["quality"]).upper(), 0
+                    ),
+                    "verified": bool(int(row["is_verified_reference"] or 0)),
+                    "created_at": float(row["created_at"]),
+                }
+            )
+        if len(parsed) <= limit:
             return
-        for row in rows[:overflow]:
+
+        verified = sorted(
+            (item for item in parsed if item["verified"]),
+            key=lambda item: (
+                -item["rank"], item["created_at"], item["id"]
+            ),
+        )
+        keep = verified[:limit]
+        keep_ids = {item["id"] for item in keep}
+
+        if len(keep) < limit:
+            min_rank = _QUALITY_RANK.get(
+                self.minimum_enrollment_quality, 2
+            )
+            pool = [item for item in parsed if item["id"] not in keep_ids]
+            eligible = sorted(
+                (item for item in pool if item["rank"] >= min_rank),
+                key=lambda item: (
+                    -item["rank"], item["created_at"], item["id"]
+                ),
+            )
+            weak = sorted(
+                (item for item in pool if item["rank"] < min_rank),
+                key=lambda item: (
+                    -item["rank"], item["created_at"], item["id"]
+                ),
+            )
+            selected: list[dict[str, Any]] = []
+            reference = [item["vector"] for item in keep]
+            while len(keep) + len(selected) < limit and eligible:
+                if not reference:
+                    chosen = eligible.pop(0)
+                else:
+                    import numpy as np
+
+                    best_index = 0
+                    best_key = None
+                    for index, item in enumerate(eligible):
+                        distance = min(
+                            1.0 - float(item["vector"] @ anchor)
+                            for anchor in reference
+                        )
+                        key = (
+                            distance,
+                            item["rank"],
+                            -item["created_at"],
+                            -item["id"],
+                        )
+                        if best_key is None or key > best_key:
+                            best_key = key
+                            best_index = index
+                    chosen = eligible.pop(best_index)
+                selected.append(chosen)
+                reference.append(chosen["vector"])
+            # Only after every eligible sample is kept may weaker samples fill
+            # the remaining slots, in quality order (never for being diverse).
+            for item in weak:
+                if len(keep) + len(selected) >= limit:
+                    break
+                selected.append(item)
+            keep.extend(selected)
+            keep_ids.update(item["id"] for item in selected)
+
+        delete_ids = [
+            item["id"] for item in parsed if item["id"] not in keep_ids
+        ]
+        for embedding_id in delete_ids:
             connection.execute(
                 "DELETE FROM speaker_embeddings WHERE embedding_id = ?",
-                (int(row["embedding_id"]),),
+                (embedding_id,),
             )
+
+    @staticmethod
+    def _decode_vector(blob):
+        import numpy as np
+
+        try:
+            vector = np.frombuffer(blob, dtype="<f4").astype(np.float32)
+        except (TypeError, ValueError):
+            return None
+        if vector.ndim != 1 or vector.size == 0:
+            return None
+        if not np.all(np.isfinite(vector)):
+            return None
+        norm = float(np.linalg.norm(vector))
+        if norm < 1e-6:
+            return None
+        return (vector / norm).astype(np.float32)
+
+    def revoke_embedding(
+        self,
+        speaker_id: str,
+        *,
+        source_session_id: str,
+        source_utterance_id: int,
+    ) -> bool:
+        """Remove a sample that was committed before a late cancellation."""
+        with self._lock, self._transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM speaker_embeddings"
+                " WHERE speaker_id = ? AND source_session_id = ?"
+                "   AND source_utterance_id = ?"
+                "   AND is_verified_reference = 0",
+                (speaker_id, str(source_session_id), int(source_utterance_id)),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    "UPDATE speaker_profiles SET updated_at = ?"
+                    " WHERE speaker_id = ?",
+                    (self._clock(), speaker_id),
+                )
+                return True
+            return False
+
 
     def record_observation(
         self,
@@ -210,23 +631,26 @@ class SpeakerStore:
         match_status: str,
         similarity: Optional[float],
         margin: Optional[float],
+        session_id: str = LEGACY_SESSION_ID,
     ) -> None:
-        """One row per utterance; a later good verdict may refine it.
+        """One row per ``(session, utterance)``; a later verdict may refine it.
 
-        A later low-information verdict (``INSUFFICIENT_AUDIO``/``PENDING``/
-        ``ERROR``) never overwrites an already recorded match, and re-processing
-        the same result is idempotent.
+        ASR utterance numbering restarts at 0 in every process, so the session
+        id is part of the row's identity. A later low-information verdict
+        (``INSUFFICIENT_AUDIO``/``PENDING``/``ERROR``) never overwrites an
+        already recorded match, and re-processing the same result is
+        idempotent.
         """
         with self._lock, self._transaction() as connection:
             previous = self._observation_speaker(
-                connection, int(utterance_id)
+                connection, str(session_id), int(utterance_id)
             )
             connection.execute(
                 "INSERT INTO speaker_observations"
-                " (utterance_id, speaker_id, match_status, similarity,"
-                "  margin, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(utterance_id) DO UPDATE SET"
+                " (session_id, utterance_id, speaker_id, match_status,"
+                "  similarity, margin, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(session_id, utterance_id) DO UPDATE SET"
                 "  speaker_id = excluded.speaker_id,"
                 "  match_status = excluded.match_status,"
                 "  similarity = excluded.similarity,"
@@ -234,6 +658,7 @@ class SpeakerStore:
                 " WHERE excluded.match_status NOT IN"
                 "       ('INSUFFICIENT_AUDIO', 'PENDING', 'ERROR')",
                 (
+                    str(session_id),
                     int(utterance_id),
                     speaker_id,
                     str(match_status),
@@ -253,11 +678,14 @@ class SpeakerStore:
 
     @staticmethod
     def _observation_speaker(
-        connection: sqlite3.Connection, utterance_id: int
+        connection: sqlite3.Connection,
+        session_id: str,
+        utterance_id: int,
     ) -> Optional[str]:
         row = connection.execute(
-            "SELECT speaker_id FROM speaker_observations WHERE utterance_id = ?",
-            (utterance_id,),
+            "SELECT speaker_id FROM speaker_observations"
+            " WHERE session_id = ? AND utterance_id = ?",
+            (session_id, utterance_id),
         ).fetchone()
         return None if row is None else row["speaker_id"]
 
@@ -410,9 +838,16 @@ class SpeakerStore:
             if canonical is None or alias is None:
                 return False
             connection.execute(
-                "UPDATE speaker_embeddings SET speaker_id = ?"
+                "UPDATE OR IGNORE speaker_embeddings SET speaker_id = ?"
                 " WHERE speaker_id = ?",
                 (canonical_speaker_id, alias_speaker_id),
+            )
+            # Samples that could not move because the canonical identity
+            # already has a sample from the same source utterance are exact
+            # duplicates and are removed with the alias.
+            connection.execute(
+                "DELETE FROM speaker_embeddings WHERE speaker_id = ?",
+                (alias_speaker_id,),
             )
             connection.execute(
                 "UPDATE speaker_observations SET speaker_id = ?"
@@ -448,16 +883,8 @@ class SpeakerStore:
             ).fetchone()
             if profile is None or str(profile["status"]) == "KNOWN":
                 return None
-            rows = connection.execute(
-                "SELECT speaker_id FROM speaker_profiles"
-                " WHERE speaker_id LIKE 'S-%'"
-            ).fetchall()
-            highest = 0
-            for row in rows:
-                suffix = str(row["speaker_id"])[len("S-"):]
-                if suffix.isdigit():
-                    highest = max(highest, int(suffix))
-            new_id = f"S-{highest + 1:04d}"
+            number = self._next_sequence(connection, "promoted_seq")
+            new_id = f"S-{number:04d}"
             now = self._clock()
             connection.execute(
                 "INSERT INTO speaker_profiles"
@@ -496,7 +923,19 @@ class SpeakerStore:
             return new_id
 
 
+_META_SCHEMA = """
+CREATE TABLE IF NOT EXISTS speaker_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS speaker_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS speaker_profiles (
     speaker_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
@@ -513,7 +952,10 @@ CREATE TABLE IF NOT EXISTS speaker_embeddings (
     vector BLOB NOT NULL,
     quality TEXT NOT NULL,
     voiced_seconds REAL NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    is_verified_reference INTEGER NOT NULL DEFAULT 0,
+    source_session_id TEXT,
+    source_utterance_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_speaker_embeddings_speaker
@@ -521,12 +963,14 @@ CREATE INDEX IF NOT EXISTS idx_speaker_embeddings_speaker
 
 CREATE TABLE IF NOT EXISTS speaker_observations (
     observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    utterance_id INTEGER NOT NULL UNIQUE,
+    session_id TEXT NOT NULL DEFAULT 'legacy',
+    utterance_id INTEGER NOT NULL,
     speaker_id TEXT,
     match_status TEXT NOT NULL,
     similarity REAL,
     margin REAL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    UNIQUE(session_id, utterance_id)
 );
 
 CREATE TABLE IF NOT EXISTS speaker_aliases (
@@ -540,6 +984,8 @@ CREATE TABLE IF NOT EXISTS speaker_aliases (
 
 __all__ = [
     "IncompatibleModelError",
+    "LEGACY_SESSION_ID",
+    "SCHEMA_VERSION",
     "SpeakerStore",
     "SpeakerStoreError",
 ]

@@ -141,6 +141,15 @@ def identity(result) -> bool:
     return result.status != "PENDING"
 
 
+def wait_until(predicate, *, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    assert predicate()
+
+
 # ------------------------------------------------------------------- tests
 def test_first_utterance_creates_one_temporary_identity(run_engine, store) -> None:
     collector = Collector()
@@ -198,6 +207,7 @@ def test_an_utterance_is_never_matched_against_its_own_samples(
     engine.on_start(1, tone(2.0, 220.0))
     first = collector.wait_for(lambda r: r.status == "NEW_CANDIDATE")
     engine.on_end(1)
+    engine.on_finalized(1, True)
 
     engine.on_start(2, tone(1.5, 221.0))
     collector.wait_for(lambda r: r.utterance_id == 2 and identity(r))
@@ -206,11 +216,13 @@ def test_an_utterance_is_never_matched_against_its_own_samples(
         lambda r: r.utterance_id == 2 and identity(r), nth=2
     )
     engine.on_end(2)
+    engine.on_finalized(2, True)
     # The worker finalises an ended utterance before it analyses the next one,
     # so utterance 3's first result guarantees utterance 2 has been enrolled.
     engine.on_start(3, tone(1.5, 221.0))
     collector.wait_for(lambda r: r.utterance_id == 3 and identity(r))
     engine.on_end(3)
+    engine.on_finalized(3, True)
 
     assert second.speaker_id == first.speaker_id == "TEMP-0001"
     assert second.status == "CANDIDATE_MATCH"
@@ -272,21 +284,22 @@ def test_a_changed_window_mid_utterance_cannot_spawn_a_second_identity(
 
     engine.on_start(1, tone(1.5, 220.0))
     collector.wait_for(lambda r: r.status == "NEW_CANDIDATE")
-    # The recent second is now a clearly different voice; once an utterance is
-    # assigned, the engine must stay with that assignment.
+    # The recent second is now a clearly different voice; the lock keeps the
+    # original identity from being replaced, but the honest verdict for this
+    # window is AMBIGUOUS — not a verified match for TEMP-0001.
     engine.on_audio(1, tone(2.0, 440.0))
     second = collector.wait_for(identity, nth=2)
     engine.on_end(1)
+    engine.on_finalized(1, True)
 
-    assert second.speaker_id == "TEMP-0001"
-    # The identity was first heard in this same utterance, so it stays "new";
-    # matching the utterance against its own provisional sample must not be
-    # reported as a candidate match.
-    assert second.status == "NEW_CANDIDATE"
-    assert second.similarity is None
+    assert second.status == "AMBIGUOUS"
+    assert second.speaker_id is None
+    # No second temporary identity was created, and the contradiction means
+    # the utterance's provisional sample is not kept as a voice print.
     assert [row["speaker_id"] for row in store.list_speakers()] == [
         "TEMP-0001"
     ]
+    wait_until(lambda: store.list_speakers()[0]["samples"] == 0)
 
 
 def test_short_utterance_is_insufficient_and_creates_nothing(

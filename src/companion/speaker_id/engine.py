@@ -23,14 +23,16 @@ import logging
 import queue
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from companion.speaker_id.config import SpeakerConfig
 from companion.speaker_id.embedding import validate_embedding
-from companion.speaker_id.matcher import SpeakerMatcher
+from companion.speaker_id.matcher import MatchDecision, SpeakerMatcher
 from companion.speaker_id.models import (
+    AMBIGUOUS,
     CANDIDATE_MATCH,
     ERROR,
     INSUFFICIENT_AUDIO,
@@ -47,6 +49,8 @@ _STOP = object()
 _MAX_RETAINED_RESULTS = 512
 _MAX_CANCELLED_IDS = 2048
 _MAX_LATENCIES = 256
+_MAX_SOURCE_HISTORY = 256
+_MAX_PENDING_REVOCATIONS = 256
 
 # The worker wakes at most this often even with no new event, so a due
 # analysis and an ended utterance are never left waiting behind a slow queue.
@@ -55,6 +59,35 @@ _POLL_SECONDS = 0.02
 # A final analysis is only repeated at VAD end when at least this much extra
 # audio arrived since the last one; otherwise the existing snapshot stands.
 _MIN_FINAL_GAP_SECONDS = 0.3
+
+
+def _timing_summary(samples) -> dict[str, Any]:
+    """Summarise bounded timing samples without inventing missing data."""
+    values = sorted(float(value) for value in samples)
+    if not values:
+        return {"count": 0, "avg_ms": None, "p50_ms": None, "max_ms": None}
+    return {
+        "count": len(values),
+        "avg_ms": sum(values) / len(values),
+        "p50_ms": values[len(values) // 2],
+        "max_ms": values[-1],
+    }
+
+
+@dataclass(frozen=True)
+class _PendingEnrollment:
+    """A verified match that may become a permanent sample at finalisation.
+
+    The decision is carried unchanged so the write can re-check the same
+    thresholds after ASR has finished; nothing is learnt while the utterance
+    could still be cancelled or fail.
+    """
+
+    speaker_id: str
+    vector: Any
+    quality: VoiceQuality
+    decision: MatchDecision
+    speaker_status: str
 
 
 @dataclass
@@ -73,9 +106,16 @@ class _UtteranceState:
     # be used to "match" the utterance against itself.
     created_speaker_id: Optional[str] = None
     enrolled: bool = False
-    # One independent sample per utterance, added when the utterance ends so
-    # later analyses of the same utterance never compare against it.
-    pending_enrollment: Optional[tuple] = None
+    # A later window contradicted the earlier identity evidence: no sample
+    # from this utterance may be committed, even if an earlier window passed.
+    identity_conflict: bool = False
+    # Why this utterance is pending: a verified match from a window, waiting
+    # for VAD end + ASR final result before it may be written.
+    pending_enrollment: Optional[_PendingEnrollment] = None
+    # The final analysis for this utterance has run (successfully or not).
+    analysis_done: bool = False
+    # ``None`` until ASR reports the final outcome; only ``True`` may learn.
+    asr_success: Optional[bool] = None
     first_identity_at: Optional[float] = None
 
 
@@ -114,11 +154,37 @@ class SpeakerEngine:
         self._closed = False
         self.logger = logging.getLogger("companion.speaker")
 
+        # Utterance ids restart at 0 with every ASR manager, so observations
+        # and samples are scoped by this process-lifetime session id.
+        self.session_id = uuid.uuid4().hex
+        # Samples committed for an utterance, kept briefly so a cancellation
+        # that arrives after the commit can still revoke them. Bounded.
+        self._source_history: "deque[tuple[int, str]]" = deque(
+            maxlen=_MAX_SOURCE_HISTORY
+        )
+        self._source_speakers: dict[int, str] = {}
+        # Revocations are queued by the ASR thread (which must not do SQLite
+        # work) and drained by the worker thread.
+        self._revocations: "deque[tuple[str, str, int]]" = deque(
+            maxlen=_MAX_PENDING_REVOCATIONS
+        )
+
         # Counters for the demo summary / benchmark. Guarded by ``_lock``.
         self.analyses = 0
         self.errors = 0
         self.dropped_wakeups = 0
         self.first_identity_latencies_ms: list[float] = []
+        # Bounded rolling timing samples. Every value is measured with
+        # ``perf_counter``; unmeasured behaviour is reported as absent, never
+        # as a fabricated score.
+        self._timings: dict[str, deque[float]] = {
+            "quality_check_ms": deque(maxlen=_MAX_LATENCIES),
+            "embedding_ms": deque(maxlen=_MAX_LATENCIES),
+            "candidate_load_ms": deque(maxlen=_MAX_LATENCIES),
+            "matching_ms": deque(maxlen=_MAX_LATENCIES),
+            "enrollment_ms": deque(maxlen=_MAX_LATENCIES),
+        }
+        self._perf = time.perf_counter
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -193,6 +259,27 @@ class SpeakerEngine:
                 state.ended = True
         self._wake()
 
+    def on_finalized(self, utterance_id: int, success: bool) -> None:
+        """ASR produced its final result (``success``) or failed.
+
+        This is a distinct event from VAD end: the engine may already have run
+        its final analysis, and only a successful final text may turn a
+        pending match into a permanent sample. O(1), never waits for storage.
+        """
+        uid = int(utterance_id)
+        with self._lock:
+            state = self._states.get(uid)
+            if state is None:
+                if not success:
+                    # ASR failed after the state was already committed/removed:
+                    # revoke any sample that carries this utterance's source.
+                    self._queue_revocation_locked(uid)
+                return
+            state.asr_success = bool(success)
+            if not success:
+                state.pending_enrollment = None
+        self._wake()
+
     def on_cancel(self, utterance_id: int) -> None:
         """Discard the utterance: failed ASR sessions leave no identity work."""
         uid = int(utterance_id)
@@ -204,7 +291,25 @@ class SpeakerEngine:
                     self._cancelled.discard(self._cancelled_order[0])
                 self._cancelled.add(uid)
                 self._cancelled_order.append(uid)
+            self._queue_revocation_locked(uid)
         self._wake()
+
+    def _queue_revocation_locked(self, uid: int) -> None:
+        speaker_id = self._source_speakers.get(uid)
+        if speaker_id is None:
+            return
+        self._revocations.append((speaker_id, self.session_id, uid))
+
+    def _remember_source_locked(self, uid: int, speaker_id: str) -> None:
+        self._source_speakers[uid] = speaker_id
+        self._source_history.append((uid, speaker_id))
+        while len(self._source_speakers) > _MAX_SOURCE_HISTORY:
+            oldest_uid, oldest_speaker = self._source_history[0]
+            # Only evict if the history entry still maps to this speaker (a
+            # uid cannot be reused inside one session, but stay defensive).
+            if self._source_speakers.get(oldest_uid) == oldest_speaker:
+                self._source_speakers.pop(oldest_uid, None)
+            self._source_history.popleft()
 
     def snapshot(self, utterance_id: int) -> SpeakerResult:
         """O(1) latest snapshot; never waits for analysis."""
@@ -238,7 +343,19 @@ class SpeakerEngine:
                 "first_identity_latencies_ms": list(
                     self.first_identity_latencies_ms
                 ),
+                "timings_ms": {
+                    name: _timing_summary(samples)
+                    for name, samples in self._timings.items()
+                },
+                "session_id": self.session_id,
             }
+
+    def _record_timing(self, name: str, milliseconds: float) -> None:
+        samples = self._timings.get(name)
+        if samples is None:
+            return
+        with self._lock:
+            samples.append(max(0.0, float(milliseconds)))
 
     # --------------------------------------------------------------- buffers
     def _append_locked(self, state: _UtteranceState, pcm: bytes) -> None:
@@ -298,31 +415,62 @@ class SpeakerEngine:
     def _scan(self) -> None:
         """Process at most one action per call so the lock is never held long."""
         with self._lock:
+            if self._revocations:
+                speaker_id, session_id, uid = self._revocations.popleft()
+                self._source_speakers.pop(uid, None)
+            else:
+                speaker_id = session_id = uid = None
+
+            cancelled_uid = None
+            ready_uid = None
             ended_uid = None
             due_uid = None
-            for uid, state in self._states.items():
+            for current_uid, state in self._states.items():
                 if state.cancelled:
-                    ended_uid = uid
+                    cancelled_uid = current_uid
                     break
+                if state.ended and state.analysis_done:
+                    if state.asr_success is not None:
+                        ready_uid = current_uid
+                        break
+                    # Final analysis is done but ASR has not reported yet:
+                    # wait; never re-run the final analysis.
+                    continue
                 if state.ended:
-                    ended_uid = uid
+                    ended_uid = current_uid
                     break
                 seconds = state.total_bytes / (2.0 * self.sample_rate)
                 if seconds + 1e-6 >= state.next_analysis_seconds:
-                    due_uid = uid
+                    due_uid = current_uid
                     break
+
+        if speaker_id is not None:
+            self._revoke(speaker_id, session_id, uid)
+            return
+        if cancelled_uid is not None:
+            self._process_cancel(cancelled_uid)
+            return
+        if ready_uid is not None:
+            self._finalize(ready_uid)
+            return
         if ended_uid is not None:
-            with self._lock:
-                state = self._states.get(ended_uid)
-                is_ended = state is not None and state.ended
-                is_cancelled = state is not None and state.cancelled
-            if is_cancelled or state is None:
-                self._process_cancel(ended_uid)
-            elif is_ended:
-                self._process_end(ended_uid)
+            self._process_end(ended_uid)
             return
         if due_uid is not None:
             self._process_analyze(due_uid)
+
+    def _revoke(self, speaker_id: str, session_id: str, uid: int) -> None:
+        revoke = getattr(self._store, "revoke_embedding", None)
+        if revoke is None:
+            return
+        try:
+            revoke(
+                speaker_id,
+                source_session_id=session_id,
+                source_utterance_id=uid,
+            )
+        except Exception:  # noqa: BLE001 - storage failure is non-fatal
+            self.logger.debug("speaker_revoke_failed uid=%s", uid)
 
     def _process_analyze(self, uid: int) -> None:
         with self._lock:
@@ -336,9 +484,16 @@ class SpeakerEngine:
         self._analyze(uid, window, total_seconds, final=False)
 
     def _process_end(self, uid: int) -> None:
+        """Run the final analysis for an ended utterance; never learn here.
+
+        learning only happens in :meth:`_finalize`, after ASR has reported its
+        final result. Re-entering this method for an utterance whose final
+        analysis already ran is a no-op, so a slow ASR result cannot cause the
+        model to be invoked twice.
+        """
         with self._lock:
             state = self._states.get(uid)
-            if state is None or state.cancelled:
+            if state is None or state.cancelled or state.analysis_done:
                 return
             state.ended = True
             total_seconds = state.total_bytes / (2.0 * self.sample_rate)
@@ -372,24 +527,78 @@ class SpeakerEngine:
                     self._record_observation(
                         uid, None, INSUFFICIENT_AUDIO, None, None
                     )
+            # Otherwise the last (non-final) analysis already stands and any
+            # eligible match is still held in ``pending_enrollment``.
         finally:
             with self._lock:
                 state = self._states.get(uid)
-                pending = None
-                if state is not None and not state.enrolled:
-                    pending = state.pending_enrollment
+                if state is not None:
+                    state.analysis_done = True
+
+    def _finalize(self, uid: int) -> None:
+        """Commit or discard the utterance's pending sample, then drop state.
+
+        Called only with VAD ended, the final analysis done and the ASR result
+        known. A failed/cancelled ASR session or a self-contradicting identity
+        discards the pending sample and revokes the provisional bootstrap
+        sample, so one bad utterance cannot pollute a long-lived voice print.
+        """
+        with self._lock:
+            state = self._states.get(uid)
+            if state is None:
+                return
+            if not (
+                state.ended
+                and state.analysis_done
+                and state.asr_success is not None
+            ):
+                return
+            if state.cancelled:
                 self._states.pop(uid, None)
-            if pending is not None:
-                # The last analysis already matched an existing identity but
-                # VAD ended before another one was due. Enrol it now, once,
-                # after this utterance can no longer be compared to it.
-                speaker_id, vector, quality = pending
-                self._enroll(speaker_id, vector, quality)
+                return
+            pending = state.pending_enrollment
+            conflict = state.identity_conflict
+            success = state.asr_success is True
+            created_speaker = state.created_speaker_id
+            provisional = state.enrolled
+
+        # Process (write/revoke) before removing the state so a caller that
+        # observes the utterance as finished can also observe its effect.
+        # ``_enroll`` registers the source first, so a cancellation racing
+        # this write still queues a revocation that runs afterwards.
+        if not success or conflict:
+            if provisional and created_speaker:
+                self._revoke(created_speaker, self.session_id, uid)
+        elif pending is not None and self._eligible_for_enrollment(
+            pending.decision,
+            pending.quality,
+            pending.speaker_status,
+            identity_conflict=False,
+        ):
+            self._enroll(
+                pending.speaker_id,
+                pending.vector,
+                pending.quality,
+                source_utterance_id=uid,
+            )
+
+        with self._lock:
+            self._states.pop(uid, None)
 
     def _process_cancel(self, uid: int) -> None:
         with self._lock:
-            self._states.pop(uid, None)
+            state = self._states.pop(uid, None)
             self._results.pop(uid, None)
+            provisional = (
+                state is not None and state.enrolled
+                and state.created_speaker_id is not None
+            )
+            created_speaker = (
+                state.created_speaker_id if state is not None else None
+            )
+        if provisional and created_speaker:
+            self._revoke(created_speaker, self.session_id, uid)
+
 
     # ------------------------------------------------------------ analysis
     def _analyze(
@@ -424,7 +633,7 @@ class SpeakerEngine:
             self._advance(uid, total_seconds)
             return
 
-        started = self._clock()
+        started = self._perf()
         try:
             vector = validate_embedding(
                 self._embedding.encode(window),
@@ -434,7 +643,8 @@ class SpeakerEngine:
             self._publish_error(uid, type(exc).__name__)
             self._advance(uid, total_seconds)
             return
-        inference_ms = max(0.0, (self._clock() - started) * 1000.0)
+        inference_ms = max(0.0, (self._perf() - started) * 1000.0)
+        self._record_timing("embedding_ms", inference_ms)
 
         with self._lock:
             state = self._states.get(uid)
@@ -442,11 +652,17 @@ class SpeakerEngine:
                 return
             locked_id = state.assigned_speaker_id
             created_here = state.created_speaker_id
+            previous_pending = state.pending_enrollment
 
         try:
+            load_started = self._perf()
             candidates, incompatible = self._store.load_candidates(
                 model_id=self._model_label,
                 embedding_version=self.config.embedding_version,
+            )
+            self._record_timing(
+                "candidate_load_ms",
+                max(0.0, (self._perf() - load_started) * 1000.0),
             )
         except Exception as exc:  # noqa: BLE001 - storage failure is non-fatal
             self._publish_error(uid, type(exc).__name__)
@@ -472,21 +688,27 @@ class SpeakerEngine:
             self._advance(uid, total_seconds)
             return
 
+        match_started = self._perf()
         decision = self._matcher.match(
             vector,
             candidates,
             quality=quality,
             locked_speaker_id=locked_id,
         )
+        self._record_timing(
+            "matching_ms",
+            max(0.0, (self._perf() - match_started) * 1000.0),
+        )
+        status_by_id = {
+            candidate.speaker_id: candidate.status for candidate in candidates
+        }
 
         speaker_id = decision.speaker_id
         assigned = locked_id
         created_now = False
+        created_by_this_utterance = created_here is not None
         if decision.status == NEW_CANDIDATE:
-            locked_still_exists = locked_id is not None and any(
-                candidate.speaker_id == locked_id for candidate in candidates
-            )
-            if locked_still_exists:
+            if locked_id is not None and locked_id in status_by_id:
                 # The assignment survives a noisy window, but only while the
                 # identity still exists (it may have been deleted/merged).
                 speaker_id = locked_id
@@ -497,31 +719,60 @@ class SpeakerEngine:
                     return
                 assigned = speaker_id
                 created_now = True
+                created_by_this_utterance = True
         elif decision.status in (CANDIDATE_MATCH, KNOWN):
             speaker_id = decision.speaker_id
             assigned = speaker_id
 
-        created_by_this_utterance = created_here is not None or created_now
-        pending = None
-        enroll_now = False
+        # A contradiction between windows of the same utterance invalidates
+        # every sample from it, even an earlier high-scoring one.
+        conflict = decision.status == AMBIGUOUS
+        if (
+            previous_pending is not None
+            and decision.status in (CANDIDATE_MATCH, KNOWN)
+            and decision.speaker_id != previous_pending.speaker_id
+        ):
+            conflict = True
+        if (
+            created_here is not None
+            and decision.status in (CANDIDATE_MATCH, KNOWN)
+            and decision.speaker_id != created_here
+        ):
+            conflict = True
+
+        pending: Optional[_PendingEnrollment] = None
+        enroll_bootstrap = False
         if speaker_id and created_now:
             # The identity must exist immediately so the next analysis of this
             # same utterance can lock onto it. This provisional sample is the
-            # utterance's own audio, so it is never shown as a match score.
-            enroll_now = True
+            # utterance's own audio; it is unverified, carries its source key,
+            # and is revoked if the utterance later fails or contradicts
+            # itself. It is never the proof for adding a further sample.
+            enroll_bootstrap = True
         elif (
             speaker_id
             and not created_by_this_utterance
             and decision.status in (CANDIDATE_MATCH, KNOWN)
         ):
-            if final:
-                enroll_now = True
-            else:
-                # Defer the sample until the utterance ends: matching for the
-                # rest of this utterance must only use older recordings.
-                pending = (speaker_id, vector, quality)
-        if enroll_now:
-            self._enroll(speaker_id, vector, quality)
+            speaker_status = status_by_id.get(speaker_id, "")
+            if self._eligible_for_enrollment(
+                decision,
+                quality,
+                speaker_status,
+                identity_conflict=conflict,
+            ):
+                pending = _PendingEnrollment(
+                    speaker_id=speaker_id,
+                    vector=vector,
+                    quality=quality,
+                    decision=decision,
+                    speaker_status=speaker_status,
+                )
+
+        if enroll_bootstrap:
+            self._enroll(
+                speaker_id, vector, quality, source_utterance_id=uid
+            )
 
         with self._lock:
             state = self._states.get(uid)
@@ -531,15 +782,26 @@ class SpeakerEngine:
                 state.assigned_speaker_id = assigned
             if created_now:
                 state.created_speaker_id = speaker_id
-            if enroll_now:
+            if enroll_bootstrap:
                 state.enrolled = True
+            if conflict:
+                state.identity_conflict = True
+                state.pending_enrollment = None
             elif pending is not None:
                 state.pending_enrollment = pending
 
         # An identity first heard in this utterance stays "new" for the whole
         # utterance: the rising self-similarity of later windows is not
-        # evidence of a known person.
-        status = NEW_CANDIDATE if created_by_this_utterance else decision.status
+        # evidence of a known person. A contradictory window is still reported
+        # as AMBIGUOUS instead of pretending the new identity matched.
+        self_match = created_by_this_utterance and decision.status in (
+            CANDIDATE_MATCH,
+            KNOWN,
+        )
+        if self_match or decision.status == NEW_CANDIDATE:
+            status = NEW_CANDIDATE
+        else:
+            status = decision.status
         similarity = None if created_by_this_utterance else decision.similarity
         margin = None if created_by_this_utterance else decision.margin
 
@@ -565,6 +827,48 @@ class SpeakerEngine:
         if assigned:
             self._note_first_identity(uid)
 
+    def _eligible_for_enrollment(
+        self,
+        decision: MatchDecision,
+        quality: Optional[VoiceQuality],
+        speaker_status: str,
+        *,
+        identity_conflict: bool,
+    ) -> bool:
+        """Stricter proof for a permanent sample than for re-identification.
+
+        Reusing an identity only needs the match threshold; writing a new
+        reference changes every future match for that identity, so it requires
+        usable audio, enrollment-grade quality, a positive match, a score above
+        the independent enrollment threshold, competition protection, no
+        identity conflict and the same model version (candidates are loaded
+        only for this version).
+        """
+        if identity_conflict:
+            return False
+        if decision is None or quality is None or not quality.usable:
+            return False
+        required = QUALITY_RANK.get(
+            self.config.minimum_enrollment_quality, 2
+        )
+        if quality.rank < required:
+            return False
+        if speaker_status not in ("KNOWN", "CANDIDATE"):
+            return False
+        if decision.status not in (CANDIDATE_MATCH, KNOWN):
+            return False
+        if decision.similarity is None:
+            return False
+        if decision.similarity < self.config.enrollment_match_threshold:
+            return False
+        if (
+            decision.margin is not None
+            and decision.margin < self.config.enrollment_margin
+        ):
+            return False
+        return True
+
+
     def _create_candidate(self, uid: int) -> Optional[str]:
         try:
             return self._store.create_candidate()
@@ -572,12 +876,24 @@ class SpeakerEngine:
             self._publish_error(uid, type(exc).__name__)
             return None
 
-    def _enroll(self, speaker_id: str, vector, quality: VoiceQuality) -> None:
+    def _enroll(
+        self,
+        speaker_id: str,
+        vector,
+        quality: VoiceQuality,
+        *,
+        source_utterance_id: int,
+    ) -> None:
         required = QUALITY_RANK.get(
             self.config.minimum_enrollment_quality, 2
         )
         if quality.rank < required:
             return
+        # Register the source *before* the write so a cancellation racing the
+        # commit is still able to revoke the sample.
+        with self._lock:
+            self._remember_source_locked(int(source_utterance_id), speaker_id)
+        started = self._perf()
         try:
             self._store.add_embedding(
                 speaker_id,
@@ -586,10 +902,18 @@ class SpeakerEngine:
                 voiced_seconds=quality.voiced_seconds,
                 model_id=self._model_label,
                 embedding_version=self.config.embedding_version,
+                source_session_id=self.session_id,
+                source_utterance_id=int(source_utterance_id),
+                is_verified_reference=False,
             )
         except Exception:  # noqa: BLE001 - a lost sample must not stop ASR
             self.logger.debug(
                 "speaker_enroll_failed speaker_id=%s", speaker_id
+            )
+        finally:
+            self._record_timing(
+                "enrollment_ms",
+                max(0.0, (self._perf() - started) * 1000.0),
             )
 
     def _record_observation(
@@ -607,6 +931,7 @@ class SpeakerEngine:
                 match_status=status,
                 similarity=similarity,
                 margin=margin,
+                session_id=self.session_id,
             )
         except Exception:  # noqa: BLE001 - diagnostics only
             self.logger.debug("speaker_observation_failed uid=%s", uid)
@@ -630,6 +955,7 @@ class SpeakerEngine:
             self.analyses += 1
 
     def _evaluate(self, window: bytes) -> Optional[VoiceQuality]:
+        started = self._perf()
         try:
             return evaluate_voice_quality(
                 window,
@@ -638,6 +964,11 @@ class SpeakerEngine:
             )
         except Exception:  # noqa: BLE001 - never kill the worker
             return None
+        finally:
+            self._record_timing(
+                "quality_check_ms",
+                max(0.0, (self._perf() - started) * 1000.0),
+            )
 
     def _build_result(
         self,

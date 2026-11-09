@@ -25,6 +25,11 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    # The offline tests for the voice-print matcher/store/quality and the ASR
+    # VAD use NumPy directly. CI installs `.[dev,ui,web]` and must not need the
+    # heavy `speaker` extra (torch/ModelScope) just to run the fake-embedding
+    # tests, so the small wheel belongs here.
+    "numpy>=1.26",
 ]
 ui = [
     "nicegui>=2.24,<3",

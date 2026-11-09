@@ -27,7 +27,7 @@ from typing import Any, Optional
 from pydantic import ValidationError
 
 from companion.people.profile_refinement import (
-    MAX_CHANGES_PER_REVIEW,
+    MAX_MODEL_CHANGES,
     ProfileChangeProposal,
     ProfileRefinementProviderError,
     ProfileRefinementValidationError,
@@ -72,7 +72,7 @@ _FACT_KEYS = {
     "evidence_quotes",
 }
 
-_MAX_CHANGES = 60
+_MAX_CHANGES = MAX_MODEL_CHANGES
 
 
 def _normalise_facts(raw: Any) -> list[dict]:
@@ -82,7 +82,7 @@ def _normalise_facts(raw: Any) -> list[dict]:
     if not isinstance(raw, list):
         raise _OutputProblem("invalid_facts")
     facts: list[dict] = []
-    for item in raw[:60]:
+    for item in raw[:MAX_MODEL_CHANGES]:
         if not isinstance(item, dict):
             raise _OutputProblem("invalid_fact_item")
         facts.append({key: item[key] for key in _FACT_KEYS if key in item})

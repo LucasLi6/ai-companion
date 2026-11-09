@@ -11,7 +11,8 @@ Matching never uses a single fixed threshold:
   ``minimum_enrollment_quality``;
 * once an utterance has been assigned an identity, later verdicts for the same
   utterance are locked to it, so one noisy window cannot spawn a second
-  temporary ID.
+  temporary ID — but a locked verdict must still re-pass the same threshold and
+  margin checks, otherwise it is reported ``AMBIGUOUS``.
 """
 
 from __future__ import annotations
@@ -72,7 +73,7 @@ class SpeakerMatcher:
             return MatchDecision(INSUFFICIENT_AUDIO, None, None, None)
         if locked_speaker_id is not None:
             return self._match_locked(
-                embedding, candidates, locked_speaker_id
+                embedding, candidates, locked_speaker_id, quality
             )
         if not candidates:
             return self._new_or_insufficient(quality, similarity=None)
@@ -130,26 +131,53 @@ class SpeakerMatcher:
         embedding,
         candidates: Sequence[SpeakerCandidate],
         locked_speaker_id: str,
+        quality: VoiceQuality,
     ) -> MatchDecision:
+        """Re-evaluate a locked identity with the same proof as a fresh match.
+
+        A lock only keeps the *candidate* from changing mid-utterance; it is
+        never proof that the current window belongs to that identity. The
+        locked score must still clear the candidate threshold, and a competing
+        identity must not come too close. Otherwise the honest answer is
+        ``AMBIGUOUS`` — not ``KNOWN``.
+        """
         locked = next(
             (c for c in candidates if c.speaker_id == locked_speaker_id),
             None,
         )
         if locked is None:
-            # The identity vanished (deleted/merged) mid-utterance. Fall back
-            # to one fresh evaluation rather than keeping a dead reference.
-            return self.match(embedding, candidates, quality=_usable())
+            # The identity vanished (deleted/merged) mid-utterance. Evaluate
+            # afresh with the *real* quality of this window; a fabricated LOW
+            # quality would silently turn every later window into a new or
+            # unknown identity.
+            return self.match(
+                embedding,
+                candidates,
+                quality=quality,
+                locked_speaker_id=None,
+            )
         locked_score = self._score(embedding, locked)
         others = [
-            (self._score(embedding, candidate), candidate)
+            self._score(embedding, candidate)
             for candidate in candidates
             if candidate.speaker_id != locked_speaker_id
         ]
-        other_best = max((score for score, _ in others), default=None)
+        other_best = max(others) if others else None
         margin = (
             locked_score - other_best if other_best is not None else None
         )
-        status = KNOWN if locked.status == "KNOWN" else CANDIDATE_MATCH
+
+        cfg = self.config
+        if locked_score < cfg.candidate_match_threshold:
+            return MatchDecision(AMBIGUOUS, None, locked_score, margin)
+        if margin is not None and margin < cfg.minimum_match_margin:
+            return MatchDecision(AMBIGUOUS, None, locked_score, margin)
+        status = (
+            KNOWN
+            if locked.status == "KNOWN"
+            and locked_score >= cfg.known_match_threshold
+            else CANDIDATE_MATCH
+        )
         return MatchDecision(status, locked.speaker_id, locked_score, margin)
 
     @staticmethod
@@ -157,12 +185,6 @@ class SpeakerMatcher:
         if not candidate.vectors:
             return -1.0
         return max(_cosine(embedding, vector) for vector in candidate.vectors)
-
-
-def _usable() -> VoiceQuality:
-    # Placeholder used only when a locked identity disappeared; the caller
-    # already passed the quality gate for the current utterance.
-    return VoiceQuality(True, 0.0, "LOW", None)
 
 
 __all__ = [

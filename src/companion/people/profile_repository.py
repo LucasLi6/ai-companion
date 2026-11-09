@@ -13,7 +13,28 @@ from datetime import datetime
 from typing import Any, Optional
 
 from companion.domain.models import new_id, utcnow
+from companion.people.profile_facts import (
+    canonical_value,
+    normalise_attribute,
+    normalise_entity_key,
+)
 from companion.storage.database import Database
+
+_NON_STABLE_SCOPES = frozenset({"ONGOING", "TEMPORARY", "EVENT", "FUTURE"})
+
+
+def _time_scopes_conflict(incoming: str, stored: str) -> bool:
+    """Two different non-stable time scopes describe incompatible states.
+
+    ``STABLE`` is compatible with anything: a stable trait can coexist with a
+    current state. Two different state-like scopes (e.g. ONGOING vs FUTURE)
+    usually mean the stored entry and the new fact are not the same claim.
+    """
+    return (
+        incoming in _NON_STABLE_SCOPES
+        and stored in _NON_STABLE_SCOPES
+        and incoming != stored
+    )
 
 
 def _iso(dt: datetime) -> str:
@@ -353,6 +374,140 @@ class PersonProfileRepository:
             }
             for row in rows
         ]
+
+    async def find_semantic_collisions(
+        self,
+        person_id: str,
+        fact: Any,
+        *,
+        field_key: str = "",
+        limit: int = 50,
+    ) -> list[dict]:
+        """Facts already stored for the same entity and attribute.
+
+        The derived fact index is used as the recall key, but the real entry
+        row is joined in so a stale cache can never authorize a write. Only an
+        exact entity + attribute match is considered: a different attribute is
+        never a merge candidate, even when its text looks similar.
+
+        Relations returned per entry:
+
+        * ``DUPLICATE`` - same canonical value, compatible polarity/time
+          semantics. An ``ADD`` for this fact would duplicate knowledge.
+        * ``EXTENDS_CANDIDATE`` - same attribute, different (or containing)
+          detail. The model may propose EXTENDS/STATE_CHANGE, but independent
+          facts are not deleted locally.
+        * ``SEMANTIC_UNRESOLVED`` - same value but opposite polarity (an
+          explicit correction) or incompatible time scopes. Local code cannot
+          decide the relation and must not silently merge or add.
+        """
+        entity_key = normalise_entity_key(getattr(fact, "entity", "self"))
+        attribute = normalise_attribute(
+            getattr(fact, "attribute", ""), field_key=field_key
+        )
+        value = canonical_value(getattr(fact, "value", ""))
+        assertion = str(getattr(fact, "assertion_type", "") or "")
+        scope = str(getattr(fact, "temporal_scope", "") or "")
+
+        cur = await self.db.execute(
+            "SELECT i.entry_id, i.entity_key, i.attribute, i.temporal_scope,"
+            " i.canonical_value, i.aliases_json, e.field_key, e.content,"
+            " e.status"
+            " FROM person_profile_fact_index i"
+            " JOIN person_profile_entries e ON e.entry_id = i.entry_id"
+            " WHERE i.person_id = ? AND i.entity_key = ? AND i.attribute = ?"
+            " AND e.status IN ('ACTIVE', 'TENTATIVE')"
+            " ORDER BY i.updated_at DESC, i.entry_id ASC LIMIT ?",
+            (person_id, entity_key, attribute, max(1, int(limit))),
+        )
+        rows = [dict(row) for row in await cur.fetchall()]
+        if not rows:
+            rows = await self._collision_fallback_rows(
+                person_id, attribute, limit
+            )
+        collisions: list[dict] = []
+        for row in rows:
+            stored = canonical_value(row.get("canonical_value"))
+            aliases = {
+                canonical_value(item)
+                for item in _loads(row.get("aliases_json"), [])
+            }
+            aliases.discard("")
+            equal = bool(value) and (value == stored or value in aliases)
+            collision = {
+                "entry_id": row["entry_id"],
+                "field_key": row.get("field_key") or "",
+                "content": row.get("content") or "",
+                "entity_key": row.get("entity_key") or entity_key,
+                "attribute": row.get("attribute") or attribute,
+                "temporal_scope": row.get("temporal_scope") or "",
+                "canonical_value": stored,
+            }
+            # Opposite polarity: an explicit correction of the same value is
+            # contradictory, not a duplicate.
+            if assertion == "CORRECTION" and equal:
+                collision["relation"] = "SEMANTIC_UNRESOLVED"
+                collision["reason"] = "explicit_correction_matches_stored_fact"
+            elif equal:
+                stored_scope = str(row.get("temporal_scope") or "")
+                if _time_scopes_conflict(scope, stored_scope):
+                    collision["relation"] = "SEMANTIC_UNRESOLVED"
+                    collision["reason"] = "time_scope_conflict"
+                else:
+                    collision["relation"] = "DUPLICATE"
+                    collision["high_confidence"] = True
+            elif value:
+                # Same attribute, different detail (or one contains the
+                # other): suggest an extension/state change, never delete an
+                # independent fact here.
+                collision["relation"] = "EXTENDS_CANDIDATE"
+                collision["reason"] = "same_attribute_different_detail"
+            else:
+                collision["relation"] = "SEMANTIC_UNRESOLVED"
+                collision["reason"] = "semantic_relation_unresolved"
+            collisions.append(collision)
+        return collisions
+
+    async def _collision_fallback_rows(
+        self, person_id: str, attribute: str, limit: int
+    ) -> list[dict]:
+        """Rebuild collision candidates from entries when the index is empty.
+
+        The index is derived and may be absent after an older upgrade. This
+        fallback derives the same recall fields from the effective entries
+        without writing anything. It only runs when no index row matched the
+        entity/attribute, so normal operation stays a single indexed query.
+        """
+        cur = await self.db.execute(
+            "SELECT entry_id, field_key, content, status FROM"
+            " person_profile_entries WHERE person_id = ?"
+            " AND status IN ('ACTIVE', 'TENTATIVE')"
+            " ORDER BY updated_at DESC, entry_id ASC LIMIT ?",
+            (person_id, max(1, int(limit)) * 4),
+        )
+        rows: list[dict] = []
+        for row in await cur.fetchall():
+            entry_field = str(row["field_key"] or "")
+            entry_attribute = normalise_attribute("", field_key=entry_field)
+            if entry_attribute != attribute:
+                continue
+            content = str(row["content"] or "")
+            rows.append(
+                {
+                    "entry_id": row["entry_id"],
+                    "entity_key": "self",
+                    "attribute": entry_attribute,
+                    "temporal_scope": "STABLE",
+                    "canonical_value": canonical_value(content),
+                    "aliases_json": "[]",
+                    "field_key": entry_field,
+                    "content": content,
+                    "status": row["status"],
+                }
+            )
+            if len(rows) >= max(1, int(limit)):
+                break
+        return rows
 
     async def rebuild_fact_index(self, person_id: str) -> int:
         """Drop and rebuild the derived index from effective entries."""
@@ -1035,6 +1190,29 @@ class PersonProfileRepository:
         candidate_id: Optional[str] = None,
         evidence_type: str = "EVENT",
     ) -> str:
+        # Retry-idempotent: the same source event (or memory/candidate) for the
+        # same person and field is one evidence row. A repeated review must not
+        # inflate the evidence list, and a history of duplicates created by an
+        # older build is left untouched (no destructive migration).
+        cur = await self.db.execute(
+            "SELECT evidence_id FROM person_profile_evidence"
+            " WHERE person_id = ? AND field_key = ? AND evidence_type = ?"
+            " AND COALESCE(memory_id, '') = COALESCE(?, '')"
+            " AND COALESCE(source_event_id, '') = COALESCE(?, '')"
+            " AND COALESCE(candidate_id, '') = COALESCE(?, '')"
+            " ORDER BY created_at ASC, evidence_id ASC LIMIT 1",
+            (
+                person_id,
+                field_key,
+                evidence_type,
+                memory_id,
+                source_event_id,
+                candidate_id,
+            ),
+        )
+        existing = await cur.fetchone()
+        if existing is not None:
+            return str(existing["evidence_id"])
         evidence_id = new_id("pfe")
         await self.db.execute(
             "INSERT INTO person_profile_evidence("

@@ -49,8 +49,10 @@ from companion.people.profile_facts import (
     FactClass,
     FactRelation,
     fact_index_row,
+    normalise_attribute,
 )
 from companion.people.profile_refinement import (
+    MAX_CHANGES_PER_REVIEW,
     MAX_ENTRY_CHARS,
     DirectSelfReportResult,
     FullProfileSnapshot,
@@ -73,7 +75,7 @@ from companion.people.profile_self_report import (
 )
 from companion.storage.repositories import AuditRepository, PersonRepository
 
-MAX_REFINEMENT_CHANGES = 10
+MAX_REFINEMENT_CHANGES = MAX_CHANGES_PER_REVIEW
 _LOGGER = logging.getLogger("companion.profile_service")
 _IDENTITY_LABELS = {
     "identity.name": "name",
@@ -95,6 +97,21 @@ _NEGATION_LOCAL = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class _CollisionFact:
+    """Minimal fact stand-in for proposals that carry no extracted fact.
+
+    Direct self-report writes still deserve the cross-category duplicate
+    check; this carries the same fields the fact index normalisers read.
+    """
+
+    entity: str
+    attribute: str
+    value: str
+    assertion_type: str = "DIRECT"
+    temporal_scope: str = "STABLE"
+
+
 def _content_terms(text: Any) -> set[str]:
     value = " ".join(str(text or "").split()).casefold()
     terms = set(_WORD.findall(value))
@@ -106,6 +123,32 @@ def _content_terms(text: Any) -> set[str]:
     return terms
 
 
+def _same_field_relation(left: Any, right: Any) -> str:
+    """Local relation between two entries stored under the same field.
+
+    * ``SAME`` - identical term set.
+    * ``EXTENDS`` - one term set fully contains the other.
+    * ``DISTINCT`` - each has detail the other lacks (independent facts).
+    * ``UNRESOLVED`` - empty content or opposite polarity; local code cannot
+      decide, so consolidation must not merge.
+
+    Only ``SAME``/``EXTENDS`` are losslessly mergeable. This is deliberately
+    not a semantic model call: consolidation never rewrites meaning.
+    """
+    left_terms, right_terms = _content_terms(left), _content_terms(right)
+    if not left_terms or not right_terms:
+        return "UNRESOLVED"
+    if bool(_NEGATION_LOCAL.search(str(left))) != bool(
+        _NEGATION_LOCAL.search(str(right))
+    ):
+        return "UNRESOLVED"
+    if left_terms == right_terms:
+        return "SAME"
+    if left_terms < right_terms or right_terms < left_terms:
+        return "EXTENDS"
+    return "DISTINCT"
+
+
 def _lossless_pair(left: Any, right: Any) -> bool:
     """Whether merging two same-field entries would lose no detail.
 
@@ -113,14 +156,7 @@ def _lossless_pair(left: Any, right: Any) -> bool:
     match. This is stricter than semantic equivalence: it is the only local
     merge a maintenance pass is allowed to perform without a model call.
     """
-    left_terms, right_terms = _content_terms(left), _content_terms(right)
-    if not left_terms or not right_terms:
-        return False
-    if bool(_NEGATION_LOCAL.search(str(left))) != bool(
-        _NEGATION_LOCAL.search(str(right))
-    ):
-        return False
-    return left_terms <= right_terms or right_terms <= left_terms
+    return _same_field_relation(left, right) in ("SAME", "EXTENDS")
 
 
 def _has_lossless_duplicates(entries: Iterable[dict]) -> bool:
@@ -1356,6 +1392,75 @@ class PersonProfileService:
         payload.update(extra)
         return payload
 
+    async def _semantic_collision_rejection(
+        self,
+        person_id: str,
+        proposal: ProfileChangeProposal,
+        targets: list[dict],
+    ) -> Optional[tuple[str, Optional[str]]]:
+        """Cross-field duplicate defence backed by the fact index.
+
+        ``already_present`` only compares entries inside the same category.
+        Two fields (for example ``interests.likes`` and ``preferences.likes``)
+        can store the same fact in different categories; the derived fact
+        index is what lets the write boundary see that. Returns
+        ``(reason, existing_entry_id)`` or ``None``.
+        """
+        if proposal.operation == "ARCHIVE":
+            return None
+        fact = proposal.fact
+        if fact is None and not proposal.proposed_content:
+            return None
+        if fact is None:
+            if is_strict_field(proposal.field_key):
+                return None
+            fact = _CollisionFact(
+                entity="self",
+                attribute=normalise_attribute(
+                    "", field_key=proposal.field_key
+                ),
+                value=proposal.proposed_content,
+                assertion_type="DIRECT",
+                temporal_scope="STABLE",
+            )
+        collisions = await self.repo.find_semantic_collisions(
+            person_id, fact, field_key=proposal.field_key
+        )
+        if not collisions:
+            return None
+        unresolved = next(
+            (
+                item
+                for item in collisions
+                if item["relation"] == "SEMANTIC_UNRESOLVED"
+            ),
+            None,
+        )
+        if unresolved is not None:
+            return "semantic_relation_unresolved", unresolved["entry_id"]
+        target_ids = {item["entry_id"] for item in targets}
+        duplicates = [
+            item for item in collisions if item["relation"] == "DUPLICATE"
+        ]
+        if proposal.operation == "SAME":
+            # Evidence must be attached to the entry that actually stores the
+            # fact. Any matching target is enough; only a completely wrong
+            # target is rejected.
+            if any(item["entry_id"] in target_ids for item in duplicates):
+                return None
+            if duplicates:
+                return (
+                    "semantic_duplicate_target_mismatch",
+                    duplicates[0]["entry_id"],
+                )
+            return None
+        outside = [
+            item for item in duplicates if item["entry_id"] not in target_ids
+        ]
+        if not outside:
+            return None
+        return "semantic_duplicate_exists", outside[0]["entry_id"]
+
     async def _precheck_changes(
         self,
         person_id: str,
@@ -1443,6 +1548,55 @@ class PersonProfileService:
                     self._reject(proposal, str(exc) or "invalid_change_target")
                 )
                 continue
+            # Cross-field duplicate defence runs before the capacity check: an
+            # ADD for a fact that is already stored must become evidence-only
+            # SAME, never a capacity failure or a second copy.
+            collision = await self._semantic_collision_rejection(
+                person_id, proposal, [item for item in found if item is not None]
+            )
+            if collision is not None:
+                reason, existing_entry_id = collision
+                if (
+                    reason == "semantic_duplicate_exists"
+                    and proposal.operation == "ADD"
+                    and existing_entry_id
+                ):
+                    existing = entries.get(existing_entry_id)
+                    if existing is None:
+                        rejected.append(
+                            self._reject(
+                                proposal, "target_entry_not_in_this_profile"
+                            )
+                        )
+                        continue
+                    # The same fact is already stored under another field.
+                    # Attach this turn's evidence to that entry (SAME never
+                    # rewrites it) instead of adding a second copy.
+                    proposal = proposal.model_copy(
+                        update={
+                            "operation": "SAME",
+                            "relation": "SAME",
+                            "target_entry_ids": [existing_entry_id],
+                            "proposed_content": None,
+                            "reason": (
+                                f"{proposal.reason} | "
+                                "semantic_duplicate_redirected_to_same"
+                            )[:500],
+                        }
+                    )
+                    change = ValidatedChange(proposal=proposal)
+                    evidence_only = True
+                    targets = [existing_entry_id]
+                    found = [existing]
+                else:
+                    rejected.append(
+                        self._reject(
+                            proposal,
+                            reason,
+                            existing_entry_id=existing_entry_id,
+                        )
+                    )
+                    continue
             if spec.max_entries and proposal.operation == "ADD":
                 effective = await self.repo.list_entries(
                     person_id,
@@ -1508,7 +1662,7 @@ class PersonProfileService:
                     self._reject(proposal, "trait_inference_requires_review")
                 )
                 continue
-            if proposal.operation != "ADD" and any(
+            if not evidence_only and any(
                 is_human_confirmed_source(item.get("source"))
                 for item in found
                 if item is not None
@@ -1604,6 +1758,11 @@ class PersonProfileService:
                 raise ValueError("target_entry_not_effective")
             targets.append(entry)
         validate_change_targets(proposal.operation, proposal.field_key, targets)
+        collision = await self._semantic_collision_rejection(
+            person_id, proposal, targets
+        )
+        if collision is not None:
+            raise ValueError(collision[0])
         if evidence_only and any(
             is_strict_field(item.get("field_key")) for item in targets
         ):
@@ -1621,7 +1780,10 @@ class PersonProfileService:
                 and not observed_pattern
             ):
                 raise ValueError("trait_inference_requires_review")
-            if any(is_human_confirmed_source(item.get("source")) for item in targets):
+            if not evidence_only and any(
+                is_human_confirmed_source(item.get("source"))
+                for item in targets
+            ):
                 raise ValueError("human_confirmed_target_requires_review")
         if proposal.operation == "ADD":
             existing = await self.repo.list_entries(
@@ -1907,7 +2069,13 @@ class PersonProfileService:
         subset of the other's and their polarity matches, so choosing the
         longer content cannot lose a fact. A semantic rewrite still requires a
         model proposal; this pass only removes redundancy.
+
+        Human-confirmed entries are never archived and never replaced by an
+        inference that lacks their terms. A strict identity field is never
+        consolidated.
         """
+        if not field_key or is_strict_field(field_key):
+            return 0
         entries = await self.repo.list_entries(
             person_id,
             statuses=(
@@ -1935,8 +2103,41 @@ class PersonProfileService:
         for group in groups:
             if len(group) < 2:
                 continue
+            term_sets = {
+                item["entry_id"]: _content_terms(item.get("content"))
+                for item in group
+            }
+            canonical_candidates = [
+                item
+                for item in group
+                if all(
+                    term_sets[item["entry_id"]]
+                    >= term_sets[other["entry_id"]]
+                    for other in group
+                )
+            ]
+            if not canonical_candidates:
+                # No single entry contains every detail; merging any of them
+                # would lose a term.
+                continue
+            confirmed_candidates = [
+                item
+                for item in canonical_candidates
+                if is_human_confirmed_source(item.get("source"))
+            ]
+            if (
+                any(
+                    is_human_confirmed_source(item.get("source"))
+                    for item in group
+                )
+                and not confirmed_candidates
+            ):
+                # A human-confirmed row must stay as its own statement; do not
+                # archive it into an inference.
+                continue
+            candidates = confirmed_candidates or canonical_candidates
             canonical = max(
-                group, key=lambda row: len(row.get("content") or "")
+                candidates, key=lambda row: len(row.get("content") or "")
             )
             others = [
                 item
@@ -1944,6 +2145,12 @@ class PersonProfileService:
                 if item["entry_id"] != canonical["entry_id"]
             ]
             if not others:
+                continue
+            if any(
+                is_human_confirmed_source(item.get("source"))
+                for item in others
+            ):
+                # Two independent human confirmations are both authoritative.
                 continue
             event_ids = sorted(
                 {

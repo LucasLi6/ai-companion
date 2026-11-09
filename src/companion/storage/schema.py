@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -2125,6 +2125,28 @@ MIGRATIONS: list[tuple[int, str]] = [
           FROM person_profile_entries
          WHERE status IN ('ACTIVE', 'TENTATIVE')
            AND instr(field_key, '.') > 0;
+        """,
+    ),
+    # Version 32 (V0.9.9.24): explicit person <-> voice-print bindings.
+    #
+    # A binding is a human decision ("this speaker id belongs to this person"),
+    # never an inference from a similarity score. The speaker store lives in a
+    # separate SQLite file, so this table holds only the trusted link and is
+    # re-validated against registration status and consent on every resolve.
+    (
+        32,
+        """
+        CREATE TABLE IF NOT EXISTS person_speaker_bindings (
+            speaker_id  TEXT PRIMARY KEY,
+            person_id   TEXT NOT NULL
+                        REFERENCES persons(person_id) ON DELETE CASCADE,
+            verified_by TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_speaker_bindings_person
+            ON person_speaker_bindings(person_id);
         """,
     ),
 ]

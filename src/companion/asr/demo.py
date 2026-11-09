@@ -151,6 +151,8 @@ def _open_store(args):
     store = SpeakerStore(
         config.db_path,
         max_embeddings_per_speaker=config.max_embeddings_per_speaker,
+        duplicate_sample_similarity=config.duplicate_sample_similarity,
+        minimum_enrollment_quality=config.minimum_enrollment_quality,
     )
     try:
         store.initialize()
@@ -205,17 +207,16 @@ def _speaker_maintenance(args) -> Optional[int]:
 
 
 def _setup_speaker(args):
-    """Load the model once and build the engine; returns ``None`` on failure."""
+    """Build the deferred observer; the model loads in the background.
+
+    Returns ``None`` only on a configuration error. A model/store failure is
+    reported by the observer and does not stop the ASR demo.
+    """
     from companion.speaker_id.config import (
         SpeakerConfigError,
         load_speaker_config,
     )
-    from companion.speaker_id.embedding import (
-        SpeakerEmbeddingError,
-        SpeakerEmbeddingModel,
-    )
-    from companion.speaker_id.engine import SpeakerEngine
-    from companion.speaker_id.store import SpeakerStore, SpeakerStoreError
+    from companion.speaker_id.runtime import DeferredSpeakerObserver
 
     try:
         config = load_speaker_config(
@@ -233,45 +234,15 @@ def _setup_speaker(args):
         f"{config.db_path}（不保存原始音频）。请确保被录音者知情并同意。",
         file=sys.stderr,
     )
-    model = SpeakerEmbeddingModel(
-        model_id=config.model_id,
-        model_revision=config.model_revision,
-        model_path=config.model_path,
-        device=config.device,
-    )
-    try:
-        print("正在加载声纹模型…", file=sys.stderr)
-        model.load()
-        print("正在预热声纹模型…", file=sys.stderr)
-        model.warmup()
-    except SpeakerEmbeddingError as exc:
-        print(f"错误: {exc}", file=sys.stderr)
-        model.close()
-        return None
-
-    store = SpeakerStore(
-        config.db_path,
-        max_embeddings_per_speaker=config.max_embeddings_per_speaker,
-    )
-    try:
-        store.initialize()
-    except SpeakerStoreError as exc:
-        print(f"错误: {exc}", file=sys.stderr)
-        model.close()
-        return None
-
-    engine = SpeakerEngine(
-        config, embedding_model=model, store=store
-    )
     print(
-        f"声纹模型已就绪：{config.model_id}@{config.model_revision}"
-        f"（{model.active_device}）",
+        "声纹模型将在后台加载；加载期间的语音仍会正常识别，"
+        "但不会附带说话人身份。",
         file=sys.stderr,
     )
-    return engine, model, store
+    return DeferredSpeakerObserver(config)
 
 
-def _print_summary(manager, *, debug: bool, engine=None) -> None:
+def _print_summary(manager, *, debug: bool, observer=None) -> None:
     stats = manager.stats
     print("", file=sys.stderr)
     print(
@@ -289,22 +260,37 @@ def _print_summary(manager, *, debug: bool, engine=None) -> None:
             f"最大 {max(latencies):.0f} ms（{len(latencies)} 段）。",
             file=sys.stderr,
         )
-    if engine is not None:
-        speaker = engine.stats()
-        identity = speaker["first_identity_latencies_ms"]
-        if identity:
-            average = sum(identity) / len(identity)
+    if observer is not None:
+        timings = observer.timings
+        if timings["model_load_ms"] is not None:
             print(
-                "说话开始 → 首次身份结果："
-                f"平均 {average:.0f} ms（{len(identity)} 段）。",
+                "声纹启动：模型加载 "
+                f"{timings['model_load_ms']:.0f} ms，"
+                f"预热 {timings['warmup_ms'] or 0.0:.0f} ms。",
                 file=sys.stderr,
             )
-        print(
-            f"声纹：分析 {speaker['analyses']} 次，"
-            f"错误 {speaker['errors']} 次，"
-            f"丢弃唤醒 {speaker['dropped_wakeups']} 次。",
-            file=sys.stderr,
-        )
+        if timings["error"]:
+            print(
+                f"声纹功能不可用：{timings['error']}",
+                file=sys.stderr,
+            )
+        engine = observer.engine
+        if engine is not None:
+            speaker = engine.stats()
+            identity = speaker["first_identity_latencies_ms"]
+            if identity:
+                average = sum(identity) / len(identity)
+                print(
+                    "说话开始 → 首次身份结果："
+                    f"平均 {average:.0f} ms（{len(identity)} 段）。",
+                    file=sys.stderr,
+                )
+            print(
+                f"声纹：分析 {speaker['analyses']} 次，"
+                f"错误 {speaker['errors']} 次，"
+                f"丢弃唤醒 {speaker['dropped_wakeups']} 次。",
+                file=sys.stderr,
+            )
     if debug:
         print(
             f"调试：输入丢弃块 {manager.dropped_audio_chunks}，"
@@ -344,19 +330,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Imported here so --list-devices stays usable without dashscope/numpy.
     from companion.asr.manager import ASRManager
 
-    engine = None
-    model = None
-    store = None
+    observer = None
     if args.speaker_id:
-        setup = _setup_speaker(args)
-        if setup is None:
+        observer = _setup_speaker(args)
+        if observer is None:
             return 3
-        engine, model, store = setup
 
-    manager = ASRManager(config, speaker_observer=engine)
-    if engine is not None:
-        engine.set_on_result(manager.post_speaker_result)
-        engine.start()
+    manager = ASRManager(config, speaker_observer=observer)
+    if observer is not None:
+        observer.set_on_result(manager.post_speaker_result)
+        observer.start_loading()
 
     interrupted = False
     try:
@@ -376,13 +359,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
     finally:
         manager.shutdown()
-        if engine is not None:
-            engine.shutdown()
-        if store is not None:
-            store.close()
-        if model is not None:
-            model.close()
-        _print_summary(manager, debug=args.debug, engine=engine)
+        if observer is not None:
+            observer.shutdown()
+        _print_summary(manager, debug=args.debug, observer=observer)
     return 130 if interrupted else 0
 
 

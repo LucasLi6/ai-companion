@@ -52,6 +52,7 @@ from companion.people.profile_refinement import (
     ProfileReviewContextSource,
 )
 from companion.people.profile_service import PersonProfileService
+from companion.people.speaker_bindings import SpeakerBindingService
 from companion.people.profile_confirmation import ProfileConfirmationService
 from companion.privacy.data_control import DataControlService
 from companion.providers.deepseek_client import (
@@ -132,6 +133,7 @@ class Runtime:
     profile_refinement_engine: object = None
     proactive_manager: Optional[ProactiveManager] = None
     profile_confirmation: Optional[ProfileConfirmationService] = None
+    speaker_bindings: Optional[SpeakerBindingService] = None
 
 
 def build_runtime(
@@ -180,6 +182,7 @@ def build_runtime(
     profile_service = PersonProfileService(
         repos.profile, repos.person, audit=repos.audit
     )
+    speaker_bindings = SpeakerBindingService(db, repos.person)
     profile_learning = PersonProfileLearningService(profile_service)
     registry = PersonRegistry(
         repos.person, audit=repos.audit, profiles=profile_service
@@ -739,4 +742,5 @@ def build_runtime(
         profile_refinement_engine=profile_refinement_engine,
         proactive_manager=proactive_manager,
         profile_confirmation=confirmation_service,
+        speaker_bindings=speaker_bindings,
     )

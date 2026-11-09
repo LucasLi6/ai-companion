@@ -147,6 +147,7 @@ _PARTIAL_TABLES = frozenset(
         "person_profile_evidence",
         "person_profile_revisions",
         "person_profile_fact_index",
+        "person_speaker_bindings",
         "utterances",
         "conversations",
     }
@@ -446,6 +447,19 @@ async def _count_plan(db: Database, owner_id: str, plan: dict[str, Any]) -> dict
             (owner_id,),
         )
         counts["person_profile_fact_index"] = TableCounts(kept=2, deleted=total)
+    if "person_speaker_bindings" in actual:
+        # A binding is a human-confirmed identity link, so the owner's
+        # bindings survive with the rest of the identity. Other people are
+        # removed entirely, and so are their bindings.
+        total = await _count(db, "SELECT COUNT(*) FROM person_speaker_bindings")
+        kept = await _count(
+            db,
+            "SELECT COUNT(*) FROM person_speaker_bindings WHERE person_id = ?",
+            (owner_id,),
+        )
+        counts["person_speaker_bindings"] = TableCounts(
+            kept=kept, deleted=max(0, total - kept)
+        )
     return counts
 
 
@@ -562,6 +576,9 @@ async def _apply_cleanup(
     await db.execute(f"DELETE FROM {_FTS_TABLE}")
 
     await db.execute("DELETE FROM persons WHERE person_id != ?", (owner_id,))
+    await db.execute(
+        "DELETE FROM person_speaker_bindings WHERE person_id != ?", (owner_id,)
+    )
     await db.execute("DELETE FROM consents WHERE person_id != ?", (owner_id,))
     await db.execute(
         "DELETE FROM person_interaction_profiles WHERE person_id != ?",
