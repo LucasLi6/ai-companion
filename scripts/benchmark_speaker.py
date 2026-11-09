@@ -17,6 +17,12 @@ What it measures (all with the real model, CPU by default):
   ambiguous_ratio         score fell inside the uncertainty band
   device / voiced length / sample counts / P50 / P95
 
+With ``--continuous-learning`` the script also runs each stage from a fresh
+store and reports recognition on a clip that never participated in learning,
+alongside the engine's real ``learning`` counters (added / duplicate /
+low_similarity / low_margin / low_quality / identity_conflict / asr_failed /
+store_error).
+
 Accuracy numbers need a labelled, consented dataset in this layout::
 
     DATASET/
@@ -32,7 +38,8 @@ Usage::
 
     .venv/bin/python scripts/benchmark_speaker.py
     .venv/bin/python scripts/benchmark_speaker.py --device mps --repeats 5
-    .venv/bin/python scripts/benchmark_speaker.py --dataset /path/to/clips --json /tmp/spk.json
+    .venv/bin/python scripts/benchmark_speaker.py --dataset /path/to/clips \
+        --continuous-learning --learning-stages 1,3,5,10,20 --json /tmp/spk.json
 """
 
 from __future__ import annotations
@@ -70,6 +77,10 @@ from companion.speaker_id.store import SpeakerStore
 
 SAMPLE_RATE = 16000
 DEFAULT_DURATIONS = (1.5, 2.0, 3.0, 5.0)
+DEFAULT_LEARNING_STAGES = (1, 3, 5, 10, 20)
+# Learning commits happen on the engine worker after ASR is reported. Every
+# wait is bounded so a stuck worker fails the benchmark instead of hanging it.
+FINALIZE_TIMEOUT_SECONDS = 30.0
 
 
 # ------------------------------------------------------------------- audio io
@@ -180,17 +191,40 @@ class TempEngine:
         )
         self.engine.start()
 
-    def run(self, uid: int, pcm: bytes) -> SpeakerResult:
+    def run(self, uid: int, pcm: bytes, *, learn: bool = True) -> SpeakerResult:
+        """One whole utterance, including its learning commit.
+
+        A match result is not a finished utterance: the engine only learns
+        after ``on_finalized`` and the worker has processed it. Waiting for
+        ``is_finished`` guarantees the next utterance starts from the committed
+        sample set (and that a rejected sample is fully rejected).
+        """
         self.engine.on_start(uid, pcm)
-        result = self.sink.wait(uid)
         self.engine.on_end(uid)
+        result = self.sink.wait(uid, timeout=FINALIZE_TIMEOUT_SECONDS)
+        self.engine.on_finalized(uid, learn)
+        if not self._wait_finished(uid):
+            raise TimeoutError(f"utterance {uid} did not finish in time")
         return result
+
+    def identify(self, uid: int, pcm: bytes) -> SpeakerResult:
+        """Recognise without learning (ASR is reported as failed)."""
+        return self.run(uid, pcm, learn=False)
+
+    def _wait_finished(self, uid: int) -> bool:
+        deadline = time.monotonic() + FINALIZE_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if self.engine.is_finished(uid):
+                return True
+            time.sleep(0.01)
+        return False
 
     def run_realtime(self, uid: int, pcm: bytes):
         """Feed 20 ms frames in wall-clock time, like a microphone.
 
         Returns ``(first_result, first_identity_ms, before_vad_end)``. The
-        whole clip is fed so the final VAD-like end can also be observed.
+        whole clip is fed, then the final analysis and learning commit run so
+        a following utterance observes the updated sample set.
         """
         chunk = int(0.02 * SAMPLE_RATE) * 2
         started = time.perf_counter()
@@ -206,8 +240,11 @@ class TempEngine:
         self.engine.on_end(uid)
         first = self.sink.first(uid)
         if first is None:
-            first = self.sink.wait(uid)
+            first = self.sink.wait(uid, timeout=FINALIZE_TIMEOUT_SECONDS)
         first_at = self.sink.first_at.get(uid, feed_end)
+        self.engine.on_finalized(uid, True)
+        if not self._wait_finished(uid):
+            raise TimeoutError(f"utterance {uid} did not finish in time")
         return first, (first_at - started) * 1000.0, first_at <= feed_end
 
     def close(self) -> None:
@@ -352,6 +389,117 @@ def benchmark_accuracy(config, model, dataset: dict[str, list[Path]]) -> dict:
     }
 
 
+def benchmark_continuous_learning(
+    config,
+    model,
+    dataset: dict[str, list[Path]],
+    stages=DEFAULT_LEARNING_STAGES,
+) -> dict:
+    """Recognition after N successful learning utterances per speaker.
+
+    Each stage starts from a fresh temporary store. The first clip enrolls a
+    speaker; the reserved last clip is *never* used for learning and is the
+    only clip scored. Learning clips are cycled from the remaining files (or
+    the enrollment clip when a speaker has no files between), so the store's
+    duplicate/diversity rules decide what is actually kept.
+
+    Accuracy is only "measured" for a labelled, consented dataset. With no
+    usable dataset the caller reports ``untested`` instead of inventing it.
+    """
+    usable = {
+        label: files
+        for label, files in dataset.items()
+        if len(files) >= 2
+    }
+    if len(usable) < 2:
+        return {
+            "status": "untested",
+            "reason": (
+                "至少需要两位说话人，且每位至少两段音频"
+                "（一段登记、一段从不参与学习的测试）。"
+            ),
+        }
+
+    stage_results = []
+    for stage in stages:
+        with tempfile.TemporaryDirectory(prefix="ava-speaker-learn-") as tmp:
+            engine = TempEngine(config, model, Path(tmp))
+            try:
+                enrolled: dict[str, Optional[str]] = {}
+                uid = 0
+                for label, files in usable.items():
+                    uid += 1
+                    first = engine.run(uid, read_wav(files[0]))
+                    enrolled[label] = first.speaker_id
+
+                attempts = 0
+                for round_index in range(int(stage)):
+                    for label, files in usable.items():
+                        pool = files[1:-1] or [files[0]]
+                        clip = pool[round_index % len(pool)]
+                        uid += 1
+                        engine.run(uid, read_wav(clip))
+                        attempts += 1
+
+                # Snapshot learning statistics before recognition tests, which
+                # are reported to the engine as ASR failures and must not count.
+                learning = dict(engine.engine.stats()["learning"])
+                stored = sum(
+                    int(item.get("samples") or 0)
+                    for item in engine.store.list_speakers()
+                )
+
+                tests = 0
+                reid = 0
+                false_match = 0
+                unknown = 0
+                for label, files in usable.items():
+                    uid += 1
+                    result = engine.identify(uid, read_wav(files[-1]))
+                    tests += 1
+                    expected = enrolled[label]
+                    if expected is None:
+                        unknown += 1
+                    elif result.status in (KNOWN, CANDIDATE_MATCH):
+                        if result.speaker_id == expected:
+                            reid += 1
+                        else:
+                            false_match += 1
+                    else:
+                        unknown += 1
+            finally:
+                engine.close()
+
+        ratio = lambda value: (value / tests) if tests else None  # noqa: E731
+        added = int(learning.get("added", 0))
+        stage_results.append(
+            {
+                "learning_count": attempts,
+                "stored_embedding_count": stored,
+                "recognition_accuracy": ratio(reid),
+                "false_match_rate": ratio(false_match),
+                "unknown_or_ambiguous_rate": ratio(unknown),
+                "added_samples": added,
+                "rejected_samples_by_reason": {
+                    key: value
+                    for key, value in learning.items()
+                    if key != "added"
+                },
+                "test_count": tests,
+            }
+        )
+
+    return {
+        "status": "measured",
+        "speakers": sorted(usable),
+        "stages": stage_results,
+        "note": (
+            "每个阶段从空库开始；最后一段录音从不参与学习。"
+            "准确率只来自该标注数据集，不适用于其他设备或噪声条件。"
+        ),
+    }
+
+
 def benchmark_calibration(model, dataset: dict[str, list[Path]]) -> dict:
     """Pairwise score distributions plus conservative threshold suggestions.
 
@@ -459,6 +607,15 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "conservative threshold suggestion",
     )
     parser.add_argument(
+        "--continuous-learning", action="store_true",
+        help="with --dataset, measure recognition after 1/3/5/10/20 successful "
+        "learning utterances per speaker",
+    )
+    parser.add_argument(
+        "--learning-stages", default="1,3,5,10,20",
+        help="comma-separated cumulative learning counts per speaker",
+    )
+    parser.add_argument(
         "--audio", default=None,
         help="optional 16 kHz WAV used instead of synthetic timing audio",
     )
@@ -480,6 +637,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         return 2
     if args.repeats < 1:
         print("错误: --repeats 必须大于等于 1。", file=sys.stderr)
+        return 2
+    try:
+        learning_stages = tuple(
+            int(part) for part in args.learning_stages.split(",") if part.strip()
+        )
+    except ValueError:
+        print("错误: --learning-stages 必须是逗号分隔的整数。", file=sys.stderr)
+        return 2
+    if not learning_stages or any(stage < 1 for stage in learning_stages):
+        print("错误: --learning-stages 每项必须大于等于 1。", file=sys.stderr)
         return 2
 
     config = load_speaker_config(device=args.device)
@@ -550,6 +717,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             config, model, audio_by_duration
         )
 
+    dataset: dict[str, list[Path]] = {}
     if args.dataset:
         root = Path(args.dataset).expanduser()
         dataset = load_dataset(root) if root.is_dir() else {}
@@ -572,6 +740,20 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             "status": "untested",
             "reason": "未提供带说话人标签且已获同意的数据集（--dataset）。",
         }
+
+    if args.continuous_learning:
+        if dataset:
+            report["continuous_learning"] = benchmark_continuous_learning(
+                config, model, dataset, learning_stages
+            )
+        else:
+            report["continuous_learning"] = {
+                "status": "untested",
+                "reason": (
+                    "持续学习准确率需要带说话人标签且已获同意的数据集"
+                    "（--dataset），未使用随机向量代替。"
+                ),
+            }
 
     report["asr_final_latency"] = {
         "status": "untested",

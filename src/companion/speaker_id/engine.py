@@ -60,6 +60,29 @@ _POLL_SECONDS = 0.02
 # audio arrived since the last one; otherwise the existing snapshot stands.
 _MIN_FINAL_GAP_SECONDS = 0.3
 
+# Explicit outcomes of the per-utterance learning decision. A successful match
+# is not a successful write: only ``ADDED`` means a new reference vector was
+# kept for the identity.
+LEARN_ADDED = "ADDED"
+LEARN_DUPLICATE = "DUPLICATE"
+LEARN_LOW_QUALITY = "LOW_QUALITY"
+LEARN_LOW_SIMILARITY = "LOW_SIMILARITY"
+LEARN_LOW_MARGIN = "LOW_MARGIN"
+LEARN_IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
+LEARN_ASR_FAILED = "ASR_FAILED"
+LEARN_STORE_ERROR = "STORE_ERROR"
+
+_LEARNING_KEYS = {
+    LEARN_ADDED: "added",
+    LEARN_DUPLICATE: "duplicate",
+    LEARN_LOW_QUALITY: "low_quality",
+    LEARN_LOW_SIMILARITY: "low_similarity",
+    LEARN_LOW_MARGIN: "low_margin",
+    LEARN_IDENTITY_CONFLICT: "identity_conflict",
+    LEARN_ASR_FAILED: "asr_failed",
+    LEARN_STORE_ERROR: "store_error",
+}
+
 
 def _timing_summary(samples) -> dict[str, Any]:
     """Summarise bounded timing samples without inventing missing data."""
@@ -112,6 +135,11 @@ class _UtteranceState:
     # Why this utterance is pending: a verified match from a window, waiting
     # for VAD end + ASR final result before it may be written.
     pending_enrollment: Optional[_PendingEnrollment] = None
+    # Why the last analysed window could not become a learning sample even
+    # though it matched an existing identity (for statistics only).
+    enrollment_block_reason: Optional[str] = None
+    # Outcome of the provisional first sample created by this utterance.
+    bootstrap_learning: Optional[str] = None
     # The final analysis for this utterance has run (successfully or not).
     analysis_done: bool = False
     # ``None`` until ASR reports the final outcome; only ``True`` may learn.
@@ -174,6 +202,11 @@ class SpeakerEngine:
         self.errors = 0
         self.dropped_wakeups = 0
         self.first_identity_latencies_ms: list[float] = []
+        # Per-utterance learning outcomes. ``added`` counts only samples the
+        # store actually kept; a reliable match never implies a write.
+        self._learning: dict[str, int] = {
+            key: 0 for key in _LEARNING_KEYS.values()
+        }
         # Bounded rolling timing samples. Every value is measured with
         # ``perf_counter``; unmeasured behaviour is reported as absent, never
         # as a fabricated score.
@@ -334,6 +367,16 @@ class SpeakerEngine:
     # Spec §9 name; identical O(1) read.
     get_latest_result = snapshot
 
+    def is_finished(self, utterance_id: int) -> bool:
+        """True once the utterance's final analysis and learning commit ended.
+
+        The state is removed only after ``_enroll``/revocation returned, so a
+        benchmark or test can wait on this instead of guessing from the match
+        result (which does not imply that learning has run).
+        """
+        with self._lock:
+            return int(utterance_id) not in self._states
+
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -343,12 +386,23 @@ class SpeakerEngine:
                 "first_identity_latencies_ms": list(
                     self.first_identity_latencies_ms
                 ),
+                "learning": dict(self._learning),
                 "timings_ms": {
                     name: _timing_summary(samples)
                     for name, samples in self._timings.items()
                 },
                 "session_id": self.session_id,
             }
+
+    def _record_learning(self, outcome: Optional[str]) -> None:
+        """Count one real learning outcome; ``None`` means nothing was tried."""
+        if outcome is None:
+            return
+        key = _LEARNING_KEYS.get(outcome)
+        if key is None:
+            return
+        with self._lock:
+            self._learning[key] += 1
 
     def _record_timing(self, name: str, milliseconds: float) -> None:
         samples = self._timings.get(name)
@@ -561,26 +615,48 @@ class SpeakerEngine:
             success = state.asr_success is True
             created_speaker = state.created_speaker_id
             provisional = state.enrolled
+            block_reason = state.enrollment_block_reason
+            bootstrap_learning = state.bootstrap_learning
 
         # Process (write/revoke) before removing the state so a caller that
         # observes the utterance as finished can also observe its effect.
         # ``_enroll`` registers the source first, so a cancellation racing
         # this write still queues a revocation that runs afterwards.
-        if not success or conflict:
+        outcome: Optional[str]
+        if not success:
             if provisional and created_speaker:
                 self._revoke(created_speaker, self.session_id, uid)
-        elif pending is not None and self._eligible_for_enrollment(
-            pending.decision,
-            pending.quality,
-            pending.speaker_status,
-            identity_conflict=False,
-        ):
-            self._enroll(
-                pending.speaker_id,
-                pending.vector,
+            outcome = LEARN_ASR_FAILED
+        elif conflict:
+            if provisional and created_speaker:
+                self._revoke(created_speaker, self.session_id, uid)
+            outcome = LEARN_IDENTITY_CONFLICT
+        elif pending is not None:
+            failure = self._enrollment_failure_reason(
+                pending.decision,
                 pending.quality,
-                source_utterance_id=uid,
+                pending.speaker_status,
+                identity_conflict=False,
             )
+            if failure is None:
+                outcome = self._enroll(
+                    pending.speaker_id,
+                    pending.vector,
+                    pending.quality,
+                    source_utterance_id=uid,
+                )
+            else:
+                outcome = failure
+        elif provisional:
+            # The provisional first sample was written during analysis; it is
+            # a real sample only if this utterance succeeded without conflict.
+            outcome = bootstrap_learning or LEARN_ADDED
+        else:
+            # A window that matched an existing identity but failed one of the
+            # enrollment gates: report the gate, not a successful learn.
+            outcome = block_reason
+
+        self._record_learning(outcome)
 
         with self._lock:
             self._states.pop(uid, None)
@@ -742,6 +818,7 @@ class SpeakerEngine:
 
         pending: Optional[_PendingEnrollment] = None
         enroll_bootstrap = False
+        block_reason: Optional[str] = None
         if speaker_id and created_now:
             # The identity must exist immediately so the next analysis of this
             # same utterance can lock onto it. This provisional sample is the
@@ -755,12 +832,13 @@ class SpeakerEngine:
             and decision.status in (CANDIDATE_MATCH, KNOWN)
         ):
             speaker_status = status_by_id.get(speaker_id, "")
-            if self._eligible_for_enrollment(
+            failure = self._enrollment_failure_reason(
                 decision,
                 quality,
                 speaker_status,
                 identity_conflict=conflict,
-            ):
+            )
+            if failure is None:
                 pending = _PendingEnrollment(
                     speaker_id=speaker_id,
                     vector=vector,
@@ -768,9 +846,12 @@ class SpeakerEngine:
                     decision=decision,
                     speaker_status=speaker_status,
                 )
+            else:
+                block_reason = failure
 
+        bootstrap_learning: Optional[str] = None
         if enroll_bootstrap:
-            self._enroll(
+            bootstrap_learning = self._enroll(
                 speaker_id, vector, quality, source_utterance_id=uid
             )
 
@@ -784,11 +865,16 @@ class SpeakerEngine:
                 state.created_speaker_id = speaker_id
             if enroll_bootstrap:
                 state.enrolled = True
+                state.bootstrap_learning = bootstrap_learning
             if conflict:
                 state.identity_conflict = True
                 state.pending_enrollment = None
+                state.enrollment_block_reason = None
             elif pending is not None:
                 state.pending_enrollment = pending
+                state.enrollment_block_reason = None
+            elif block_reason is not None and state.pending_enrollment is None:
+                state.enrollment_block_reason = block_reason
 
         # An identity first heard in this utterance stays "new" for the whole
         # utterance: the rising self-similarity of later windows is not
@@ -835,7 +921,26 @@ class SpeakerEngine:
         *,
         identity_conflict: bool,
     ) -> bool:
-        """Stricter proof for a permanent sample than for re-identification.
+        """Stricter proof for a permanent sample than for re-identification."""
+        return (
+            self._enrollment_failure_reason(
+                decision,
+                quality,
+                speaker_status,
+                identity_conflict=identity_conflict,
+            )
+            is None
+        )
+
+    def _enrollment_failure_reason(
+        self,
+        decision: MatchDecision,
+        quality: Optional[VoiceQuality],
+        speaker_status: str,
+        *,
+        identity_conflict: bool,
+    ) -> Optional[str]:
+        """Return why a window must not become a sample, or ``None``.
 
         Reusing an identity only needs the match threshold; writing a new
         reference changes every future match for that identity, so it requires
@@ -845,28 +950,32 @@ class SpeakerEngine:
         only for this version).
         """
         if identity_conflict:
-            return False
+            return LEARN_IDENTITY_CONFLICT
         if decision is None or quality is None or not quality.usable:
-            return False
+            return LEARN_LOW_QUALITY
         required = QUALITY_RANK.get(
             self.config.minimum_enrollment_quality, 2
         )
         if quality.rank < required:
-            return False
-        if speaker_status not in ("KNOWN", "CANDIDATE"):
-            return False
+            return LEARN_LOW_QUALITY
         if decision.status not in (CANDIDATE_MATCH, KNOWN):
-            return False
+            if decision.status == AMBIGUOUS:
+                return LEARN_IDENTITY_CONFLICT
+            return LEARN_LOW_SIMILARITY
+        if speaker_status not in ("KNOWN", "CANDIDATE"):
+            if speaker_status == AMBIGUOUS:
+                return LEARN_IDENTITY_CONFLICT
+            return LEARN_LOW_SIMILARITY
         if decision.similarity is None:
-            return False
+            return LEARN_LOW_SIMILARITY
         if decision.similarity < self.config.enrollment_match_threshold:
-            return False
+            return LEARN_LOW_SIMILARITY
         if (
             decision.margin is not None
             and decision.margin < self.config.enrollment_margin
         ):
-            return False
-        return True
+            return LEARN_LOW_MARGIN
+        return None
 
 
     def _create_candidate(self, uid: int) -> Optional[str]:
@@ -883,19 +992,20 @@ class SpeakerEngine:
         quality: VoiceQuality,
         *,
         source_utterance_id: int,
-    ) -> None:
+    ) -> str:
+        """Write at most one sample and report exactly what the store did."""
         required = QUALITY_RANK.get(
             self.config.minimum_enrollment_quality, 2
         )
         if quality.rank < required:
-            return
+            return LEARN_LOW_QUALITY
         # Register the source *before* the write so a cancellation racing the
         # commit is still able to revoke the sample.
         with self._lock:
             self._remember_source_locked(int(source_utterance_id), speaker_id)
         started = self._perf()
         try:
-            self._store.add_embedding(
+            outcome = self._store.add_embedding(
                 speaker_id,
                 vector,
                 quality=quality.quality,
@@ -910,11 +1020,13 @@ class SpeakerEngine:
             self.logger.debug(
                 "speaker_enroll_failed speaker_id=%s", speaker_id
             )
+            return LEARN_STORE_ERROR
         finally:
             self._record_timing(
                 "enrollment_ms",
                 max(0.0, (self._perf() - started) * 1000.0),
             )
+        return LEARN_ADDED if outcome == LEARN_ADDED else LEARN_DUPLICATE
 
     def _record_observation(
         self,

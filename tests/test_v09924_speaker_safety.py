@@ -575,7 +575,7 @@ def test_duplicate_and_better_quality_sample_rules(tmp_path) -> None:
             embedding_version=VERSION,
         )
         assert first is not None
-        assert duplicate is None
+        assert duplicate == "DUPLICATE"
         assert count_samples(store) == 1
 
         better = store.add_embedding(
@@ -617,7 +617,7 @@ def test_verified_sample_is_never_replaced_by_a_duplicate(tmp_path) -> None:
             voiced_seconds=3.0,
             model_id=MODEL,
             embedding_version=VERSION,
-        ) is None
+        ) == "DUPLICATE"
         with sqlite3.connect(store.path) as connection:
             row = connection.execute(
                 "SELECT quality, is_verified_reference"
@@ -653,7 +653,8 @@ def test_source_idempotency_and_revocation(tmp_path) -> None:
             source_session_id="session",
             source_utterance_id=4,
         )
-        assert first == again
+        assert first == "ADDED"
+        assert again == "DUPLICATE"
         assert count_samples(store) == 1
 
         assert store.revoke_embedding(

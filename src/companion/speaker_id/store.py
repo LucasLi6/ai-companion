@@ -50,6 +50,11 @@ class IncompatibleModelError(SpeakerStoreError):
 
 _QUALITY_RANK = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
+# What ``add_embedding`` did with the offered sample. Only ``SAMPLE_ADDED``
+# means the identity gained a reference vector.
+SAMPLE_ADDED = "ADDED"
+SAMPLE_DUPLICATE = "DUPLICATE"
+
 
 class SpeakerStore:
     def __init__(
@@ -335,7 +340,7 @@ class SpeakerStore:
         source_session_id: Optional[str] = None,
         source_utterance_id: Optional[int] = None,
         is_verified_reference: bool = False,
-    ) -> Optional[int]:
+    ) -> str:
         """Store one normalized voice print, keeping the sample set useful.
 
         The write is idempotent per ``(speaker, source session, source
@@ -346,8 +351,9 @@ class SpeakerStore:
         ``max_embeddings_per_speaker`` with verified references protected and
         the rest chosen by deterministic farthest-first diversity.
 
-        Returns the new (or existing source) embedding id, or ``None`` when
-        the sample added no value.
+        Returns ``SAMPLE_ADDED`` only when a reference vector was actually
+        kept, otherwise ``SAMPLE_DUPLICATE`` (including a same-source retry
+        and a sample evicted by the trim in the same transaction).
         """
         from companion.speaker_id.embedding import validate_embedding
 
@@ -388,7 +394,7 @@ class SpeakerStore:
                 if existing is not None:
                     # A retry after a commit (or an ASR replay) must not add a
                     # second sample for the same spoken utterance.
-                    return int(existing["embedding_id"])
+                    return SAMPLE_DUPLICATE
 
             duplicate = self._find_duplicate(
                 connection, speaker_id, array
@@ -397,7 +403,7 @@ class SpeakerStore:
                 existing_id, existing_vector, existing_rank, protected = duplicate
                 new_rank = _QUALITY_RANK.get(str(quality).upper(), 0)
                 if protected or new_rank <= existing_rank:
-                    return None
+                    return SAMPLE_DUPLICATE
                 connection.execute(
                     "DELETE FROM speaker_embeddings WHERE embedding_id = ?",
                     (existing_id,),
@@ -426,8 +432,14 @@ class SpeakerStore:
                 "UPDATE speaker_profiles SET updated_at = ? WHERE speaker_id = ?",
                 (now, speaker_id),
             )
+            new_id = int(cursor.lastrowid)
             self._trim_embeddings(connection, speaker_id)
-            return int(cursor.lastrowid)
+            # A sample inserted and evicted by the same trim did not add value.
+            kept = connection.execute(
+                "SELECT 1 FROM speaker_embeddings WHERE embedding_id = ?",
+                (new_id,),
+            ).fetchone()
+            return SAMPLE_ADDED if kept is not None else SAMPLE_DUPLICATE
 
     def _find_duplicate(
         self,
