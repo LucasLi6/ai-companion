@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import logging
 import os
 import shutil
 import sys
@@ -24,6 +25,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from companion.config import configure_logging, default_db_path
 from companion.agent.constants import (
@@ -93,7 +95,7 @@ from companion.runtime_context.timezone import TimeZoneService, valid_zone
 from companion.storage.database import Database
 from companion.storage.repositories import make_repositories
 from companion.tts import SpeechJob, TTSManager
-from companion.tts.config import tts_enabled_by_default
+from companion.tts.config import load_local_env, tts_enabled_by_default
 
 DEFAULT_CONVERSATION = "default"
 
@@ -2096,6 +2098,10 @@ async def _select_repl_person(rt, person_id):
 
 
 async def cmd_repl(args) -> int:
+    # ``AVA_PROACTIVE_ACTIVITY`` (and other local settings) may live in the
+    # git-ignored .env; load it before the runtime builds the proactive
+    # manager. Exported values always win.
+    load_local_env()
     db = await _connect(args.db)
     try:
         provider = getattr(args, "provider", "mock")
@@ -2233,6 +2239,11 @@ async def cmd_repl(args) -> int:
                     await rt.conversations.set_quiet_mode(
                         args.conversation, parts[1] == "on"
                     )
+                    if parts[1] == "on" and proactive is not None:
+                        # Quiet Mode stops every later proactive round now,
+                        # not only after its next timer expires.
+                        with contextlib.suppress(Exception):
+                            proactive.cancel_cycle(args.conversation)
                     print(f"quiet_mode={'on' if parts[1] == 'on' else 'off'}")
                 elif cmd == "/to" and len(parts) == 2 and parts[1] in ("agent", "human", "unknown"):
                     addressee = parts[1]
@@ -2355,7 +2366,9 @@ async def cmd_repl(args) -> int:
                 while True:
                     try:
                         line = (
-                            await _read_line_with_proactive(rt, repl_session)
+                            await _read_line_with_proactive(
+                                rt, repl_session, tts_manager=tts_manager
+                            )
                         ).strip()
                     except (EOFError, KeyboardInterrupt):
                         print()
@@ -2371,11 +2384,24 @@ async def cmd_repl(args) -> int:
                     )
             else:
                 # Unified input scheduler: one long-lived prompt task plus the
-                # ASR-final and proactive waiters. A submitted keyboard line is
-                # never cancelled or re-submitted; a voice turn may run while
-                # the prompt stays active (output goes above the input line),
-                # and an Enter pressed during that turn is processed next.
+                # ASR-final, proactive-event and proactive-delivery waiters. A
+                # submitted keyboard line is never cancelled or re-submitted; a
+                # voice turn may run while the prompt stays active (output goes
+                # above the input line), and an Enter pressed during that turn
+                # is processed next.
+
+                async def _deliver_proactive_voice_local(event) -> None:
+                    await _deliver_proactive_voice(
+                        event,
+                        manager=proactive,
+                        coordinator=coordinator,
+                        tts_manager=tts_manager,
+                        session=repl_session,
+                        output=voice_output,
+                    )
+
                 prompt_task = asyncio.create_task(_prompt_once())
+                proactive_task: Optional[asyncio.Task] = None
                 quit_requested = False
                 try:
                     while not quit_requested:
@@ -2384,20 +2410,26 @@ async def cmd_repl(args) -> int:
                         )
                         event_future = (
                             asyncio.ensure_future(proactive.next_event())
-                            if proactive is not None
+                            if proactive is not None and proactive_task is None
                             else None
                         )
                         waiters = {prompt_task, final_future}
                         if event_future is not None:
                             waiters.add(event_future)
+                        if proactive_task is not None:
+                            waiters.add(proactive_task)
                         done, _pending = await asyncio.wait(
                             waiters, return_when=asyncio.FIRST_COMPLETED
                         )
 
                         if prompt_task.done():
-                            # A pressed Enter is already an accepted input.
+                            # A pressed Enter is already an accepted input and
+                            # cancels any pending/deferred proactive delivery.
                             _discard_future(final_future)
                             _discard_future(event_future)
+                            if proactive_task is not None:
+                                await _cancel_async_task(proactive_task)
+                                proactive_task = None
                             try:
                                 line = prompt_task.result()
                             except (EOFError, KeyboardInterrupt):
@@ -2431,6 +2463,9 @@ async def cmd_repl(args) -> int:
 
                         if final_future in done:
                             _discard_future(event_future)
+                            if proactive_task is not None:
+                                await _cancel_async_task(proactive_task)
+                                proactive_task = None
                             final = final_future.result()
                             # The ASR renderer does not print finals in the
                             # formal REPL; echo the accepted text exactly once,
@@ -2450,18 +2485,23 @@ async def cmd_repl(args) -> int:
                             )
                             continue
 
+                        if proactive_task is not None and proactive_task in done:
+                            _discard_future(final_future)
+                            proactive_task = None
+                            continue
+
                         if event_future is not None and event_future in done:
                             _discard_future(final_future)
                             event = event_future.result()
-                            if (
-                                event is not None
-                                and coordinator.should_deliver_proactive()
-                            ):
-                                await _render_proactive_event(
-                                    event, repl_session
+                            if event is not None:
+                                # Deferral is asynchronous and bounded to one
+                                # proactive delivery at a time; new input
+                                # cancels it without touching the manager's
+                                # next scheduling time (no ack = not delivered).
+                                proactive_task = asyncio.create_task(
+                                    _deliver_proactive_voice_local(event),
+                                    name="ava-proactive-delivery",
                                 )
-                            # Otherwise a recording/reply owns the user's
-                            # attention: the proactive line is dropped.
                             continue
 
                         # Defensive: a waiter vanished without an item.
@@ -2474,6 +2514,8 @@ async def cmd_repl(args) -> int:
                             asyncio.CancelledError, Exception
                         ):
                             await prompt_task
+                    if proactive_task is not None:
+                        await _cancel_async_task(proactive_task)
         finally:
             # Stop voice input, then speech/audio threads, before the event
             # loop closes; the REPL must exit without a recording, a playing
@@ -2499,6 +2541,16 @@ def _discard_future(future) -> None:
     """Cancel a pending waiter without consuming or re-submitting its data."""
     if future is not None and not future.done():
         future.cancel()
+
+
+async def _cancel_async_task(task) -> None:
+    """Cancel a background task and wait for its cleanup (no orphan tasks)."""
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
 
 
 async def _handle_mic_command(parts: list[str], voice_mode: bool, coordinator) -> None:
@@ -2676,9 +2728,26 @@ def _print_proactive_line(text: str) -> None:
     sys.stdout.flush()
 
 
-async def _render_proactive_event(event, session=None) -> None:
+async def _render_proactive_event(
+    event,
+    session=None,
+    *,
+    tts_manager=None,
+    coordinator=None,
+    output=None,
+) -> bool:
+    """Display a proactive message, then speak it through the shared TTS.
+
+    Order is fixed: the terminal line is shown first, then the same text is
+    submitted to the existing :class:`TTSManager` (never a second Router or
+    conversation record). ``display_text`` is used for speech so legal voice
+    labels reach Qwen; ``text`` stays the canonical persisted reply.
+
+    Returns True when the event was a completed, non-empty proactive message
+    (whether or not TTS happened to be enabled).
+    """
     if event.type != "response_completed" or not (event.text or "").strip():
-        return
+        return False
     # display_text keeps voice-expression labels for the surface; text remains
     # the canonical, persisted reply.
     text = (
@@ -2694,13 +2763,170 @@ async def _render_proactive_event(event, session=None) -> None:
 
         try:
             await run_in_terminal(lambda: _print_proactive_line(text))
-            return
         except Exception:
-            pass
-    _print_proactive_line(text)
+            _print_proactive_line(text)
+    else:
+        _print_proactive_line(text)
+
+    spoke = False
+    if tts_manager is not None:
+        speech_text = text or event.text
+        if speech_text and speech_text.strip():
+            try:
+                spoke = bool(
+                    tts_manager.submit(
+                        SpeechJob(
+                            response_id=event.response_id,
+                            conversation_id=event.conversation_id,
+                            text=speech_text,
+                            generation=getattr(tts_manager, "generation", 0),
+                            reply_completed_at=time.monotonic(),
+                        )
+                    )
+                )
+            except Exception:  # noqa: BLE001 - text delivery already happened
+                spoke = False
+        if spoke and coordinator is not None:
+            try:
+                coordinator.on_reply_started(tts_manager.generation)
+            except Exception:  # noqa: BLE001 - voice state is best effort
+                pass
+        if spoke and output is not None:
+            with contextlib.suppress(Exception):
+                await output.write("[tts] Speaking...\n")
+    logging.getLogger("companion.proactive").info(
+        "proactive_surface_rendered conversation_id=%s source_event_id=%s"
+        " message_id=%s chars=%d tts_submitted=%s",
+        getattr(event, "conversation_id", None),
+        getattr(event, "event_id", None),
+        getattr(event, "response_id", None),
+        len(text or ""),
+        spoke,
+    )
+    return True
 
 
-async def _read_line_with_prompt_session(manager, session) -> str:
+async def _ack_proactive_event(manager, event, *, delivered: bool, reason: str) -> None:
+    """Report whether one proactive message really reached the surface."""
+    if manager is None or event is None:
+        return
+    try:
+        if delivered and hasattr(manager, "note_proactive_delivered"):
+            manager.note_proactive_delivered(event)
+        elif hasattr(manager, "note_proactive_cancelled"):
+            manager.note_proactive_cancelled(event, reason)
+    except Exception:  # noqa: BLE001 - acknowledgement never breaks chat
+        pass
+
+
+async def _deliver_proactive_voice(
+    event,
+    *,
+    manager,
+    coordinator,
+    tts_manager=None,
+    session=None,
+    output=None,
+) -> bool:
+    """Display, speak and acknowledge one proactive message in voice mode.
+
+    Deferred (never silently dropped) while ASR is recording or Ava is
+    speaking; the event is re-checked after that wait. The mic is paused for
+    the proactive playback exactly like a reply turn, and listening resumes
+    only after the real playback-complete event and the existing cooldown.
+    A new keyboard line or voice final cancels this task.
+    """
+    log = logging.getLogger("companion.proactive")
+    try:
+        if coordinator is not None:
+            await coordinator.wait_until_proactive_allowed()
+            # Let an already-queued ASR speech-start event run before taking
+            # the turn: a user who has just begun speaking keeps the floor.
+            await asyncio.sleep(0)
+            if not coordinator.should_deliver_proactive():
+                await _ack_proactive_event(
+                    manager,
+                    event,
+                    delivered=False,
+                    reason="user_started_speaking",
+                )
+                return False
+        if manager is not None:
+            can_deliver = getattr(manager, "can_deliver", None)
+            if callable(can_deliver) and not await can_deliver(event):
+                await _ack_proactive_event(
+                    manager,
+                    event,
+                    delivered=False,
+                    reason="stale_before_delivery",
+                )
+                return False
+        if coordinator is not None:
+            coordinator.begin_turn()
+        rendered = await _render_proactive_event(
+            event,
+            session,
+            tts_manager=tts_manager,
+            coordinator=coordinator,
+            output=output,
+        )
+        if not rendered:
+            if coordinator is not None:
+                coordinator.on_turn_finished({"delivered": False})
+            await _ack_proactive_event(
+                manager,
+                event,
+                delivered=False,
+                reason="render_failed",
+            )
+            return False
+        if coordinator is not None:
+            coordinator.on_turn_finished(
+                {
+                    "delivered": True,
+                    "status": "COMPLETED",
+                    "action": "RESPOND",
+                }
+            )
+            # Resume only after the real playback-complete event.
+            await coordinator.wait_until_proactive_allowed()
+        await _ack_proactive_event(
+            manager, event, delivered=True, reason="delivered"
+        )
+        log.info(
+            "proactive_voice_delivered conversation_id=%s"
+            " source_event_id=%s message_id=%s",
+            getattr(event, "conversation_id", None),
+            getattr(event, "event_id", None),
+            getattr(event, "response_id", None),
+        )
+        return True
+    except asyncio.CancelledError:
+        # A keyboard line or a voice final won: never let the old proactive
+        # turn keep the mic paused.
+        if coordinator is not None:
+            coordinator.on_turn_finished({"delivered": False})
+        await _ack_proactive_event(
+            manager, event, delivered=False, reason="interrupted_by_user"
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001 - REPL stays alive
+        if coordinator is not None:
+            coordinator.on_turn_finished({"delivered": False})
+        await _ack_proactive_event(
+            manager, event, delivered=False, reason="surface_error"
+        )
+        log.warning(
+            "proactive_voice_failed conversation_id=%s error=%s",
+            getattr(event, "conversation_id", None),
+            type(exc).__name__,
+        )
+        return False
+
+
+async def _read_line_with_prompt_session(
+    manager, session, *, tts_manager=None
+) -> str:
     """One async prompt; proactive messages are inserted above it."""
     if manager is None:
         return await session.prompt_async("you> ")
@@ -2728,7 +2954,15 @@ async def _read_line_with_prompt_session(manager, session) -> str:
 
             event = event_future.result()
             if event is not None:
-                await _render_proactive_event(event, session)
+                delivered = await _render_proactive_event(
+                    event, session, tts_manager=tts_manager
+                )
+                await _ack_proactive_event(
+                    manager,
+                    event,
+                    delivered=delivered,
+                    reason="render_failed",
+                )
     finally:
         if not input_future.done():
             input_future.cancel()
@@ -2736,7 +2970,7 @@ async def _read_line_with_prompt_session(manager, session) -> str:
                 await input_future
 
 
-async def _read_line_with_thread(manager) -> str:
+async def _read_line_with_thread(manager, *, tts_manager=None) -> str:
     """Fallback for non-TTY runs; never redraws a Readline buffer.
 
     ``input()`` runs in one worker thread. A proactive message is printed as
@@ -2763,7 +2997,15 @@ async def _read_line_with_thread(manager) -> str:
 
             event = event_future.result()
             if event is not None:
-                await _render_proactive_event(event, None)
+                delivered = await _render_proactive_event(
+                    event, None, tts_manager=tts_manager
+                )
+                await _ack_proactive_event(
+                    manager,
+                    event,
+                    delivered=delivered,
+                    reason="render_failed",
+                )
     finally:
         if not input_future.done():
             input_future.cancel()
@@ -2771,7 +3013,7 @@ async def _read_line_with_thread(manager) -> str:
                 await input_future
 
 
-async def _read_line_with_proactive(rt, session=None) -> str:
+async def _read_line_with_proactive(rt, session=None, *, tts_manager=None) -> str:
     """Read one line, showing delivered proactive replies without losing input.
 
     Exactly one input owner exists per prompt: a prompt_toolkit session on a
@@ -2781,10 +3023,12 @@ async def _read_line_with_proactive(rt, session=None) -> str:
     """
     manager = getattr(rt, "proactive_manager", None)
     if session is not None:
-        return await _read_line_with_prompt_session(manager, session)
+        return await _read_line_with_prompt_session(
+            manager, session, tts_manager=tts_manager
+        )
     if manager is None:
         return await asyncio.to_thread(input, "you> ")
-    return await _read_line_with_thread(manager)
+    return await _read_line_with_thread(manager, tts_manager=tts_manager)
 
 
 class _DirectTurnOutput:

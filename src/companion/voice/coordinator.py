@@ -106,6 +106,11 @@ class VoiceCoordinator:
         self._resume_task: Optional[asyncio.Task] = None
         self._resume_epoch = 0
         self._last_error: Optional[str] = None
+        # Set exactly while a proactive message may be delivered or while we
+        # are waiting for a proactive reply's real playback to finish. A
+        # proactive delivery pauses it through begin_turn().
+        self._proactive_allowed = asyncio.Event()
+        self._proactive_allowed.set()
         self.stats = VoiceStats()
 
         self._tts_registered = False
@@ -129,6 +134,10 @@ class VoiceCoordinator:
 
     def _set_state(self, state: VoiceState) -> None:
         self._state = state
+        if state in (VoiceState.DISABLED, VoiceState.LISTENING):
+            self._proactive_allowed.set()
+        else:
+            self._proactive_allowed.clear()
 
     def _notice(self, text: str) -> None:
         callback = self._on_notice
@@ -145,6 +154,16 @@ class VoiceCoordinator:
             VoiceState.DISABLED,
             VoiceState.LISTENING,
         )
+
+    async def wait_until_proactive_allowed(self) -> None:
+        """Wait until no user turn or Ava playback is in progress.
+
+        Used to *defer* (never silently drop) a proactive message. It returns
+        as soon as the coordinator is LISTENING/DISABLED again, which happens
+        only after the real playback-complete event and the existing cooldown.
+        """
+        while not self.should_deliver_proactive():
+            await self._proactive_allowed.wait()
 
     def description(self) -> str:
         manager = self._manager

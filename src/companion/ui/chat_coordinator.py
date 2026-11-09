@@ -237,9 +237,14 @@ class ChatCoordinator:
             )
 
     async def _deliver(self, event: ResponseEvent) -> None:
+        manager = self._manager()
         if event.type != RESPONSE_COMPLETED:
+            if manager is not None:
+                manager.note_proactive_cancelled(event, "not_completed")
             return
         if not (event.text or "").strip():
+            if manager is not None:
+                manager.note_proactive_cancelled(event, "empty_text")
             return
         subscribers = list(
             self._subscribers.get(event.conversation_id, {}).values()
@@ -247,12 +252,16 @@ class ChatCoordinator:
         if not subscribers:
             # The manager checks before saving; this is only a display-time
             # race. The message remains in history for the next page load.
+            if manager is not None:
+                manager.note_proactive_cancelled(event, "no_subscriber")
             return
+        delivered = False
         for callback in subscribers:
             try:
                 result = callback(event)
                 if inspect.isawaitable(result):
                     await result
+                delivered = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -261,6 +270,15 @@ class ChatCoordinator:
                     " error=%s",
                     event.conversation_id,
                     type(exc).__name__,
+                )
+        # Delivery timing must be based on a message that really reached a
+        # surface, never on model generation alone.
+        if manager is not None:
+            if delivered:
+                manager.note_proactive_delivered(event)
+            else:
+                manager.note_proactive_cancelled(
+                    event, "subscriber_failed"
                 )
 
     # -- helpers -----------------------------------------------------------

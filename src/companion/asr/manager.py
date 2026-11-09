@@ -12,14 +12,25 @@ when input stops; ASR ``sentence_end`` only confirms text.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Protocol
 
-from companion.asr.client import ASRClientError, ASRSession
+from companion.asr.client import (
+    ASRClientError,
+    ASRSession,
+    ASRSessionStateError,
+    CLOSE_ORIGIN_EXTERNAL,
+    CLOSE_ORIGIN_LOCAL_CANCEL,
+    CLOSE_ORIGIN_LOCAL_NORMAL,
+    CLOSE_ORIGIN_LOCAL_TIMEOUT,
+    STATE_TASK_FINISHED,
+    classify_failure,
+)
 from companion.asr.config import ASRConfig
 from companion.asr.microphone import (
     AudioChunk,
@@ -81,6 +92,10 @@ def _merge_turn_text(texts: Any) -> str:
     for part in parts[1:]:
         merged += (" " if _needs_space(merged, part) else "") + part
     return merged
+
+
+def _one_line(text: Any) -> str:
+    return " ".join(str(text or "").split()) or "-"
 
 
 @dataclass
@@ -166,6 +181,26 @@ class _Mute:
 
 
 # ------------------------------------------------------- external integrations
+class SpeakerObserver(Protocol):
+    """Optional, non-blocking voice-print hook owned by the embedding app.
+
+    The ASR demo knows nothing about the model or the identity store. Every
+    method must return immediately: ``on_audio`` may only buffer the PCM, and
+    ``snapshot`` must be an O(1) read of an already completed result. A slow
+    implementation would delay ASR finalization, which is forbidden.
+    """
+
+    def on_start(self, utterance_id: int, pcm: bytes) -> None: ...
+
+    def on_audio(self, utterance_id: int, pcm: bytes) -> None: ...
+
+    def on_end(self, utterance_id: int) -> None: ...
+
+    def on_cancel(self, utterance_id: int) -> None: ...
+
+    def snapshot(self, utterance_id: int) -> Any: ...
+
+
 @dataclass(frozen=True)
 class FinalUtterance:
     """One completed user turn delivered to an embedding application.
@@ -173,13 +208,16 @@ class FinalUtterance:
     Emitted at most once per utterance, only after the local VAD ended *and*
     the ASR session finished successfully with at least one confirmed
     fragment. Empty, cancelled, aborted and failed recognitions never produce
-    one. It carries no identity or audio metadata: the embedding conversation
-    decides who is speaking.
+    one. ``speaker`` is an opaque identity snapshot (see
+    ``companion.speaker_id.models.SpeakerResult``) or ``None`` when speaker
+    identification is disabled; it is deliberately a separate field so the
+    transcript text never carries identity state.
     """
 
     utterance_id: int
     text: str
     completed_at: float
+    speaker: Any = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +244,11 @@ class _Utterance:
         self.session: Optional[ASRSession] = None
         self.opened = threading.Event()
         self.sender_done = threading.Event()
+        self.receiver_done = threading.Event()
+        # Set by the first thread to observe a fatal failure: the sender and
+        # receiver cooperate so buffered audio is no longer uploaded and the
+        # receiver's wait is not left unbounded.
+        self.abort_event = threading.Event()
         self.open_error: Optional[str] = None
         self.started = False
         self.sender: Optional[threading.Thread] = None
@@ -218,6 +261,8 @@ class _Utterance:
         self.session_done = False
         self.session_error: Optional[str] = None
         self.session_done_at: Optional[float] = None
+        self.primary_error: Optional[str] = None
+        self.secondary_error: Optional[str] = None
         self.finalized = False
         self.aborted = False
         self.stop_sent = False
@@ -241,6 +286,7 @@ class ASRManager:
         on_speech: Optional[Callable[[SpeechActivity], None]] = None,
         on_turn_closed: Optional[Callable[[int, bool], None]] = None,
         render_finals: bool = True,
+        speaker_observer: Optional[SpeakerObserver] = None,
     ) -> None:
         self.config = config
         self.audio_queue: "queue.Queue[Any]" = (
@@ -257,6 +303,7 @@ class ASRManager:
         self._session_factory = session_factory or (lambda: ASRSession(config))
         self._renderer = renderer or TerminalRenderer()
         self.stats = ASRStats()
+        self.logger = logging.getLogger("companion.asr")
 
         # Optional embedding hooks. They are called from the thread that runs
         # the control loop (``run``), never from a sender/receiver worker, and
@@ -266,6 +313,10 @@ class ASRManager:
         self._on_speech = on_speech
         self._on_turn_closed = on_turn_closed
         self.render_finals = render_finals
+        # Optional voice-print observer. Its methods are called from the
+        # control thread and must never block; exceptions are swallowed so a
+        # speaker-model problem can never stop recognition.
+        self._speaker_observer = speaker_observer
 
         self._control: "queue.Queue[Any]" = queue.Queue(maxsize=2048)
         self._render_queue: "queue.Queue[Any]" = queue.Queue(
@@ -318,6 +369,12 @@ class ASRManager:
         self._on_turn_closed = on_turn_closed
         if render_finals is not None:
             self.render_finals = bool(render_finals)
+
+    def set_speaker_observer(
+        self, observer: Optional[SpeakerObserver]
+    ) -> None:
+        """Attach or replace the optional voice-print observer."""
+        self._speaker_observer = observer
 
     def set_input_enabled(self, enabled: bool) -> None:
         """Pause/resume feeding microphone audio into the VAD.
@@ -511,12 +568,19 @@ class ASRManager:
         try:
             session = self._session_factory()
             utterance.session = session
+            bind = getattr(session, "bind_utterance", None)
+            if callable(bind):
+                bind(utterance.uid)
             session.open()
             opened_ok = True
             utterance.opened.set()
             buffer = bytearray()
             first_buffered_at: Optional[float] = None
-            while not (self._stop.is_set() or utterance.aborted):
+            while not (
+                self._stop.is_set()
+                or utterance.aborted
+                or utterance.abort_event.is_set()
+            ):
                 try:
                     item = utterance.send_queue.get(timeout=0.02)
                 except queue.Empty:
@@ -527,13 +591,18 @@ class ASRManager:
                         first_buffered_at = now
                     buffer.extend(item)
                     if len(buffer) >= SEND_FRAME_BYTES:
-                        self._flush_audio(session, buffer)
+                        if not utterance.abort_event.is_set():
+                            self._flush_audio(utterance, session, buffer)
                         first_buffered_at = None
                 elif item is _STOP:
-                    if buffer:
-                        self._flush_audio(session, buffer)
+                    if buffer and not utterance.abort_event.is_set():
+                        self._flush_audio(utterance, session, buffer)
                         buffer.clear()
-                    session.stop()
+                    if not utterance.abort_event.is_set():
+                        mark_last = getattr(session, "mark_last_audio_sent", None)
+                        if callable(mark_last):
+                            mark_last()
+                        session.stop()
                     self._put_control(
                         _InputClosed(utterance.uid, time.monotonic()),
                         critical=True,
@@ -546,43 +615,33 @@ class ASRManager:
                     and first_buffered_at is not None
                     and now - first_buffered_at >= SEND_FRAME_SECONDS
                 ):
-                    self._flush_audio(session, buffer)
+                    if not utterance.abort_event.is_set():
+                        self._flush_audio(utterance, session, buffer)
                     first_buffered_at = None
-            if buffer and not utterance.aborted:
-                self._flush_audio(session, buffer)
-        except ASRClientError as exc:
             if (
-                opened_ok
-                and session is not None
-                and getattr(session, "closed", False)
+                buffer
+                and not utterance.aborted
+                and not utterance.abort_event.is_set()
             ):
-                # The session was closed underneath us: either the receiver
-                # saw the server finish the task (it already reports the real
-                # outcome) or the control loop finalized/aborted this turn.
-                # Remaining buffered audio is moot; a closed-socket error is
-                # not a recognition failure and must not overwrite a result.
-                return
-            utterance.open_error = str(exc)
-            self._put_control(
-                _SessionDone(utterance.uid, str(exc), time.monotonic()),
-                critical=True,
-            )
+                self._flush_audio(utterance, session, buffer)
+        except ASRClientError as exc:
+            self._handle_sender_error(utterance, exc, opened_ok)
         except Exception as exc:  # noqa: BLE001 - sanitized
-            message = f"ASR 发送失败（{type(exc).__name__}）。"
-            utterance.open_error = message
-            self._put_control(
-                _SessionDone(utterance.uid, message, time.monotonic()),
-                critical=True,
+            self._handle_sender_error(
+                utterance, classify_failure(exc, action="发送"), opened_ok
             )
         finally:
             utterance.opened.set()
             utterance.sender_done.set()
+            self._log_lifecycle(utterance, "sender_exited", session)
             self._unregister_thread(threading.current_thread())
 
     def _receiver_loop(self, utterance: _Utterance) -> None:
+        session: Optional[ASRSession] = None
         try:
             timeout = self.config.timeout_seconds + 2.0
             if not utterance.opened.wait(timeout=timeout):
+                utterance.abort_event.set()
                 self._put_control(
                     _SessionDone(
                         utterance.uid, "ASR 连接超时。", time.monotonic()
@@ -597,6 +656,7 @@ class ASRManager:
                 for event in session.events():
                     now = time.monotonic()
                     if event.kind == "error":
+                        utterance.abort_event.set()
                         self._put_control(
                             _SessionDone(utterance.uid, event.error, now),
                             critical=True,
@@ -613,36 +673,68 @@ class ASRManager:
                             ),
                             critical=True,
                         )
-                self._put_control(
-                    _SessionDone(utterance.uid, None, time.monotonic()),
-                    critical=True,
-                )
+                if self._session_terminated_cleanly(session):
+                    self._put_control(
+                        _SessionDone(utterance.uid, None, time.monotonic()),
+                        critical=True,
+                    )
             except ASRClientError as exc:
-                self._put_control(
-                    _SessionDone(utterance.uid, str(exc), time.monotonic()),
-                    critical=True,
-                )
+                self._handle_receiver_error(utterance, exc)
             except Exception as exc:  # noqa: BLE001 - sanitized
-                self._put_control(
-                    _SessionDone(
-                        utterance.uid,
-                        f"ASR 接收失败（{type(exc).__name__}）。",
-                        time.monotonic(),
-                    ),
-                    critical=True,
+                self._handle_receiver_error(
+                    utterance, classify_failure(exc, action="接收")
                 )
-            finally:
-                try:
-                    session.close()
-                except Exception:  # noqa: BLE001 - best effort
-                    pass
         finally:
+            utterance.receiver_done.set()
+            self._log_lifecycle(utterance, "receiver_exited", session)
             self._unregister_thread(threading.current_thread())
 
-    def _flush_audio(
-        self, session: ASRSession, buffer: bytearray
+    def _handle_sender_error(
+        self,
+        utterance: _Utterance,
+        exc: ASRClientError,
+        opened_ok: bool,
     ) -> None:
-        while buffer:
+        secondary = opened_ok and isinstance(exc, ASRSessionStateError)
+        utterance.abort_event.set()
+        if secondary:
+            utterance.secondary_error = str(exc)
+            self._log_lifecycle(utterance, "secondary_error", utterance.session)
+            return
+        message = str(exc)
+        utterance.open_error = message
+        utterance.primary_error = message
+        self._put_control(
+            _SessionDone(utterance.uid, message, time.monotonic()),
+            critical=True,
+        )
+
+    def _handle_receiver_error(
+        self, utterance: _Utterance, exc: ASRClientError
+    ) -> None:
+        # The session's events() generator raises ASRSessionStateError for a
+        # receive failure that is only a symptom of an earlier close; that must
+        # never overwrite the primary error.
+        secondary = isinstance(exc, ASRSessionStateError)
+        utterance.abort_event.set()
+        if secondary:
+            utterance.secondary_error = str(exc)
+            self._log_lifecycle(utterance, "secondary_error", utterance.session)
+            return
+        message = str(exc)
+        utterance.primary_error = message
+        self._put_control(
+            _SessionDone(utterance.uid, message, time.monotonic()),
+            critical=True,
+        )
+
+    def _flush_audio(
+        self,
+        utterance: _Utterance,
+        session: ASRSession,
+        buffer: bytearray,
+    ) -> None:
+        while buffer and not utterance.abort_event.is_set():
             chunk = bytes(buffer[:SEND_FRAME_BYTES])
             del buffer[:SEND_FRAME_BYTES]
             session.send_audio(chunk)
@@ -680,6 +772,7 @@ class ASRManager:
         self._current = utterance
         self.stats.utterances += 1
         self._emit_speech("started", utterance.uid, event.at)
+        self._speaker_start(utterance.uid, event.audio)
         if not self._enqueue_audio(utterance, event.audio):
             return
         if utterance.finalized:
@@ -699,6 +792,7 @@ class ASRManager:
         utterance = self._current
         if utterance is None or utterance.finalized:
             return
+        self._speaker_audio(utterance.uid, event.audio)
         self._enqueue_audio(utterance, event.audio)
 
     def _handle_speech_ended(self, event: _SpeechEnded) -> None:
@@ -708,6 +802,8 @@ class ASRManager:
             return
         utterance.vad_end_at = event.at
         self._emit_speech("ended", utterance.uid, event.at)
+        self._speaker_end(utterance.uid)
+        self._log_lifecycle(utterance, "vad_ended")
         if not utterance.stop_sent:
             utterance.stop_sent = True
             if not self._enqueue_sentinel(utterance, _STOP):
@@ -773,7 +869,11 @@ class ASRManager:
             [fragment for _, fragment in utterance.finals]
             + ([utterance.partial] if utterance.partial else [])
         )
-        if preview:
+        # Partials are part of the standalone transcript renderer. In formal
+        # voice mode (render_finals=False) the embedding app prints the final
+        # itself, so provisional lines are fully suppressed to avoid a stale
+        # partial leaking into the REPL after a failure/cancel/timeout.
+        if preview and self.render_finals:
             self._render(
                 RenderEvent(
                     kind="partial",
@@ -787,10 +887,35 @@ class ASRManager:
         if utterance is None or utterance.finalized:
             return
         if utterance.session_done:
+            # A second worker reported after the primary outcome. Never emit a
+            # duplicate failure or a duplicate Final/TurnClosed.
+            if event.error is not None:
+                utterance.secondary_error = event.error
+                self._log_lifecycle(utterance, "secondary_error")
             return
         utterance.session_done = True
         utterance.session_error = event.error
         utterance.session_done_at = event.at
+        if event.error is not None:
+            utterance.primary_error = event.error
+            if utterance.vad_end_at is None:
+                # The session failed while the user was still speaking: stop
+                # uploading to the dead connection immediately. The turn is
+                # still finalized only after the VAD ends, so a failed
+                # recognition never becomes a normal final.
+                utterance.abort_event.set()
+        # The session will produce no more events, so the control thread (the
+        # single owner of the socket) releases it now. For a normal
+        # completion this happens right after task-finished; for a failure it
+        # prevents the sender from writing into a dead socket.
+        self._close_session(
+            utterance,
+            origin=(
+                CLOSE_ORIGIN_EXTERNAL
+                if event.error is not None
+                else CLOSE_ORIGIN_LOCAL_NORMAL
+            ),
+        )
         self._maybe_finish(utterance)
 
     def _handle_input_closed(self, event: _InputClosed) -> None:
@@ -820,7 +945,8 @@ class ASRManager:
         utterance = self._utterances.get(event.uid)
         if utterance is None or utterance.finalized:
             return
-        self._close_session(utterance)
+        utterance.abort_event.set()
+        self._close_session(utterance, origin=CLOSE_ORIGIN_LOCAL_TIMEOUT)
         self._finish(
             utterance,
             f"等待最终识别结果超时（超过 "
@@ -885,11 +1011,17 @@ class ASRManager:
         if utterance.finalized:
             return
         utterance.finalized = True
+        # O(1) snapshot. If the recognition worker has not finished, the
+        # latest provisional result (or PENDING) is attached — the final is
+        # never delayed waiting for voice-print inference.
+        speaker = self._speaker_snapshot(utterance.uid)
+        if error and utterance.primary_error is None:
+            utterance.primary_error = error
         if utterance.final_timer is not None:
             utterance.final_timer.cancel()
         if utterance.started:
             self._active_sessions = max(0, self._active_sessions - 1)
-        self._close_session(utterance)
+        self._close_session(utterance, origin=CLOSE_ORIGIN_LOCAL_NORMAL)
         # The session is over; late events for this id are now safely ignored
         # and no longer need to be kept in the open/known collections. The
         # session threads unregister themselves when they exit.
@@ -923,6 +1055,7 @@ class ASRManager:
                         kind="final",
                         utterance_id=utterance.uid,
                         text=merged,
+                        speaker_result=speaker,
                     )
                 )
             if utterance.vad_end_at is not None:
@@ -944,6 +1077,7 @@ class ASRManager:
                         utterance_id=utterance.uid,
                         text=merged,
                         completed_at=time.monotonic(),
+                        speaker=speaker,
                     )
                 )
         else:
@@ -954,6 +1088,7 @@ class ASRManager:
                 )
         self._emit_turn_closed(utterance.uid, ok)
         self._promote_pending()
+        self._log_lifecycle(utterance, "utterance_finalized")
 
     def _maybe_finish(self, utterance: _Utterance) -> None:
         """Finish only once BOTH local VAD ended and the ASR session ended."""
@@ -978,12 +1113,14 @@ class ASRManager:
         if utterance.finalized:
             return
         utterance.aborted = True
+        utterance.abort_event.set()
         utterance.finalized = True
+        self._speaker_cancel(utterance.uid)
         if utterance.final_timer is not None:
             utterance.final_timer.cancel()
         if utterance.started:
             self._active_sessions = max(0, self._active_sessions - 1)
-        self._close_session(utterance)
+        self._close_session(utterance, origin=CLOSE_ORIGIN_LOCAL_CANCEL)
         self._enqueue_sentinel(utterance, _ABORT)
         self._remove_utterance(utterance)
         if utterance.partial:
@@ -999,6 +1136,7 @@ class ASRManager:
         self._emit_turn_closed(utterance.uid, False)
         if promote:
             self._promote_pending()
+        self._log_lifecycle(utterance, "utterance_aborted")
 
     def _promote_pending(self) -> None:
         for utterance in self._open_order:
@@ -1056,14 +1194,90 @@ class ASRManager:
             _FinalTimeout(uid), critical=False, timeout=0.5
         )
 
-    def _close_session(self, utterance: _Utterance) -> None:
+    def _close_session(
+        self,
+        utterance: _Utterance,
+        origin: str = CLOSE_ORIGIN_LOCAL_NORMAL,
+    ) -> None:
+        """Idempotently release the session; the sole socket-closing owner.
+
+        Only the control thread finalizes/aborts a turn and closes the socket,
+        so close ordering is a single serialized point instead of a race
+        between the sender and receiver workers.
+        """
         session = utterance.session
         if session is None:
             return
+        close = getattr(session, "close", None)
+        if not callable(close):
+            return
         try:
-            session.close()
+            close(origin=origin)
+        except TypeError:
+            # A fake/legacy session's close() takes no keyword argument.
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
         except Exception:  # noqa: BLE001 - best effort
             pass
+
+    def _session_state(self, session: Any) -> Optional[str]:
+        state = getattr(session, "state", None)
+        if callable(state):
+            try:
+                state = state()
+            except Exception:  # noqa: BLE001 - fake/legacy session
+                return None
+        return state if isinstance(state, str) else None
+
+    def _session_terminated_cleanly(self, session: Any) -> bool:
+        state = self._session_state(session)
+        if state is None:
+            return True
+        return state == STATE_TASK_FINISHED
+
+    def _log_lifecycle(
+        self,
+        utterance: _Utterance,
+        event_type: str,
+        session: Any = None,
+    ) -> None:
+        if not self.logger.isEnabledFor(logging.DEBUG):
+            return
+        if session is None:
+            session = utterance.session
+        request_id = getattr(session, "request_id", None)
+        state = self._session_state(session)
+        origin = getattr(session, "close_origin", None)
+        primary = utterance.primary_error or getattr(
+            session, "primary_error", None
+        )
+        secondary = utterance.secondary_error or getattr(
+            session, "secondary_error", None
+        )
+        last_event = getattr(session, "last_server_event", None)
+        failure = getattr(session, "primary_failure", None)
+        self.logger.debug(
+            "asr_lifecycle utterance_id=%s request_id=%s thread_name=%s"
+            " timestamp_monotonic=%.3f session_state=%s event_type=%s"
+            " last_server_event=%s close_origin=%s primary_error=%s"
+            " secondary_error=%s error_type=%s error_code=%s",
+            utterance.uid,
+            request_id or "-",
+            threading.current_thread().name,
+            time.monotonic(),
+            state or "-",
+            event_type,
+            last_event or "-",
+            origin or "-",
+            _one_line(primary),
+            _one_line(secondary),
+            getattr(failure, "exc_type", "") or "-",
+            getattr(failure, "code", "")
+            if getattr(failure, "code", None) is not None
+            else "-",
+        )
 
     def _put_control(
         self,
@@ -1125,6 +1339,69 @@ class ASRManager:
             callback(uid, ok)
         except Exception:  # noqa: BLE001 - recognition must keep running
             pass
+
+    # ---------------------------------------------------------- speaker hooks
+    def post_speaker_result(self, result: Any) -> None:
+        """Render an identity snapshot published by the observer's worker.
+
+        Called from the voice-print thread; it only enqueues a render event,
+        so it never touches the terminal from another thread.
+        """
+        if result is None:
+            return
+        uid = int(getattr(result, "utterance_id", 0) or 0)
+        self._render(
+            RenderEvent(
+                kind="speaker_status",
+                utterance_id=uid,
+                speaker_result=result,
+            )
+        )
+
+    def _speaker_start(self, uid: int, pcm: bytes) -> None:
+        observer = self._speaker_observer
+        if observer is None or not pcm:
+            return
+        try:
+            observer.on_start(uid, pcm)
+        except Exception:  # noqa: BLE001 - voice-print must not stop ASR
+            self.logger.debug("speaker_on_start_failed uid=%s", uid)
+
+    def _speaker_audio(self, uid: int, pcm: bytes) -> None:
+        observer = self._speaker_observer
+        if observer is None or not pcm:
+            return
+        try:
+            observer.on_audio(uid, pcm)
+        except Exception:  # noqa: BLE001 - voice-print must not stop ASR
+            self.logger.debug("speaker_on_audio_failed uid=%s", uid)
+
+    def _speaker_end(self, uid: int) -> None:
+        observer = self._speaker_observer
+        if observer is None:
+            return
+        try:
+            observer.on_end(uid)
+        except Exception:  # noqa: BLE001 - voice-print must not stop ASR
+            self.logger.debug("speaker_on_end_failed uid=%s", uid)
+
+    def _speaker_cancel(self, uid: int) -> None:
+        observer = self._speaker_observer
+        if observer is None:
+            return
+        try:
+            observer.on_cancel(uid)
+        except Exception:  # noqa: BLE001 - voice-print must not stop ASR
+            self.logger.debug("speaker_on_cancel_failed uid=%s", uid)
+
+    def _speaker_snapshot(self, uid: int) -> Any:
+        observer = self._speaker_observer
+        if observer is None:
+            return None
+        try:
+            return observer.snapshot(uid)
+        except Exception:  # noqa: BLE001 - never block or fail the final
+            return None
 
 
 __all__ = [

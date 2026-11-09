@@ -123,14 +123,14 @@ def test_config_defaults_and_overrides():
     assert config.sample_rate == 16000
 
 
-def test_config_default_voice_is_xuyanchu():
+def test_config_default_voice_is_anruorou():
     config = load_tts_config(
         {
             "DASHSCOPE_API_KEY": "k",
             "DASHSCOPE_WORKSPACE_ID": "w",
         }
     )
-    assert config.voice == "xuyanchu_v3.1"
+    assert config.voice == "anruorou_v3.1"
     assert config.model == "qwen-audio-3.1-tts-flash"
 
 
@@ -214,7 +214,7 @@ def test_client_passes_configured_voice_and_settings_lazily():
         "voice": CONFIG.voice,
         "format": "pcm",
         "sample_rate": 24000,
-        "rate": 1.07,
+        "rate": 1.03,
         "parameters": {"instruction": "test-instruction"},
     }
     assert created == [True]
@@ -863,7 +863,7 @@ def test_tts_status_never_contains_credentials():
         enabled=True,
         state="idle",
         model="qwen-audio-3.1-tts-flash",
-        voice="xuyanchu_v3.1",
+        voice="anruorou_v3.1",
         region="cn-beijing",
         sample_rate=24000,
         waiting_jobs=0,

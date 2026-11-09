@@ -242,7 +242,7 @@ def test_invalid_segment_lengths_are_rejected():
 
 def test_speech_rate_defaults_to_1_07_and_is_configurable():
     base = {"DASHSCOPE_API_KEY": "k", "DASHSCOPE_WORKSPACE_ID": "w"}
-    assert load_tts_config(base).speech_rate == 1.07
+    assert load_tts_config(base).speech_rate == 1.03
     assert load_tts_config({**base, "AVA_TTS_RATE": "1.15"}).speech_rate == 1.15
     for bad in ("0.4", "2.5", "fast"):
         with pytest.raises(TTSConfigError):
@@ -506,10 +506,10 @@ def test_open_stream_uses_connect_with_voice_and_format():
     assert calls == [
         {
             "model": "qwen-audio-3.1-tts-flash",
-            "voice": "xuyanchu_v3.1",
+            "voice": "anruorou_v3.1",
             "format": "pcm",
             "sample_rate": 24000,
-            "rate": 1.07,
+            "rate": 1.03,
             "parameters": {"instruction": "test-instruction"},
         }
     ]
@@ -576,10 +576,10 @@ def test_open_stream_omits_instruction_when_disabled():
     assert calls == [
         {
             "model": "qwen-audio-3.1-tts-flash",
-            "voice": "xuyanchu_v3.1",
+            "voice": "anruorou_v3.1",
             "format": "pcm",
             "sample_rate": 24000,
-            "rate": 1.07,
+            "rate": 1.03,
             "parameters": {},
         }
     ]
@@ -593,7 +593,7 @@ def test_status_reports_rate_without_credentials():
     finally:
         manager.shutdown()
     text = "\n".join(lines)
-    assert "rate: 1.07" in text
+    assert "rate: 1.03" in text
     assert "output: system default" in text
     assert "unit-test-key" not in text
 

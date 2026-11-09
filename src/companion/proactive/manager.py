@@ -1,4 +1,4 @@
-"""Dual-stage ProactiveManager (V0.9.9).
+"""Continuous ProactiveManager (V0.9.9.21).
 
 The manager owns *timing, staleness and delivery* only. It never decides
 whether a topic is interesting: :class:`ProactiveJudge` returns one boolean,
@@ -8,13 +8,25 @@ Lifecycle per triggering turn:
 
     normal reply committed + delivered
         -> on_response_delivered()            (non-blocking)
-        -> STAGE 1 IMMEDIATE: judge once, right away
+        -> IMMEDIATE: judge once, right away
              (no fixed delay, no observation of Profile Review / Turn Analysis)
-        -> (YES) existing Speaker, one message, persisted with mode=IMMEDIATE
-        -> wait a random 120-240 s from Ava's last delivered message
-        -> STAGE 2 LONG_IDLE: judge once whether to start a *new* exchange
-        -> (YES) existing Speaker, one message, persisted with mode=LONG_IDLE
-        -> stop (a proactive message never schedules another cycle)
+        -> then a continuous, adaptive loop while the user stays silent:
+             LONG_IDLE round 1 after 20-40 s        (high activity)
+             LONG_IDLE round 2 after 45-90 s
+             LONG_IDLE round 3 after 2-5 min
+             later rounds after 5-10 min
+        -> the loop never stops by itself; only a new user turn, Quiet Mode,
+           revoked authorization, an explicit stop or shutdown ends it.
+
+Each round is a *judgment attempt*, not a forced send. The wait is measured
+from Ava's last **actually delivered** message (delivery is acknowledged by
+the surface that showed/spoke it), never from model generation completion.
+
+Persistence rounds use ``LONG_IDLE_1``, ``LONG_IDLE_2``, ... while the
+semantic generation mode stays ``LONG_IDLE``. ``proactive_messages`` has
+``UNIQUE(source_event_id, mode)``; the round suffix keeps every round distinct
+without weakening that protection. Old rows persisted as plain ``LONG_IDLE``
+remain readable; round 1 checks them for compatibility and is never re-sent.
 
 New user input, Quiet Mode, revoked authorization or shutdown invalidate the
 whole cycle. Timers live only in this process and are never persisted.
@@ -25,8 +37,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import secrets
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from companion.core.orchestrator import EmptySpeechOutputError
@@ -43,18 +57,61 @@ ORIGIN_AVA_INITIATED = "AVA_INITIATED"
 MODE_IMMEDIATE = "IMMEDIATE"
 MODE_LONG_IDLE = "LONG_IDLE"
 
+ACTIVITY_HIGH = "high"
+ACTIVITY_NORMAL = "normal"
+ACTIVITY_LOW = "low"
+DEFAULT_ACTIVITY = ACTIVITY_HIGH
+ACTIVITY_ENV = "AVA_PROACTIVE_ACTIVITY"
+
+# (min, max) seconds per unanswered proactive round. The last entry repeats
+# forever: activity slows down but never stops.
+ACTIVITY_INTERVALS: dict[str, tuple[tuple[int, int], ...]] = {
+    ACTIVITY_HIGH: (
+        (20, 40),
+        (45, 90),
+        (120, 300),
+        (180, 300),
+        (300, 600),
+    ),
+    ACTIVITY_NORMAL: (
+        (120, 240),
+        (180, 300),
+        (300, 600),
+        (300, 600),
+    ),
+    ACTIVITY_LOW: (
+        (300, 600),
+        (600, 900),
+        (600, 900),
+    ),
+}
+
+# Kept for embedding compatibility; the activity profiles above are the real
+# source of truth in production.
 MIN_IDLE_SECONDS = 120
 MAX_IDLE_SECONDS = 240
 
 
 @dataclass
 class _ConversationState:
+    conversation_id: str = ""
     generation: int = 0
     person_id: Optional[str] = None
     source_event_id: Optional[str] = None
     latest_user_event_id: Optional[str] = None
     last_delivered_at: Optional[float] = None
+    last_user_input_at: Optional[float] = None
+    last_attempt_at: Optional[float] = None
+    next_attempt_at: Optional[float] = None
+    unanswered: int = 0
+    last_ack_message_id: Optional[str] = None
+    # message_id -> persistence mode, so an acknowledgement can tell an
+    # immediate remark apart from an unanswered long-idle round.
+    pending_modes: dict[str, str] = field(default_factory=dict)
     task: Optional[asyncio.Task] = None
+    # Set when the surface confirms a proactive message really reached the
+    # user; waiting cycles recompute their next attempt from that moment.
+    delivery_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(frozen=True)
@@ -76,6 +133,7 @@ class ProactiveManager:
         judge: ProactiveJudge,
         idle_delay_seconds: Optional[float] = None,
         delivery_available: Optional[Callable[[str], bool]] = None,
+        activity: Optional[str] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.repos = repos
@@ -83,7 +141,7 @@ class ProactiveManager:
         self.conversations = conversations
         self.orchestrator = orchestrator
         self.judge = judge
-        # ``None`` means the real 120-240 s random wait. An explicit value is
+        # ``None`` means the adaptive activity profile. An explicit value is
         # only for tests/embedding; production never selects a fixed delay.
         self.idle_delay_seconds = idle_delay_seconds
         # Optional surface hook (used by the web chat coordinator): when it
@@ -92,6 +150,12 @@ class ProactiveManager:
         # is unchanged.
         self.delivery_available = delivery_available
         self.logger = logger or logging.getLogger("companion.proactive")
+        self.activity = _normalise_activity(
+            activity
+            if activity is not None
+            else os.environ.get(ACTIVITY_ENV, DEFAULT_ACTIVITY),
+            self.logger,
+        )
 
         self._states: dict[str, _ConversationState] = {}
         self._events: asyncio.Queue[Optional[ResponseEvent]] = asyncio.Queue()
@@ -106,7 +170,7 @@ class ProactiveManager:
         person_id: str,
         source_event_id: str,
     ) -> None:
-        """Start one dual-stage cycle after a delivered normal reply.
+        """Start a continuous cycle after a delivered normal reply.
 
         This method is synchronous and never blocks the chat surface. Callers
         must invoke it only after the reply is fully displayed; WAIT/IGNORE,
@@ -119,11 +183,20 @@ class ProactiveManager:
             # A duplicate completion event must never schedule a second cycle.
             return
 
+        now = _loop_time()
         state.generation += 1
         state.person_id = person_id
         state.source_event_id = source_event_id
         state.latest_user_event_id = source_event_id
-        state.last_delivered_at = asyncio.get_running_loop().time()
+        state.last_delivered_at = now
+        if state.last_user_input_at is None:
+            state.last_user_input_at = now
+        state.last_attempt_at = None
+        state.next_attempt_at = None
+        state.unanswered = 0
+        state.last_ack_message_id = None
+        state.pending_modes.clear()
+        state.delivery_event.clear()
         self._cancel_task(state.task)
         cycle = _Cycle(
             conversation_id=conversation_id,
@@ -132,6 +205,14 @@ class ProactiveManager:
             generation=state.generation,
         )
         state.task = asyncio.create_task(self._run_cycle(cycle, state))
+        self.logger.info(
+            "proactive_cycle_started conversation_id=%s source_event_id=%s"
+            " activity=%s generation=%d",
+            conversation_id,
+            source_event_id,
+            self.activity,
+            state.generation,
+        )
 
     def note_user_input(self, conversation_id: str, source_event_id: str) -> None:
         """Invalidate any pending/running cycle as soon as a user turn starts.
@@ -143,13 +224,23 @@ class ProactiveManager:
         state = self._state_for(conversation_id)
         state.generation += 1
         state.latest_user_event_id = source_event_id
+        state.last_user_input_at = time.monotonic()
+        state.next_attempt_at = None
+        state.unanswered = 0
         self._cancel_task(state.task)
         state.task = None
+        state.delivery_event.set()
         # Any event still queued for *this* conversation belongs to the
         # previous turn and must not be shown after the user has started a new
         # one. Events for other conversations (other web tabs, other people)
         # stay queued and remain deliverable.
         self._discard_pending_events(conversation_id)
+        self.logger.info(
+            "proactive_cycle_cancelled_by_user conversation_id=%s"
+            " source_event_id=%s",
+            conversation_id,
+            source_event_id,
+        )
 
     def cancel_cycle(self, conversation_id: str) -> None:
         """Invalidate a conversation's pending/running cycle without a new turn.
@@ -164,8 +255,10 @@ class ProactiveManager:
         if state is None:
             return
         state.generation += 1
+        state.next_attempt_at = None
         self._cancel_task(state.task)
         state.task = None
+        state.delivery_event.set()
         self._discard_pending_events(conversation_id)
 
     async def shutdown(self) -> None:
@@ -176,6 +269,8 @@ class ProactiveManager:
         tasks = []
         for state in self._states.values():
             state.generation += 1
+            state.next_attempt_at = None
+            state.delivery_event.set()
             if state.task is not None and not state.task.done():
                 state.task.cancel()
                 tasks.append(state.task)
@@ -184,6 +279,103 @@ class ProactiveManager:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._events.put_nowait(None)
+
+    # -- delivery acknowledgements ----------------------------------------
+
+    def note_proactive_delivered(self, event: Optional[ResponseEvent]) -> bool:
+        """The surface really showed/spoke this proactive message.
+
+        Only this acknowledgement advances ``last_delivered_at`` and the
+        unanswered counter, so the next interval is measured from real
+        delivery instead of model completion. Returns False for duplicate,
+        stale or foreign events.
+        """
+        if self._closed or event is None:
+            return False
+        conversation_id = getattr(event, "conversation_id", None)
+        source_event_id = getattr(event, "event_id", None)
+        message_id = getattr(event, "response_id", None)
+        state = self._states.get(conversation_id or "")
+        if state is None:
+            self.logger.info(
+                "proactive_ack_ignored conversation_id=%s reason=no_state",
+                conversation_id,
+            )
+            return False
+        if source_event_id != state.latest_user_event_id:
+            self.logger.info(
+                "proactive_ack_ignored conversation_id=%s reason=stale_event",
+                conversation_id,
+            )
+            return False
+        if message_id is not None and message_id == state.last_ack_message_id:
+            return False
+        state.last_ack_message_id = message_id
+        state.last_delivered_at = _loop_time()
+        state.next_attempt_at = None
+        delivered_mode = (
+            state.pending_modes.pop(message_id, "") if message_id else ""
+        )
+        if delivered_mode.startswith(MODE_LONG_IDLE):
+            # Only unanswered long-idle rounds make the schedule slower. An
+            # immediate remark, a duplicate ack or an unknown row never does.
+            state.unanswered += 1
+        state.delivery_event.set()
+        self.logger.info(
+            "proactive_delivery_confirmed conversation_id=%s source_event_id=%s"
+            " message_id=%s unanswered=%d next_interval=%s",
+            conversation_id,
+            source_event_id,
+            message_id,
+            state.unanswered,
+            self._interval_bounds(state.unanswered),
+        )
+        return True
+
+    def note_proactive_cancelled(
+        self, event: Optional[ResponseEvent], reason: str = "cancelled"
+    ) -> None:
+        """The surface could not deliver this proactive message."""
+        if event is None:
+            return
+        message_id = getattr(event, "response_id", None)
+        conversation_id = getattr(event, "conversation_id", None) or ""
+        state = self._states.get(conversation_id)
+        if state is not None and message_id:
+            state.pending_modes.pop(message_id, None)
+        self.logger.info(
+            "proactive_delivery_cancelled conversation_id=%s source_event_id=%s"
+            " message_id=%s reason=%s",
+            conversation_id,
+            getattr(event, "event_id", None),
+            message_id,
+            reason,
+        )
+
+    async def can_deliver(self, event: Optional[ResponseEvent]) -> bool:
+        """Re-check a queued event just before its deferred delivery.
+
+        Used by a surface that had to wait (Ava was speaking): the user may
+        have started a new turn, entered Quiet Mode, withdrawn authorization
+        or shut the session down while the message waited.
+        """
+        if self._closed or event is None:
+            return False
+        conversation_id = getattr(event, "conversation_id", None) or ""
+        state = self._states.get(conversation_id)
+        if state is None or not state.person_id:
+            return False
+        if state.task is None or state.task.done():
+            # The cycle that produced this message was cancelled (user speech,
+            # a new turn, quiet mode, revocation) or already ended.
+            return False
+        cycle = _Cycle(
+            conversation_id=conversation_id,
+            person_id=state.person_id,
+            source_event_id=getattr(event, "event_id", "") or "",
+            generation=state.generation,
+        )
+        return await self._still_valid(cycle)
 
     # -- delivery surface --------------------------------------------------
 
@@ -240,7 +432,7 @@ class ProactiveManager:
             if not await self._still_valid(cycle):
                 return
             # Local hard floor: an explicit departure or refusal to continue
-            # blocks both stages, independently of the judge's answer.
+            # blocks every round, independently of the judge's answer.
             if await self._explicit_stop(cycle):
                 self.logger.info(
                     "proactive_blocked_explicit_stop conversation_id=%s"
@@ -251,21 +443,60 @@ class ProactiveManager:
                 return
             # Stage 1: right after the delivered normal reply. If Ava has just
             # asked an identity-confirmation question, the immediate judge must
-            # not interject or urge; the long-idle stage may still start a
+            # not interject or urge; the long-idle rounds may still start a
             # different topic later.
             if not await self._confirmation_pending(cycle):
                 await self._attempt(cycle, state, MODE_IMMEDIATE)
 
-            if not self._is_current(state, cycle.generation):
-                return
-            await self._wait_for_idle(state)
-
-            if not self._is_current(state, cycle.generation):
-                return
-            if not await self._still_valid(cycle):
-                return
-            # Stage 2: exactly one long-idle judgment per idle cycle.
-            await self._attempt(cycle, state, MODE_LONG_IDLE)
+            # Continuous adaptive loop: every round is a judgment attempt, so
+            # an answered "no" or an unanswered message merely lengthens the
+            # next wait. Only fatal conditions end the cycle.
+            round_number = 0
+            while self._is_current(state, cycle.generation):
+                delay = self._next_idle_delay(state.unanswered)
+                self.logger.info(
+                    "proactive_wait conversation_id=%s source_event_id=%s"
+                    " activity=%s round=%d unanswered=%d delay=%.1fs"
+                    " last_user_input_at=%s last_delivered_at=%s",
+                    cycle.conversation_id,
+                    cycle.source_event_id,
+                    self.activity,
+                    round_number + 1,
+                    state.unanswered,
+                    delay,
+                    _clock_label(state.last_user_input_at),
+                    _clock_label(state.last_delivered_at),
+                )
+                await self._wait_for_idle(state, delay)
+                if not self._is_current(state, cycle.generation):
+                    return
+                if await self._fatal_stop(cycle):
+                    self.logger.info(
+                        "proactive_cycle_stopped conversation_id=%s"
+                        " source_event_id=%s reason=fatal_state",
+                        cycle.conversation_id,
+                        cycle.source_event_id,
+                    )
+                    return
+                if await self._explicit_stop(cycle):
+                    self.logger.info(
+                        "proactive_blocked_explicit_stop conversation_id=%s"
+                        " source_event_id=%s",
+                        cycle.conversation_id,
+                        cycle.source_event_id,
+                    )
+                    return
+                if not await self._still_valid(cycle):
+                    # Transient (orchestrator busy, delivery surface briefly
+                    # unavailable): retry on the next interval.
+                    continue
+                round_number += 1
+                await self._attempt(
+                    cycle,
+                    state,
+                    MODE_LONG_IDLE,
+                    f"{MODE_LONG_IDLE}_{round_number}",
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -280,45 +511,104 @@ class ProactiveManager:
             if state.task is asyncio.current_task():
                 state.task = None
 
-    async def _wait_for_idle(self, state: _ConversationState) -> None:
-        """Wait 120-240 s from Ava's last actually delivered message."""
-        loop = asyncio.get_running_loop()
-        base = state.last_delivered_at or loop.time()
-        deadline = base + self._next_idle_delay()
-        remaining = deadline - loop.time()
-        if remaining > 0:
-            await asyncio.sleep(remaining)
+    async def _wait_for_idle(
+        self, state: _ConversationState, delay: Optional[float] = None
+    ) -> None:
+        """Wait ``delay`` seconds from Ava's last actually delivered message.
 
-    def _next_idle_delay(self) -> float:
+        The wait is a cancellable ``asyncio`` wait rather than a blocking
+        sleep, and it is woken early when a delivery acknowledgement moves the
+        baseline so the next attempt is measured from the real delivery.
+        """
+        interval = self._next_idle_delay(state.unanswered) if delay is None else delay
+        loop = asyncio.get_running_loop()
+        logged_at: Optional[float] = None
+        while True:
+            now = loop.time()
+            if state.last_delivered_at is None:
+                state.last_delivered_at = now
+            remaining = (state.last_delivered_at + interval) - now
+            if remaining <= 0:
+                state.next_attempt_at = None
+                return
+            state.next_attempt_at = now + remaining
+            if state.next_attempt_at != logged_at:
+                logged_at = state.next_attempt_at
+                self.logger.info(
+                    "proactive_next_attempt conversation_id=%s delay=%.1fs"
+                    " at=%.1f last_delivered_at=%s",
+                    state.conversation_id,
+                    remaining,
+                    state.next_attempt_at,
+                    _clock_label(state.last_delivered_at),
+                )
+            try:
+                await asyncio.wait_for(
+                    state.delivery_event.wait(), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                state.next_attempt_at = None
+                return
+            # A real delivery moved the baseline and may have increased the
+            # unanswered count; recompute both the baseline and the interval.
+            state.delivery_event.clear()
+            interval = self._next_idle_delay(state.unanswered)
+
+    def interval_plan(self) -> tuple[tuple[int, int], ...]:
+        """The (min, max) seconds plan for the selected activity profile."""
+        return ACTIVITY_INTERVALS[self.activity]
+
+    def _interval_bounds(self, unanswered: int) -> tuple[int, int]:
+        plan = self.interval_plan()
+        index = min(max(0, int(unanswered)), len(plan) - 1)
+        return plan[index]
+
+    def _next_idle_delay(self, unanswered: int = 0) -> float:
         if self.idle_delay_seconds is not None:
             return max(0.0, float(self.idle_delay_seconds))
-        return float(
-            secrets.randbelow(MAX_IDLE_SECONDS - MIN_IDLE_SECONDS + 1)
-            + MIN_IDLE_SECONDS
-        )
+        low, high = self._interval_bounds(unanswered)
+        return float(secrets.randbelow(high - low + 1) + low)
 
     async def _attempt(
         self,
         cycle: _Cycle,
         state: _ConversationState,
         mode: str,
+        storage_mode: Optional[str] = None,
     ) -> None:
         """One judge + (possibly) one delivered proactive message."""
+        storage_mode = storage_mode or mode
         if not await self._still_valid(cycle):
             return
 
-        # One utterance per mode per triggering turn, including across a
-        # restart that lost the in-memory state.
+        # One utterance per persistence round per triggering turn, including
+        # across a restart that lost the in-memory state.
         if await self.repos.proactive.get_for_source_event(
-            cycle.source_event_id, mode
+            cycle.source_event_id, storage_mode
         ):
             return
+        if storage_mode == f"{MODE_LONG_IDLE}_1":
+            # Compatibility with rows written before round suffixes existed.
+            if await self.repos.proactive.get_for_source_event(
+                cycle.source_event_id, MODE_LONG_IDLE
+            ):
+                return
 
         source_event = await self.repos.utterance.get(cycle.source_event_id)
         if source_event is None:
             return
         if not await self._still_valid(cycle):
             return
+
+        state.last_attempt_at = asyncio.get_running_loop().time()
+        self.logger.info(
+            "proactive_judge_attempt conversation_id=%s source_event_id=%s"
+            " semantic_mode=%s storage_mode=%s",
+            cycle.conversation_id,
+            cycle.source_event_id,
+            mode,
+            storage_mode,
+        )
 
         data = await self.orchestrator.build_proactive_judge_context(
             source_event=source_event, person_id=cycle.person_id, mode=mode
@@ -329,8 +619,9 @@ class ProactiveManager:
         if decision is None:
             return
         self.logger.info(
-            "proactive_judge mode=%s decision=%s reason=%s",
+            "proactive_judge mode=%s storage_mode=%s decision=%s reason=%s",
             mode,
+            storage_mode,
             decision.should_initiate,
             decision.reason,
         )
@@ -354,7 +645,7 @@ class ProactiveManager:
                 " source_event_id=%s mode=%s",
                 cycle.conversation_id,
                 cycle.source_event_id,
-                mode,
+                storage_mode,
             )
             return
         text = str(generated.get("text") or "").strip()
@@ -364,7 +655,7 @@ class ProactiveManager:
                 " source_event_id=%s mode=%s",
                 cycle.conversation_id,
                 cycle.source_event_id,
-                mode,
+                storage_mode,
             )
             return
         display_text = generated.get("display_text")
@@ -378,7 +669,7 @@ class ProactiveManager:
                 " source_event_id=%s mode=%s",
                 cycle.conversation_id,
                 cycle.source_event_id,
-                mode,
+                storage_mode,
             )
             return
         if not self._is_current(state, cycle.generation):
@@ -391,7 +682,7 @@ class ProactiveManager:
             conversation_id=cycle.conversation_id,
             person_id=cycle.person_id,
             source_event_id=cycle.source_event_id,
-            mode=mode,
+            mode=storage_mode,
             origin=ORIGIN_AVA_INITIATED,
             text=text,
             status="COMPLETED",
@@ -408,6 +699,7 @@ class ProactiveManager:
             cycle
         ):
             await self.repos.proactive.delete(message.message_id)
+            state.pending_modes.pop(message.message_id, None)
             return
 
         sink = ResponseEventSink(
@@ -421,13 +713,14 @@ class ProactiveManager:
             report_status="COMPLETED",
             action="RESPOND",
         )
-        state.last_delivered_at = asyncio.get_running_loop().time()
+        state.pending_modes[message.message_id] = storage_mode
+        state.next_attempt_at = None
         self.logger.info(
-            "proactive_delivered conversation_id=%s source_event_id=%s"
-            " mode=%s message_id=%s chars=%d",
+            "proactive_generated conversation_id=%s source_event_id=%s"
+            " mode=%s message_id=%s chars=%d awaiting_delivery_ack=true",
             cycle.conversation_id,
             cycle.source_event_id,
-            mode,
+            storage_mode,
             message.message_id,
             len(text),
         )
@@ -464,37 +757,46 @@ class ProactiveManager:
     def _is_current(self, state: _ConversationState, generation: int) -> bool:
         return not self._closed and state.generation == generation
 
-    async def _still_valid(self, cycle: _Cycle) -> bool:
+    async def _fatal_stop(self, cycle: _Cycle) -> bool:
+        """Conditions that end the whole cycle (not just one attempt)."""
         state = self._states.get(cycle.conversation_id)
         if state is None or state.generation != cycle.generation:
-            return False
+            return True
+        if self._closed:
+            return True
         if cycle.source_event_id != state.latest_user_event_id:
-            return False
+            return True
         if self.delivery_available is not None:
             # No attached surface means the message would be generated and
-            # saved with nowhere to go. Stop before the judge, before the
-            # Speaker call and again before/after persistence.
+            # saved with nowhere to go.
             try:
                 if not self.delivery_available(cycle.conversation_id):
-                    return False
+                    return True
             except Exception:
-                return False
+                return True
         conversation = await self.repos.conversation.get(cycle.conversation_id)
         if conversation is None or conversation.quiet_mode:
-            return False
-        if self._orchestrator_is_processing(cycle.conversation_id):
-            return False
+            return True
         if not await self.registry.is_authorized(cycle.person_id):
-            return False
+            return True
         if not await self.registry.is_external_ai_authorized(cycle.person_id):
-            return False
+            return True
         consent = await self.repos.person.get_consent(cycle.person_id)
         if consent is None or not consent.allow_persistence:
-            return False
+            return True
         latest = await self.repos.utterance.recent_context(
             cycle.conversation_id, exclude_event_id=None, limit=1
         )
         if not latest or latest[-1].event_id != cycle.source_event_id:
+            return True
+        return False
+
+    async def _still_valid(self, cycle: _Cycle) -> bool:
+        if self._closed:
+            return False
+        if await self._fatal_stop(cycle):
+            return False
+        if self._orchestrator_is_processing(cycle.conversation_id):
             return False
         return True
 
@@ -507,7 +809,7 @@ class ProactiveManager:
     def _state_for(self, conversation_id: str) -> _ConversationState:
         state = self._states.get(conversation_id)
         if state is None:
-            state = _ConversationState()
+            state = _ConversationState(conversation_id=conversation_id)
             self._states[conversation_id] = state
         return state
 
@@ -517,9 +819,40 @@ class ProactiveManager:
             task.cancel()
 
 
+def _normalise_activity(
+    value: Optional[str], logger: logging.Logger
+) -> str:
+    text = str(value or "").strip().lower()
+    if text in ACTIVITY_INTERVALS:
+        return text
+    if text:
+        logger.warning(
+            "proactive_activity_invalid value=%s using=%s",
+            text,
+            DEFAULT_ACTIVITY,
+        )
+    return DEFAULT_ACTIVITY
+
+
+def _loop_time() -> float:
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        return time.monotonic()
+
+
+def _clock_label(value: Optional[float]) -> str:
+    return f"{value:.1f}" if value is not None else "-"
+
+
 __all__ = [
     "ProactiveManager",
     "ORIGIN_AVA_INITIATED",
     "MODE_IMMEDIATE",
     "MODE_LONG_IDLE",
+    "ACTIVITY_ENV",
+    "ACTIVITY_HIGH",
+    "ACTIVITY_NORMAL",
+    "ACTIVITY_LOW",
+    "ACTIVITY_INTERVALS",
 ]

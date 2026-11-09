@@ -7,20 +7,30 @@ Usage::
     python -m companion.asr.demo --device "AirPods"
     python -m companion.asr.demo --device 2 --debug
 
+    # optional local speaker identification
+    python -m companion.asr.demo --speaker-id
+    python -m companion.asr.demo --speaker-id --speaker-debug
+    python -m companion.asr.demo --speaker-list
+    python -m companion.asr.demo --speaker-delete TEMP-0001
+    python -m companion.asr.demo --speaker-clear --yes
+
 This demo is deliberately self-contained: it never imports Ava's Speaker,
 Router, TTS, Memory or Orchestrator, and it never writes captured audio to
-disk.
+disk. Speaker identification is an opt-in extra; without ``--speaker-id`` no
+voice-print model is loaded and the original behaviour is unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from typing import Optional
 
 from companion.asr.config import ASRConfigError, load_asr_config
 from companion.asr.microphone import MicrophoneError, list_input_devices
 from companion.asr.vad import VADError
+from companion.config import configure_logging
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -29,6 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "独立实时语音识别 Demo：麦克风 → Silero VAD → Qwen 流式 ASR → 终端。"
             "不接入 Ava 的 Speaker、Router、TTS 或 Memory。"
+            "加 --speaker-id 时额外使用本地声纹模型（不保存原始音频）。"
         ),
     )
     parser.add_argument(
@@ -50,6 +61,54 @@ def _build_parser() -> argparse.ArgumentParser:
         "--debug",
         action="store_true",
         help="显示设备接口、分段状态和 VAD→最终结果延迟",
+    )
+    # ------------------------------------------------------ speaker options
+    parser.add_argument(
+        "--speaker-id",
+        action="store_true",
+        help="启用本地声纹识别（需要 speaker 可选依赖；请先获得被录音者同意）",
+    )
+    parser.add_argument(
+        "--speaker-db",
+        default=None,
+        help="声纹 SQLite 路径（默认 ~/.cache/ava-speaker/speakers.sqlite3）",
+    )
+    parser.add_argument(
+        "--speaker-model",
+        default=None,
+        help="本地声纹模型目录（离线使用；默认由 ModelScope 缓存管理）",
+    )
+    parser.add_argument(
+        "--speaker-device",
+        choices=("cpu", "mps", "auto"),
+        default=None,
+        help="声纹推理设备，默认 cpu；mps 不可用时自动回退 cpu",
+    )
+    parser.add_argument(
+        "--speaker-debug",
+        action="store_true",
+        help="输出声纹识别的调试日志",
+    )
+    parser.add_argument(
+        "--speaker-list",
+        action="store_true",
+        help="列出声纹库中的身份后退出（不需要 API Key）",
+    )
+    parser.add_argument(
+        "--speaker-delete",
+        default=None,
+        metavar="ID",
+        help="删除一个声纹身份后退出（例如 TEMP-0001）",
+    )
+    parser.add_argument(
+        "--speaker-clear",
+        action="store_true",
+        help="清空整个声纹库（必须同时加 --yes）",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="与 --speaker-clear 一起使用，确认删除全部声纹",
     )
     return parser
 
@@ -81,7 +140,138 @@ def _show_devices() -> int:
     return 0
 
 
-def _print_summary(manager, *, debug: bool) -> None:
+def _open_store(args):
+    from companion.speaker_id.config import load_speaker_config
+    from companion.speaker_id.store import SpeakerStore, SpeakerStoreError
+
+    config = load_speaker_config(
+        db_path=args.speaker_db,
+        device=args.speaker_device,
+    )
+    store = SpeakerStore(
+        config.db_path,
+        max_embeddings_per_speaker=config.max_embeddings_per_speaker,
+    )
+    try:
+        store.initialize()
+    except SpeakerStoreError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return None
+    return config, store
+
+
+def _speaker_maintenance(args) -> Optional[int]:
+    """Explicit list/delete/clear commands; no ASR or model is started."""
+    if not (
+        args.speaker_list or args.speaker_delete or args.speaker_clear
+    ):
+        return None
+    opened = _open_store(args)
+    if opened is None:
+        return 2
+    config, store = opened
+    try:
+        if args.speaker_list:
+            speakers = store.list_speakers()
+            if not speakers:
+                print("声纹库为空。")
+            for speaker in speakers:
+                print(
+                    f"{speaker['speaker_id']}  {speaker['status']}  "
+                    f"样本 {speaker['samples']}  观察 "
+                    f"{speaker['observation_count']}  "
+                    f"更新 {speaker['updated_at']:.0f}"
+                )
+        if args.speaker_delete:
+            deleted = store.delete_speaker(args.speaker_delete)
+            print(
+                f"已删除 {args.speaker_delete}。"
+                if deleted
+                else f"未找到 {args.speaker_delete}。"
+            )
+        if args.speaker_clear:
+            if not args.yes:
+                print(
+                    "拒绝清空：请同时加 --yes 明确确认。",
+                    file=sys.stderr,
+                )
+                return 2
+            removed = store.clear()
+            print(f"已清空声纹库（删除 {removed} 个身份）。")
+        print(f"声纹库: {config.db_path}")
+        return 0
+    finally:
+        store.close()
+
+
+def _setup_speaker(args):
+    """Load the model once and build the engine; returns ``None`` on failure."""
+    from companion.speaker_id.config import (
+        SpeakerConfigError,
+        load_speaker_config,
+    )
+    from companion.speaker_id.embedding import (
+        SpeakerEmbeddingError,
+        SpeakerEmbeddingModel,
+    )
+    from companion.speaker_id.engine import SpeakerEngine
+    from companion.speaker_id.store import SpeakerStore, SpeakerStoreError
+
+    try:
+        config = load_speaker_config(
+            db_path=args.speaker_db,
+            model_path=args.speaker_model,
+            device=args.speaker_device,
+            debug=args.speaker_debug,
+        )
+    except SpeakerConfigError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return None
+
+    print(
+        "已启用本地声纹识别：说话音频只用于提取声纹向量并保存在 "
+        f"{config.db_path}（不保存原始音频）。请确保被录音者知情并同意。",
+        file=sys.stderr,
+    )
+    model = SpeakerEmbeddingModel(
+        model_id=config.model_id,
+        model_revision=config.model_revision,
+        model_path=config.model_path,
+        device=config.device,
+    )
+    try:
+        print("正在加载声纹模型…", file=sys.stderr)
+        model.load()
+        print("正在预热声纹模型…", file=sys.stderr)
+        model.warmup()
+    except SpeakerEmbeddingError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        model.close()
+        return None
+
+    store = SpeakerStore(
+        config.db_path,
+        max_embeddings_per_speaker=config.max_embeddings_per_speaker,
+    )
+    try:
+        store.initialize()
+    except SpeakerStoreError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        model.close()
+        return None
+
+    engine = SpeakerEngine(
+        config, embedding_model=model, store=store
+    )
+    print(
+        f"声纹模型已就绪：{config.model_id}@{config.model_revision}"
+        f"（{model.active_device}）",
+        file=sys.stderr,
+    )
+    return engine, model, store
+
+
+def _print_summary(manager, *, debug: bool, engine=None) -> None:
     stats = manager.stats
     print("", file=sys.stderr)
     print(
@@ -99,6 +289,22 @@ def _print_summary(manager, *, debug: bool) -> None:
             f"最大 {max(latencies):.0f} ms（{len(latencies)} 段）。",
             file=sys.stderr,
         )
+    if engine is not None:
+        speaker = engine.stats()
+        identity = speaker["first_identity_latencies_ms"]
+        if identity:
+            average = sum(identity) / len(identity)
+            print(
+                "说话开始 → 首次身份结果："
+                f"平均 {average:.0f} ms（{len(identity)} 段）。",
+                file=sys.stderr,
+            )
+        print(
+            f"声纹：分析 {speaker['analyses']} 次，"
+            f"错误 {speaker['errors']} 次，"
+            f"丢弃唤醒 {speaker['dropped_wakeups']} 次。",
+            file=sys.stderr,
+        )
     if debug:
         print(
             f"调试：输入丢弃块 {manager.dropped_audio_chunks}，"
@@ -114,6 +320,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.list_devices:
         return _show_devices()
 
+    maintenance = _speaker_maintenance(args)
+    if maintenance is not None:
+        return maintenance
+
     try:
         config = load_asr_config(
             device=args.device,
@@ -124,10 +334,30 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
 
+    # `--debug` surfaces structured ``asr_lifecycle`` lines (session state,
+    # close origin, primary/secondary error) on stderr; without it only
+    # concise user-facing errors are shown and the file log stays quiet.
+    configure_logging(args.debug)
+    if args.speaker_debug:
+        logging.getLogger("companion.speaker").setLevel(logging.DEBUG)
+
     # Imported here so --list-devices stays usable without dashscope/numpy.
     from companion.asr.manager import ASRManager
 
-    manager = ASRManager(config)
+    engine = None
+    model = None
+    store = None
+    if args.speaker_id:
+        setup = _setup_speaker(args)
+        if setup is None:
+            return 3
+        engine, model, store = setup
+
+    manager = ASRManager(config, speaker_observer=engine)
+    if engine is not None:
+        engine.set_on_result(manager.post_speaker_result)
+        engine.start()
+
     interrupted = False
     try:
         manager.run()
@@ -146,7 +376,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
     finally:
         manager.shutdown()
-        _print_summary(manager, debug=args.debug)
+        if engine is not None:
+            engine.shutdown()
+        if store is not None:
+            store.close()
+        if model is not None:
+            model.close()
+        _print_summary(manager, debug=args.debug, engine=engine)
     return 130 if interrupted else 0
 
 

@@ -1,9 +1,10 @@
-"""Prompts for the one-shot proactive judgment and proactive generation mode.
+"""Prompts for proactive judgment and proactive generation mode.
 
 The judge prompt is deliberately separate from Ava's Speaker prompt: deciding
 *whether* to speak must never become a second persona or a content generator.
-The generation-mode block is a short trusted system note, not a replacement
-persona and not a fake user message.
+The same judge prompt serves every continuous round; the generation-mode block
+is a short trusted system note, not a replacement persona and not a fake user
+message.
 """
 
 from __future__ import annotations
@@ -225,10 +226,20 @@ PROACTIVE_MODE_BLOCK_LONG_IDLE = """【本轮生成模式：长时间安静后�
 结合最近对话、你的性格、兴趣、记忆和当前状态，
 说你此刻真正想说的、自然的话。
 
+不需要每次都提问，也不必只围绕对方上一句话。
+你可以根据最近的交流、记忆和自己的兴趣产生新的想法，
+分享观察、表达好奇，或自然开启不同的话题。
+
+对方没有回应时，不要反复要求对方回应，
+不要重复之前问过的问题，也不要假装对方刚刚说过什么。
+不要编造自己看见、听见或亲身经历过的事。
+不要为了主动而主动地说空洞的寒暄。
+
+参考最近已经发出的主动消息，避免重复相同的内容或问法。
+保持自然口语，通常简短，但不必强行限制句数。
+
 不需要解释为什么主动说话。
-不需要假装对方刚刚说过什么。
-不要提及确认身份等尚未完成的流程，也不要催促对方回应。
-不要重复此前的回复。
+不要提及确认身份等尚未完成的流程。
 
 保持你原本的性格和说话习惯。"""
 

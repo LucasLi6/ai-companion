@@ -1804,8 +1804,8 @@ class Orchestrator:
         profile are performed here.
 
         ``mode`` is ``IMMEDIATE`` (right after a delivered reply) or
-        ``LONG_IDLE`` (after a 2-4 minute silence). Only ``LONG_IDLE`` carries
-        the structurally validated explicit-departure floor.
+        ``LONG_IDLE`` (a later continuous silence round). Only ``LONG_IDLE``
+        carries the structurally validated explicit-departure floor.
         """
         if self.context_builder is None:
             return None

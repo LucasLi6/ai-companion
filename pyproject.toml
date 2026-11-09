@@ -68,6 +68,30 @@ asr = [
     "onnxruntime>=1.17",
     "silero-vad>=5.1",
 ]
+# speaker: optional local speaker identification for the independent ASR demo
+#   (V0.9.9.22). The architecture and weights come from the pinned ModelScope
+#   package/revision (3D-Speaker ERes2NetV2); no GitHub code is fetched at
+#   runtime. Nothing in the core or the plain ASR demo imports these packages,
+#   so a headless install never pulls in PyTorch. CPU is the default backend;
+#   MPS is tried only when explicitly requested and falls back to CPU.
+#   Versions below were installed together and exercised end to end with the
+#   real checkpoint (load, warmup, encode). torch/torchaudio must stay on the
+#   same release: this index has no torch 2.11.1 to pair with torchaudio
+#   2.11.1, and other combinations fail to import. addict/datasets/pillow/
+#   simplejson/sortedcontainers are imported by modelscope.pipelines in 1.40.2
+#   but are not declared as hard dependencies, so they are listed here.
+speaker = [
+    "modelscope==1.40.2",
+    "torch==2.11.0",
+    "torchaudio==2.11.0",
+    "numpy>=1.26",
+    "soundfile>=0.12",
+    "addict>=2.4",
+    "datasets>=4.0,<6",
+    "pillow>=9",
+    "simplejson>=3.3.0",
+    "sortedcontainers>=1.5.9",
+]
 
 [project.scripts]
 companion = "companion.cli:main"

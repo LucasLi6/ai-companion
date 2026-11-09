@@ -161,6 +161,7 @@ def build_runtime(
     profile_review_delay_seconds: float = 30.0,
     proactive_judge=None,
     proactive_idle_delay_seconds: Optional[float] = None,
+    proactive_activity: Optional[str] = None,
     profile_confirmation=None,
 ) -> Runtime:
     """Build a fully wired runtime over an already-connected database.
@@ -672,12 +673,14 @@ def build_runtime(
         logger=logger,
     )
 
-    # V0.9.9: dual-stage proactive cycle after a delivered normal reply.
-    # Stage 1 judges immediately; stage 2 waits a random 120-240 s from Ava's
-    # last delivered message. It is wired only for the real external-AI path
-    # (the Judge is a model call); the manager itself is provider-agnostic and
-    # can be injected in tests. It never holds the conversation lock and never
-    # creates a second agent or task queue.
+    # V0.9.9.21: continuous proactive cycle after a delivered normal reply.
+    # An immediate judgment is followed by adaptive long-idle rounds (activity
+    # profile from ``AVA_PROACTIVE_ACTIVITY``; default high). Each round is a
+    # judgment attempt, measured from Ava's last actually delivered message,
+    # and the loop slows down but never permanently stops. It is wired only
+    # for the real external-AI path (the Judge is a model call); the manager
+    # itself is provider-agnostic and can be injected in tests. It never holds
+    # the conversation lock and never creates a second agent or task queue.
     proactive_manager = None
     if provider == "deepseek":
         judge = proactive_judge
@@ -693,6 +696,7 @@ def build_runtime(
             orchestrator=orchestrator,
             judge=judge,
             idle_delay_seconds=proactive_idle_delay_seconds,
+            activity=proactive_activity,
             logger=logger,
         )
 

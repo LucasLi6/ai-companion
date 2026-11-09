@@ -12,8 +12,8 @@ pytest:
         --text "今天天气不错，我们出去走走吧，顺便喝杯咖啡。" \
         --out /tmp/tts_compare
 
-Modes (same model qwen-audio-3.1-tts-flash, same voice xuyanchu_v3.1,
-same rate 1.07):
+Modes (same model qwen-audio-3.1-tts-flash, same voice anruorou_v3.1,
+same rate 1.03):
 
   B_no_instruction    sentence-first, auto flush, no instruction
   C_instruction       sentence-first, auto flush, Chinese instruction

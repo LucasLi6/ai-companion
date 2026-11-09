@@ -522,13 +522,17 @@ async def test_long_idle_runs_after_the_window_and_delivers_once(chat):
     await _web_turn(coordinator, rt, person, "今天天气不错")
 
     await _wait_for(
-        lambda: [p.mode for p in judge.payloads] == [MODE_IMMEDIATE, MODE_LONG_IDLE]
+        lambda: len(judge.payloads) >= 2
+        and [p.mode for p in judge.payloads[:2]]
+        == [MODE_IMMEDIATE, MODE_LONG_IDLE]
     )
     await _wait_for(lambda: received)
     rows = await rt.repos.proactive.list_for_conversation(CONVERSATION)
-    assert [row.mode for row in rows] == [MODE_LONG_IDLE]
+    assert [row.mode for row in rows] == [f"{MODE_LONG_IDLE}_1"]
     assert len(received) == 1
     await asyncio.sleep(0.1)
+    # The cycle keeps judging (continuous scheduling), but the scripted
+    # decisions are exhausted, so no further message may be persisted.
     assert len(await rt.repos.proactive.list_for_conversation(CONVERSATION)) == 1
 
 
@@ -808,8 +812,8 @@ async def test_mock_provider_has_no_proactive_manager_and_no_extra_call(chat):
 # -- T22-T25: lifecycle edges ---------------------------------------------
 
 
-async def test_proactive_delivery_never_schedules_another_cycle(chat):
-    """T22: two stages, then the cycle stops. Nothing self-triggers."""
+async def test_continuous_judgments_never_duplicate_delivered_messages(chat):
+    """Continuous scheduling keeps judging, but rounds stay idempotent."""
     received, callback = _collector()
     coordinator, rt, client, judge = await chat(
         decisions=[True, True], idle_delay=0.02
@@ -820,12 +824,23 @@ async def test_proactive_delivery_never_schedules_another_cycle(chat):
 
     await _wait_for(
         lambda: len(received) == 2
-        and [p.mode for p in judge.payloads] == [MODE_IMMEDIATE, MODE_LONG_IDLE]
+        and len(judge.payloads) >= 2
+        and [p.mode for p in judge.payloads[:2]]
+        == [MODE_IMMEDIATE, MODE_LONG_IDLE]
     )
     await asyncio.sleep(0.15)
-    assert [p.mode for p in judge.payloads] == [MODE_IMMEDIATE, MODE_LONG_IDLE]
+    # The adaptive loop is still making judgment attempts (never stops while
+    # the user stays silent), and every later attempt is a LONG_IDLE round.
+    assert len(judge.payloads) > 2
+    assert all(
+        p.mode == MODE_LONG_IDLE for p in judge.payloads[1:]
+    )
     rows = await rt.repos.proactive.list_for_conversation(CONVERSATION)
-    assert [row.mode for row in rows] == [MODE_IMMEDIATE, MODE_LONG_IDLE]
+    assert [row.mode for row in rows] == [
+        MODE_IMMEDIATE,
+        f"{MODE_LONG_IDLE}_1",
+    ]
+    assert len(received) == 2
 
 
 async def test_explicit_self_report_does_not_block_the_immediate_stage(chat):

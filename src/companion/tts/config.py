@@ -23,13 +23,13 @@ DEFAULT_ENV_FILE = ".env"
 ENV_FILE_OVERRIDE = "AVA_ENV_FILE"
 
 DEFAULT_MODEL = "qwen-audio-3.1-tts-flash"
-DEFAULT_VOICE = "xuyanchu_v3.1"
+DEFAULT_VOICE = "anruorou_v3.1"
 DEFAULT_REGION = "cn-beijing"
 DEFAULT_SAMPLE_RATE = 24000
 DEFAULT_FORMAT = "pcm"
 
 # DashScope accepts 0.5~2.0 for the speech rate (1.0 = normal speed).
-DEFAULT_SPEECH_RATE = 1.07
+DEFAULT_SPEECH_RATE = 1.03
 MIN_SPEECH_RATE = 0.5
 MAX_SPEECH_RATE = 2.0
 
