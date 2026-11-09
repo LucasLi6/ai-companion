@@ -1072,6 +1072,15 @@ class TTSManager:
                     listener(generation, frame, timestamp)
                 except Exception:  # noqa: BLE001 - optional side channel
                     pass
+            # Re-check after the listener: TTS may have been cancelled on
+            # another thread while the reference was being enqueued. Never let
+            # a superseded generation keep writing into the speaker.
+            with self._lock:
+                if not self._started or generation != self._generation:
+                    return
+                player = self._player
+            if player is None:
+                raise RuntimeError("音频输出设备已关闭")
             player.write(frame)
             if first:
                 with self._lock:

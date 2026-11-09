@@ -2256,7 +2256,12 @@ async def cmd_repl(args) -> int:
                     try:
                         echo_pipeline = EchoCancellationPipeline(
                             playback_sample_rate=playback_rate,
+                            # AEC3 device-buffer hint only.
                             stream_delay_ms=barge_in_config.aec_delay_ms,
+                            # Independent, measured timeline calibration.
+                            timeline_offset_ms=(
+                                barge_in_config.timeline_offset_ms
+                            ),
                         )
                     except Exception as exc:  # noqa: BLE001 - optional extra
                         print(
@@ -2819,10 +2824,20 @@ async def _handle_mic_command(parts: list[str], voice_mode: bool, coordinator) -
             print(
                 "  latency: "
                 f"speech_to_confirm={confirm_latency if confirm_latency is not None else 'n/a'}ms"
-                f"  confirm_to_stop={latency if latency is not None else 'n/a'}ms"
+                # This is the stop() call time, not measured device silence.
+                f"  confirm_to_stop_call={latency if latency is not None else 'n/a'}ms"
                 f"  mic_dropped={barge.get('mic_dropped_chunks', 0)}"
             )
-            aec = (barge.get("asr") or {}).get("aec") or {}
+            asr_stats = barge.get("asr") or {}
+            aec = asr_stats.get("aec") or {}
+            if asr_stats:
+                print(
+                    "  mode: "
+                    f"{asr_stats.get('mode')}"
+                    f"  detecting={str(asr_stats.get('detecting')).lower()}"
+                    f"  tail={str(asr_stats.get('tail')).lower()}"
+                    f"  gaps={asr_stats.get('gaps', 0)}"
+                )
             if aec:
                 print(
                     "  aec: "
@@ -2832,8 +2847,30 @@ async def _handle_mic_command(parts: list[str], voice_mode: bool, coordinator) -
                     f"  rms_near={aec.get('near_rms_p50')}"
                     f"  rms_clean={aec.get('clean_rms_p50')}"
                     f"  ref_frames={aec.get('reference_frames')}"
+                    f"  ref_consumed={aec.get('reference_consumed')}"
+                    f"  ref_expired={aec.get('reference_expired')}"
+                    f"  ref_dropped={aec.get('reference_dropped')}"
+                    f"  discontinuities={aec.get('sync_discontinuities')}"
+                    f"  mic_jumps={aec.get('mic_discontinuities')}"
+                    f"  tail_frames={aec.get('tail_frames')}"
                     f"  drops={aec.get('playback_dropped')}"
                 )
+                print(
+                    "  align: "
+                    f"far_seq={aec.get('far_sequence')}"
+                    f"  near_seq={aec.get('near_sequence')}"
+                    f"  ref_age_ms={aec.get('reference_age_ms')}"
+                    f"  offset_ms={aec.get('alignment_offset_ms')}"
+                    f"  generation={aec.get('generation')}"
+                    f"  aec_valid={str(aec.get('aec_valid')).lower()}"
+                )
+                reasons = aec.get("invalid_reasons") or {}
+                if reasons:
+                    summary = " ".join(
+                        f"{key}={value}"
+                        for key, value in sorted(reasons.items())
+                    )
+                    print(f"  aec invalid: {summary}")
     elif action == "devices":
         try:
             from companion.asr.microphone import list_input_devices

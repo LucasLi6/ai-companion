@@ -18,13 +18,21 @@ ENABLED_ENV = "AVA_BARGE_IN_ENABLED"
 VAD_THRESHOLD_ENV = "AVA_BARGE_IN_VAD_THRESHOLD"
 MIN_SPEECH_MS_ENV = "AVA_BARGE_IN_MIN_SPEECH_MS"
 PRE_ROLL_MS_ENV = "AVA_BARGE_IN_PREROLL_MS"
+# AVA_BARGE_IN_AEC_DELAY_MS is only the WebRTC AEC3 ``stream_delay_ms`` hint
+# (the device buffer latency the model uses internally). It is never applied
+# to the reference/mic timeline as well.
 AEC_DELAY_MS_ENV = "AVA_BARGE_IN_AEC_DELAY_MS"
+# Optional, independent calibration of the reference timeline. Use this (not
+# AEC_DELAY_MS) if measured hardware latency requires shifting which playback
+# frame is paired with a microphone block.
+TIMELINE_OFFSET_MS_ENV = "AVA_BARGE_IN_TIMELINE_OFFSET_MS"
 
 DEFAULT_ENABLED = False
 DEFAULT_VAD_THRESHOLD = 0.65
 DEFAULT_MIN_SPEECH_MS = 192
 DEFAULT_PRE_ROLL_MS = 400
 DEFAULT_AEC_DELAY_MS = 0
+DEFAULT_TIMELINE_OFFSET_MS = 0.0
 # While the user's interrupting utterance is being recognized, keep the
 # echo-cancelled path for the decaying playback tail before switching the ASR
 # input back to its unchanged normal path.
@@ -47,6 +55,9 @@ class BargeInConfig:
     min_speech_ms: int = DEFAULT_MIN_SPEECH_MS
     pre_roll_ms: int = DEFAULT_PRE_ROLL_MS
     aec_delay_ms: int = DEFAULT_AEC_DELAY_MS
+    # Measured alignment calibration; separate from the AEC3 device hint so a
+    # single latency value is never compensated twice.
+    timeline_offset_ms: float = DEFAULT_TIMELINE_OFFSET_MS
     echo_tail_ms: int = DEFAULT_ECHO_TAIL_MS
 
     @property
@@ -72,6 +83,26 @@ def _int_env(
         raise BargeInConfigError(f"{name} 必须是整数。") from exc
     if value < minimum:
         raise BargeInConfigError(f"{name} 必须大于等于 {minimum}。")
+    return value
+
+
+def _float_env(
+    env: Mapping[str, str],
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw = _env(env, name, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise BargeInConfigError(f"{name} 必须是数字。") from exc
+    if not minimum <= value <= maximum:
+        raise BargeInConfigError(
+            f"{name} 必须在 {minimum} 和 {maximum} 之间。"
+        )
     return value
 
 
@@ -116,6 +147,13 @@ def load_barge_in_config(
         aec_delay_ms=_int_env(
             env, AEC_DELAY_MS_ENV, DEFAULT_AEC_DELAY_MS, minimum=0
         ),
+        timeline_offset_ms=_float_env(
+            env,
+            TIMELINE_OFFSET_MS_ENV,
+            DEFAULT_TIMELINE_OFFSET_MS,
+            minimum=-500.0,
+            maximum=500.0,
+        ),
         echo_tail_ms=_int_env(
             env, "AVA_BARGE_IN_ECHO_TAIL_MS", DEFAULT_ECHO_TAIL_MS,
             minimum=0,
@@ -132,10 +170,12 @@ __all__ = [
     "DEFAULT_ENABLED",
     "DEFAULT_MIN_SPEECH_MS",
     "DEFAULT_PRE_ROLL_MS",
+    "DEFAULT_TIMELINE_OFFSET_MS",
     "DEFAULT_VAD_THRESHOLD",
     "ENABLED_ENV",
     "MIN_SPEECH_MS_ENV",
     "PRE_ROLL_MS_ENV",
+    "TIMELINE_OFFSET_MS_ENV",
     "VAD_THRESHOLD_ENV",
     "load_barge_in_config",
 ]

@@ -439,14 +439,22 @@ class VoiceCoordinator:
 
         # 1. Stop generation immediately; never wait for ASR to finish.
         self._stop_tts_now(activity.at)
-        # 2. Tell the embedder to cancel the old reply task (LLM stream).
+        # 2. Keep the confirmed user turn continuous after playback stops. The
+        #    pipeline uses remaining real references, then bounded silent far
+        #    frames, so reference exhaustion can never drop the user's words.
+        manager = self._manager
+        confirm = getattr(manager, "confirm_barge_in", None)
+        if callable(confirm):
+            with contextlib.suppress(Exception):
+                confirm(generation)
+        # 3. Tell the embedder to cancel the old reply task (LLM stream).
         callback = self._on_barge_in
         if callback is not None:
             try:
                 callback(generation)
             except Exception:  # noqa: BLE001 - old reply cleanup is best effort
                 pass
-        # 3. Preserve the user's turn for the ASR already in flight.
+        # 4. Preserve the user's turn for the ASR already in flight.
         self._current_uid = activity.utterance_id
         self._expected_generation = None
         self._playback_terminal_generation = None
@@ -477,9 +485,14 @@ class VoiceCoordinator:
                 stop()
         except Exception:  # noqa: BLE001 - playback is already being stopped
             pass
-        self.barge_stats["stop_latency_ms"] = round(
+        # This measures the stop() call (queue drain + device interrupt
+        # request). It is not proof that the speaker is already silent; the
+        # TTS manager does not expose a device-silence timestamp.
+        elapsed = round(
             max(0.0, (time.monotonic() - confirmed_at) * 1000.0), 1
         )
+        self.barge_stats["stop_latency_ms"] = elapsed
+        self.barge_stats["stop_call_ms"] = elapsed
 
     def _schedule_echo_tail(self) -> None:
         """Switch the ASR input back to its normal path after the echo tail."""
@@ -504,6 +517,10 @@ class VoiceCoordinator:
             if callable(setter):
                 with contextlib.suppress(Exception):
                     setter("NORMAL")
+            end_tail = getattr(manager, "end_echo_tail", None)
+            if callable(end_tail):
+                with contextlib.suppress(Exception):
+                    end_tail()
 
         self._echo_tail_task = asyncio.create_task(
             _tail(), name="ava-voice-echo-tail"

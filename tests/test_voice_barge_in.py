@@ -24,6 +24,7 @@ import time
 from array import array
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from companion.asr.config import ASRConfig
@@ -42,10 +43,16 @@ from companion.asr.vad import (
 )
 from companion.cli import _run_streaming_turn
 from companion.voice import VoiceCoordinator, VoiceState
-from companion.voice.barge_in_config import BargeInConfig
+from companion.voice.barge_in_config import (
+    BargeInConfig,
+    BargeInConfigError,
+    load_barge_in_config,
+)
 from companion.voice.echo_canceller import (
+    AECFormatError,
     EchoCancellationPipeline,
     MicProcessingResult,
+    _aec_process_frame,
 )
 
 WINDOW = 1024  # 512 int16 samples = one 32 ms Silero window
@@ -84,25 +91,61 @@ def energy_probability(window: bytes) -> float:
     return 0.95 if level > 1500 else 0.0
 
 
+def _assert_aec_arrays(near, far) -> None:
+    """The real pywebrtc-audio interface: ndarray int16, equal lengths."""
+    assert isinstance(near, np.ndarray)
+    assert isinstance(far, np.ndarray)
+    assert near.dtype == np.int16
+    assert far.dtype == np.int16
+    assert len(near) == len(far)
+
+
 class PassThroughCanceller:
     """Models perfect AEC: the near signal survives unchanged."""
 
-    def process(self, near: bytes, far: bytes) -> bytes:
-        assert len(near) == len(far)
-        return near
+    def process(self, near, far):
+        _assert_aec_arrays(near, far)
+        return near.copy()
 
 
 class SilenceCanceller:
     """Models perfect echo removal: only residual silence remains."""
 
-    def process(self, near: bytes, far: bytes) -> bytes:
-        assert len(near) == len(far)
-        return b"\x00\x00" * (len(near) // 2)
+    def process(self, near, far):
+        _assert_aec_arrays(near, far)
+        return np.zeros_like(near)
 
 
 class ExplodingCanceller:
-    def process(self, near: bytes, far: bytes) -> bytes:
+    def process(self, near, far):
+        _assert_aec_arrays(near, far)
         raise RuntimeError("aec exploded")
+
+
+class EchoSubtractingCanceller:
+    """Models a loudspeaker path: remove exactly the far-end echo."""
+
+    def process(self, near, far):
+        _assert_aec_arrays(near, far)
+        return np.clip(
+            near.astype(np.int32) - far.astype(np.int32), -32768, 32767
+        ).astype(np.int16)
+
+
+class RecordingCanceller:
+    """Perfect pass-through that records every far-end frame it was given."""
+
+    def __init__(self) -> None:
+        self.fars: list[np.ndarray] = []
+
+    def process(self, near, far):
+        _assert_aec_arrays(near, far)
+        self.fars.append(np.array(far, copy=True))
+        return near.copy()
+
+
+def constant(samples: int, value: int) -> bytes:
+    return np.full(samples, value, dtype="<i2").tobytes()
 
 
 def _config(**overrides) -> ASRConfig:
@@ -265,7 +308,13 @@ def test_g_missing_reference_blocks_detection_without_raw_fallback() -> None:
     assert pipeline.process_microphone(tone(320), 20.0).valid
     stale = pipeline.process_microphone(tone(320), 20.6)
     assert not stale.valid
-    assert stale.reason in ("stale_reference", "ahead_reference")
+    # The single reference frame was consumed once; with audio stopped there
+    # is no reference left to pair with later microphone audio.
+    assert stale.reason in (
+        "stale_reference",
+        "ahead_reference",
+        "no_reference",
+    )
 
 
 def test_g_generation_mismatch_rejects_playback() -> None:
@@ -275,6 +324,253 @@ def test_g_generation_mismatch_rejects_playback() -> None:
     assert pipeline.start(2)
     assert pipeline.push_playback(tone(480), 1.0, 3) is False
     assert pipeline.push_playback(tone(480), 1.0, 2) is True
+
+
+# ------------------------------------------------------ real AEC interface (P0)
+def test_aec_interface_passes_numpy_int16_arrays() -> None:
+    seen: dict[str, np.ndarray] = {}
+
+    class StrictCanceller:
+        def process(self, near, far):
+            seen["near"] = near
+            seen["far"] = far
+            return near.copy()
+
+    near = tone(320)
+    far = tone(320)
+    output = _aec_process_frame(StrictCanceller(), near, far)
+    assert seen["near"].dtype == np.int16
+    assert seen["far"].dtype == np.int16
+    assert seen["near"].shape == (320,)
+    assert seen["far"].shape == (320,)
+    assert np.array_equal(seen["near"], np.frombuffer(near, dtype="<i2"))
+    assert np.array_equal(seen["far"], np.frombuffer(far, dtype="<i2"))
+    assert isinstance(output, bytes) and len(output) == 640
+
+
+def test_aec_interface_rejects_bad_frames_and_results() -> None:
+    good = tone(320)
+
+    class Good:
+        def process(self, near, far):
+            return near
+
+    # Length mismatch / wrong frame size are rejected before the model runs.
+    with pytest.raises(AECFormatError):
+        _aec_process_frame(Good(), good, tone(480))
+    with pytest.raises(AECFormatError):
+        _aec_process_frame(Good(), good, b"")
+
+    class BadDtype:
+        def process(self, near, far):
+            return np.zeros(near.size, dtype=np.float32)
+
+    class BadShape:
+        def process(self, near, far):
+            return np.zeros(near.size * 2, dtype=np.int16)
+
+    class BadBytes:
+        def process(self, near, far):
+            return good
+
+    for canceller in (BadDtype(), BadShape(), BadBytes()):
+        with pytest.raises((AECFormatError, TypeError)):
+            _aec_process_frame(canceller, good, good)
+
+
+def test_real_pywebrtc_audio_accepts_int16_frames() -> None:
+    """Real library check. SKIPPED, not passed, when the extra is absent."""
+    pywebrtc = pytest.importorskip(
+        "pywebrtc_audio", reason="optional bargein extra not installed"
+    )
+    try:
+        canceller = pywebrtc.EchoCanceller(
+            sample_rate=16000, num_channels=1, stream_delay_ms=0
+        )
+    except TypeError:  # pragma: no cover - binding signature variant
+        canceller = pywebrtc.EchoCanceller(16000, 1, 0)
+
+    near = tone(320, amplitude=4000)
+    far = tone(320, amplitude=4000)
+    first = _aec_process_frame(canceller, near, far)
+    assert len(first) == 640
+    # The same continuous instance must handle consecutive frames.
+    for _ in range(4):
+        assert len(_aec_process_frame(canceller, near, far)) == 640
+    with pytest.raises((AECFormatError, TypeError, ValueError)):
+        _aec_process_frame(canceller, b"", b"")
+    with pytest.raises((AECFormatError, TypeError, ValueError)):
+        _aec_process_frame(canceller, near, tone(480))
+
+
+# -------------------------------------------------- reference timeline (P1)
+def test_reference_timeline_is_consumed_once_in_order() -> None:
+    recorder = RecordingCanceller()
+    pipeline = EchoCancellationPipeline(
+        canceller_factory=lambda *_: recorder
+    )
+    assert pipeline.start(3)
+    jitter = (0.0, 0.003, -0.002, 0.001, -0.003)
+    values: list[int] = []
+    for index in range(20):
+        value = 100 + index
+        values.append(value)
+        timestamp = 100.0 + index * 0.02 + jitter[index % len(jitter)]
+        assert pipeline.push_playback(constant(480, value), timestamp, 3)
+        result = pipeline.process_microphone(
+            silence(320), 100.02 + index * 0.02
+        )
+        assert result.valid, result.reason
+    consumed = [int(frame[0]) for frame in recorder.fars]
+    assert consumed == values  # ordered, no duplicates, no skipped frames
+    stats = pipeline.stats()
+    assert stats["reference_consumed"] == 20
+    assert stats["reference_expired"] == 0
+
+
+def test_timeline_does_not_substitute_a_future_reference() -> None:
+    recorder = RecordingCanceller()
+    pipeline = EchoCancellationPipeline(
+        canceller_factory=lambda *_: recorder
+    )
+    assert pipeline.start(1)
+    assert pipeline.push_playback(constant(480, 500), 50.5, 1)
+    ahead = pipeline.process_microphone(silence(320), 50.0)
+    assert not ahead.valid
+    assert ahead.reason == "ahead_reference"
+    assert recorder.fars == []  # a future frame was not consumed early
+
+    reached = pipeline.process_microphone(silence(320), 50.52)
+    assert reached.valid
+    assert len(recorder.fars) == 1
+    assert int(recorder.fars[0][0]) == 500
+
+
+def test_playback_and_microphone_jumps_are_counted() -> None:
+    pipeline = EchoCancellationPipeline(
+        canceller_factory=lambda *_: PassThroughCanceller()
+    )
+    assert pipeline.start(1)
+    assert pipeline.push_playback(tone(480), 10.0, 1)
+    assert pipeline.process_microphone(tone(320), 10.02).valid
+    # A large playback timestamp jump restarts the reference timeline.
+    assert pipeline.push_playback(tone(480), 11.0, 1)
+    assert pipeline.process_microphone(tone(320), 11.02).valid
+    # A microphone timebase jump is counted, not silently treated as continuous.
+    jump = pipeline.process_microphone(tone(320), 12.5)
+    assert not jump.valid
+    stats = pipeline.stats()
+    assert stats["sync_discontinuities"] >= 1
+    assert stats["mic_discontinuities"] >= 1
+
+
+# --------------------------------------------- non-blocking playback (P1)
+def test_push_playback_never_waits_for_a_slow_aec_frame() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowCanceller:
+        def process(self, near, far):
+            entered.set()
+            assert release.wait(2.0)
+            return near.copy()
+
+    pipeline = EchoCancellationPipeline(
+        canceller_factory=lambda *_: SlowCanceller()
+    )
+    assert pipeline.start(1)
+    assert pipeline.push_playback(tone(480), 10.0, 1)
+    box: dict[str, MicProcessingResult] = {}
+
+    def run_aec() -> None:
+        box["result"] = pipeline.process_microphone(tone(320), 10.02)
+
+    worker = threading.Thread(target=run_aec, daemon=True)
+    worker.start()
+    assert entered.wait(1.0)
+    started = time.monotonic()
+    assert pipeline.push_playback(tone(480), 10.02, 1) is True
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2, f"push_playback waited {elapsed:.3f}s for AEC"
+    release.set()
+    worker.join(timeout=2.0)
+    assert box["result"].valid
+
+
+# ------------------------------------- confirmed-turn continuity (P0/P1)
+def test_confirmed_tail_keeps_audio_continuous_after_references_run_out() -> None:
+    pipeline = EchoCancellationPipeline(
+        canceller_factory=lambda *_: PassThroughCanceller()
+    )
+    assert pipeline.start(9)
+    assert pipeline.push_playback(tone(480), 100.0, 9)
+    assert pipeline.process_microphone(tone(320), 100.02).valid
+    pipeline.stop(9)
+    assert pipeline.begin_echo_tail(9) is True
+
+    chunks = [tone(320, amplitude=6000) for _ in range(25)]
+    cleaned: list[bytes] = []
+    for index, chunk in enumerate(chunks):
+        result = pipeline.process_microphone(
+            chunk, 100.04 + index * 0.02
+        )
+        assert result.valid, result.reason
+        assert len(result.pcm) == 640
+        cleaned.append(result.pcm)
+    # Every sample of the confirmed turn is kept, unchanged and in order.
+    assert b"".join(cleaned) == b"".join(chunks)
+    stats = pipeline.stats()
+    assert stats["tail_active"] is True
+    assert stats["tail_frames"] >= 20
+    assert stats["reference_consumed"] == 1
+
+
+def test_tail_mode_is_bounded_and_reports_expiry() -> None:
+    pipeline = EchoCancellationPipeline(
+        canceller_factory=lambda *_: PassThroughCanceller(),
+        tail_max_seconds=0.05,
+    )
+    assert pipeline.start(1)
+    assert pipeline.begin_echo_tail(1)
+    time.sleep(0.08)
+    result = pipeline.process_microphone(tone(320), 10.0)
+    assert not result.valid
+    assert result.reason == "tail_expired"
+
+
+def test_tail_mode_refuses_a_non_matching_generation() -> None:
+    pipeline = EchoCancellationPipeline(
+        canceller_factory=lambda *_: PassThroughCanceller()
+    )
+    assert pipeline.start(4)
+    assert pipeline.begin_echo_tail(5) is False
+    assert pipeline.tail_active is False
+
+
+def test_dual_speaker_voice_survives_echo_cancellation() -> None:
+    pipeline = EchoCancellationPipeline(
+        canceller_factory=lambda *_: EchoSubtractingCanceller()
+    )
+    assert pipeline.start(1)
+    segmenter = VADSegmenter(energy_probability, _config())
+    segmenter.configure(threshold=0.65, min_speech_ms=192, pre_roll_ms=400)
+
+    echo = np.full(320, 3000, dtype=np.int32)
+    voice = np.array(
+        [8000 if index % 2 else -8000 for index in range(320)],
+        dtype=np.int32,
+    )
+    near = np.clip(echo + voice, -32768, 32767).astype(np.int16).tobytes()
+
+    events = []
+    for index in range(20):
+        timestamp = 500.0 + index * 0.02
+        assert pipeline.push_playback(constant(480, 3000), timestamp, 1)
+        result = pipeline.process_microphone(near, timestamp)
+        assert result.valid, result.reason
+        events.extend(segmenter.process(result.pcm))
+    # The echo was removed but the independent speaker still reaches VAD.
+    assert any(event.kind == SPEECH_STARTED for event in events)
 
 
 # --------------------------------------------------------------- manager path
@@ -301,6 +597,18 @@ class _RecordingSegmenter:
 
     def reset(self) -> None:
         pass
+
+
+class _RecordingVAD(VADSegmenter):
+    """A real segmenter (fake probability function) that records its input."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.calls: list[bytes] = []
+
+    def process(self, pcm: bytes):
+        self.calls.append(bytes(pcm))
+        return super().process(pcm)
 
 
 class _FakePipeline:
@@ -431,6 +739,117 @@ def test_manager_falls_back_when_pipeline_raises() -> None:
         manager.shutdown()
 
 
+class _TailPipeline:
+    """Pipeline that runs out of references once playback is stopped."""
+
+    available = True
+    healthy = True
+    unavailable_reason = ""
+    degraded = False
+
+    def __init__(self) -> None:
+        self.started: list[int] = []
+        self.stopped: list[int | None] = []
+        self.exhausted = False
+        self._tail = False
+
+    @property
+    def tail_active(self) -> bool:
+        return self._tail
+
+    def start(self, generation: int) -> bool:
+        self.started.append(generation)
+        self.exhausted = False
+        self._tail = False
+        return True
+
+    def stop(self, generation: int | None = None) -> None:
+        self.stopped.append(generation)
+        self.exhausted = True
+
+    def reset(self) -> None:
+        self.exhausted = False
+        self._tail = False
+
+    def begin_echo_tail(self, generation: int) -> bool:
+        self._tail = True
+        return True
+
+    def end_echo_tail(self) -> None:
+        self._tail = False
+
+    def stats(self) -> dict:
+        return {}
+
+    def process_microphone(self, pcm: bytes, timestamp: float):
+        if self._tail or not self.exhausted:
+            return MicProcessingResult(
+                pcm=bytes(pcm), valid=True, reason="ok"
+            )
+        return MicProcessingResult(valid=False, reason="no_reference")
+
+
+def test_confirmed_barge_in_turn_survives_reference_exhaustion() -> None:
+    config = _config()
+    segmenter = _RecordingVAD(energy_probability, config)
+    pipeline = _TailPipeline()
+    manager = ASRManager(
+        config,
+        microphone=_FakeMic(),
+        vad_segmenter=segmenter,
+        renderer=_renderer(),
+    )
+    activities: list[SpeechActivity] = []
+    manager.set_listeners(on_speech=activities.append)
+    # No DashScope session in this offline test.
+    manager._active_sessions = config.max_concurrent_sessions
+    manager.attach_echo_canceller(pipeline)
+    assert manager.begin_barge_in(3) is True
+    thread = threading.Thread(target=manager.run, daemon=True)
+    thread.start()
+    try:
+        assert wait_for(lambda: manager._started)
+        now = time.monotonic()
+        for index in range(12):
+            manager.audio_queue.put(
+                AudioChunk(tone(320), 16000, 16000, now + index * 0.02)
+            )
+        assert wait_for(
+            lambda: any(item.kind == "barge_in" for item in activities)
+        )
+        # Drain the detection chunks before switching phases.
+        assert wait_for(lambda: manager.audio_queue.empty())
+        time.sleep(0.1)
+
+        # What the coordinator does on a confirmed interruption: stop TTS
+        # (playback intake ends) and keep the turn continuous.
+        manager.end_barge_in(3)
+        manager.confirm_barge_in(3)
+        assert pipeline.tail_active is True
+
+        before = len(segmenter.calls)
+        tail_chunks = [tone(320, amplitude=9000) for _ in range(20)]
+        for index, chunk in enumerate(tail_chunks):
+            manager.audio_queue.put(
+                AudioChunk(
+                    chunk, 16000, 16000, now + (12 + index) * 0.02
+                )
+            )
+        assert wait_for(lambda: len(segmenter.calls) >= before + 20)
+        # Reference exhaustion during the echo tail loses no audio, and the
+        # samples arrive once, in order.
+        assert segmenter.calls[-20:] == tail_chunks
+        kinds = [item.kind for item in activities]
+        assert kinds.count("barge_in") == 1
+        assert kinds.count("started") == 1
+        assert activities[0].utterance_id == activities[1].utterance_id
+        assert len(manager._utterances) == 1
+    finally:
+        manager.stop()
+        thread.join(timeout=4.0)
+        manager.shutdown()
+
+
 # ----------------------------------------------------------- coordinator (C-F)
 class _FakeASR:
     def __init__(self) -> None:
@@ -445,6 +864,8 @@ class _FakeASR:
         self.unavailable_listener = None
         self.barge_started: list[int] = []
         self.barge_stopped: list[int | None] = []
+        self.barge_confirmed: list[int] = []
+        self.tails_ended = 0
         self._stop = asyncio.Event()
 
     # -- manager contract --------------------------------------------------
@@ -479,6 +900,13 @@ class _FakeASR:
 
     def end_barge_in(self, generation=None) -> None:
         self.barge_stopped.append(generation)
+
+    def confirm_barge_in(self, generation: int) -> bool:
+        self.barge_confirmed.append(generation)
+        return True
+
+    def end_echo_tail(self) -> None:
+        self.tails_ended += 1
 
     def barge_in_available(self) -> bool:
         return True
@@ -554,6 +982,7 @@ async def test_c_barge_in_stops_tts_and_enters_recording() -> None:
         assert cancelled == [7]
         assert coordinator.state == VoiceState.RECORDING
         assert fake.barge_stopped == [7]
+        assert fake.barge_confirmed == [7]
         assert coordinator.barge_stats["confirmed"] == 1
 
         # The started notice that follows is not a second turn.
@@ -726,6 +1155,41 @@ class _Out:
         pass
 
 
+def test_tts_rechecks_generation_after_the_reference_listener() -> None:
+    """A cancel between listener and write must not reach the speaker."""
+    from companion.tts.manager import TTSManager
+
+    class Player:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+    manager = TTSManager()
+    player = Player()
+    manager._player = player
+    manager._started = True
+    manager._generation = 1
+    manager._config = SimpleNamespace(
+        sample_rate=24000, sample_width=2, channels=1
+    )
+    seen: list[bytes] = []
+
+    def listener(generation: int, frame: bytes, timestamp: float) -> None:
+        seen.append(frame)
+        if len(seen) == 3:
+            # Simulates TTSManager.stop() on another thread while the
+            # reference was being delivered.
+            with manager._lock:
+                manager._generation = 2
+
+    manager.set_playback_pcm_listener(listener)
+    manager._write_playback(1, b"\x01\x00" * (480 * 6))
+    assert len(seen) == 3
+    assert len(player.writes) == 2  # the superseded frame was never written
+
+
 async def test_e_interrupted_stream_is_cancelled_and_closed() -> None:
     tts = _FakeStreamTTS()
     out = _Out()
@@ -760,3 +1224,25 @@ async def test_e_interrupted_stream_is_cancelled_and_closed() -> None:
     # the orchestrator can persist CANCELLED and release its conversation lock.
     assert tts.cancelled == [tts.stream]
     assert tts.stream.closed is True
+
+
+# ---------------------------------------------------------------- configuration
+def test_timeline_offset_is_separate_from_the_aec_device_hint() -> None:
+    cfg = load_barge_in_config({})
+    assert cfg.timeline_offset_ms == 0.0
+    assert cfg.aec_delay_ms == 0
+
+    cfg = load_barge_in_config(
+        {
+            "AVA_BARGE_IN_AEC_DELAY_MS": "120",
+            "AVA_BARGE_IN_TIMELINE_OFFSET_MS": "-35.5",
+        }
+    )
+    # The device hint and the measured timeline calibration stay independent.
+    assert cfg.aec_delay_ms == 120
+    assert cfg.timeline_offset_ms == -35.5
+
+    with pytest.raises(BargeInConfigError):
+        load_barge_in_config({"AVA_BARGE_IN_TIMELINE_OFFSET_MS": "600"})
+    with pytest.raises(BargeInConfigError):
+        load_barge_in_config({"AVA_BARGE_IN_TIMELINE_OFFSET_MS": "abc"})

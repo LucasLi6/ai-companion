@@ -381,6 +381,7 @@ class ASRManager:
         self._barge_in_pre_roll_ms = 400
         self._barge_in_generation: Optional[int] = None
         self._barge_in_detecting = False
+        self._barge_in_tail = False
         self._barge_in_candidate_at: Optional[float] = None
         self._barge_in_unavailable_listener: Optional[
             Callable[[str], None]
@@ -518,6 +519,7 @@ class ASRManager:
             return False
         self._barge_in_generation = int(generation)
         self._barge_in_detecting = True
+        self._barge_in_tail = False
         self._barge_in_candidate_at = None
         self._barge_in_unavailable_reported = False
         with self._barge_stats_lock:
@@ -541,6 +543,50 @@ class ASRManager:
             pass
         self._barge_in_generation = None
 
+    def confirm_barge_in(self, generation: int) -> bool:
+        """Keep the confirmed user turn continuous after TTS is stopped.
+
+        Detection is over (the pre-roll was already preserved by the VAD
+        segmenter). The pipeline switches to a bounded echo-tail mode: it keeps
+        using real far-end references while they exist, then runs the same AEC
+        instance on silent far-end frames so the acknowledged turn can never be
+        dropped merely because the playback reference ran out.
+
+        A pipeline without tail support falls back to the ordinary input path
+        *without resetting the open utterance*, so the user's audio continues
+        to be recognized.
+        """
+        self._barge_in_detecting = False
+        self._barge_in_candidate_at = None
+        pipeline = self._echo_canceller
+        if pipeline is not None:
+            begin_tail = getattr(pipeline, "begin_echo_tail", None)
+            if callable(begin_tail):
+                try:
+                    if bool(begin_tail(int(generation))):
+                        self._barge_in_tail = True
+                        return True
+                except Exception:  # noqa: BLE001 - optional side channel
+                    pass
+        # No usable tail support: the interruption is already confirmed, so
+        # raw microphone audio is safe from here on. Switch without a reset.
+        self._barge_in_tail = False
+        self.set_input_mode(InputMode.NORMAL)
+        return False
+
+    def end_echo_tail(self) -> None:
+        """Finish the confirmed-barge-in continuity window."""
+        self._barge_in_tail = False
+        pipeline = self._echo_canceller
+        if pipeline is None:
+            return
+        end_tail = getattr(pipeline, "end_echo_tail", None)
+        if callable(end_tail):
+            try:
+                end_tail()
+            except Exception:  # noqa: BLE001 - optional side channel
+                pass
+
     def barge_in_stats(self) -> dict:
         """Counters for ``/mic status`` and the real-device diagnostic report."""
         with self._barge_stats_lock:
@@ -551,6 +597,8 @@ class ASRManager:
                 "available": self.barge_in_available(),
                 "mode": self._input_mode.value,
                 "generation": self._barge_in_generation,
+                "detecting": self._barge_in_detecting,
+                "tail": self._barge_in_tail,
             }
         )
         pipeline = self._echo_canceller
@@ -694,13 +742,18 @@ class ASRManager:
                 pcm = item.pcm
                 barge_in_audio = False
                 if mode == InputMode.BARGE_IN:
-                    pcm, accepted = self._process_barge_in_audio(item)
+                    pcm, accepted, barge_in_audio = (
+                        self._process_barge_in_audio(item)
+                    )
                     if not accepted:
                         # Never run VAD on raw, un-cancelled microphone audio:
                         # without a valid reference there is no safe barge-in
-                        # decision to make.
+                        # decision to make. A gap also invalidates the partial
+                        # candidate, so audio on either side of the gap can
+                        # never be stitched into one confirmed interruption.
+                        if self._barge_in_detecting:
+                            self._reset_barge_in_candidate(segmenter)
                         continue
-                    barge_in_audio = True
                 try:
                     events = segmenter.process(pcm)
                 except Exception as exc:  # noqa: BLE001 - keep listening
@@ -717,9 +770,14 @@ class ASRManager:
 
     def _sync_vad_mode(self, segmenter: Any) -> None:
         mode = self._input_mode
-        if mode == self._vad_mode:
+        previous = self._vad_mode
+        if mode == previous:
             return
         self._vad_mode = mode
+        if previous == InputMode.BARGE_IN and mode != InputMode.BARGE_IN:
+            # The confirmed-barge-in continuity window is over; no pipeline
+            # tail may linger into the ordinary recognition path.
+            self.end_echo_tail()
         if mode == InputMode.MUTED:
             if self._vad_input_enabled:
                 self._vad_input_enabled = False
@@ -807,17 +865,26 @@ class ASRManager:
 
     def _process_barge_in_audio(
         self, item: AudioChunk
-    ) -> tuple[bytes, bool]:
+    ) -> tuple[bytes, bool, bool]:
+        """Process one chunk in BARGE_IN mode.
+
+        Returns ``(pcm, accepted, tagged_as_barge_in)``. Only AEC-cancelled
+        audio is accepted during detection. After the interruption is
+        confirmed, a failing tail switches this turn to NORMAL and accepts its
+        raw PCM rather than dropping the user's audio.
+        """
         pipeline = self._echo_canceller
         if pipeline is None:
-            return b"", False
+            return b"", False, False
         try:
             result = pipeline.process_microphone(item.pcm, item.timestamp)
         except Exception as exc:  # noqa: BLE001 - optional side channel
             self._notify_barge_in_unavailable(
                 f"aec:{type(exc).__name__}"
             )
-            return b"", False
+            if self._barge_in_tail:
+                return self._accept_after_tail_failure(item)
+            return b"", False, False
         try:
             degraded = bool(getattr(pipeline, "degraded", False))
         except Exception:  # noqa: BLE001 - fake pipeline
@@ -827,9 +894,58 @@ class ASRManager:
                 "aec_degraded"
             )
             self._notify_barge_in_unavailable(str(reason))
+            if self._barge_in_tail:
+                return self._accept_after_tail_failure(item)
         if not getattr(result, "valid", False):
-            return b"", False
-        return bytes(getattr(result, "pcm", b"") or b""), True
+            reason = str(getattr(result, "reason", "") or "")
+            tailing = False
+            try:
+                tailing = bool(getattr(pipeline, "tail_active", False))
+            except Exception:  # noqa: BLE001 - fake pipeline
+                tailing = False
+            if self._barge_in_tail and (
+                tailing or reason.startswith("tail_") or reason in (
+                    "aec_error",
+                    "aec_length",
+                    "no_reference",
+                )
+            ):
+                # The interruption is already confirmed and TTS was stopped;
+                # finish this turn on the ordinary path instead of losing it.
+                return self._accept_after_tail_failure(item)
+            return b"", False, False
+        return bytes(getattr(result, "pcm", b"") or b""), True, True
+
+    def _accept_after_tail_failure(
+        self, item: AudioChunk
+    ) -> tuple[bytes, bool, bool]:
+        """End a broken echo tail and keep the confirmed turn recording.
+
+        Only reachable after a barge-in was confirmed and TTS was stopped; the
+        ordinary recognition path is safe by then and must not drop audio.
+        """
+        self._barge_in_tail = False
+        self.set_input_mode(InputMode.NORMAL)
+        pipeline = self._echo_canceller
+        end_tail = getattr(pipeline, "end_echo_tail", None)
+        if callable(end_tail):
+            try:
+                end_tail()
+            except Exception:  # noqa: BLE001 - optional side channel
+                pass
+        return bytes(item.pcm), True, False
+
+    def _reset_barge_in_candidate(self, segmenter: Any) -> None:
+        """Drop an unfinished candidate after a gap in valid AEC audio."""
+        self._barge_in_candidate_at = None
+        try:
+            segmenter.reset()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        with self._barge_stats_lock:
+            self._barge_stats["gaps"] = (
+                int(self._barge_stats.get("gaps", 0)) + 1
+            )
 
     def _notify_barge_in_unavailable(self, reason: str) -> None:
         with self._barge_stats_lock:
@@ -1317,6 +1433,7 @@ class ASRManager:
         words; keep the turn and switch it to the ordinary raw-mic path.
         """
         self._barge_in_detecting = False
+        self._barge_in_tail = False
         utterance = self._current
         if utterance is not None and not utterance.finalized:
             self._input_mode = InputMode.NORMAL
