@@ -25,6 +25,16 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from companion.people.profile_facts import (
+    AssertionType,
+    ExtractedPersonFact,
+    FactClass,
+    FactRelation,
+    FactRelationDecision,
+    RELATION_OPERATIONS,
+    TemporalScope,
+    classify_fact,
+)
 from companion.people.profile_models import (
     ENTRY_FIELD_KEYS,
     ProfileFieldSpec,
@@ -40,8 +50,9 @@ DEFAULT_RECENT_TURNS = 8
 DEFAULT_RECENT_CHARS = 2000
 MAX_SNAPSHOT_LEGACY_FIELDS = 40
 MAX_SNAPSHOT_TEXT_CHARS = 4000
+MAX_FACT_INDEX_ROWS = 80
 
-_OPERATIONS = ("ADD", "UPDATE", "CORRECT", "MERGE", "REFINE", "ARCHIVE")
+_OPERATIONS = ("ADD", "UPDATE", "CORRECT", "MERGE", "REFINE", "ARCHIVE", "SAME")
 
 # Cross-field movement is not a general capability. Only an explicit project
 # state transition may target an entry that lives under a different field key,
@@ -85,6 +96,13 @@ def validate_change_targets(
     if operation == "ADD":
         if entries:
             raise ValueError("add_must_not_target_entries")
+        return
+    if operation == "SAME":
+        # Evidence-only: the fact is already stored, possibly under another
+        # field. It may target zero or more entries, but it never rewrites one.
+        ids = {item.get("entry_id") for item in entries}
+        if len(ids) < len(entries):
+            raise ValueError("same_targets_must_be_unique")
         return
     if operation not in ("UPDATE", "CORRECT", "MERGE", "REFINE", "ARCHIVE"):
         raise ValueError("unsupported_operation")
@@ -291,10 +309,20 @@ class ProfileChangeProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     operation: Literal[
-        "ADD", "UPDATE", "CORRECT", "MERGE", "REFINE", "ARCHIVE"
+        "ADD", "UPDATE", "CORRECT", "MERGE", "REFINE", "ARCHIVE", "SAME"
     ]
     field_key: str = Field(min_length=1, max_length=120)
     target_entry_ids: list[str] = Field(default_factory=list)
+    fact_id: Optional[str] = Field(default=None, max_length=64)
+    # Resolved by the engine from ``facts`` and attached locally. It is never
+    # read from model output; the provider drops unknown proposal keys.
+    fact: Optional[ExtractedPersonFact] = None
+    relation: Optional[
+        Literal[
+            "SAME", "EXTENDS", "STATE_CHANGE", "CORRECTS", "DISTINCT",
+            "UNCERTAIN",
+        ]
+    ] = None
     proposed_content: Optional[str] = Field(default=None, max_length=MAX_ENTRY_CHARS)
     evidence_event_ids: list[str] = Field(default_factory=list)
     evidence_quotes: list[str] = Field(default_factory=list)
@@ -326,6 +354,7 @@ class ProfileReviewDecision(BaseModel):
     base_revision: int = Field(ge=0)
     decision: Literal["NO_CHANGE", "PROPOSE_CHANGES"]
     reason: str = Field(default="", max_length=500)
+    facts: list[ExtractedPersonFact] = Field(default_factory=list)
     changes: list[ProfileChangeProposal] = Field(default_factory=list)
 
     @field_validator("changes")
@@ -625,6 +654,32 @@ def _normalise_text(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
+def _unanswered_fact_reason(fact: ExtractedPersonFact) -> str:
+    """Explain why an extracted fact produced no profile change.
+
+    Every fact in model output must appear in the review result. When the model
+    gave no relation for it, the reason still distinguishes a missing decision
+    from a fact that never belonged to the long-term Profile.
+    """
+    if fact.assertion_type == AssertionType.UNCERTAIN:
+        return "fact_uncertain_requires_more_evidence"
+    if fact.classification is not None:
+        return (
+            "fact_has_no_relation_decision"
+            if fact.classification == FactClass.PROFILE
+            else "fact_not_profile_relevant"
+        )
+    if fact.temporal_scope in (
+        TemporalScope.EVENT,
+        TemporalScope.TEMPORARY,
+    ) or fact.assertion_type in (
+        AssertionType.HYPOTHETICAL,
+        AssertionType.THIRD_PARTY,
+    ):
+        return "fact_not_profile_relevant"
+    return "fact_has_no_relation_decision"
+
+
 class ProfileFieldRegistry:
     """Small local policy layer over the storage field registry."""
 
@@ -736,6 +791,13 @@ class ProfileRefinementEngine:
         # should change and proposes minimal edits. It never sees a different
         # revision than the one above.
         snapshot = existing.model_input()
+        # Derived semantic index: entity / attribute / time scope / canonical
+        # value per entry. It is advisory recall material only; stored entries
+        # remain authoritative and local validation re-reads them.
+        list_fact_index = getattr(self.repository, "list_fact_index", None)
+        fact_index = (
+            await list_fact_index(person_id) if list_fact_index is not None else []
+        )
         # Strict identity/relationship fields are written only by the trusted
         # direct self-report path. Hiding them from the model keeps the prompt
         # honest and the token budget small; local validation still rejects any
@@ -752,6 +814,7 @@ class ProfileRefinementEngine:
             "profile_revision": existing.revision,
             "existing_profile": snapshot["existing_profile"],
             "entry_ids": snapshot["entry_ids"],
+            "fact_index": fact_index,
             "allowed_field_keys": allowed_field_keys,
             "legacy_unconverted": snapshot["legacy_unconverted"],
             "compact_summary": snapshot["compact_summary"],
@@ -800,6 +863,28 @@ class ProfileRefinementEngine:
         except ValidationError as exc:
             raise ProfileRefinementValidationError(str(exc)) from exc
 
+    @staticmethod
+    def _assign_fact_ids(
+        facts: list[ExtractedPersonFact],
+    ) -> list[ExtractedPersonFact]:
+        """Give every extracted fact a stable local id.
+
+        The model may omit ``fact_id``; local ids are positional and never
+        derived from content. A duplicate id is a schema error because it would
+        let one fact authorize two different changes.
+        """
+        assigned: list[ExtractedPersonFact] = []
+        seen: set[str] = set()
+        for index, fact in enumerate(facts):
+            fact_id = str(fact.fact_id or "").strip() or f"f{index + 1}"
+            if fact_id in seen:
+                raise ProfileRefinementValidationError(
+                    "duplicate_fact_id_in_model_output"
+                )
+            seen.add(fact_id)
+            assigned.append(fact.model_copy(update={"fact_id": fact_id}))
+        return assigned
+
     def validate_decision(
         self,
         existing: FullProfileSnapshot,
@@ -825,29 +910,76 @@ class ProfileRefinementEngine:
         )
         if decision.decision == "NO_CHANGE":
             result.status = "NO_CHANGE"
+            # A fact can never disappear because the model chose NO_CHANGE.
+            for fact in self._assign_fact_ids(decision.facts):
+                result.rejected.append(
+                    {
+                        "operation": "OBSERVE",
+                        "field_key": "",
+                        "fact_id": fact.fact_id,
+                        "reason": _unanswered_fact_reason(fact),
+                        "status": "REJECTED",
+                    }
+                )
             return result
 
         entries_by_id = _entries_by_id(existing)
         user_texts = evidence.user_event_texts()
         validated: list[ValidatedChange] = []
 
-        for index, proposal in enumerate(decision.changes):
-            issue = self._check_proposal(
-                proposal, existing, entries_by_id, user_texts
+        facts = self._assign_fact_ids(decision.facts)
+        facts_by_id = {fact.fact_id: fact for fact in facts}
+
+        for index, raw_proposal in enumerate(decision.changes):
+            proposal, issue = self._normalise_relation(
+                raw_proposal, facts_by_id
             )
+            if issue is None:
+                issue = self._check_proposal(
+                    proposal,
+                    existing,
+                    entries_by_id,
+                    user_texts,
+                    facts_by_id=facts_by_id,
+                )
             if issue is None and index >= self.registry.max_changes:
                 issue = "change_limit_exceeded"
             if issue is not None:
                 result.rejected.append(
                     {
-                        "operation": proposal.operation,
-                        "field_key": proposal.field_key,
+                        "operation": raw_proposal.operation,
+                        "field_key": raw_proposal.field_key,
+                        "fact_id": raw_proposal.fact_id,
                         "reason": issue,
                         "status": "REJECTED",
                     }
                 )
                 continue
             validated.append(ValidatedChange(proposal=proposal, accepted=True))
+
+        # Every extracted fact must end up with a result. A relation the model
+        # itself could not decide is never a write, and a fact the model left
+        # without any change is recorded too: nothing is silently dropped.
+        answered = {
+            change.proposal.fact_id
+            for change in validated
+            if change.proposal.fact_id
+        } | {
+            item["fact_id"] for item in result.rejected if item.get("fact_id")
+        }
+        for fact in facts:
+            if fact.fact_id in answered:
+                continue
+            result.rejected.append(
+                {
+                    "operation": "OBSERVE",
+                    "field_key": "",
+                    "fact_id": fact.fact_id,
+                    "reason": _unanswered_fact_reason(fact),
+                    "status": "REJECTED",
+                }
+            )
+
 
         result.changes = validated
         if validated:
@@ -862,12 +994,102 @@ class ProfileRefinementEngine:
             result.status = "REJECTED"
         return result
 
+    @staticmethod
+    def _normalise_relation(
+        proposal: ProfileChangeProposal,
+        facts_by_id: dict[str, ExtractedPersonFact],
+    ) -> tuple[ProfileChangeProposal, Optional[str]]:
+        """Turn an optional semantic relation into one mechanical operation.
+
+        The relation is the semantic decision and therefore wins over the
+        model's ``operation`` field. Legacy output without ``relation`` is left
+        untouched: old providers and tests keep working, and every new write
+        still passes the same local evidence and target checks.
+        """
+        if proposal.relation is None and proposal.fact_id is None:
+            return proposal, None
+
+        fact: Optional[ExtractedPersonFact] = None
+        if proposal.fact_id:
+            fact = facts_by_id.get(str(proposal.fact_id))
+            if fact is None:
+                return proposal, "unknown_fact_id"
+        if proposal.relation is None:
+            return proposal, "missing_relation_decision"
+        relation = str(proposal.relation)
+        if relation not in RELATION_OPERATIONS:
+            return proposal, "unknown_relation"
+        if relation == FactRelation.UNCERTAIN:
+            return proposal, "relation_uncertain_requires_more_evidence"
+
+        update: dict[str, Any] = {
+            "operation": RELATION_OPERATIONS[relation],
+        }
+        if fact is not None:
+            # Attach the validated fact locally so the write transaction can
+            # persist its semantic identity without trusting the model again.
+            update["fact"] = fact
+            # The extracted fact is itself the evidence carrier; a well-formed
+            # change may omit duplicates. Never let the change cite *different*
+            # evidence than its fact.
+            if not proposal.evidence_event_ids and not proposal.evidence_quotes:
+                update["evidence_event_ids"] = list(fact.evidence_event_ids)
+                update["evidence_quotes"] = list(fact.evidence_quotes)
+            elif not proposal.evidence_event_ids:
+                update["evidence_event_ids"] = list(fact.evidence_event_ids)
+            if not proposal.proposed_content and relation != FactRelation.SAME:
+                update["proposed_content"] = fact.value
+
+        if relation == FactRelation.SAME:
+            if not proposal.target_entry_ids:
+                return proposal, "same_relation_requires_target"
+        elif relation == FactRelation.DISTINCT:
+            if proposal.target_entry_ids:
+                return proposal, "distinct_must_not_target_entries"
+        else:
+            if not proposal.target_entry_ids:
+                return proposal, "relation_requires_target_entry"
+            if len(dict.fromkeys(proposal.target_entry_ids)) != 1:
+                return proposal, "relation_requires_one_target"
+        return proposal.model_copy(update=update), None
+
+    def _check_fact_evidence(
+        self,
+        fact: ExtractedPersonFact,
+        user_texts: dict[str, str],
+    ) -> Optional[str]:
+        """Validate the evidence carried by one extracted fact."""
+        event_ids = list(dict.fromkeys(fact.evidence_event_ids))
+        if event_ids and not set(event_ids) <= set(user_texts):
+            return "fact_evidence_event_not_authorized"
+        if not event_ids and not fact.evidence_quotes:
+            return "fact_no_evidence"
+        cited = [
+            _normalise_text(user_texts[event_id])
+            for event_id in event_ids
+            if event_id in user_texts
+        ]
+        for quote in fact.evidence_quotes:
+            normalised = _normalise_text(quote)
+            if not any(normalised and normalised in text for text in cited):
+                return "fact_evidence_quote_not_found"
+        corpus = " ".join(cited) if cited else " ".join(
+            _normalise_text(text) for text in user_texts.values()
+        )
+        if _HYPOTHETICAL.search(f"{fact.value} {corpus}"):
+            return "hypothetical_or_reported_evidence"
+        if not content_supported_by_text(fact.value, cited or list(user_texts.values())):
+            return "fact_content_not_supported_by_evidence"
+        return None
+
     def _check_proposal(
         self,
         proposal: ProfileChangeProposal,
         existing: FullProfileSnapshot,
         entries_by_id: dict[str, SnapshotEntry],
         user_texts: dict[str, str],
+        *,
+        facts_by_id: Optional[dict[str, ExtractedPersonFact]] = None,
     ) -> Optional[str]:
         """Return a stable rejection reason, or ``None`` when the change is legal.
 
@@ -879,10 +1101,53 @@ class ProfileRefinementEngine:
             return "unknown_field_key"
         if not self.registry.is_entry(proposal.field_key):
             return "field_not_an_understanding_entry"
-        if not proposal.proposed_content and proposal.operation != "ARCHIVE":
+
+        fact: Optional[ExtractedPersonFact] = None
+        if proposal.fact_id:
+            fact = (facts_by_id or {}).get(str(proposal.fact_id))
+            if fact is None:
+                return "unknown_fact_id"
+            issue = self._check_fact_evidence(fact, user_texts)
+            if issue is not None:
+                return issue
+            classification = classify_fact(fact, proposal.field_key)
+            if classification != FactClass.PROFILE:
+                return f"fact_classified_as_{classification.lower()}"
+            if (
+                fact.classification is not None
+                and fact.classification != FactClass.PROFILE
+            ):
+                return f"fact_classified_as_{fact.classification.lower()}"
+
+        # Shared experiences and one-off events belong to Scene/Memory. They
+        # used to be written here verbatim and were the main source of Profile
+        # growth without long-term value.
+        if proposal.field_key == "interaction.shared_context":
+            return "shared_context_belongs_to_scene_memory"
+
+        if (
+            not proposal.proposed_content
+            and proposal.operation not in ("ARCHIVE", "SAME")
+        ):
             return "missing_proposed_content"
 
-        if proposal.operation == "ADD":
+        evidence_only = proposal.operation == "SAME"
+        if proposal.operation == "SAME":
+            if not proposal.target_entry_ids:
+                return "missing_target_entry_ids"
+            unique_ids = list(dict.fromkeys(proposal.target_entry_ids))
+            if any(entry_id not in entries_by_id for entry_id in unique_ids):
+                return "target_entry_not_in_this_profile"
+            target_entries = [
+                entries_by_id[entry_id].model_dump() for entry_id in unique_ids
+            ]
+            try:
+                validate_change_targets(
+                    proposal.operation, proposal.field_key, target_entries
+                )
+            except ValueError as exc:
+                return str(exc) or "invalid_change_target"
+        elif proposal.operation == "ADD":
             if proposal.target_entry_ids:
                 return "add_must_not_target_entries"
             if not self._add_is_new(existing, proposal):
@@ -921,13 +1186,15 @@ class ProfileRefinementEngine:
             return "strict_identity_requires_explicit_self_report"
         if not self.registry.is_model_writable(proposal.field_key):
             return "field_not_model_writable"
-        if proposal.operation != "ADD" and any(
+        if not evidence_only and proposal.operation != "ADD" and any(
             is_human_confirmed_source(item.get("source")) for item in target_entries
         ):
             # A fact the person explicitly corrected or confirmed outranks a
             # model rewrite. Only a new explicit correction may replace it.
             return "human_confirmed_target_requires_review"
-        if _SENSITIVE.search(proposal.proposed_content or ""):
+        if not evidence_only and _SENSITIVE.search(
+            proposal.proposed_content or ""
+        ):
             return "sensitive_attribute_not_auto_saved"
 
         allowed_event_ids = set(user_texts)
@@ -971,24 +1238,38 @@ class ProfileRefinementEngine:
             # self-report and are never auto-written.
             return "hypothetical_or_reported_evidence"
         if requires_direct_quote(proposal.field_key):
-            if not proposal.evidence_quotes:
-                return "trait_inference_requires_self_description"
-            if not any(
-                _TRAIT_SELF_DESCRIPTION.search(_normalise_text(quote))
-                for quote in proposal.evidence_quotes
-            ):
-                # A single observed act is not a stable personality trait or
-                # habit, even when the act itself is quoted.
-                return "trait_inferred_from_single_act"
-        if proposal.operation in ("ADD", "UPDATE", "CORRECT") and not (
-            content_supported_by_text(
-                proposal.proposed_content or "",
-                cited_texts or list(user_texts.values()),
+            observed_pattern = bool(
+                fact is not None
+                and fact.assertion_type == AssertionType.OBSERVED
+                and fact.temporal_scope == TemporalScope.STABLE
+                and len(set(fact.evidence_event_ids)) >= 2
+                and classify_fact(fact, proposal.field_key)
+                == FactClass.PROFILE
+            )
+            if not observed_pattern:
+                if not proposal.evidence_quotes:
+                    return "trait_inference_requires_self_description"
+                if not any(
+                    _TRAIT_SELF_DESCRIPTION.search(_normalise_text(quote))
+                    for quote in proposal.evidence_quotes
+                ):
+                    # A single observed act is not a stable personality trait
+                    # or habit, even when the act itself is quoted.
+                    return "trait_inferred_from_single_act"
+        if (
+            not evidence_only
+            and proposal.operation in ("ADD", "UPDATE", "CORRECT")
+            and not (
+                content_supported_by_text(
+                    proposal.proposed_content or "",
+                    cited_texts or list(user_texts.values()),
+                )
             )
         ):
             return "content_not_supported_by_evidence"
         if (
-            proposal.operation == "ADD"
+            not evidence_only
+            and proposal.operation == "ADD"
             and spec.single_value
             and existing.entries.get(proposal.field_key)
         ):
@@ -1002,9 +1283,20 @@ class ProfileRefinementEngine:
         content = proposal.proposed_content or ""
         if not _normalise_text(content):
             return False
-        for entry in existing.entries.get(proposal.field_key, []):
-            if entries_equivalent(entry.content, content):
-                return False
+        category = proposal.field_key.split(".", 1)[0]
+        for field_key, entries in existing.entries.items():
+            # Cross-field de-duplication is limited to the same category
+            # ("interests.topics" vs "interests.likes"). Merging across
+            # categories would collide an interest with a skill ("摄影" vs
+            # "喜欢摄影"), which the spec explicitly forbids. Cross-category
+            # semantic duplicates are caught by the model's SAME relation.
+            if field_key != proposal.field_key and field_key.split(
+                ".", 1
+            )[0] != category:
+                continue
+            for entry in entries:
+                if entries_equivalent(entry.content, content):
+                    return False
         return True
 
     # -- apply -------------------------------------------------------------

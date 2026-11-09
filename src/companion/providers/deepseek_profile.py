@@ -50,6 +50,8 @@ _PROPOSAL_KEYS = {
     "operation",
     "field_key",
     "target_entry_ids",
+    "fact_id",
+    "relation",
     "proposed_content",
     "evidence_event_ids",
     "evidence_quotes",
@@ -58,7 +60,34 @@ _PROPOSAL_KEYS = {
     "requires_confirmation",
 }
 
-_MAX_CHANGES = MAX_CHANGES_PER_REVIEW
+_FACT_KEYS = {
+    "fact_id",
+    "entity",
+    "attribute",
+    "value",
+    "assertion_type",
+    "temporal_scope",
+    "classification",
+    "evidence_event_ids",
+    "evidence_quotes",
+}
+
+_MAX_CHANGES = 60
+
+
+def _normalise_facts(raw: Any) -> list[dict]:
+    """Keep only schema-shaped facts, never arbitrary model keys."""
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list):
+        raise _OutputProblem("invalid_facts")
+    facts: list[dict] = []
+    for item in raw[:60]:
+        if not isinstance(item, dict):
+            raise _OutputProblem("invalid_fact_item")
+        facts.append({key: item[key] for key in _FACT_KEYS if key in item})
+    return facts
+
 
 
 class _OutputProblem(Exception):
@@ -160,6 +189,7 @@ def _normalise_decision(
         "base_revision": base_revision,
         "decision": decision,
         "reason": str(data.get("reason") or "")[:500],
+        "facts": _normalise_facts(data.get("facts")),
         "changes": changes,
     }
     try:

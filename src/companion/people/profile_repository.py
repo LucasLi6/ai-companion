@@ -287,6 +287,104 @@ class PersonProfileRepository:
         await self.db.execute(
             "DELETE FROM person_profile_entries WHERE entry_id = ?", (entry_id,)
         )
+        await self.db.execute(
+            "DELETE FROM person_profile_fact_index WHERE entry_id = ?",
+            (entry_id,),
+        )
+
+    async def upsert_fact_index(self, row: dict) -> None:
+        """Write one derived fact-index row.
+
+        The index is a recall cache, never an authority. Callers must still
+        read and validate the real entry before any write.
+        """
+        await self.db.execute(
+            "INSERT INTO person_profile_fact_index("
+            " entry_id, person_id, entity_key, attribute, temporal_scope,"
+            " canonical_value, aliases_json, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(entry_id) DO UPDATE SET"
+            " person_id = excluded.person_id,"
+            " entity_key = excluded.entity_key,"
+            " attribute = excluded.attribute,"
+            " temporal_scope = excluded.temporal_scope,"
+            " canonical_value = excluded.canonical_value,"
+            " aliases_json = excluded.aliases_json,"
+            " updated_at = excluded.updated_at",
+            (
+                row["entry_id"],
+                row["person_id"],
+                str(row.get("entity_key") or "self"),
+                str(row.get("attribute") or ""),
+                str(row.get("temporal_scope") or "STABLE"),
+                str(row.get("canonical_value") or ""),
+                _json(list(row.get("aliases_json") or [])),
+                row.get("updated_at") or _iso(utcnow()),
+            ),
+        )
+
+    async def delete_fact_index(self, entry_id: str) -> None:
+        await self.db.execute(
+            "DELETE FROM person_profile_fact_index WHERE entry_id = ?",
+            (entry_id,),
+        )
+
+    async def list_fact_index(
+        self, person_id: str, *, limit: int = 200
+    ) -> list[dict]:
+        cur = await self.db.execute(
+            "SELECT entry_id, person_id, entity_key, attribute, temporal_scope,"
+            " canonical_value, aliases_json, updated_at"
+            " FROM person_profile_fact_index WHERE person_id = ?"
+            " ORDER BY updated_at DESC, entry_id ASC LIMIT ?",
+            (person_id, max(1, int(limit))),
+        )
+        rows = await cur.fetchall()
+        return [
+            {
+                "entry_id": row["entry_id"],
+                "person_id": row["person_id"],
+                "entity_key": row["entity_key"],
+                "attribute": row["attribute"],
+                "temporal_scope": row["temporal_scope"],
+                "canonical_value": row["canonical_value"],
+                "aliases": _loads(row["aliases_json"], []),
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    async def rebuild_fact_index(self, person_id: str) -> int:
+        """Drop and rebuild the derived index from effective entries."""
+        await self.db.execute(
+            "DELETE FROM person_profile_fact_index WHERE person_id = ?",
+            (person_id,),
+        )
+        entries = await self.list_entries(
+            person_id,
+            statuses=(
+                "ACTIVE",
+                "TENTATIVE",
+            ),
+        )
+        for item in entries:
+            field_key = str(item.get("field_key") or "")
+            attribute = field_key.rsplit(".", 1)[-1] or field_key
+            await self.upsert_fact_index(
+                {
+                    "entry_id": item["entry_id"],
+                    "person_id": person_id,
+                    "entity_key": "self",
+                    "attribute": attribute,
+                    "temporal_scope": "STABLE",
+                    "canonical_value": " ".join(
+                        str(item.get("content") or "").split()
+                    ).casefold(),
+                    "aliases_json": [],
+                    "updated_at": _iso(utcnow()),
+                }
+            )
+        return len(entries)
 
     async def update_entry(
         self,

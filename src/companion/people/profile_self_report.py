@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from companion.people.profile_facts import looks_like_person_name
+
 _CJK = r"一-鿿"
 _NAME_TOKEN = (
     rf"(?:[A-Za-z][A-Za-z0-9.'’\-]*(?:\s+[A-Za-z][A-Za-z0-9.'’\-]*){{0,2}}"
@@ -34,6 +36,16 @@ _THIRD_PERSON_SUBJECT = re.compile(
 )
 _TRAILING_CUT = re.compile(
     r"(?:以后|之后|今后|平时|现在|就好|就行|就可以|然后|吧|呀|啊|哦|嘛|呢|你|您)"
+)
+
+# Values for these fields must look like a name, not a sentence fragment.
+_NAME_FIELDS = frozenset(
+    {
+        "identity.name",
+        "identity.preferred_name",
+        "identity.nicknames",
+        "communication.address_preference",
+    }
 )
 
 
@@ -136,12 +148,17 @@ def detect_self_reports(text: str) -> tuple[DetectedSelfReport, ...]:
     for field_key, pattern in _SELF_REPORT_PATTERNS:
         if field_key in found:
             continue
+        candidates: list[str] = []
         for match in pattern.finditer(value):
             prefix = value[max(0, match.start() - 8) : match.start()]
             if _THIRD_PERSON.search(prefix) or _THIRD_PERSON_SUBJECT.search(prefix):
                 continue
             cleaned = clean_name(match.group("value"))
             if not cleaned:
+                continue
+            # A broad "叫我..." pattern must never turn ordinary speech
+            # ("你叫我顺其自然就好", "我叫自己顺其自然") into an identity.
+            if field_key in _NAME_FIELDS and not looks_like_person_name(cleaned):
                 continue
             # Guard role descriptions resembling a Chinese name in a bare
             # "我是..." introduction (e.g. "我是高三生").
@@ -150,10 +167,15 @@ def detect_self_reports(text: str) -> tuple[DetectedSelfReport, ...]:
                 "王老师", "李老师", "程序员", "中国人", "巴西人",
             }:
                 continue
-            found[field_key] = DetectedSelfReport(
-                field_key=field_key, value=cleaned, quote=value[:200]
-            )
-            break
+            candidates.append(cleaned)
+        unique = list(dict.fromkeys(candidates))
+        if len(unique) != 1:
+            # Zero matches, or several contradictory names in one message
+            # ("我叫李约……其实我叫李明"): ambiguous is not consent.
+            continue
+        found[field_key] = DetectedSelfReport(
+            field_key=field_key, value=unique[0], quote=value[:200]
+        )
     return tuple(found.values())
 
 

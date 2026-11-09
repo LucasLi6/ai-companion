@@ -331,7 +331,7 @@ async def test_t11_proposed_content_is_written_verbatim(rt):
     assert [item["content"] for item in entries] == [content]
 
 
-async def test_t12_current_project_and_shared_context_are_recorded(rt):
+async def test_t12_current_project_is_recorded_but_shared_context_is_scene_memory(rt):
     person = await _person(rt)
     event = await _event(rt, person, "我们在上周末一起调试了机器狗。")
     provider = ScriptedProfileRefinementProvider(
@@ -348,7 +348,13 @@ async def test_t12_current_project_and_shared_context_are_recorded(rt):
 
     assert applied.status == "APPLIED"
     fields = {item["field_key"] for item in await _active_entries(rt, person.person_id)}
-    assert fields == {"projects.active", "interaction.shared_context"}
+    # A one-off shared experience belongs to Scene/Memory, not the long-term
+    # Profile; only the explicitly stated current project is written.
+    assert fields == {"projects.active"}
+    assert any(
+        item.get("reason") == "shared_context_belongs_to_scene_memory"
+        for item in (result.rejected + applied.rejected)
+    )
 
 
 async def test_t13_trait_with_quote_auto_applies(rt):

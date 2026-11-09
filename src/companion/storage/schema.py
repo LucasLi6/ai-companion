@@ -11,7 +11,7 @@ see ``docs/DATA_MODEL.md``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -2070,6 +2070,61 @@ MIGRATIONS: list[tuple[int, str]] = [
                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE state NOT IN ('CONFIRMED', 'REJECTED', 'ACCEPTED_SELF_REPORT',
                              'MIGRATED');
+        """,
+    ),
+    # Version 31 (V0.9.9.23): structured fact identity + derived fact index.
+    #
+    # ``person_profile_entries`` keeps the human-readable content; the new
+    # nullable columns record the semantic identity of the fact the entry was
+    # written from. They are nullable so every pre-existing row stays readable.
+    #
+    # ``person_profile_fact_index`` is a *derived* cache for cross-field
+    # recall (entity + attribute + time scope). It is never authoritative and
+    # can be rebuilt from ACTIVE entries at any time; write validation always
+    # reads the real entry rows.
+    (
+        31,
+        """
+        ALTER TABLE person_profile_entries ADD COLUMN entity_key TEXT;
+        ALTER TABLE person_profile_entries ADD COLUMN attribute TEXT;
+        ALTER TABLE person_profile_entries ADD COLUMN temporal_scope TEXT;
+        ALTER TABLE person_profile_entries ADD COLUMN assertion_type TEXT;
+        ALTER TABLE person_profile_entries ADD COLUMN canonical_value TEXT;
+        ALTER TABLE person_profile_entries
+            ADD COLUMN aliases_json TEXT NOT NULL DEFAULT '[]';
+
+        CREATE TABLE IF NOT EXISTS person_profile_fact_index (
+            entry_id        TEXT PRIMARY KEY
+                            REFERENCES person_profile_entries(entry_id)
+                            ON DELETE CASCADE,
+            person_id       TEXT NOT NULL
+                            REFERENCES persons(person_id) ON DELETE CASCADE,
+            entity_key      TEXT NOT NULL DEFAULT 'self',
+            attribute       TEXT NOT NULL DEFAULT '',
+            temporal_scope  TEXT NOT NULL DEFAULT 'STABLE',
+            canonical_value TEXT NOT NULL DEFAULT '',
+            aliases_json    TEXT NOT NULL DEFAULT '[]',
+            updated_at      TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_profile_fact_index_person_entity
+            ON person_profile_fact_index(person_id, entity_key, attribute);
+        CREATE INDEX IF NOT EXISTS idx_profile_fact_index_person_scope
+            ON person_profile_fact_index(person_id, temporal_scope);
+
+        -- Best-effort backfill from effective entries. The attribute is the
+        -- field suffix ("interests.likes" -> "likes"); it is only a recall
+        -- key, not a claim about the person.
+        INSERT OR REPLACE INTO person_profile_fact_index(
+            entry_id, person_id, entity_key, attribute, temporal_scope,
+            canonical_value, aliases_json, updated_at)
+        SELECT entry_id, person_id, 'self',
+               lower(substr(field_key, instr(field_key, '.') + 1)),
+               'STABLE',
+               lower(trim(content)), '[]', updated_at
+          FROM person_profile_entries
+         WHERE status IN ('ACTIVE', 'TENTATIVE')
+           AND instr(field_key, '.') > 0;
         """,
     ),
 ]

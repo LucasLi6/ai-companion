@@ -44,7 +44,14 @@ from companion.people.profile_models import (
     profile_field_spec,
     validate_field_value,
 )
+from companion.people.profile_facts import (
+    ExtractedPersonFact,
+    FactClass,
+    FactRelation,
+    fact_index_row,
+)
 from companion.people.profile_refinement import (
+    MAX_ENTRY_CHARS,
     DirectSelfReportResult,
     FullProfileSnapshot,
     ProfileApplyResult,
@@ -79,6 +86,51 @@ _SENSITIVE_CONTENT = re.compile(
     r"银行|信用卡|贷款|工资|收入|存款|密码|"
     r"住址|家庭地址|身份证|护照号)"
 )
+
+_CJK_RUN = re.compile(r"[一-鿿]+")
+_WORD = re.compile(r"[a-z0-9_+\-]+")
+_NEGATION_LOCAL = re.compile(
+    r"(不喜欢|不想要|不需要|不爱|讨厌|不想|不再|不常|很少|从不|"
+    r"没有|不是|不用|不太)"
+)
+
+
+def _content_terms(text: Any) -> set[str]:
+    value = " ".join(str(text or "").split()).casefold()
+    terms = set(_WORD.findall(value))
+    for run in _CJK_RUN.findall(value):
+        if len(run) == 1:
+            terms.add(run)
+            continue
+        terms.update(run[index : index + 2] for index in range(len(run) - 1))
+    return terms
+
+
+def _lossless_pair(left: Any, right: Any) -> bool:
+    """Whether merging two same-field entries would lose no detail.
+
+    One item's terms must be a subset of the other's, and their polarity must
+    match. This is stricter than semantic equivalence: it is the only local
+    merge a maintenance pass is allowed to perform without a model call.
+    """
+    left_terms, right_terms = _content_terms(left), _content_terms(right)
+    if not left_terms or not right_terms:
+        return False
+    if bool(_NEGATION_LOCAL.search(str(left))) != bool(
+        _NEGATION_LOCAL.search(str(right))
+    ):
+        return False
+    return left_terms <= right_terms or right_terms <= left_terms
+
+
+def _has_lossless_duplicates(entries: Iterable[dict]) -> bool:
+    items = [item for item in entries if item.get("content")]
+    for index, left in enumerate(items):
+        for right in items[index + 1 :]:
+            if _lossless_pair(left.get("content"), right.get("content")):
+                return True
+    return False
+
 
 _SENTINEL = object()
 
@@ -135,6 +187,22 @@ class ProfileInvalidationResult:
             or self.entries_deleted
             or self.receipts_cleaned
         )
+
+
+@dataclass
+class ProfileConsolidationResult:
+    """Outcome of one low-frequency, on-demand Profile consolidation."""
+
+    person_id: str
+    status: str
+    reason: str = ""
+    revision: Optional[int] = None
+    entries_merged: int = 0
+    fields: tuple[str, ...] = ()
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.entries_merged)
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:
@@ -1034,6 +1102,55 @@ class PersonProfileService:
         )
         rejected.extend(late_rejected)
 
+        # SAME means "this fact is already stored". It may attach evidence but
+        # never rewrites content, so a review that only confirms existing facts
+        # must not bump the Profile revision.
+        if accepted and all(
+            change.proposal.operation == "SAME" for change in accepted
+        ):
+            async with self.repo.db.transaction(immediate=True):
+                await self._assert_review_execution_locked(
+                    person_id, source_event_id, execution
+                )
+                row = await self.repo.get(person_id)
+                if row is None:
+                    return ProfileApplyResult(
+                        person_id=person_id,
+                        source_event_id=source_event_id,
+                        status="UNAUTHORIZED",
+                        base_revision=base_revision,
+                        reason="no_profile",
+                    )
+                if int(row["revision"] or 1) != base_revision:
+                    return ProfileApplyResult(
+                        person_id=person_id,
+                        source_event_id=source_event_id,
+                        status="REVISION_CONFLICT",
+                        base_revision=base_revision,
+                        reason="profile_revision_changed",
+                    )
+                applied = [
+                    await self._apply_change_locked(
+                        person_id,
+                        change,
+                        revision=base_revision,
+                        source_event_id=source_event_id,
+                        actor=actor,
+                    )
+                    for change in accepted
+                ]
+                await self.repo.set_reviewed(person_id)
+            return ProfileApplyResult(
+                person_id=person_id,
+                source_event_id=source_event_id,
+                status="NO_CHANGE",
+                base_revision=base_revision,
+                new_revision=None,
+                applied=applied,
+                rejected=rejected,
+                reason=reason or "same_fact_evidence_only",
+            )
+
         if not accepted:
             async with self.repo.db.transaction(immediate=True):
                 await self._assert_review_execution_locked(
@@ -1271,6 +1388,14 @@ class PersonProfileService:
             if spec is None or spec.storage is not ProfileFieldStorage.ENTRY:
                 rejected.append(self._reject(proposal, "field_not_refinable"))
                 continue
+            evidence_only = proposal.operation == "SAME"
+            if proposal.field_key == "interaction.shared_context":
+                rejected.append(
+                    self._reject(
+                        proposal, "shared_context_belongs_to_scene_memory"
+                    )
+                )
+                continue
             if (spec.strict_identity or not spec.model_writable) and not allow_strict:
                 rejected.append(
                     self._reject(
@@ -1279,13 +1404,24 @@ class PersonProfileService:
                     )
                 )
                 continue
-            if _SENSITIVE_CONTENT.search(proposal.proposed_content or ""):
+            if len(
+                " ".join(str(proposal.proposed_content or "").split())
+            ) > MAX_ENTRY_CHARS:
+                rejected.append(
+                    self._reject(
+                        proposal, "content_exceeds_entry_limit_requires_refinement"
+                    )
+                )
+                continue
+            if not evidence_only and _SENSITIVE_CONTENT.search(
+                proposal.proposed_content or ""
+            ):
                 rejected.append(
                     self._reject(proposal, "sensitive_attribute_not_auto_saved")
                 )
                 continue
             targets = list(dict.fromkeys(proposal.target_entry_ids))
-            if proposal.operation != "ADD" and not targets:
+            if proposal.operation not in ("ADD",) and not targets:
                 rejected.append(
                     self._reject(proposal, "missing_target_entry_ids")
                 )
@@ -1316,7 +1452,9 @@ class PersonProfileService:
                     ),
                     field_key=proposal.field_key,
                 )
-                if len(effective) >= spec.max_entries:
+                if len(effective) >= spec.max_entries and not _has_lossless_duplicates(
+                    effective
+                ):
                     rejected.append(
                         self._reject(proposal, "field_capacity_reached")
                     )
@@ -1386,9 +1524,12 @@ class PersonProfileService:
                     )
                     for item in entries.values()
                     if item["field_key"] == proposal.field_key
+                    or item["field_key"].split(".", 1)[0]
+                    == proposal.field_key.split(".", 1)[0]
                 )
                 or any(
-                    item.proposal.field_key == proposal.field_key
+                    item.proposal.field_key.split(".", 1)[0]
+                    == proposal.field_key.split(".", 1)[0]
                     and entries_equivalent(
                         item.proposal.proposed_content,
                         proposal.proposed_content or "",
@@ -1432,8 +1573,13 @@ class PersonProfileService:
         spec = profile_field_spec(proposal.field_key)
         if spec is None or spec.storage is not ProfileFieldStorage.ENTRY:
             raise ValueError("field_not_refinable")
-        content = self._normalise_entry_content(proposal.proposed_content, spec)
-        if not content and proposal.operation != "ARCHIVE":
+        evidence_only = proposal.operation == "SAME"
+        content = (
+            ""
+            if evidence_only
+            else self._normalise_entry_content(proposal.proposed_content, spec)
+        )
+        if not content and proposal.operation not in ("ARCHIVE", "SAME"):
             raise ValueError("missing_proposed_content")
         # Final write-boundary checks. Even a caller that constructs
         # ``ValidatedChange(auto_apply=True)`` by hand cannot bypass these.
@@ -1441,7 +1587,7 @@ class PersonProfileService:
         # self-report path; it still requires the person's explicit statement.
         if not trusted and (spec.strict_identity or not spec.model_writable):
             raise ValueError("strict_identity_requires_explicit_self_report")
-        if _SENSITIVE_CONTENT.search(content):
+        if not evidence_only and _SENSITIVE_CONTENT.search(content):
             raise ValueError("sensitive_attribute_not_auto_saved")
         targets: list[dict] = []
         for entry_id in dict.fromkeys(proposal.target_entry_ids):
@@ -1458,8 +1604,22 @@ class PersonProfileService:
                 raise ValueError("target_entry_not_effective")
             targets.append(entry)
         validate_change_targets(proposal.operation, proposal.field_key, targets)
+        if evidence_only and any(
+            is_strict_field(item.get("field_key")) for item in targets
+        ):
+            raise ValueError("strict_identity_requires_explicit_self_report")
         if not trusted:
-            if requires_direct_quote(proposal.field_key) and not proposal.evidence_quotes:
+            observed_pattern = bool(
+                proposal.fact is not None
+                and proposal.fact.assertion_type == "OBSERVED"
+                and proposal.fact.temporal_scope == "STABLE"
+                and len(set(proposal.fact.evidence_event_ids)) >= 2
+            )
+            if (
+                requires_direct_quote(proposal.field_key)
+                and not proposal.evidence_quotes
+                and not observed_pattern
+            ):
                 raise ValueError("trait_inference_requires_review")
             if any(is_human_confirmed_source(item.get("source")) for item in targets):
                 raise ValueError("human_confirmed_target_requires_review")
@@ -1472,10 +1632,38 @@ class PersonProfileService:
                 ),
                 field_key=proposal.field_key,
             )
-            if any(entries_equivalent(item["content"], content) for item in existing):
+            category = proposal.field_key.split(".", 1)[0]
+            all_effective = await self.repo.list_entries(
+                person_id,
+                statuses=(
+                    ProfileEntryStatus.ACTIVE.value,
+                    ProfileEntryStatus.TENTATIVE.value,
+                ),
+            )
+            if any(
+                entries_equivalent(item["content"], content)
+                for item in all_effective
+                if item["field_key"] == proposal.field_key
+                or item["field_key"].split(".", 1)[0] == category
+            ):
                 raise ValueError("already_present")
             if spec.max_entries and len(existing) >= spec.max_entries:
-                raise ValueError("field_capacity_reached")
+                # Capacity is a signal to consolidate, never a reason to lose
+                # a new fact while lossless duplicates exist.
+                if _has_lossless_duplicates(existing):
+                    await self._merge_lossless_duplicates_locked(
+                        person_id, proposal.field_key, revision
+                    )
+                    existing = await self.repo.list_entries(
+                        person_id,
+                        statuses=(
+                            ProfileEntryStatus.ACTIVE.value,
+                            ProfileEntryStatus.TENTATIVE.value,
+                        ),
+                        field_key=proposal.field_key,
+                    )
+                if len(existing) >= spec.max_entries:
+                    raise ValueError("field_capacity_reached")
 
         evidence_events = list(
             dict.fromkeys(
@@ -1493,7 +1681,11 @@ class PersonProfileService:
         before = [item["content"] for item in targets]
         now = utcnow()
 
-        if operation == "ADD":
+        if operation == "SAME":
+            # Evidence-only: the fact is already stored, possibly under another
+            # field. No content is rewritten and no fact index row changes.
+            entry_id = None
+        elif operation == "ADD":
             if spec.single_value:
                 for existing in await self.repo.list_entries(
                     person_id,
@@ -1508,6 +1700,7 @@ class PersonProfileService:
                         status=ProfileEntryStatus.ARCHIVED.value,
                         valid_until=now,
                     )
+                    await self._drop_fact_index(existing["entry_id"])
             entry_id = await self.repo.insert_entry(
                 person_id=person_id,
                 field_key=proposal.field_key,
@@ -1517,6 +1710,9 @@ class PersonProfileService:
                 confidence=proposal.confidence,
                 evidence_event_ids=evidence_events,
                 evidence_memory_ids=[],
+            )
+            await self._sync_fact_index(
+                person_id, entry_id, proposal.field_key, content, proposal
             )
         elif operation in ("UPDATE", "CORRECT"):
             if len(targets) != 1:
@@ -1542,6 +1738,10 @@ class PersonProfileService:
                     superseded_by=entry_id,
                     valid_until=now,
                 )
+                await self._drop_fact_index(target["entry_id"])
+                await self._sync_fact_index(
+                    person_id, entry_id, proposal.field_key, content, proposal
+                )
             else:
                 entry_id = target["entry_id"]
                 await self.repo.update_entry(
@@ -1550,6 +1750,9 @@ class PersonProfileService:
                     status=ProfileEntryStatus.ACTIVE.value,
                     confidence=proposal.confidence,
                     evidence_event_ids=evidence_events,
+                )
+                await self._sync_fact_index(
+                    person_id, entry_id, proposal.field_key, content, proposal
                 )
         elif operation == "MERGE":
             if len(targets) < 2:
@@ -1581,6 +1784,10 @@ class PersonProfileService:
                     superseded_by=entry_id,
                     valid_until=now,
                 )
+                await self._drop_fact_index(item["entry_id"])
+            await self._sync_fact_index(
+                person_id, entry_id, proposal.field_key, content, proposal
+            )
         elif operation == "REFINE":
             if len(targets) != 1:
                 raise ValueError("refine_needs_one_target")
@@ -1595,6 +1802,9 @@ class PersonProfileService:
                 confidence=proposal.confidence,
                 evidence_event_ids=evidence_events,
             )
+            await self._sync_fact_index(
+                person_id, entry_id, proposal.field_key, content, proposal
+            )
         elif operation == "ARCHIVE":
             if not targets:
                 raise ValueError("archive_needs_targets")
@@ -1608,9 +1818,32 @@ class PersonProfileService:
                     status=ProfileEntryStatus.ARCHIVED.value,
                     valid_until=now,
                 )
+                await self._drop_fact_index(item["entry_id"])
             entry_id = None
         else:
             raise ValueError(f"unsupported_operation:{operation}")
+
+        if operation == "SAME":
+            # Attach the evidence to the stored entries it supports, not to the
+            # (possibly different) field the model named.
+            for target in targets:
+                for event_id in evidence_events:
+                    await self._record_evidence(
+                        person_id,
+                        target["field_key"],
+                        memory_ids=[],
+                        event_ids=[event_id],
+                    )
+            return {
+                "operation": operation,
+                "field_key": proposal.field_key,
+                "target_entry_ids": [item["entry_id"] for item in targets],
+                "before": before,
+                "after": before,
+                "entry_id": None,
+                "status": "NO_CHANGE",
+                "reason": proposal.reason or "same_fact_evidence_only",
+            }
 
         for event_id in evidence_events:
             await self._record_evidence(
@@ -1634,9 +1867,234 @@ class PersonProfileService:
     def _normalise_entry_content(
         content: Any, spec: Any = None
     ) -> str:
+        """Normalise whitespace, never cut the fact.
+
+        A stored entry must remain a complete statement. If a proposal exceeds
+        the hard schema limit it is rejected (or refined by the model) in
+        validation; it is never silently truncated into a half sentence.
+        """
         text = " ".join(str(content or "").split())
-        limit = getattr(spec, "max_chars", 240) if spec is not None else 240
-        return text[:limit]
+        if len(text) > MAX_ENTRY_CHARS:
+            raise ValueError("content_exceeds_entry_limit_requires_refinement")
+        return text
+
+    async def _sync_fact_index(
+        self,
+        person_id: str,
+        entry_id: str,
+        field_key: str,
+        content: str,
+        proposal: ProfileChangeProposal,
+    ) -> None:
+        row = fact_index_row(
+            person_id=person_id,
+            entry_id=entry_id,
+            field_key=field_key,
+            content=content,
+            fact=proposal.fact,
+        )
+        await self.repo.upsert_fact_index(row)
+
+    async def _drop_fact_index(self, entry_id: str) -> None:
+        await self.repo.delete_fact_index(entry_id)
+
+    async def _merge_lossless_duplicates_locked(
+        self, person_id: str, field_key: str, revision: int
+    ) -> int:
+        """Merge same-field entries whose detail is fully contained.
+
+        This is the only automatic consolidation: one item's terms are a
+        subset of the other's and their polarity matches, so choosing the
+        longer content cannot lose a fact. A semantic rewrite still requires a
+        model proposal; this pass only removes redundancy.
+        """
+        entries = await self.repo.list_entries(
+            person_id,
+            statuses=(
+                ProfileEntryStatus.ACTIVE.value,
+                ProfileEntryStatus.TENTATIVE.value,
+            ),
+            field_key=field_key,
+        )
+        groups: list[list[dict]] = []
+        for item in sorted(
+            entries, key=lambda row: len(row.get("content") or ""), reverse=True
+        ):
+            for group in groups:
+                if all(
+                    _lossless_pair(item.get("content"), other.get("content"))
+                    for other in group
+                ):
+                    group.append(item)
+                    break
+            else:
+                groups.append([item])
+
+        merged = 0
+        now = utcnow()
+        for group in groups:
+            if len(group) < 2:
+                continue
+            canonical = max(
+                group, key=lambda row: len(row.get("content") or "")
+            )
+            others = [
+                item
+                for item in group
+                if item["entry_id"] != canonical["entry_id"]
+            ]
+            if not others:
+                continue
+            event_ids = sorted(
+                {
+                    event_id
+                    for item in group
+                    for event_id in item.get("evidence_event_ids", [])
+                }
+            )
+            memory_ids = sorted(
+                {
+                    memory_id
+                    for item in group
+                    for memory_id in item.get("evidence_memory_ids", [])
+                }
+            )
+            await self.repo.update_entry(
+                canonical["entry_id"],
+                content=canonical["content"],
+                status=ProfileEntryStatus.ACTIVE.value,
+                evidence_event_ids=event_ids,
+                evidence_memory_ids=memory_ids,
+                merged_from=[item["entry_id"] for item in others],
+            )
+            for item in others:
+                await self.repo.update_entry(
+                    item["entry_id"],
+                    status=ProfileEntryStatus.MERGED.value,
+                    superseded_by=canonical["entry_id"],
+                    valid_until=now,
+                )
+                await self._drop_fact_index(item["entry_id"])
+            await self._sync_fact_index(
+                person_id,
+                canonical["entry_id"],
+                field_key,
+                canonical["content"],
+                ProfileChangeProposal(
+                    operation="REFINE",
+                    field_key=field_key,
+                    proposed_content=canonical["content"],
+                ),
+            )
+            merged += 1
+        if merged:
+            _LOGGER.info(
+                "profile_consolidation person_id=%s field=%s merges=%s revision=%s",
+                person_id,
+                field_key,
+                merged,
+                revision,
+            )
+        return merged
+
+    # -- on-demand consolidation ------------------------------------------
+
+    async def consolidate(
+        self,
+        person_id: str,
+        *,
+        field_keys: Optional[Iterable[str]] = None,
+        actor: str = "profile_consolidation",
+    ) -> ProfileConsolidationResult:
+        """Merge lossless same-field duplicates in one transaction.
+
+        This is the low-frequency maintenance entry point. It performs only
+        *lossless* merges (term-subset + matching polarity), never semantic
+        rewrites and never truncation. A field with distinct entries is left
+        untouched: capacity pressure must be resolved by refinement, not by
+        discarding detail. One revision is recorded only when something
+        actually merged.
+        """
+        if not await self.can_learn(person_id):
+            return ProfileConsolidationResult(
+                person_id=person_id,
+                status="UNAUTHORIZED",
+                reason="missing_consent",
+            )
+        async with self.repo.db.transaction(immediate=True):
+            row = await self.repo.get(person_id)
+            if row is None:
+                return ProfileConsolidationResult(
+                    person_id=person_id,
+                    status="NO_PROFILE",
+                    reason="profile_not_initialized",
+                )
+            base_revision = int(row["revision"] or 1)
+            if field_keys is None:
+                entries = await self.repo.list_entries(
+                    person_id,
+                    statuses=(
+                        ProfileEntryStatus.ACTIVE.value,
+                        ProfileEntryStatus.TENTATIVE.value,
+                    ),
+                )
+                targets = sorted({item["field_key"] for item in entries})
+            else:
+                targets = sorted({str(key) for key in field_keys})
+
+            merged = 0
+            merged_fields: list[str] = []
+            for field_key in targets:
+                count = await self._merge_lossless_duplicates_locked(
+                    person_id, field_key, base_revision
+                )
+                if count:
+                    merged += count
+                    merged_fields.append(field_key)
+
+            if not merged:
+                return ProfileConsolidationResult(
+                    person_id=person_id,
+                    status="NO_CHANGE",
+                )
+
+            new_revision = await self.repo.bump_revision(
+                person_id,
+                expected_revision=base_revision,
+                updated_by=actor,
+            )
+            if not new_revision:
+                # Another writer moved the revision under us: roll back every
+                # merge above instead of writing a half-consistent snapshot.
+                raise ReviewExecutionLost("profile_revision_changed")
+            await self.repo.insert_revision(
+                person_id=person_id,
+                revision=new_revision,
+                changes={
+                    "kind": "consolidation",
+                    "fields": merged_fields,
+                    "merges": merged,
+                },
+                changed_by=actor,
+                source_event_id=None,
+                reason="profile_consolidation",
+            )
+            await self._refresh_summary(person_id)
+
+        await self._audit_field(
+            actor,
+            "profile_consolidation",
+            person_id,
+            ",".join(merged_fields)[:200],
+            ProfileSource.INTERACTION_INFERENCE.value,
+        )
+        return ProfileConsolidationResult(
+            person_id=person_id,
+            status="APPLIED",
+            revision=new_revision,
+            entries_merged=merged,
+            fields=tuple(merged_fields),
+        )
 
     # -- snapshot helpers --------------------------------------------------
 
@@ -1842,6 +2300,7 @@ class PersonProfileService:
                             status=ProfileEntryStatus.ARCHIVED.value,
                             valid_until=utcnow(),
                         )
+                        await self._drop_fact_index(entry["entry_id"])
                         result.entries_archived += 1
                     # The retracted sources may no longer be cited as support.
                     await self.repo.replace_entry_evidence(
@@ -1859,6 +2318,7 @@ class PersonProfileService:
                             status=ProfileEntryStatus.PENDING_REVIEW.value,
                             valid_until=utcnow(),
                         )
+                        await self._drop_fact_index(entry["entry_id"])
                         result.entries_archived += 1
                     await self.repo.replace_entry_evidence(
                         entry["entry_id"],
