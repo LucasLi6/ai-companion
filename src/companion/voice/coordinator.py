@@ -25,11 +25,13 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional
 
 from companion.asr.manager import FinalUtterance, SpeechActivity
+from companion.voice.barge_in_config import BargeInConfig
 from companion.voice.bridge import (
     BridgeFailure,
     TurnClosed,
@@ -75,6 +77,8 @@ class VoiceCoordinator:
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
         on_speech_started: Optional[Callable[[], None]] = None,
         on_notice: Optional[Callable[[str], None]] = None,
+        barge_in: Optional[BargeInConfig] = None,
+        on_barge_in: Optional[Callable[[int], None]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._loop = asyncio.get_running_loop()
@@ -85,6 +89,22 @@ class VoiceCoordinator:
         )
         self._on_speech_started = on_speech_started
         self._on_notice = on_notice
+        self._barge_config = barge_in
+        self._barge_enabled = bool(barge_in is not None and barge_in.enabled)
+        self._on_barge_in = on_barge_in
+        self._barge_armed = False
+        self._barge_disabled_reason: Optional[str] = None
+        self._interrupted_generation: Optional[int] = None
+        self._echo_tail_task: Optional[asyncio.Task] = None
+        self._echo_tail_epoch = 0
+        # Monotonic token for one reply turn. Callbacks from an older turn
+        # (a cancelled reply finishing late) are ignored by token mismatch.
+        self._turn_token = 0
+        self.barge_stats: dict[str, Any] = {
+            "confirmed": 0,
+            "stop_latency_ms": None,
+            "fallbacks": 0,
+        }
         self.logger = logger or logging.getLogger("companion.voice")
 
         self._state = VoiceState.DISABLED
@@ -181,6 +201,24 @@ class VoiceCoordinator:
             f"  model={model}"
         )
 
+    def barge_in_status(self) -> dict[str, Any]:
+        """Aggregated barge-in/AEC diagnostics for ``/mic status``."""
+        result: dict[str, Any] = {
+            "enabled": self._barge_enabled,
+            "armed": self._barge_armed,
+            "fallback_reason": self._barge_disabled_reason,
+            **self.barge_stats,
+        }
+        manager = self._manager
+        getter = getattr(manager, "barge_in_stats", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                result["asr"] = getter()
+        dropped = getattr(manager, "dropped_audio_chunks", None)
+        if dropped is not None:
+            result["mic_dropped_chunks"] = dropped
+        return result
+
     # --------------------------------------------------------------- lifecycle
     async def enable(self) -> tuple[bool, str]:
         """Start the ASR pipeline and begin persistent listening."""
@@ -209,6 +247,17 @@ class VoiceCoordinator:
                 # the standalone demo keeps the renderer's final line.
                 render_finals=False,
             )
+
+        if self._barge_config is not None:
+            attach = getattr(
+                manager, "set_barge_in_unavailable_listener", None
+            )
+            if callable(attach):
+                with contextlib.suppress(Exception):
+                    attach(self._on_barge_in_unavailable_threadsafe)
+            self._barge_disabled_reason = None
+            self._barge_armed = False
+            self._interrupted_generation = None
 
         try:
             await asyncio.to_thread(manager.start)
@@ -243,6 +292,7 @@ class VoiceCoordinator:
     async def disable(self) -> str:
         """Stop listening, abort an in-flight recording and release threads."""
         self._cancel_resume()
+        self._cancel_echo_tail()
         if self._state == VoiceState.DISABLED and self._manager is None:
             return "mic: off"
         self._set_state(VoiceState.DISABLED)
@@ -250,6 +300,8 @@ class VoiceCoordinator:
         self._expected_generation = None
         self._turn_finished = False
         self._playback_terminal_generation = None
+        self._barge_armed = False
+        self._interrupted_generation = None
         await self._stop_manager()
         self._notice("[mic] off")
         return "mic: off"
@@ -329,9 +381,15 @@ class VoiceCoordinator:
                 )
 
     def _accept_speech(self, activity: SpeechActivity) -> None:
+        if activity.kind == "barge_in":
+            self._accept_barge_in(activity)
+            return
         if activity.kind != "started":
             return
         if self._state != VoiceState.LISTENING:
+            # The "started" that follows a handled barge-in arrives while we
+            # are already RECORDING with the same utterance id; it is not a
+            # second turn and must not create another one.
             return
         self._current_uid = activity.utterance_id
         self._set_state(VoiceState.RECORDING)
@@ -343,6 +401,121 @@ class VoiceCoordinator:
             except Exception:  # noqa: BLE001 - scheduling is best effort
                 pass
 
+    def _accept_barge_in(self, activity: SpeechActivity) -> None:
+        """A confirmed user interruption while Ava is speaking.
+
+        The ASR manager already preserved the pre-roll and is recognizing the
+        interruption as its own turn (same utterance id). Here we only stop
+        playback and abandon the old reply; recognition keeps running.
+        """
+        if not self._barge_enabled:
+            return
+        if self._state != VoiceState.SPEAKING:
+            return
+        generation = (
+            int(activity.generation)
+            if activity.generation is not None
+            else self._expected_generation
+        )
+        if generation is None:
+            return
+        if (
+            self._expected_generation is not None
+            and generation != self._expected_generation
+        ):
+            # A signal for a reply that is not the one playing now.
+            return
+        if self._interrupted_generation == generation:
+            # Duplicate signal: stop exactly once per interruption.
+            return
+
+        self._interrupted_generation = generation
+        self._barge_armed = False
+        self.barge_stats["confirmed"] += 1
+        # Invalidate the old turn before any callback can observe it.
+        self._turn_token += 1
+        self._cancel_resume()
+        self._cancel_echo_tail()
+
+        # 1. Stop generation immediately; never wait for ASR to finish.
+        self._stop_tts_now(activity.at)
+        # 2. Tell the embedder to cancel the old reply task (LLM stream).
+        callback = self._on_barge_in
+        if callback is not None:
+            try:
+                callback(generation)
+            except Exception:  # noqa: BLE001 - old reply cleanup is best effort
+                pass
+        # 3. Preserve the user's turn for the ASR already in flight.
+        self._current_uid = activity.utterance_id
+        self._expected_generation = None
+        self._playback_terminal_generation = None
+        self._turn_finished = True
+        self._set_state(VoiceState.RECORDING)
+        self._schedule_echo_tail()
+        if self._on_speech_started is not None:
+            try:
+                self._on_speech_started()
+            except Exception:  # noqa: BLE001 - scheduling is best effort
+                pass
+        manager = self._manager
+        end = getattr(manager, "end_barge_in", None)
+        if callable(end):
+            with contextlib.suppress(Exception):
+                # Keep already-received far-end frames for the echo tail,
+                # but accept no new playback from the stopped generation.
+                end(generation)
+
+    def _stop_tts_now(self, confirmed_at: float) -> None:
+        stop = getattr(self._tts, "stop", None)
+        if not callable(stop):
+            return
+        try:
+            stop(wait=False)
+        except TypeError:
+            with contextlib.suppress(Exception):
+                stop()
+        except Exception:  # noqa: BLE001 - playback is already being stopped
+            pass
+        self.barge_stats["stop_latency_ms"] = round(
+            max(0.0, (time.monotonic() - confirmed_at) * 1000.0), 1
+        )
+
+    def _schedule_echo_tail(self) -> None:
+        """Switch the ASR input back to its normal path after the echo tail."""
+        self._cancel_echo_tail()
+        delay = (
+            self._barge_config.echo_tail_seconds
+            if self._barge_config is not None
+            else 0.3
+        )
+        self._echo_tail_epoch += 1
+        epoch = self._echo_tail_epoch
+
+        async def _tail() -> None:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if epoch != self._echo_tail_epoch:
+                return
+            if self._state != VoiceState.RECORDING:
+                return
+            manager = self._manager
+            setter = getattr(manager, "set_input_mode", None)
+            if callable(setter):
+                with contextlib.suppress(Exception):
+                    setter("NORMAL")
+
+        self._echo_tail_task = asyncio.create_task(
+            _tail(), name="ava-voice-echo-tail"
+        )
+
+    def _cancel_echo_tail(self) -> None:
+        self._echo_tail_epoch += 1
+        task = self._echo_tail_task
+        self._echo_tail_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
     def _accept_final(self, final: FinalUtterance) -> None:
         if self._state != VoiceState.RECORDING:
             # A duplicate, late or already-muted result must never start a
@@ -351,12 +524,14 @@ class VoiceCoordinator:
             self.stats.stale_finals += 1
             return
         self._cancel_resume()
+        self._cancel_echo_tail()
         self._set_state(VoiceState.THINKING)
         self._pause_input()
         self._current_uid = None
         self._expected_generation = None
         self._playback_terminal_generation = None
         self._turn_finished = False
+        self._interrupted_generation = None
         self.stats.finals_accepted += 1
         try:
             self._finals.put_nowait(final)
@@ -386,35 +561,118 @@ class VoiceCoordinator:
         """Wait for the next accepted user turn (consumed serially)."""
         return await self._finals.get()
 
-    def begin_turn(self) -> None:
+    def begin_turn(self) -> int:
         """Mark the start of a reply, including a keyboard-submitted one.
 
-        Idempotent: it pauses input and arms the next playback wait. Called by
-        the REPL right before every accepted input so keyboard and voice share
-        the same half-duplex rules.
+        Idempotent: it pauses input and arms the next playback wait. Returns a
+        turn token; pass it to :meth:`on_reply_started` and
+        :meth:`on_turn_finished` so callbacks from a reply that was interrupted
+        (and is unwinding late) cannot restore the newer state. Called by the
+        REPL right before every accepted input so keyboard and voice share the
+        same half-duplex rules.
         """
+        self._turn_token += 1
+        token = self._turn_token
         if self._state == VoiceState.DISABLED:
-            return
+            return token
         self._cancel_resume()
+        self._cancel_echo_tail()
         self._pause_input()
         self._set_state(VoiceState.THINKING)
         self._expected_generation = None
         self._playback_terminal_generation = None
         self._turn_finished = False
         self._current_uid = None
+        self._interrupted_generation = None
+        return token
 
-    def on_reply_started(self, generation: Optional[int] = None) -> None:
+    def on_reply_started(
+        self,
+        generation: Optional[int] = None,
+        *,
+        token: Optional[int] = None,
+    ) -> None:
         """Ava's spoken reply started (first TTS generation is now playing)."""
         if generation is None:
+            return
+        if token is not None and token != self._turn_token:
             return
         if self._state != VoiceState.THINKING:
             return
         self._expected_generation = int(generation)
         self._playback_terminal_generation = None
         self._set_state(VoiceState.SPEAKING)
+        self._arm_barge_in(int(generation))
 
-    def on_turn_finished(self, delivery: Optional[Mapping[str, Any]]) -> None:
+    def _arm_barge_in(self, generation: int) -> None:
+        """Enable real-time detection only if the AEC channel is really ready.
+
+        Arming is tied to an actual playback reference generation, not merely
+        to ``on_reply_started``: the manager refuses unless the optional
+        pipeline is loaded and healthy, and playback frames must actually
+        arrive before detection can confirm anything.
+        """
+        if not self._barge_enabled or self._barge_disabled_reason:
+            self._barge_armed = False
+            self._pause_input()
+            return
+        manager = self._manager
+        begin = getattr(manager, "begin_barge_in", None)
+        if not callable(begin):
+            self._barge_armed = False
+            self._pause_input()
+            return
+        try:
+            armed = bool(begin(generation))
+        except Exception:  # noqa: BLE001 - optional side channel
+            armed = False
+        self._barge_armed = armed
+        if not armed:
+            # Half-duplex fallback: keep the mic paused while Ava speaks.
+            self._pause_input()
+
+    def _on_barge_in_unavailable_threadsafe(self, reason: str) -> None:
+        if self._closed:
+            return
+        try:
+            self._loop.call_soon_threadsafe(
+                self._handle_barge_in_unavailable, reason
+            )
+        except RuntimeError:
+            pass
+
+    def _handle_barge_in_unavailable(self, reason: str) -> None:
+        """AEC failed mid-reply; fall back without losing a real turn."""
+        self.barge_stats["fallbacks"] += 1
+        self._barge_armed = False
+        if self._barge_disabled_reason is None:
+            self._barge_disabled_reason = reason or "aec_unavailable"
+            self._notice(
+                "[mic] 实时打断不可用，已回退到半双工模式。"
+            )
+        manager = self._manager
+        setter = getattr(manager, "set_input_mode", None)
+        if not callable(setter):
+            return
+        if self._state == VoiceState.RECORDING:
+            # A turn is already being recognized; keep it on the ordinary
+            # path rather than aborting the user's first words.
+            with contextlib.suppress(Exception):
+                setter("NORMAL")
+        elif self._state in (VoiceState.THINKING, VoiceState.SPEAKING):
+            with contextlib.suppress(Exception):
+                setter("MUTED")
+
+    def on_turn_finished(
+        self,
+        delivery: Optional[Mapping[str, Any]],
+        *,
+        token: Optional[int] = None,
+    ) -> None:
         """The text turn is over; resume only when speech is really done."""
+        if token is not None and token != self._turn_token:
+            # A reply that a barge-in superseded is finishing late.
+            return
         if self._state not in (VoiceState.THINKING, VoiceState.SPEAKING):
             return
         self._turn_finished = True
@@ -508,11 +766,14 @@ class VoiceCoordinator:
         )
 
     def _finish_resume(self) -> None:
+        self._cancel_echo_tail()
         self._expected_generation = None
         self._playback_terminal_generation = None
         self._playback_delay = 0.0
         self._turn_finished = False
         self._current_uid = None
+        self._barge_armed = False
+        self._interrupted_generation = None
         self._set_state(VoiceState.LISTENING)
         self._resume_input()
         self._notice("[mic] Listening...")

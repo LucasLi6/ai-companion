@@ -97,6 +97,13 @@ speaker = [
     "simplejson>=3.3.0",
     "sortedcontainers>=1.5.9",
 ]
+# bargein: optional WebRTC AEC3 echo cancellation for real-time barge-in while
+#   Ava speaks. Strictly additive: without this extra, or if the package does
+#   not load, the REPL keeps its existing half-duplex voice behaviour and never
+#   runs VAD on raw microphone audio during playback.
+bargein = [
+    "pywebrtc-audio>=0.2,<0.3",
+]
 
 [project.scripts]
 companion = "companion.cli:main"

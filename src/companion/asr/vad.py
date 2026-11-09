@@ -284,8 +284,50 @@ class VADSegmenter:
         self.min_speech_ms = self.min_speech_windows * self.window_ms
         self.end_silence_ms = self.end_silence_windows * self.window_ms
         self.pre_roll_ms = self.pre_roll_windows * self.window_ms
+        # Optional fast diagnostic/tuning hook for barge-in: receives every
+        # window's probability. It must return immediately and must not alter
+        # segmentation. ``None`` (the default) is a zero-effect no-op.
+        self.window_observer: Optional[Callable[[float], None]] = None
         self._buffer = bytearray()
         self.reset()
+
+    def configure(
+        self,
+        *,
+        threshold: Optional[float] = None,
+        min_speech_ms: Optional[int] = None,
+        pre_roll_ms: Optional[int] = None,
+        end_silence_ms: Optional[int] = None,
+    ) -> None:
+        """Adjust detection parameters without discarding an open utterance.
+
+        Used to give the barge-in gate a stricter threshold, a longer
+        confirmation window and a longer pre-roll than the normal ASR path.
+        Existing pre-roll/tail windows are preserved and re-bounded.
+        """
+        if threshold is not None:
+            self.threshold = float(threshold)
+        if min_speech_ms is not None:
+            self.min_speech_windows = max(
+                1, _ceil_windows(int(min_speech_ms), self.window_ms)
+            )
+            self.min_speech_ms = self.min_speech_windows * self.window_ms
+        if pre_roll_ms is not None:
+            self.pre_roll_windows = max(
+                1, _ceil_windows(int(pre_roll_ms), self.window_ms)
+            )
+            self.pre_roll_ms = self.pre_roll_windows * self.window_ms
+        if end_silence_ms is not None:
+            self.end_silence_windows = max(
+                1, _ceil_windows(int(end_silence_ms), self.window_ms)
+            )
+            self.end_silence_ms = self.end_silence_windows * self.window_ms
+        self._pre_roll = deque(
+            self._pre_roll, maxlen=max(1, self.pre_roll_windows)
+        )
+        self._tail = deque(
+            self._tail, maxlen=max(1, self.pre_roll_windows)
+        )
 
     # ------------------------------------------------------------------ state
     def reset(self) -> None:
@@ -334,6 +376,12 @@ class VADSegmenter:
 
     def _process_window(self, window: bytes) -> list[VADEvent]:
         probability = float(self._probability(window))
+        observer = self.window_observer
+        if observer is not None:
+            try:
+                observer(probability)
+            except Exception:  # noqa: BLE001 - diagnostics only
+                pass
         events: list[VADEvent] = []
 
         if self.state == WAITING_FOR_SPEECH:

@@ -2230,13 +2230,80 @@ async def cmd_repl(args) -> int:
                 from companion.asr.config import load_asr_config
                 from companion.asr.manager import ASRManager
                 from companion.voice import VoiceCoordinator
+                from companion.voice.barge_in_config import (
+                    BargeInConfigError,
+                    load_barge_in_config,
+                )
+                from companion.voice.echo_canceller import (
+                    EchoCancellationPipeline,
+                )
+
+                # Optional real-time barge-in. Off by default and completely
+                # additive: if anything below fails, the existing half-duplex
+                # voice system runs exactly as before.
+                barge_in_config = None
+                echo_pipeline = None
+                try:
+                    barge_in_config = load_barge_in_config()
+                except BargeInConfigError as exc:
+                    print(f"barge-in: off ({exc}) — 使用半双工模式")
+                    barge_in_config = None
+                if barge_in_config is not None and barge_in_config.enabled:
+                    try:
+                        playback_rate = int(tts_manager.status().sample_rate)
+                    except Exception:  # noqa: BLE001 - TTS status is advisory
+                        playback_rate = 24000
+                    try:
+                        echo_pipeline = EchoCancellationPipeline(
+                            playback_sample_rate=playback_rate,
+                            stream_delay_ms=barge_in_config.aec_delay_ms,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - optional extra
+                        print(
+                            "barge-in: off "
+                            f"({type(exc).__name__}) — 使用半双工模式"
+                        )
+                        echo_pipeline = None
+                        barge_in_config = None
+                    if echo_pipeline is not None:
+                        if not echo_pipeline.available:
+                            print(
+                                "barge-in: off "
+                                f"({echo_pipeline.unavailable_reason})"
+                                " — 使用半双工模式"
+                            )
+                            echo_pipeline = None
+                            barge_in_config = None
+                        else:
+                            setter = getattr(
+                                tts_manager, "set_playback_pcm_listener", None
+                            )
+                            if callable(setter):
+                                setter(
+                                    lambda generation, pcm, timestamp: (
+                                        echo_pipeline.push_playback(
+                                            pcm, timestamp, generation
+                                        )
+                                    )
+                                )
+                            else:
+                                echo_pipeline = None
+                                barge_in_config = None
 
                 def _make_asr_manager():
-                    return ASRManager(
+                    manager = ASRManager(
                         load_asr_config(
                             debug=bool(getattr(args, "debug", False))
                         )
                     )
+                    if echo_pipeline is not None and barge_in_config:
+                        manager.attach_echo_canceller(
+                            echo_pipeline,
+                            vad_threshold=barge_in_config.vad_threshold,
+                            min_speech_ms=barge_in_config.min_speech_ms,
+                            pre_roll_ms=barge_in_config.pre_roll_ms,
+                        )
+                    return manager
 
                 def _pause_proactive() -> None:
                     if proactive is not None:
@@ -2261,12 +2328,32 @@ async def cmd_repl(args) -> int:
                     except RuntimeError:  # loop shutting down
                         pass
 
+                # The reply currently being generated, as an explicit task so
+                # a barge-in can cancel exactly it (never the new turn). The
+                # same slot also tracks a proactive delivery's task.
+                active_reply_task: Optional[asyncio.Task] = None
+                active_reply_generation: Optional[int] = None
+
+                def _cancel_interrupted_reply(generation: int) -> None:
+                    task = active_reply_task
+                    if task is None or task.done():
+                        return
+                    if (
+                        active_reply_generation is not None
+                        and active_reply_generation != generation
+                    ):
+                        # A stale signal for a reply that is no longer active.
+                        return
+                    task.cancel()
+
                 coordinator = VoiceCoordinator(
                     manager_factory=_make_asr_manager,
                     tts_manager=tts_manager,
                     cooldown_seconds=_cooldown_seconds(),
                     on_speech_started=_pause_proactive,
                     on_notice=_voice_notice,
+                    barge_in=barge_in_config,
+                    on_barge_in=_cancel_interrupted_reply,
                 )
                 # ``--voice`` means persistent listening from startup. A
                 # missing key or device is reported once and text chat
@@ -2364,8 +2451,8 @@ async def cmd_repl(args) -> int:
                 return False
 
             async def _voice_tts_started(generation: int) -> None:
-                if coordinator is not None:
-                    coordinator.on_reply_started(generation)
+                # Voice state is armed by _run_turn with its turn token; this
+                # callback only renders the one user-visible line.
                 await voice_output.write("[tts] Speaking...\n")
 
             async def _run_turn(
@@ -2387,7 +2474,20 @@ async def cmd_repl(args) -> int:
                     else person_id
                 )
                 if coordinator is not None:
-                    coordinator.begin_turn()
+                    turn_token = coordinator.begin_turn()
+                else:
+                    turn_token = None
+
+                async def _tts_started_for_turn(generation: int) -> None:
+                    nonlocal active_reply_generation
+                    active_reply_generation = int(generation)
+                    if coordinator is not None:
+                        coordinator.on_reply_started(
+                            generation, token=turn_token
+                        )
+                    if on_tts_started is not None:
+                        await on_tts_started(generation)
+
                 delivery = {"delivered": False}
                 try:
                     delivery = await handle_user_message(
@@ -2401,7 +2501,7 @@ async def cmd_repl(args) -> int:
                         debug=bool(getattr(args, "debug", False)),
                         tts_manager=tts_manager,
                         output=output,
-                        on_tts_started=on_tts_started,
+                        on_tts_started=_tts_started_for_turn,
                     )
                 except Exception as exc:  # noqa: BLE001 - keep the REPL alive
                     message = f"[failed] {type(exc).__name__}: {exc}\n"
@@ -2413,8 +2513,11 @@ async def cmd_repl(args) -> int:
                 finally:
                     if coordinator is not None:
                         # Resume only after real playback completion (or
-                        # immediately when no speech was produced).
-                        coordinator.on_turn_finished(delivery)
+                        # immediately when no speech was produced). The token
+                        # makes a reply superseded by a barge-in inert.
+                        coordinator.on_turn_finished(
+                            delivery, token=turn_token
+                        )
                     if output is not None:
                         with contextlib.suppress(Exception):
                             await output.flush()
@@ -2460,6 +2563,51 @@ async def cmd_repl(args) -> int:
                         output=voice_output,
                     )
 
+                async def _run_reply_turn(*turn_args, **turn_kwargs) -> None:
+                    """Run one reply as an explicit task.
+
+                    A confirmed barge-in cancels exactly this task (through the
+                    coordinator callback). The ASR turn of the interrupting
+                    utterance is untouched and arrives through the normal
+                    final queue.
+                    """
+                    nonlocal active_reply_task, active_reply_generation
+                    reply_task = asyncio.create_task(
+                        _run_turn(*turn_args, **turn_kwargs),
+                        name="ava-reply-turn",
+                    )
+                    active_reply_task = reply_task
+                    active_reply_generation = None
+                    try:
+                        await reply_task
+                    except asyncio.CancelledError:
+                        if not reply_task.cancelled():
+                            # This REPL task itself is being cancelled.
+                            raise
+                        with contextlib.suppress(Exception):
+                            await voice_output.write("[interrupted]\n")
+                    finally:
+                        if active_reply_task is reply_task:
+                            active_reply_task = None
+                            active_reply_generation = None
+                        if not reply_task.done():
+                            reply_task.cancel()
+                            with contextlib.suppress(
+                                asyncio.CancelledError, Exception
+                            ):
+                                await reply_task
+
+                async def _cancel_proactive() -> None:
+                    nonlocal proactive_task, active_reply_task
+                    nonlocal active_reply_generation
+                    task = proactive_task
+                    proactive_task = None
+                    if task is not None:
+                        await _cancel_async_task(task)
+                    if active_reply_task is task:
+                        active_reply_task = None
+                        active_reply_generation = None
+
                 prompt_task = asyncio.create_task(_prompt_once())
                 proactive_task: Optional[asyncio.Task] = None
                 quit_requested = False
@@ -2482,14 +2630,17 @@ async def cmd_repl(args) -> int:
                             waiters, return_when=asyncio.FIRST_COMPLETED
                         )
 
-                        if prompt_task.done():
+                        if prompt_task.done() and final_future not in done:
                             # A pressed Enter is already an accepted input and
                             # cancels any pending/deferred proactive delivery.
+                            # A completed ASR final wins a tie (below): it is
+                            # already-accepted user speech that must never be
+                            # dropped, while the typed line stays queued and is
+                            # consumed on the next iteration.
                             _discard_future(final_future)
                             _discard_future(event_future)
                             if proactive_task is not None:
-                                await _cancel_async_task(proactive_task)
-                                proactive_task = None
+                                await _cancel_proactive()
                             try:
                                 line = prompt_task.result()
                             except (EOFError, KeyboardInterrupt):
@@ -2509,7 +2660,7 @@ async def cmd_repl(args) -> int:
                                         _prompt_once()
                                     )
                                 continue
-                            await _run_turn(
+                            await _run_reply_turn(
                                 line,
                                 EventSource.CLI,
                                 time.monotonic(),
@@ -2524,8 +2675,7 @@ async def cmd_repl(args) -> int:
                         if final_future in done:
                             _discard_future(event_future)
                             if proactive_task is not None:
-                                await _cancel_async_task(proactive_task)
-                                proactive_task = None
+                                await _cancel_proactive()
                             final = final_future.result()
                             # The ASR renderer does not print finals in the
                             # formal REPL; echo the accepted text exactly once,
@@ -2551,7 +2701,7 @@ async def cmd_repl(args) -> int:
                             )
                             # The prompt (and its typed buffer) stays alive;
                             # output is drawn above the input line.
-                            await _run_turn(
+                            await _run_reply_turn(
                                 final.text,
                                 EventSource.VOICE,
                                 time.monotonic(),
@@ -2563,7 +2713,7 @@ async def cmd_repl(args) -> int:
 
                         if proactive_task is not None and proactive_task in done:
                             _discard_future(final_future)
-                            proactive_task = None
+                            await _cancel_proactive()
                             continue
 
                         if event_future is not None and event_future in done:
@@ -2578,6 +2728,8 @@ async def cmd_repl(args) -> int:
                                     _deliver_proactive_voice_local(event),
                                     name="ava-proactive-delivery",
                                 )
+                                active_reply_task = proactive_task
+                                active_reply_generation = None
                             continue
 
                         # Defensive: a waiter vanished without an item.
@@ -2591,7 +2743,7 @@ async def cmd_repl(args) -> int:
                         ):
                             await prompt_task
                     if proactive_task is not None:
-                        await _cancel_async_task(proactive_task)
+                        await _cancel_proactive()
         finally:
             # Stop voice input, then speech/audio threads, before the event
             # loop closes; the REPL must exit without a recording, a playing
@@ -2651,6 +2803,37 @@ async def _handle_mic_command(parts: list[str], voice_mode: bool, coordinator) -
         )
         if coordinator.last_error:
             print(f"last_error: {coordinator.last_error}")
+        barge = coordinator.barge_in_status()
+        if barge.get("enabled"):
+            print(
+                "barge-in: "
+                f"armed={str(barge.get('armed')).lower()}"
+                f"  candidates={barge.get('candidates', 0)}"
+                f"  confirmed={barge.get('confirmed', 0)}"
+                f"  fallback={barge.get('fallback_reason') or '-'}"
+            )
+            latency = barge.get("stop_latency_ms")
+            confirm_latency = (barge.get("asr") or {}).get(
+                "last_user_speech_to_confirm_ms"
+            )
+            print(
+                "  latency: "
+                f"speech_to_confirm={confirm_latency if confirm_latency is not None else 'n/a'}ms"
+                f"  confirm_to_stop={latency if latency is not None else 'n/a'}ms"
+                f"  mic_dropped={barge.get('mic_dropped_chunks', 0)}"
+            )
+            aec = (barge.get("asr") or {}).get("aec") or {}
+            if aec:
+                print(
+                    "  aec: "
+                    f"valid_ratio={aec.get('valid_ratio')}"
+                    f"  p50={aec.get('aec_p50_ms')}ms"
+                    f"  p95={aec.get('aec_p95_ms')}ms"
+                    f"  rms_near={aec.get('near_rms_p50')}"
+                    f"  rms_clean={aec.get('clean_rms_p50')}"
+                    f"  ref_frames={aec.get('reference_frames')}"
+                    f"  drops={aec.get('playback_dropped')}"
+                )
     elif action == "devices":
         try:
             from companion.asr.microphone import list_input_devices
@@ -2811,6 +2994,7 @@ async def _render_proactive_event(
     tts_manager=None,
     coordinator=None,
     output=None,
+    turn_token: int | None = None,
 ) -> bool:
     """Display a proactive message, then speak it through the shared TTS.
 
@@ -2864,7 +3048,14 @@ async def _render_proactive_event(
                 spoke = False
         if spoke and coordinator is not None:
             try:
-                coordinator.on_reply_started(tts_manager.generation)
+                coordinator.on_reply_started(
+                    tts_manager.generation, token=turn_token
+                )
+            except TypeError:
+                # Embedders/tests that implement the pre-barge-in two-argument
+                # callback keep working unchanged.
+                with contextlib.suppress(Exception):
+                    coordinator.on_reply_started(tts_manager.generation)
             except Exception:  # noqa: BLE001 - voice state is best effort
                 pass
         if spoke and output is not None:
@@ -2913,6 +3104,7 @@ async def _deliver_proactive_voice(
     A new keyboard line or voice final cancels this task.
     """
     log = logging.getLogger("companion.proactive")
+    turn_token: int | None = None
     try:
         if coordinator is not None:
             await coordinator.wait_until_proactive_allowed()
@@ -2938,17 +3130,20 @@ async def _deliver_proactive_voice(
                 )
                 return False
         if coordinator is not None:
-            coordinator.begin_turn()
+            turn_token = coordinator.begin_turn()
         rendered = await _render_proactive_event(
             event,
             session,
             tts_manager=tts_manager,
             coordinator=coordinator,
             output=output,
+            turn_token=turn_token,
         )
         if not rendered:
             if coordinator is not None:
-                coordinator.on_turn_finished({"delivered": False})
+                coordinator.on_turn_finished(
+                    {"delivered": False}, token=turn_token
+                )
             await _ack_proactive_event(
                 manager,
                 event,
@@ -2962,7 +3157,8 @@ async def _deliver_proactive_voice(
                     "delivered": True,
                     "status": "COMPLETED",
                     "action": "RESPOND",
-                }
+                },
+                token=turn_token,
             )
             # Resume only after the real playback-complete event.
             await coordinator.wait_until_proactive_allowed()
@@ -2981,14 +3177,18 @@ async def _deliver_proactive_voice(
         # A keyboard line or a voice final won: never let the old proactive
         # turn keep the mic paused.
         if coordinator is not None:
-            coordinator.on_turn_finished({"delivered": False})
+            coordinator.on_turn_finished(
+                {"delivered": False}, token=turn_token
+            )
         await _ack_proactive_event(
             manager, event, delivered=False, reason="interrupted_by_user"
         )
         raise
     except Exception as exc:  # noqa: BLE001 - REPL stays alive
         if coordinator is not None:
-            coordinator.on_turn_finished({"delivered": False})
+            coordinator.on_turn_finished(
+                {"delivered": False}, token=turn_token
+            )
         await _ack_proactive_event(
             manager, event, delivered=False, reason="surface_error"
         )
@@ -3389,6 +3589,19 @@ async def _run_streaming_turn(
             await _write("\n")
         await _line("[cancelled]")
         return {"delivered": False}
+    except asyncio.CancelledError:
+        # A confirmed barge-in cancelled this reply. Stop and discard the old
+        # speech stream, close the orchestrator generator so it persists the
+        # partial reply as CANCELLED and releases the conversation lock, then
+        # let the cancellation reach the scheduler. No old text is displayed
+        # and the REPL keeps running for the interrupting utterance.
+        _cancel_tts()
+        with contextlib.suppress(Exception):
+            await stream.aclose()
+        if saw_started:
+            with contextlib.suppress(Exception):
+                await _write("\n")
+        raise
     except Exception as exc:  # provider/validation failure is shown truthfully
         _cancel_tts()
         if saw_started:

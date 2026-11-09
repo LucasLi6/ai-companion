@@ -425,6 +425,11 @@ class TTSManager:
         # generation -> (response_id, conversation_id) for playback notices.
         self._playback_info: dict[int, tuple[str, str]] = {}
         self._playback_listeners: list[Callable[[PlaybackEvent], None]] = []
+        # Optional far-end observer for barge-in. Called just before each
+        # ~20 ms frame is written; it must only enqueue and must never block.
+        self._playback_pcm_listener: Optional[
+            Callable[[int, bytes, float], None]
+        ] = None
         # Every stream that has not finished yet. Superseded streams are
         # cancelled without joining on the chat path; this set lets explicit
         # teardown join them within one bounded deadline.
@@ -469,6 +474,24 @@ class TTSManager:
                 self._playback_listeners.remove(listener)
             except ValueError:
                 pass
+
+    def set_playback_pcm_listener(
+        self, listener: Optional[Callable[[int, bytes, float], None]]
+    ) -> None:
+        """Observe the exact 24 kHz PCM frames about to be played.
+
+        The callback receives ``(generation, pcm, timestamp)`` on the player
+        thread immediately before the blocking device write. It is optional,
+        must return immediately, and must only enqueue the frame (the barge-in
+        pipeline uses a bounded queue). An exception or a full queue never
+        affects playback.
+        """
+        with self._lock:
+            self._playback_pcm_listener = listener
+
+    def remove_playback_pcm_listener(self) -> None:
+        with self._lock:
+            self._playback_pcm_listener = None
 
     def _notify_playback(
         self,
@@ -980,14 +1003,8 @@ class TTSManager:
                 self._notify_playback("finished", generation)
                 continue
 
-            with self._lock:
-                if generation == self._generation:
-                    timings = self._timings.setdefault(generation, {})
-                    timings.setdefault(
-                        "first_audio_write_started_at", time.monotonic()
-                    )
             try:
-                player.write(data)
+                self._write_playback(generation, data)
             except Exception as exc:  # noqa: BLE001 - TTS-isolated
                 failed = False
                 with self._lock:
@@ -1004,13 +1021,67 @@ class TTSManager:
                     )
                 continue
 
+    def _playback_frame_bytes(self) -> int:
+        """Bytes in one ~20 ms frame of the configured TTS output."""
+        with self._lock:
+            config = self._config
+        if config is None:
+            return 960  # 20 ms mono 16-bit at 24 kHz
+        width = max(1, int(config.sample_width))
+        channels = max(1, int(config.channels))
+        samples = max(1, int(round(config.sample_rate * 0.02)))
+        return samples * width * channels
+
+    def _write_playback(self, generation: int, data: bytes) -> None:
+        """Write one decoded chunk, split into re-checkable ~20 ms frames.
+
+        Splitting keeps ``stop(wait=False)`` from waiting for a long device
+        write and lets the optional far-end observer see exactly what is about
+        to play. The global lock is never held during ``player.write``.
+        """
+        frame_bytes = self._playback_frame_bytes()
+        first = True
+        offset = 0
+        total = len(data)
+        while offset < total:
+            frame = bytes(data[offset : offset + frame_bytes])
+            offset += frame_bytes
             with self._lock:
-                if generation == self._generation:
-                    timings = self._timings.setdefault(generation, {})
-                    timings.setdefault(
-                        "first_audio_played_at", time.monotonic()
-                    )
-                    self._status = "playing"
+                if not self._started or generation != self._generation:
+                    return
+                player = self._player
+                listener = self._playback_pcm_listener
+            if player is None:
+                raise RuntimeError("音频输出设备已关闭")
+            timestamp = time.monotonic()
+            if first:
+                # Same mark the pre-split implementation recorded: the first
+                # device write, before it can block.
+                with self._lock:
+                    if generation == self._generation:
+                        timings = self._timings.setdefault(generation, {})
+                        timings.setdefault(
+                            "first_audio_write_started_at", timestamp
+                        )
+                        self._status = "playing"
+            if listener is not None:
+                # Must be a fast enqueue; a slow observer must never delay or
+                # break playback. A cancelled generation is already filtered
+                # by the generation check above.
+                try:
+                    listener(generation, frame, timestamp)
+                except Exception:  # noqa: BLE001 - optional side channel
+                    pass
+            player.write(frame)
+            if first:
+                with self._lock:
+                    if generation == self._generation:
+                        timings = self._timings.setdefault(generation, {})
+                        timings.setdefault(
+                            "first_audio_played_at", time.monotonic()
+                        )
+                        self._status = "playing"
+                first = False
 
     # ---------------------------------------------------------------- status
     def status(self) -> TTSStatus:

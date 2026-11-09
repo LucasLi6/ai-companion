@@ -18,6 +18,7 @@ import threading
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Optional, Protocol
 
 from companion.asr.client import (
@@ -43,6 +44,7 @@ from companion.asr.vad import (
     AUDIO,
     SPEECH_ENDED,
     SPEECH_STARTED,
+    WAITING_FOR_SPEECH,
     SileroVAD,
     VADEvent,
     VADSegmenter,
@@ -51,6 +53,20 @@ from companion.asr.vad import (
 # The provider accepts small frames; ~100 ms mono 16-bit PCM is 3200 bytes.
 SEND_FRAME_BYTES = 3200
 SEND_FRAME_SECONDS = 0.1
+
+
+class InputMode(str, Enum):
+    """How the VAD thread treats captured microphone audio.
+
+    ``NORMAL`` is the unchanged recognition path, ``MUTED`` drains and
+    discards input (half-duplex while Ava speaks) and ``BARGE_IN`` feeds the
+    AEC pipeline's echo-cancelled output to the same Silero segmenter.
+    """
+
+    NORMAL = "NORMAL"
+    MUTED = "MUTED"
+    BARGE_IN = "BARGE_IN"
+
 
 _STOP = object()
 _ABORT = object()
@@ -117,6 +133,7 @@ class ASRStats:
 class _SpeechStarted:
     audio: bytes
     at: float
+    barge_in: bool = False
 
 
 @dataclass(frozen=True)
@@ -180,6 +197,13 @@ class _Mute:
     """Stop feeding microphone audio to the VAD and drop the open turn."""
 
 
+@dataclass(frozen=True)
+class _BargeInUnavailable:
+    """The optional AEC channel cannot be trusted for this reply."""
+
+    reason: str
+
+
 # ------------------------------------------------------- external integrations
 class SpeakerObserver(Protocol):
     """Optional, non-blocking voice-print hook owned by the embedding app.
@@ -226,13 +250,16 @@ class FinalUtterance:
 class SpeechActivity:
     """VAD speech start/end notice for half-duplex orchestration.
 
-    ``kind`` is ``"started"`` or ``"ended"``. The manager owns the boundary;
-    consumers must not treat this as a transcript.
+    ``kind`` is ``"started"``, ``"ended"`` or ``"barge_in"``. A barge-in
+    notice is emitted *before* the matching ``"started"`` notice for the same
+    ``utterance_id``; it carries the TTS generation whose playback it
+    interrupted. Consumers must not treat this as a transcript.
     """
 
     kind: str
     utterance_id: int
     at: float
+    generation: Optional[int] = None
 
 
 class _Utterance:
@@ -342,6 +369,29 @@ class ASRManager:
         self._input_enabled = threading.Event()
         self._input_enabled.set()
         self._vad_input_enabled = True
+        # Explicit input modes keep ``set_input_enabled`` working while adding
+        # the optional AEC barge-in path. ``_input_mode`` is a plain reference
+        # assignment; the VAD thread applies the matching profile itself.
+        self._input_mode = InputMode.NORMAL
+        self._vad_mode = InputMode.NORMAL
+        self._echo_canceller: Any = None
+        self._normal_vad_profile: Optional[dict[str, Any]] = None
+        self._barge_in_vad_threshold = 0.65
+        self._barge_in_min_speech_ms = 192
+        self._barge_in_pre_roll_ms = 400
+        self._barge_in_generation: Optional[int] = None
+        self._barge_in_detecting = False
+        self._barge_in_candidate_at: Optional[float] = None
+        self._barge_in_unavailable_listener: Optional[
+            Callable[[str], None]
+        ] = None
+        self._barge_in_unavailable_reported = False
+        self._barge_stats_lock = threading.Lock()
+        self._barge_stats: dict[str, Any] = {
+            "candidates": 0,
+            "confirmed": 0,
+            "last_user_speech_to_confirm_ms": None,
+        }
 
     # ------------------------------------------------------------------ public
     @property
@@ -379,19 +429,137 @@ class ASRManager:
         self._speaker_observer = observer
 
     def set_input_enabled(self, enabled: bool) -> None:
-        """Pause/resume feeding microphone audio into the VAD.
+        """Backward-compatible alias for ``set_input_mode(NORMAL/MUTED)``.
 
-        Safe from any thread. While paused the VAD thread drains and discards
-        captured chunks and resets the segmentation state; the control loop
-        aborts any turn that is still open, so no provisional partial can be
-        submitted after the application decided the mic is no longer
-        listening. ``/mic off`` uses :meth:`shutdown` instead.
+        While muted the VAD thread drains and discards captured chunks and
+        resets the segmentation state; the control loop aborts any turn that
+        is still open, so no provisional partial can be submitted after the
+        application decided the mic is no longer listening.
         """
-        if enabled:
-            self._input_enabled.set()
-        else:
+        self.set_input_mode(
+            InputMode.NORMAL if enabled else InputMode.MUTED
+        )
+
+    def set_input_mode(self, mode: "InputMode | str") -> bool:
+        """Switch the microphone path; safe from any thread.
+
+        ``BARGE_IN`` is accepted only after an echo canceller was attached and
+        is currently usable. Returns False when the mode was refused, so the
+        caller can fall back to the existing half-duplex behaviour.
+        """
+        try:
+            chosen = InputMode(mode)
+        except ValueError:
+            return False
+        if chosen == InputMode.BARGE_IN and not self.barge_in_available():
+            return False
+        self._input_mode = chosen
+        if chosen == InputMode.MUTED:
             self._input_enabled.clear()
             self._put_control(_Mute(), critical=True)
+        else:
+            self._input_enabled.set()
+        return True
+
+    @property
+    def input_mode(self) -> InputMode:
+        return self._input_mode
+
+    # ---------------------------------------------------------- barge-in API
+    def attach_echo_canceller(
+        self,
+        pipeline: Any,
+        *,
+        vad_threshold: float = 0.65,
+        min_speech_ms: int = 192,
+        pre_roll_ms: int = 400,
+    ) -> None:
+        """Attach the optional AEC pipeline; no effect on the normal path."""
+        self._echo_canceller = pipeline
+        self._barge_in_vad_threshold = float(vad_threshold)
+        self._barge_in_min_speech_ms = max(1, int(min_speech_ms))
+        self._barge_in_pre_roll_ms = max(0, int(pre_roll_ms))
+        self._capture_normal_vad_profile()
+
+    def set_barge_in_unavailable_listener(
+        self, listener: Optional[Callable[[str], None]]
+    ) -> None:
+        """Called once from the control thread if AEC becomes untrustworthy."""
+        self._barge_in_unavailable_listener = listener
+
+    def barge_in_available(self) -> bool:
+        pipeline = self._echo_canceller
+        if pipeline is None:
+            return False
+        try:
+            return bool(
+                getattr(pipeline, "available", False)
+                and getattr(pipeline, "healthy", True)
+            )
+        except Exception:  # noqa: BLE001 - optional side channel
+            return False
+
+    def begin_barge_in(self, generation: int) -> bool:
+        """Arm AEC detection for one TTS generation.
+
+        Called on the asyncio loop when a spoken reply starts. The pipeline is
+        reset for this generation; no detection decision is possible until the
+        player supplies real far-end frames.
+        """
+        pipeline = self._echo_canceller
+        if pipeline is None:
+            return False
+        if not self.barge_in_available():
+            return False
+        try:
+            if not bool(pipeline.start(int(generation))):
+                return False
+        except Exception:  # noqa: BLE001 - optional side channel
+            return False
+        self._barge_in_generation = int(generation)
+        self._barge_in_detecting = True
+        self._barge_in_candidate_at = None
+        self._barge_in_unavailable_reported = False
+        with self._barge_stats_lock:
+            self._barge_stats["confirmed"] = 0
+            self._barge_stats["candidates"] = 0
+        return self.set_input_mode(InputMode.BARGE_IN)
+
+    def end_barge_in(self, generation: Optional[int] = None) -> None:
+        """Stop accepting playback for a generation (echo tail is retained)."""
+        pipeline = self._echo_canceller
+        self._barge_in_detecting = False
+        if pipeline is None:
+            return
+        try:
+            pipeline.stop(
+                self._barge_in_generation
+                if generation is None
+                else int(generation)
+            )
+        except Exception:  # noqa: BLE001 - optional side channel
+            pass
+        self._barge_in_generation = None
+
+    def barge_in_stats(self) -> dict:
+        """Counters for ``/mic status`` and the real-device diagnostic report."""
+        with self._barge_stats_lock:
+            stats = dict(self._barge_stats)
+        stats.update(
+            {
+                "enabled": self._echo_canceller is not None,
+                "available": self.barge_in_available(),
+                "mode": self._input_mode.value,
+                "generation": self._barge_in_generation,
+            }
+        )
+        pipeline = self._echo_canceller
+        if pipeline is not None:
+            try:
+                stats["aec"] = pipeline.stats()
+            except Exception:  # noqa: BLE001 - diagnostics only
+                stats["aec"] = None
+        return stats
 
     def start(self) -> None:
         if self._started:
@@ -400,6 +568,7 @@ class ASRManager:
             vad = SileroVAD(self.config)
             vad.preload()
             self._vad_segmenter = VADSegmenter(vad.probability, self.config)
+        self._capture_normal_vad_profile()
 
         self._render_thread = threading.Thread(
             target=self._render_loop, name="asr-render", daemon=True
@@ -469,6 +638,13 @@ class ASRManager:
             pass
         if self._vad_thread is not None:
             self._vad_thread.join(timeout=2.0)
+        self.end_barge_in()
+        pipeline = self._echo_canceller
+        if pipeline is not None:
+            try:
+                pipeline.reset()
+            except Exception:  # noqa: BLE001 - optional side channel
+                pass
         for utterance in list(self._utterances.values()):
             if not utterance.finalized:
                 self._abort_utterance(
@@ -493,20 +669,13 @@ class ASRManager:
     def _vad_loop(self) -> None:
         segmenter = self._vad_segmenter
         while not self._stop.is_set():
-            enabled = self._input_enabled.is_set()
-            if enabled != self._vad_input_enabled:
-                self._vad_input_enabled = enabled
-                # Reset on both edges: the pre-roll and the model's recurrent
-                # state from before the pause must not leak into what is
-                # recognized after it.
-                try:
-                    segmenter.reset()
-                except Exception:  # noqa: BLE001 - best effort
-                    pass
+            self._sync_vad_mode(segmenter)
             try:
                 item = self.audio_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            self._sync_vad_mode(segmenter)
+            mode = self._input_mode
             if isinstance(item, AudioInterrupted):
                 try:
                     segmenter.reset()
@@ -518,12 +687,22 @@ class ASRManager:
                     _Notice(item.text, item.is_error), critical=False
                 )
             elif isinstance(item, AudioChunk):
-                if not self._input_enabled.is_set():
+                if mode == InputMode.MUTED:
                     # Paused: keep draining so the bounded capture queue never
                     # wedges the microphone thread, but never segment.
                     continue
+                pcm = item.pcm
+                barge_in_audio = False
+                if mode == InputMode.BARGE_IN:
+                    pcm, accepted = self._process_barge_in_audio(item)
+                    if not accepted:
+                        # Never run VAD on raw, un-cancelled microphone audio:
+                        # without a valid reference there is no safe barge-in
+                        # decision to make.
+                        continue
+                    barge_in_audio = True
                 try:
-                    events = segmenter.process(item.pcm)
+                    events = segmenter.process(pcm)
                 except Exception as exc:  # noqa: BLE001 - keep listening
                     self._put_control(
                         _Notice(
@@ -534,12 +713,147 @@ class ASRManager:
                     )
                     continue
                 for event in events:
-                    self._dispatch_vad_event(event)
+                    self._dispatch_vad_event(event, barge_in=barge_in_audio)
 
-    def _dispatch_vad_event(self, event: VADEvent) -> None:
+    def _sync_vad_mode(self, segmenter: Any) -> None:
+        mode = self._input_mode
+        if mode == self._vad_mode:
+            return
+        self._vad_mode = mode
+        if mode == InputMode.MUTED:
+            if self._vad_input_enabled:
+                self._vad_input_enabled = False
+                try:
+                    segmenter.reset()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+            self._restore_normal_vad_profile()
+            return
+        if not self._vad_input_enabled:
+            self._vad_input_enabled = True
+            try:
+                segmenter.reset()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+        if mode == InputMode.BARGE_IN:
+            # Arming always starts from a clean waiting state: pre-roll
+            # captured before the echo canceller was fed real far-end audio
+            # must never become the beginning of the user's utterance.
+            if getattr(segmenter, "state", None) == WAITING_FOR_SPEECH:
+                try:
+                    segmenter.reset()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+            self._activate_barge_in_profile()
+        else:
+            self._restore_normal_vad_profile()
+
+    def _capture_normal_vad_profile(self) -> None:
+        segmenter = self._vad_segmenter
+        if segmenter is None or self._normal_vad_profile is not None:
+            return
+        try:
+            self._normal_vad_profile = {
+                "threshold": float(segmenter.threshold),
+                "min_speech_ms": int(segmenter.min_speech_ms),
+                "pre_roll_ms": int(segmenter.pre_roll_ms),
+            }
+        except Exception:  # noqa: BLE001 - fake/legacy segmenter
+            self._normal_vad_profile = None
+
+    def _restore_normal_vad_profile(self) -> None:
+        segmenter = self._vad_segmenter
+        if segmenter is None:
+            return
+        try:
+            segmenter.window_observer = None
+            profile = self._normal_vad_profile
+            if profile:
+                segmenter.configure(**profile)
+        except Exception:  # noqa: BLE001 - fake/legacy segmenter
+            pass
+
+    def _activate_barge_in_profile(self) -> None:
+        segmenter = self._vad_segmenter
+        if segmenter is None:
+            return
+        # Only a waiting segmenter may take new detection parameters; an open
+        # utterance (which should not exist while Ava is speaking) is kept.
+        if getattr(segmenter, "state", None) != WAITING_FOR_SPEECH:
+            return
+        try:
+            segmenter.configure(
+                threshold=self._barge_in_vad_threshold,
+                min_speech_ms=self._barge_in_min_speech_ms,
+                pre_roll_ms=self._barge_in_pre_roll_ms,
+            )
+            segmenter.window_observer = self._observe_barge_in_window
+        except Exception:  # noqa: BLE001 - fake/legacy segmenter
+            return
+        self._barge_in_detecting = True
+        self._barge_in_candidate_at = None
+
+    def _observe_barge_in_window(self, probability: float) -> None:
+        """Record candidate latency; runs on the VAD thread, must be trivial."""
+        if not self._barge_in_detecting:
+            return
+        if probability >= self._barge_in_vad_threshold:
+            if self._barge_in_candidate_at is None:
+                self._barge_in_candidate_at = time.monotonic()
+                with self._barge_stats_lock:
+                    self._barge_stats["candidates"] += 1
+        else:
+            self._barge_in_candidate_at = None
+
+    def _process_barge_in_audio(
+        self, item: AudioChunk
+    ) -> tuple[bytes, bool]:
+        pipeline = self._echo_canceller
+        if pipeline is None:
+            return b"", False
+        try:
+            result = pipeline.process_microphone(item.pcm, item.timestamp)
+        except Exception as exc:  # noqa: BLE001 - optional side channel
+            self._notify_barge_in_unavailable(
+                f"aec:{type(exc).__name__}"
+            )
+            return b"", False
+        try:
+            degraded = bool(getattr(pipeline, "degraded", False))
+        except Exception:  # noqa: BLE001 - fake pipeline
+            degraded = False
+        if degraded:
+            reason = getattr(pipeline, "unavailable_reason", "") or (
+                "aec_degraded"
+            )
+            self._notify_barge_in_unavailable(str(reason))
+        if not getattr(result, "valid", False):
+            return b"", False
+        return bytes(getattr(result, "pcm", b"") or b""), True
+
+    def _notify_barge_in_unavailable(self, reason: str) -> None:
+        with self._barge_stats_lock:
+            if self._barge_in_unavailable_reported:
+                return
+            self._barge_in_unavailable_reported = True
+            self._barge_stats.setdefault("errors", 0)
+            self._barge_stats["errors"] += 1
+        # The control thread picks the fallback mode: until it does, invalid
+        # AEC blocks are dropped and VAD never sees raw microphone audio.
+        self._barge_in_detecting = False
+        self._put_control(
+            _BargeInUnavailable(str(reason)), critical=True
+        )
+
+    def _dispatch_vad_event(
+        self, event: VADEvent, *, barge_in: bool = False
+    ) -> None:
         if event.kind == SPEECH_STARTED:
             self._put_control(
-                _SpeechStarted(event.audio, time.monotonic()), critical=True
+                _SpeechStarted(
+                    event.audio, time.monotonic(), barge_in=barge_in
+                ),
+                critical=True,
             )
         elif event.kind == AUDIO:
             self._put_control(
@@ -759,10 +1073,29 @@ class ASRManager:
             self._handle_final_timeout(event)
         elif isinstance(event, _Mute):
             self._handle_mute()
+        elif isinstance(event, _BargeInUnavailable):
+            self._handle_barge_in_unavailable(event)
         elif isinstance(event, _Interrupted):
             self._handle_interrupted(event)
         elif isinstance(event, _Notice):
             self._render_status(event.text, is_error=event.is_error)
+
+    def _record_barge_in_confirmed(self) -> None:
+        """Record detection latency; called on the control thread."""
+        now = time.monotonic()
+        candidate_at = self._barge_in_candidate_at
+        self._barge_in_candidate_at = None
+        self._barge_in_detecting = False
+        latency_ms = (
+            max(0.0, (now - candidate_at) * 1000.0)
+            if candidate_at is not None
+            else None
+        )
+        with self._barge_stats_lock:
+            self._barge_stats["confirmed"] += 1
+            self._barge_stats["last_user_speech_to_confirm_ms"] = (
+                round(latency_ms, 1) if latency_ms is not None else None
+            )
 
     def _handle_speech_started(self, event: _SpeechStarted) -> None:
         self._next_uid += 1
@@ -773,6 +1106,16 @@ class ASRManager:
         self._open_order.append(utterance)
         self._current = utterance
         self.stats.utterances += 1
+        if event.barge_in:
+            # One utterance, one id: the interruption notice and the normal
+            # lifecycle events all refer to the same ASR turn.
+            self._record_barge_in_confirmed()
+            self._emit_speech(
+                "barge_in",
+                utterance.uid,
+                event.at,
+                generation=self._barge_in_generation,
+            )
         self._emit_speech("started", utterance.uid, event.at)
         self._speaker_start(utterance.uid, event.audio)
         if not self._enqueue_audio(utterance, event.audio):
@@ -964,6 +1307,29 @@ class ASRManager:
                 utterance,
                 "录音中断，已中止当前识别；临时文本不会作为最终结果。",
             )
+
+    def _handle_barge_in_unavailable(self, event: _BargeInUnavailable) -> None:
+        """The AEC side channel failed; fall back without losing a real turn.
+
+        Before the user was confirmed, the safe fallback is the existing
+        half-duplex behaviour (pause the mic while Ava speaks). After a turn
+        has already started, aborting it would risk losing the user's first
+        words; keep the turn and switch it to the ordinary raw-mic path.
+        """
+        self._barge_in_detecting = False
+        utterance = self._current
+        if utterance is not None and not utterance.finalized:
+            self._input_mode = InputMode.NORMAL
+            self._input_enabled.set()
+        else:
+            self._input_mode = InputMode.MUTED
+            self._input_enabled.clear()
+        listener = self._barge_in_unavailable_listener
+        if listener is not None:
+            try:
+                listener(event.reason)
+            except Exception:  # noqa: BLE001 - optional integration hook
+                pass
 
     def _handle_mute(self) -> None:
         """Drop every turn still open when the application stops listening.
@@ -1329,12 +1695,19 @@ class ASRManager:
         except Exception:  # noqa: BLE001 - recognition must keep running
             pass
 
-    def _emit_speech(self, kind: str, uid: int, at: float) -> None:
+    def _emit_speech(
+        self,
+        kind: str,
+        uid: int,
+        at: float,
+        *,
+        generation: Optional[int] = None,
+    ) -> None:
         callback = self._on_speech
         if callback is None:
             return
         try:
-            callback(SpeechActivity(kind, uid, at))
+            callback(SpeechActivity(kind, uid, at, generation=generation))
         except Exception:  # noqa: BLE001 - recognition must keep running
             pass
 
