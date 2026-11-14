@@ -32,7 +32,7 @@ from companion.asr.client import (
     STATE_TASK_FINISHED,
     classify_failure,
 )
-from companion.asr.config import ASRConfig
+from companion.asr.config import ASRConfig, VAD_WINDOW_MS
 from companion.asr.microphone import (
     AudioChunk,
     AudioInterrupted,
@@ -124,6 +124,7 @@ class ASRStats:
     aborted: int = 0
     errors: int = 0
     deferred: int = 0
+    truncations: int = 0
     dropped_control_events: int = 0
     final_latencies_ms: list[float] = field(default_factory=list)
 
@@ -247,6 +248,22 @@ class FinalUtterance:
 
 
 @dataclass(frozen=True)
+class PartialTranscript:
+    """A provisional transcript for an utterance still being recognized.
+
+    Display-only: it never becomes a user message, is never persisted and is
+    never spoken. ``sequence`` increases per utterance so a surface can discard
+    an out-of-order update instead of overwriting newer text with older text.
+    """
+
+    utterance_id: int
+    text: str
+    sequence: int = 0
+    is_final: bool = False
+    at: float = 0.0
+
+
+@dataclass(frozen=True)
 class SpeechActivity:
     """VAD speech start/end notice for half-duplex orchestration.
 
@@ -262,14 +279,93 @@ class SpeechActivity:
     generation: Optional[int] = None
 
 
+class NearEndSpeechGate:
+    """Confirm that barge-in speech is the user, not Ava's own leaked echo.
+
+    The AEC pipeline reports, per processed chunk, the pre-cancellation
+    ``near_rms`` and the post-cancellation ``clean_rms``. When the near end is
+    mostly Ava's echo, cancellation removes it and ``clean_rms`` collapses
+    relative to ``near_rms``; a real user interjection survives cancellation,
+    so ``clean_rms`` stays a meaningful fraction of ``near_rms``. A barge-in is
+    only *confirmed* after ``confirm_windows`` consecutive qualifying chunks,
+    matching the VAD ``min_speech_ms``, so a single burst of leaked echo can
+    never stop Ava. This is a deterministic energy rule: no LLM, no fake
+    WebRTC API.
+    """
+
+    def __init__(
+        self,
+        *,
+        confirm_windows: int = 6,
+        clean_rms_floor: float = 400.0,
+        echo_ratio: float = 0.5,
+    ) -> None:
+        self.confirm_windows = max(1, int(confirm_windows))
+        self.clean_rms_floor = float(clean_rms_floor)
+        self.echo_ratio = float(echo_ratio)
+        self._streak = 0
+        self._unmetered = 0
+
+    @property
+    def confirmed(self) -> bool:
+        return (
+            self._streak >= self.confirm_windows
+            or self._unmetered >= self.confirm_windows
+        )
+
+    def observe(
+        self,
+        *,
+        near_rms: float,
+        clean_rms: float,
+        metrics_available: bool = True,
+    ) -> bool:
+        """Consume one processed chunk; True once the gate is satisfied.
+
+        A pipeline that does not report energy metrics (both levels stay at
+        zero) cannot be gated on energy. For those the gate degrades to the
+        previous behaviour — VAD alone after the same number of chunks — so
+        barge-in keeps working instead of being silently disabled.
+        """
+        if not metrics_available:
+            self._unmetered += 1
+            return self._unmetered >= self.confirm_windows
+        self._unmetered = 0
+        near = float(near_rms or 0.0)
+        clean = float(clean_rms or 0.0)
+        survived = (
+            clean >= self.clean_rms_floor
+            and clean >= self.echo_ratio * near
+        )
+        self._streak = self._streak + 1 if survived else 0
+        return self.confirmed
+
+    def reset(self) -> None:
+        self._streak = 0
+        self._unmetered = 0
+
+
 class _Utterance:
     """Mutable state for one VAD-bounded utterance."""
 
-    def __init__(self, uid: int, send_queue_frames: int) -> None:
+    def __init__(
+        self,
+        uid: int,
+        send_queue_frames: int,
+        max_utterance_seconds: int = 0,
+    ) -> None:
         self.uid = uid
-        self.send_queue: "queue.Queue[Any]" = queue.Queue(
-            maxsize=max(1, send_queue_frames)
-        )
+        frames = max(1, int(send_queue_frames))
+        if max_utterance_seconds > 0:
+            # The documented bound is one whole utterance, not the fixed
+            # handful of seconds: while the session handshake is still in
+            # progress nothing drains this queue, so a legitimate long
+            # statement must still fit. Memory stays bounded by that number.
+            frames = max(
+                frames,
+                int(max_utterance_seconds * 1000 / VAD_WINDOW_MS) + 1,
+            )
+        self.send_queue: "queue.Queue[Any]" = queue.Queue(maxsize=frames)
         self.session: Optional[ASRSession] = None
         self.opened = threading.Event()
         self.sender_done = threading.Event()
@@ -287,6 +383,7 @@ class _Utterance:
         self.final_ids: set[str] = set()
         self.partial = ""
         self.partial_id = ""
+        self.partial_seq = 0
         self.session_done = False
         self.session_error: Optional[str] = None
         self.session_done_at: Optional[float] = None
@@ -295,6 +392,11 @@ class _Utterance:
         self.finalized = False
         self.aborted = False
         self.stop_sent = False
+        # The upload queue hit its bound while the person was still talking.
+        # The turn continues with the prefix that was already accepted; only
+        # the audio past this point is dropped (never the whole turn).
+        self.truncated = False
+        self.stop_requested = threading.Event()
         self.final_timer: Optional[threading.Timer] = None
         self.final_latency_ms: Optional[float] = None
 
@@ -314,6 +416,7 @@ class ASRManager:
         on_final: Optional[Callable[[FinalUtterance], None]] = None,
         on_speech: Optional[Callable[[SpeechActivity], None]] = None,
         on_turn_closed: Optional[Callable[[int, bool], None]] = None,
+        on_partial: Optional[Callable[[PartialTranscript], None]] = None,
         render_finals: bool = True,
         speaker_observer: Optional[SpeakerObserver] = None,
     ) -> None:
@@ -341,6 +444,7 @@ class ASRManager:
         self._on_final = on_final
         self._on_speech = on_speech
         self._on_turn_closed = on_turn_closed
+        self._on_partial = on_partial
         self.render_finals = render_finals
         # Optional voice-print observer. Its methods are called from the
         # control thread and must never block; exceptions are swallowed so a
@@ -383,6 +487,7 @@ class ASRManager:
         self._barge_in_detecting = False
         self._barge_in_tail = False
         self._barge_in_candidate_at: Optional[float] = None
+        self._barge_gate = NearEndSpeechGate()
         self._barge_in_unavailable_listener: Optional[
             Callable[[str], None]
         ] = None
@@ -409,6 +514,7 @@ class ASRManager:
         on_final: Optional[Callable[[FinalUtterance], None]] = None,
         on_speech: Optional[Callable[[SpeechActivity], None]] = None,
         on_turn_closed: Optional[Callable[[int, bool], None]] = None,
+        on_partial: Optional[Callable[[PartialTranscript], None]] = None,
         render_finals: Optional[bool] = None,
     ) -> None:
         """Attach or replace the embedding hooks after construction.
@@ -420,6 +526,8 @@ class ASRManager:
         self._on_final = on_final
         self._on_speech = on_speech
         self._on_turn_closed = on_turn_closed
+        if on_partial is not None:
+            self._on_partial = on_partial
         if render_finals is not None:
             self.render_finals = bool(render_finals)
 
@@ -428,6 +536,17 @@ class ASRManager:
     ) -> None:
         """Attach or replace the optional voice-print observer."""
         self._speaker_observer = observer
+
+    def set_partial_listener(
+        self, listener: Optional[Callable[[PartialTranscript], None]]
+    ) -> None:
+        """Attach a display-only listener for provisional transcripts.
+
+        Separate from :meth:`set_listeners` so an embedder whose listener
+        signature predates partials keeps working. The callback runs on the
+        ASR control thread and must never block.
+        """
+        self._on_partial = listener
 
     def set_input_enabled(self, enabled: bool) -> None:
         """Backward-compatible alias for ``set_input_mode(NORMAL/MUTED)``.
@@ -505,12 +624,13 @@ class ASRManager:
 
         Called on the asyncio loop when a spoken reply starts. The pipeline is
         reset for this generation; no detection decision is possible until the
-        player supplies real far-end frames.
+        player supplies real far-end frames. Recovery is per-generation: the
+        pipeline's ``start()`` rebuilds the canceller and clears any
+        ``failed``/``degraded`` flag from a previous reply before the
+        availability check, so one bad reply can never disable later ones.
         """
         pipeline = self._echo_canceller
         if pipeline is None:
-            return False
-        if not self.barge_in_available():
             return False
         try:
             if not bool(pipeline.start(int(generation))):
@@ -521,6 +641,7 @@ class ASRManager:
         self._barge_in_detecting = True
         self._barge_in_tail = False
         self._barge_in_candidate_at = None
+        self._barge_gate.reset()
         self._barge_in_unavailable_reported = False
         with self._barge_stats_lock:
             self._barge_stats["confirmed"] = 0
@@ -766,6 +887,33 @@ class ASRManager:
                     )
                     continue
                 for event in events:
+                    if (
+                        barge_in_audio
+                        and event.kind == SPEECH_STARTED
+                        and self._barge_in_detecting
+                        and not self._barge_gate.confirmed
+                    ):
+                        # The VAD fired on audio that did not survive echo
+                        # cancellation: this is Ava's own voice leaking back,
+                        # never a user turn. Reset the segmenter so the user's
+                        # next real words are detected from a clean state
+                        # instead of being folded into this rejected segment.
+                        self._barge_gate.reset()
+                        self._barge_in_candidate_at = None
+                        try:
+                            segmenter.reset()
+                        except Exception:  # noqa: BLE001 - best effort
+                            pass
+                        with self._barge_stats_lock:
+                            self._barge_stats["echo_rejected"] = (
+                                int(
+                                    self._barge_stats.get(
+                                        "echo_rejected", 0
+                                    )
+                                )
+                                + 1
+                            )
+                        continue
                     self._dispatch_vad_event(event, barge_in=barge_in_audio)
 
     def _sync_vad_mode(self, segmenter: Any) -> None:
@@ -850,6 +998,7 @@ class ASRManager:
             return
         self._barge_in_detecting = True
         self._barge_in_candidate_at = None
+        self._barge_gate.reset()
 
     def _observe_barge_in_window(self, probability: float) -> None:
         """Record candidate latency; runs on the VAD thread, must be trivial."""
@@ -914,6 +1063,14 @@ class ASRManager:
                 # finish this turn on the ordinary path instead of losing it.
                 return self._accept_after_tail_failure(item)
             return b"", False, False
+        near_rms = float(getattr(result, "near_rms", 0.0) or 0.0)
+        clean_rms = float(getattr(result, "clean_rms", 0.0) or 0.0)
+        if self._barge_in_detecting:
+            self._barge_gate.observe(
+                near_rms=near_rms,
+                clean_rms=clean_rms,
+                metrics_available=bool(near_rms > 0.0 or clean_rms > 0.0),
+            )
         return bytes(getattr(result, "pcm", b"") or b""), True, True
 
     def _accept_after_tail_failure(
@@ -938,6 +1095,7 @@ class ASRManager:
     def _reset_barge_in_candidate(self, segmenter: Any) -> None:
         """Drop an unfinished candidate after a gap in valid AEC audio."""
         self._barge_in_candidate_at = None
+        self._barge_gate.reset()
         try:
             segmenter.reset()
         except Exception:  # noqa: BLE001 - best effort
@@ -1017,6 +1175,12 @@ class ASRManager:
                     item = utterance.send_queue.get(timeout=0.02)
                 except queue.Empty:
                     item = None
+                if item is None and utterance.stop_requested.is_set():
+                    # The control thread could not enqueue the stop sentinel
+                    # (the queue was full of accepted audio). Everything ahead
+                    # of it has now been uploaded, so finish here: no turn is
+                    # aborted and no audio is dropped.
+                    item = _STOP
                 now = time.monotonic()
                 if isinstance(item, (bytes, bytearray)):
                     if not buffer:
@@ -1214,9 +1378,22 @@ class ASRManager:
             )
 
     def _handle_speech_started(self, event: _SpeechStarted) -> None:
+        if (
+            event.barge_in
+            and self._barge_in_detecting
+            and not self._barge_gate.confirmed
+        ):
+            # The VAD saw speech during barge-in detection, but the near-end
+            # gate did not confirm it survived cancellation: this is Ava's own
+            # leaked echo, not a user interruption. Never start a user turn for
+            # it (self-recognition fix), and never stop TTS for it.
+            self._barge_in_candidate_at = None
+            return
         self._next_uid += 1
         utterance = _Utterance(
-            self._next_uid, self.config.asr_send_queue_frames
+            self._next_uid,
+            self.config.asr_send_queue_frames,
+            self.config.max_utterance_seconds,
         )
         self._utterances[utterance.uid] = utterance
         self._open_order.append(utterance)
@@ -1330,6 +1507,11 @@ class ASRManager:
             [fragment for _, fragment in utterance.finals]
             + ([utterance.partial] if utterance.partial else [])
         )
+        # Provisional text is shown to the embedder as soon as it exists, so
+        # the formal REPL can display what ASR heard while the user is still
+        # speaking. It never becomes a message and is never persisted.
+        if preview:
+            self._emit_partial(utterance, preview)
         # Partials are part of the standalone transcript renderer. In formal
         # voice mode (render_finals=False) the embedding app prints the final
         # itself, so provisional lines are fully suppressed to avoid a stale
@@ -1662,14 +1844,28 @@ class ASRManager:
     def _enqueue_audio(self, utterance: _Utterance, data: bytes) -> bool:
         if not data or utterance.finalized:
             return False
+        if utterance.truncated:
+            # Past the upload budget: keep the recognized prefix and stop
+            # growing the queue. The turn still ends (and is finalized)
+            # normally when the person stops speaking.
+            return False
         try:
             utterance.send_queue.put_nowait(bytes(data))
             return True
         except queue.Full:
-            self._abort_utterance(
-                utterance,
-                "ASR 发送队列已满，网络可能过慢；已中止当前识别。",
-            )
+            # The link cannot keep up (typically the session handshake is
+            # still in progress). Dropping only the tail keeps the turn; the
+            # old behaviour aborted it and lost everything the person said.
+            first = not utterance.truncated
+            utterance.truncated = True
+            if first:
+                self.stats.truncations += 1
+                self._log_lifecycle(utterance, "truncated")
+                if self.config.debug:
+                    self._render_status(
+                        f"#{utterance.uid} 音频缓冲已满，后续音频不再上传；"
+                        "已识别的部分仍会提交。"
+                    )
             return False
 
     def _enqueue_sentinel(self, utterance: _Utterance, item: Any) -> bool:
@@ -1677,7 +1873,11 @@ class ASRManager:
             utterance.send_queue.put_nowait(item)
             return True
         except queue.Full:
-            return False
+            # The queue is full of accepted audio that still has to be
+            # uploaded. The sender honours ``stop_requested`` as soon as it has
+            # drained those frames, so no slot is needed and nothing is lost.
+            utterance.stop_requested.set()
+            return True
 
     def _enqueue_final_timeout(self, uid: int) -> None:
         self._put_control(
@@ -1812,6 +2012,23 @@ class ASRManager:
         except Exception:  # noqa: BLE001 - recognition must keep running
             pass
 
+    def _emit_partial(self, utterance: _Utterance, text: str) -> None:
+        callback = self._on_partial
+        if callback is None:
+            return
+        utterance.partial_seq += 1
+        event = PartialTranscript(
+            utterance_id=utterance.uid,
+            text=str(text),
+            sequence=utterance.partial_seq,
+            is_final=False,
+            at=time.monotonic(),
+        )
+        try:
+            callback(event)
+        except Exception:  # noqa: BLE001 - recognition must keep running
+            pass
+
     def _emit_speech(
         self,
         kind: str,
@@ -1915,5 +2132,6 @@ __all__ = [
     "ASRManager",
     "ASRStats",
     "FinalUtterance",
+    "PartialTranscript",
     "SpeechActivity",
 ]

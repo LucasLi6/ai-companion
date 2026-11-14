@@ -407,6 +407,19 @@ class ProactiveMessageRepository:
             (message_id,),
         )
 
+    async def update_status(self, message_id: str, status: str) -> None:
+        """Promote a generated row once its delivery was really acknowledged.
+
+        A row is stored as ``GENERATED`` at model completion; only the surface's
+        delivery acknowledgement may turn it into ``COMPLETED``. History
+        builders read ``COMPLETED`` only, so a message nobody saw can never be
+        replayed as if Ava had said it.
+        """
+        await self.db.execute(
+            "UPDATE proactive_messages SET status = ? WHERE message_id = ?",
+            (str(status), message_id),
+        )
+
     async def list_for_conversation(
         self, conversation_id: str, limit: int = 50
     ) -> list[ProactiveMessageRecord]:

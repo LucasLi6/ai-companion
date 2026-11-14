@@ -106,8 +106,9 @@ class RoutingContextBuilder:
         actions = await self.repos.analysis.get_actions_for_events(
             [item.event_id for item in history]
         )
+        proactive = await self._proactive_by_source(history)
         labels = await self._labels(history, event)
-        turns = self._interleave(history, actions, labels)
+        turns = self._interleave(history, actions, labels, proactive)
         turns = self._truncate(turns, self.max_chars)
         action_history = self._action_history(history, actions, turns)
 
@@ -174,8 +175,42 @@ class RoutingContextBuilder:
             )
         return labels
 
+    async def _proactive_by_source(self, history) -> dict:
+        """Load *delivered* Ava-initiated messages for the visible turns.
+
+        Without this the router (and the semantic speaker context that reuses
+        its turns) could not see that Ava already spoke after a turn, which is
+        what made her repeat or answer her own proactive message. Only rows
+        whose source utterance survived the privacy filter are considered, and
+        only ``COMPLETED`` rows are real dialogue — a generated-but-undelivered
+        message must never look as if it was said.
+        """
+        if not history:
+            return {}
+        event_ids = {item.event_id for item in history}
+        try:
+            rows = await self.repos.proactive.list_for_conversation(
+                history[0].conversation_id,
+                limit=max(50, len(history) * 2),
+            )
+        except Exception as exc:  # noqa: BLE001 - proactive is optional
+            self.logger.warning(
+                "routing_proactive_failed error=%s", type(exc).__name__
+            )
+            return {}
+        grouped: dict[str, list] = {}
+        for row in rows:
+            if (
+                row.source_event_id in event_ids
+                and row.status == "COMPLETED"
+                and str(row.text or "").strip()
+            ):
+                grouped.setdefault(row.source_event_id, []).append(row)
+        return grouped
+
     @staticmethod
-    def _interleave(history, actions, labels) -> list[dict]:
+    def _interleave(history, actions, labels, proactive_by_source=None) -> list[dict]:
+        proactive_by_source = proactive_by_source or {}
         turns: list[dict] = []
         for item in history:
             label = labels.get(
@@ -206,6 +241,17 @@ class RoutingContextBuilder:
                         speaker_label="assistant",
                         addressee_hint=None,
                         text=action.response_text,
+                    ).model_dump()
+                )
+            for message in proactive_by_source.get(item.event_id, ()):
+                turns.append(
+                    CognitiveTurn(
+                        event_id=item.event_id,
+                        role=ROLE_ASSISTANT,
+                        speaker_person_id=None,
+                        speaker_label="assistant",
+                        addressee_hint=None,
+                        text=message.text,
                     ).model_dump()
                 )
         return turns

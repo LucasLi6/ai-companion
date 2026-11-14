@@ -38,6 +38,16 @@ _SOURCE_LABEL = {
     "utc": "UTC",
 }
 
+# Continuity states that describe a real interruption, with the one factual
+# line that explains what the older topic means now. These are context facts,
+# not instructions about what to say (and never a fixed greeting).
+_LONG_CONTINUITY = {
+    "SHORT_PAUSE": "stage=短暂停顿后继续：刚才的话题仍可能未结束",
+    "EXTENDED_PAUSE": "stage=几小时间隔后继续：旧话题仍是记忆背景，不默认双方停在同一个问题上",
+    "RETURNING": "stage=间隔后重新交流：旧话题仍是记忆背景，不默认仍是当前未结束的讨论",
+    "NEW_DAY": "stage=新的交流阶段：旧话题只是记忆背景，除非本次输入提到它，否则不是当前未结束的讨论",
+}
+
 
 def _value(snapshot, name: str, default=None):
     if isinstance(snapshot, dict):
@@ -105,6 +115,9 @@ def compile_runtime_context(
         _as_datetime(_value(snapshot, "occurred_at_utc")), zone, snapshot
     )
     speaker = _single_line(_value(snapshot, "speaker_label"), 60)
+    last_user = _local(
+        _as_datetime(_value(snapshot, "last_heard_at_utc")), zone, snapshot
+    )
     last_interaction = _local(
         _as_datetime(_value(snapshot, "last_interaction_at_utc")), zone, snapshot
     )
@@ -148,12 +161,24 @@ def compile_runtime_context(
         lines.append(f"voice_features={voice_features}")
     if speaker:
         lines.append(f"speaker={speaker}")
+    if last_user is not None:
+        # The person's own last message, which is not the same fact as when
+        # Ava last replied — and never updated by Ava's proactive speech.
+        gap = humanize_gap(_value(snapshot, "last_heard_gap_seconds"))
+        suffix = f"（{gap}前）" if gap else ""
+        lines.append(f"last_user_message={_stamp(last_user)}{suffix}")
     if last_interaction is not None:
         gap = humanize_gap(
             _value(snapshot, "last_interaction_gap_seconds")
         )
         suffix = f"（{gap}前）" if gap else ""
         lines.append(f"last_interaction={_stamp(last_interaction)}{suffix}")
+    continuity = str(_value(snapshot, "continuity") or "NEW")
+    if last_user is not None and continuity in _LONG_CONTINUITY:
+        # Only a real interruption adds these lines; an ordinary exchange
+        # keeps the same compact block.
+        lines.append(f"continuity={continuity}")
+        lines.append(_LONG_CONTINUITY[continuity])
     if _value(snapshot, "previous_turn_departure", False):
         # Only an explicit previous departure is reported; a long silence is
         # not evidence that the person left.

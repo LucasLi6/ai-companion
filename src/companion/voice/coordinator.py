@@ -34,6 +34,7 @@ from companion.asr.manager import FinalUtterance, SpeechActivity
 from companion.voice.barge_in_config import BargeInConfig
 from companion.voice.bridge import (
     BridgeFailure,
+    PartialTranscript,
     TurnClosed,
     VoiceBridge,
 )
@@ -92,6 +93,10 @@ class VoiceCoordinator:
         self._barge_config = barge_in
         self._barge_enabled = bool(barge_in is not None and barge_in.enabled)
         self._on_barge_in = on_barge_in
+        self._partial_listener: Optional[Callable[[int, str], None]] = None
+        # Newest display sequence accepted per utterance. A delayed partial
+        # must never overwrite newer text or a later utterance's subtitle.
+        self._partial_sequence: dict[int, int] = {}
         self._barge_armed = False
         self._barge_disabled_reason: Optional[str] = None
         self._interrupted_generation: Optional[int] = None
@@ -247,6 +252,13 @@ class VoiceCoordinator:
                 # the standalone demo keeps the renderer's final line.
                 render_finals=False,
             )
+        # Provisional transcripts are delivered to the surface for live
+        # display. Attached separately so listener implementations written
+        # before partials existed keep their signature.
+        partial_setter = getattr(manager, "set_partial_listener", None)
+        if callable(partial_setter):
+            with contextlib.suppress(Exception):
+                partial_setter(bridge.publish_partial)
 
         if self._barge_config is not None:
             attach = getattr(
@@ -295,6 +307,8 @@ class VoiceCoordinator:
         self._cancel_echo_tail()
         if self._state == VoiceState.DISABLED and self._manager is None:
             return "mic: off"
+        if self._current_uid is not None:
+            self._clear_partial(self._current_uid)
         self._set_state(VoiceState.DISABLED)
         self._current_uid = None
         self._expected_generation = None
@@ -369,6 +383,8 @@ class VoiceCoordinator:
                     self._accept_final(item)
                 elif isinstance(item, SpeechActivity):
                     self._accept_speech(item)
+                elif isinstance(item, PartialTranscript):
+                    self._accept_partial(item)
                 elif isinstance(item, TurnClosed):
                     self._accept_turn_closed(item)
                 elif isinstance(item, BridgeFailure):
@@ -379,6 +395,48 @@ class VoiceCoordinator:
                 self.logger.warning(
                     "voice_event_failed type=%s", type(exc).__name__
                 )
+
+    def set_partial_listener(
+        self, listener: Optional[Callable[[int, str], None]]
+    ) -> None:
+        """Attach a display-only provisional-transcript callback.
+
+        Called on the asyncio loop, never from an ASR thread, so a surface may
+        repaint its input line directly. Partials are never persisted, never
+        become a reply, and are cleared by the final result.
+        """
+        self._partial_listener = listener
+
+    def _accept_partial(self, partial: PartialTranscript) -> None:
+        if self._state not in (VoiceState.RECORDING, VoiceState.LISTENING):
+            return
+        listener = self._partial_listener
+        if listener is None:
+            return
+        previous = self._partial_sequence.get(partial.utterance_id, -1)
+        if partial.sequence <= previous:
+            # An out-of-order update from an older revision.
+            return
+        self._partial_sequence[partial.utterance_id] = partial.sequence
+        try:
+            listener(partial.utterance_id, partial.text)
+        except Exception:  # noqa: BLE001 - display must not break voice
+            pass
+
+    def _clear_partial(self, utterance_id: int) -> None:
+        """Erase the provisional line for one utterance from the surface.
+
+        Sent as an empty text so the display can distinguish "no partial any
+        more" from "no partial yet" and repaint its subtitle.
+        """
+        self._partial_sequence.pop(int(utterance_id), None)
+        listener = self._partial_listener
+        if listener is None:
+            return
+        try:
+            listener(int(utterance_id), "")
+        except Exception:  # noqa: BLE001 - display must not break voice
+            pass
 
     def _accept_speech(self, activity: SpeechActivity) -> None:
         if activity.kind == "barge_in":
@@ -534,6 +592,7 @@ class VoiceCoordinator:
             task.cancel()
 
     def _accept_final(self, final: FinalUtterance) -> None:
+        self._clear_partial(final.utterance_id)
         if self._state != VoiceState.RECORDING:
             # A duplicate, late or already-muted result must never start a
             # second turn (Ava's own voice is not recognized because input is
@@ -556,6 +615,7 @@ class VoiceCoordinator:
             self.stats.stale_finals += 1
 
     def _accept_turn_closed(self, closed: TurnClosed) -> None:
+        self._clear_partial(closed.utterance_id)
         if self._state == VoiceState.RECORDING:
             # Recognition failed, timed out, was aborted, or produced no text
             # (its final would have moved us to THINKING). Go back to a safe
@@ -628,8 +688,13 @@ class VoiceCoordinator:
         to ``on_reply_started``: the manager refuses unless the optional
         pipeline is loaded and healthy, and playback frames must actually
         arrive before detection can confirm anything.
+
+        Recovery is per-generation: a failure in one reply must not disable
+        barge-in for every later reply, so the sticky failure reason is cleared
+        before each new attempt.
         """
-        if not self._barge_enabled or self._barge_disabled_reason:
+        self._barge_disabled_reason = None
+        if not self._barge_enabled:
             self._barge_armed = False
             self._pause_input()
             return

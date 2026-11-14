@@ -91,6 +91,13 @@ ACTIVITY_INTERVALS: dict[str, tuple[tuple[int, int], ...]] = {
 MIN_IDLE_SECONDS = 120
 MAX_IDLE_SECONDS = 240
 
+# After this many delivered long-idle messages with no user response the
+# current cycle ends. The judge may answer "no" any number of times; only
+# messages that were really shown to the person count, and a genuine new user
+# turn starts a fresh cycle (``unanswered`` resets).
+DEFAULT_MAX_UNANSWERED_ROUNDS = 3
+MAX_UNANSWERED_ENV = "AVA_PROACTIVE_MAX_UNANSWERED"
+
 
 @dataclass
 class _ConversationState:
@@ -105,6 +112,11 @@ class _ConversationState:
     next_attempt_at: Optional[float] = None
     unanswered: int = 0
     last_ack_message_id: Optional[str] = None
+    # Newest generated message whose delivery was never acknowledged. While
+    # set, no further message may be generated for this cycle: generating a
+    # second one before the first was actually shown is exactly the repeated
+    # proactive loop this version fixes.
+    pending_message_id: Optional[str] = None
     # message_id -> persistence mode, so an acknowledgement can tell an
     # immediate remark apart from an unanswered long-idle round.
     pending_modes: dict[str, str] = field(default_factory=dict)
@@ -156,9 +168,11 @@ class ProactiveManager:
             else os.environ.get(ACTIVITY_ENV, DEFAULT_ACTIVITY),
             self.logger,
         )
+        self.max_unanswered_rounds = _load_max_unanswered(self.logger)
 
         self._states: dict[str, _ConversationState] = {}
         self._events: asyncio.Queue[Optional[ResponseEvent]] = asyncio.Queue()
+        self._persist_tasks: set[asyncio.Task] = set()
         self._closed = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -195,6 +209,7 @@ class ProactiveManager:
         state.next_attempt_at = None
         state.unanswered = 0
         state.last_ack_message_id = None
+        state.pending_message_id = None
         state.pending_modes.clear()
         state.delivery_event.clear()
         self._cancel_task(state.task)
@@ -227,6 +242,7 @@ class ProactiveManager:
         state.last_user_input_at = time.monotonic()
         state.next_attempt_at = None
         state.unanswered = 0
+        state.pending_message_id = None
         self._cancel_task(state.task)
         state.task = None
         state.delivery_event.set()
@@ -313,20 +329,24 @@ class ProactiveManager:
         state.last_ack_message_id = message_id
         state.last_delivered_at = _loop_time()
         state.next_attempt_at = None
+        state.pending_message_id = None
         delivered_mode = (
             state.pending_modes.pop(message_id, "") if message_id else ""
         )
-        if delivered_mode.startswith(MODE_LONG_IDLE):
-            # Only unanswered long-idle rounds make the schedule slower. An
-            # immediate remark, a duplicate ack or an unknown row never does.
-            state.unanswered += 1
+        if message_id:
+            self._mark_persisted(message_id, "COMPLETED")
+        # A long-idle round already advanced ``unanswered`` when it generated
+        # its message; the acknowledgement confirms it was really heard and
+        # must not slow the schedule a second time. An immediate remark never
+        # counts as an unanswered long-idle round.
         state.delivery_event.set()
         self.logger.info(
             "proactive_delivery_confirmed conversation_id=%s source_event_id=%s"
-            " message_id=%s unanswered=%d next_interval=%s",
+            " message_id=%s mode=%s unanswered=%d next_interval=%s",
             conversation_id,
             source_event_id,
             message_id,
+            delivered_mode or "-",
             state.unanswered,
             self._interval_bounds(state.unanswered),
         )
@@ -335,7 +355,11 @@ class ProactiveManager:
     def note_proactive_cancelled(
         self, event: Optional[ResponseEvent], reason: str = "cancelled"
     ) -> None:
-        """The surface could not deliver this proactive message."""
+        """The surface could not deliver this proactive message.
+
+        The row stays ``GENERATED`` (it was never heard), and a later round may
+        try again once the delivery path is available.
+        """
         if event is None:
             return
         message_id = getattr(event, "response_id", None)
@@ -343,6 +367,8 @@ class ProactiveManager:
         state = self._states.get(conversation_id)
         if state is not None and message_id:
             state.pending_modes.pop(message_id, None)
+            if state.pending_message_id == message_id:
+                state.pending_message_id = None
         self.logger.info(
             "proactive_delivery_cancelled conversation_id=%s source_event_id=%s"
             " message_id=%s reason=%s",
@@ -396,6 +422,30 @@ class ProactiveManager:
     def _emit(self, event: ResponseEvent) -> None:
         if not self._closed:
             self._events.put_nowait(event)
+
+    def _mark_persisted(self, message_id: str, status: str) -> None:
+        """Best-effort status update from a synchronous callback.
+
+        ``note_proactive_delivered`` is a plain method called by the surface on
+        the loop thread; the row update is scheduled rather than awaited so a
+        slow database can never delay the acknowledgement path. A failure only
+        affects history replay, never delivery.
+        """
+        repo = getattr(self.repos, "proactive", None)
+        update = getattr(repo, "update_status", None)
+        if not callable(update):
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(
+                update(message_id, status)
+            )
+        except RuntimeError:  # no running loop (sync embedding/tests)
+            return
+        except Exception:  # noqa: BLE001 - persistence is best effort
+            return
+        # Keep a reference so the task is not collected mid-flight.
+        self._persist_tasks.add(task)
+        task.add_done_callback(self._persist_tasks.discard)
 
     def _discard_pending_events(self, conversation_id: Optional[str] = None) -> None:
         """Drop queued proactive events, optionally only for one conversation.
@@ -490,6 +540,21 @@ class ProactiveManager:
                     # Transient (orchestrator busy, delivery surface briefly
                     # unavailable): retry on the next interval.
                     continue
+                if (
+                    self.max_unanswered_rounds > 0
+                    and state.unanswered >= self.max_unanswered_rounds
+                ):
+                    # Enough delivered messages went unanswered: end this
+                    # cycle instead of talking to an empty room forever.
+                    self.logger.info(
+                        "proactive_cycle_stopped conversation_id=%s"
+                        " source_event_id=%s reason=unanswered_budget"
+                        " unanswered=%d",
+                        cycle.conversation_id,
+                        cycle.source_event_id,
+                        state.unanswered,
+                    )
+                    return
                 round_number += 1
                 await self._attempt(
                     cycle,
@@ -579,6 +644,19 @@ class ProactiveManager:
         """One judge + (possibly) one delivered proactive message."""
         storage_mode = storage_mode or mode
         if not await self._still_valid(cycle):
+            return
+        if state.pending_message_id:
+            # The previous message was generated but never acknowledged as
+            # delivered. Generating another one now would stack unseen
+            # messages; wait for the current round to resolve first.
+            self.logger.info(
+                "proactive_blocked_pending_delivery conversation_id=%s"
+                " source_event_id=%s pending_message_id=%s mode=%s",
+                cycle.conversation_id,
+                cycle.source_event_id,
+                state.pending_message_id,
+                storage_mode,
+            )
             return
 
         # One utterance per persistence round per triggering turn, including
@@ -685,7 +763,10 @@ class ProactiveManager:
             mode=storage_mode,
             origin=ORIGIN_AVA_INITIATED,
             text=text,
-            status="COMPLETED",
+            # Generated is not delivered: only the surface's acknowledgement
+            # promotes this row to COMPLETED, and only COMPLETED rows are
+            # replayed as dialogue history.
+            status="GENERATED",
             finish_reason=finish_reason,
             model=str(generated.get("model") or ""),
             created_at=utcnow(),
@@ -700,6 +781,8 @@ class ProactiveManager:
         ):
             await self.repos.proactive.delete(message.message_id)
             state.pending_modes.pop(message.message_id, None)
+            if state.pending_message_id == message.message_id:
+                state.pending_message_id = None
             return
 
         sink = ResponseEventSink(
@@ -714,7 +797,14 @@ class ProactiveManager:
             action="RESPOND",
         )
         state.pending_modes[message.message_id] = storage_mode
+        state.pending_message_id = message.message_id
         state.next_attempt_at = None
+        if storage_mode.startswith(MODE_LONG_IDLE):
+            # Every long-idle round Ava actually speaks into counts toward the
+            # back-off budget, whether or not the user answers it. Counting a
+            # round only on delivery acknowledgement let undelivered rounds
+            # repeat at the shortest interval forever.
+            state.unanswered += 1
         self.logger.info(
             "proactive_generated conversation_id=%s source_event_id=%s"
             " mode=%s message_id=%s chars=%d awaiting_delivery_ack=true",
@@ -841,6 +931,26 @@ def _loop_time() -> float:
         return time.monotonic()
 
 
+def _load_max_unanswered(logger: logging.Logger) -> int:
+    """Consecutive unanswered long-idle deliveries allowed per cycle.
+
+    ``0`` disables the budget (the pre-V0.9.9.27 behaviour). An invalid value
+    falls back to the default rather than stopping proactive messages.
+    """
+    raw = os.environ.get(MAX_UNANSWERED_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_MAX_UNANSWERED_ROUNDS
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        logger.warning(
+            "proactive_max_unanswered_invalid value=%s using=%d",
+            raw,
+            DEFAULT_MAX_UNANSWERED_ROUNDS,
+        )
+        return DEFAULT_MAX_UNANSWERED_ROUNDS
+
+
 def _clock_label(value: Optional[float]) -> str:
     return f"{value:.1f}" if value is not None else "-"
 
@@ -855,4 +965,6 @@ __all__ = [
     "ACTIVITY_NORMAL",
     "ACTIVITY_LOW",
     "ACTIVITY_INTERVALS",
+    "DEFAULT_MAX_UNANSWERED_ROUNDS",
+    "MAX_UNANSWERED_ENV",
 ]

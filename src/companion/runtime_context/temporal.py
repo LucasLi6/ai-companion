@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 
 DEFAULT_ACTIVE_GAP_SECONDS = 10 * 60
@@ -32,6 +33,67 @@ REENTRY_CONTINUING = "CONTINUING"
 REENTRY_RETURNING = "RETURNING"
 
 WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+class ConversationContinuity(str, Enum):
+    """How the current turn relates to the previous user message in time.
+
+    This is a pure classification of ``last_heard_gap_seconds`` — the gap
+    since the *person's own* last message, never Ava's proactive speech. It
+    decides only the default context continuity (whether old topics still
+    count as an unfinished discussion); it never decides what Ava must say,
+    and it never authorises a greeting.
+
+    NEW             no earlier user message at all
+    ACTIVE          within 10 minutes: ordinary turn-by-turn exchange
+    SHORT_PAUSE     10 minutes – 2 hours
+    EXTENDED_PAUSE  2 – 6 hours
+    RETURNING       6 – 24 hours
+    NEW_DAY         24 hours or more: a new exchange stage
+    """
+
+    NEW = "NEW"
+    ACTIVE = "ACTIVE"
+    SHORT_PAUSE = "SHORT_PAUSE"
+    EXTENDED_PAUSE = "EXTENDED_PAUSE"
+    RETURNING = "RETURNING"
+    NEW_DAY = "NEW_DAY"
+
+
+CONTINUITY_SHORT_PAUSE_SECONDS = 10 * 60
+CONTINUITY_EXTENDED_PAUSE_SECONDS = 2 * 60 * 60
+CONTINUITY_RETURNING_SECONDS = 6 * 60 * 60
+CONTINUITY_NEW_DAY_SECONDS = 24 * 60 * 60
+
+CONTINUITY_LABELS = {
+    ConversationContinuity.NEW: "尚无历史",
+    ConversationContinuity.ACTIVE: "连续交流",
+    ConversationContinuity.SHORT_PAUSE: "短暂停顿",
+    ConversationContinuity.EXTENDED_PAUSE: "几小时间隔",
+    ConversationContinuity.RETURNING: "间隔后重新交流",
+    ConversationContinuity.NEW_DAY: "新的交流阶段",
+}
+
+
+def classify_continuity(
+    last_heard_gap_seconds: Optional[int],
+) -> ConversationContinuity:
+    """Pure classifier over the *user* gap. No LLM, no clock, no I/O."""
+    if last_heard_gap_seconds is None:
+        return ConversationContinuity.NEW
+    try:
+        gap = max(0, int(last_heard_gap_seconds))
+    except (TypeError, ValueError):
+        return ConversationContinuity.NEW
+    if gap < CONTINUITY_SHORT_PAUSE_SECONDS:
+        return ConversationContinuity.ACTIVE
+    if gap < CONTINUITY_EXTENDED_PAUSE_SECONDS:
+        return ConversationContinuity.SHORT_PAUSE
+    if gap < CONTINUITY_RETURNING_SECONDS:
+        return ConversationContinuity.EXTENDED_PAUSE
+    if gap < CONTINUITY_NEW_DAY_SECONDS:
+        return ConversationContinuity.RETURNING
+    return ConversationContinuity.NEW_DAY
 
 
 def weekday_label(moment: datetime) -> str:
@@ -68,6 +130,10 @@ class TemporalSignals:
     last_interaction_gap_seconds: Optional[int] = None
     last_meaningful_context_gap_seconds: Optional[int] = None
     reentry_state: str = REENTRY_NEW
+    # V0.9.9.27: six-level continuity derived from the user gap only. It is
+    # the fact the assembler and the Speaker use to decide whether an old
+    # topic still counts as an unfinished discussion.
+    continuity: ConversationContinuity = ConversationContinuity.NEW
     # True only when the person's previous turn was a structurally explicit
     # departure. A gap alone never means the person left.
     previous_turn_departure: bool = False
@@ -123,6 +189,7 @@ def build_temporal_signals(
             active_gap_seconds=active_gap_seconds,
             reentry_gap_seconds=reentry_gap_seconds,
         ),
+        continuity=classify_continuity(heard_gap),
         previous_turn_departure=bool(previous_turn_departure),
     )
 

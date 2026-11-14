@@ -78,6 +78,12 @@ class RuntimeSnapshot(DomainModel):
     last_meaningful_context_gap_seconds: Optional[int] = None
     reentry: bool = False
     reentry_state: Literal["NEW", "ACTIVE", "CONTINUING", "RETURNING"] = "NEW"
+    # V0.9.9.27: continuity of the *user's* own messages. The speaker uses it
+    # to judge whether an earlier topic still counts as an unfinished
+    # discussion. Defaults keep old stored snapshots readable.
+    continuity: Literal[
+        "NEW", "ACTIVE", "SHORT_PAUSE", "EXTENDED_PAUSE", "RETURNING", "NEW_DAY"
+    ] = "NEW"
     # V0.9.9.7: the person's previous turn was a structurally explicit
     # departure, so this turn is a real return. Silence alone never sets it.
     previous_turn_departure: bool = False
@@ -120,9 +126,10 @@ class RuntimeSnapshotBuilder:
         allow_external_ai: bool = False,
         persist: bool = True,
         emotion_state: Optional[str] = None,
+        temporal_now: Optional[datetime] = None,
     ) -> RuntimeSnapshot:
         stored = await self.repos.runtime_snapshot.get(event.event_id)
-        if stored is not None:
+        if stored is not None and temporal_now is None:
             # A retry sees exactly the original timing. A later privacy change
             # may still strip a location that is no longer authorised.
             if not (allow_external_ai and await self._geo_enabled()):
@@ -151,7 +158,7 @@ class RuntimeSnapshotBuilder:
             at=received,
         )
 
-        temporal = await self._temporal(event)
+        temporal = await self._temporal(event, now=temporal_now)
         modality = getattr(
             getattr(event, "source", None), "modality", "text"
         )
@@ -179,6 +186,7 @@ class RuntimeSnapshotBuilder:
             ),
             reentry=temporal.reentry,
             reentry_state=temporal.reentry_state,
+            continuity=temporal.continuity.value,
             previous_turn_departure=temporal.previous_turn_departure,
             ava_emotion=emotion_state,
             location=location,
@@ -224,12 +232,19 @@ class RuntimeSnapshotBuilder:
             return []
         return [item.strip() for item in str(raw).split(",") if item.strip()]
 
-    async def _temporal(self, event) -> TemporalSignals:
+    async def _temporal(
+        self, event, *, now: Optional[datetime] = None
+    ) -> TemporalSignals:
         if event.speaker_person_id is None:
             return build_temporal_signals(event.occurred_at)
+        # A normal reply measures the gaps at the moment the person spoke. A
+        # proactive generation measures them at the moment Ava actually
+        # speaks, and against the newest real user message — including the one
+        # that triggered the cycle — never against an old source event.
+        moment = now or event.occurred_at
         last_heard = await self.repos.utterance.last_before_speaker(
             event.speaker_person_id,
-            before=event.occurred_at,
+            before=moment,
             exclude_event_id=None,
         )
         # A return is evidence-backed: the *previous* turn must have been an
@@ -244,7 +259,7 @@ class RuntimeSnapshotBuilder:
         # in made the "how long since we talked" fact wrong.
         last_action = await self.repos.analysis.last_action_for_speaker(
             event.speaker_person_id,
-            before=event.occurred_at,
+            before=moment,
             action_type="RESPOND",
         )
         last_meaningful = last_action
@@ -254,7 +269,7 @@ class RuntimeSnapshotBuilder:
         except (TypeError, ValueError):
             reentry_gap = DEFAULT_REENTRY_GAP_SECONDS
         return build_temporal_signals(
-            event.occurred_at,
+            moment,
             last_heard_at=last_heard.occurred_at if last_heard else None,
             last_interaction_at=last_action[1] if last_action else None,
             last_meaningful_context_at=last_meaningful[1] if last_meaningful else None,

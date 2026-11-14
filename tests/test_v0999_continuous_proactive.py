@@ -343,7 +343,11 @@ async def test_multiple_rounds_persist_with_distinct_storage_modes(db):
     try:
         await _start_cycle(rt, person, event)
         for _ in range(3):
-            assert await asyncio.wait_for(manager.next_event(), 2) is not None
+            event_out = await asyncio.wait_for(manager.next_event(), 2)
+            assert event_out is not None
+            # A real surface acknowledges (or cancels) every message; only an
+            # acknowledged message may be followed by the next round.
+            assert manager.note_proactive_delivered(event_out) is True
         rows = await rt.repos.proactive.list_for_conversation("c1")
         assert sorted(row.mode for row in rows) == sorted(
             [MODE_IMMEDIATE, f"{MODE_LONG_IDLE}_1", f"{MODE_LONG_IDLE}_2"]

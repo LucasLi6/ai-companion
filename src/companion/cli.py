@@ -2213,8 +2213,11 @@ async def cmd_repl(args) -> int:
             # Created once for the session: prompt_toolkit owns the live input
             # line, so proactive / voice output can be printed above it
             # without ever reading or restoring the typed buffer.
-            repl_session = _build_prompt_session()
             voice_mode = bool(getattr(args, "voice", False))
+            # Voice mode shows recognized speech under the prompt as it
+            # arrives; text-only sessions keep the plain prompt.
+            voice_subtitle = _PartialSubtitle() if voice_mode else None
+            repl_session = _build_prompt_session(subtitle=voice_subtitle)
             voice_binding_enabled = voice_mode and voice_person_binding_enabled()
             coordinator = None
             voice_output = (
@@ -2365,6 +2368,14 @@ async def cmd_repl(args) -> int:
                 # continues; it never aborts the REPL.
                 _mic_ok, _mic_message = await coordinator.enable()
                 print(_mic_message)
+                if repl_session is not None and voice_subtitle is not None:
+                    # Part 3: show what ASR has recognized so far under the
+                    # prompt. Runs on the loop (the coordinator consumer), and
+                    # an empty text clears the line again.
+                    def _show_partial(_uid: int, text: str) -> None:
+                        voice_subtitle.set(text)
+
+                    coordinator.set_partial_listener(_show_partial)
 
             async def _prompt_once():
                 if repl_session is not None:
@@ -2998,13 +3009,69 @@ def _format_tts_metrics(metrics: dict) -> str:
     )
 
 
-def _build_prompt_session():
+class _PartialSubtitle:
+    """Live provisional ASR text drawn under the prompt while the user speaks.
+
+    Display-only: the text never becomes a message, is never persisted and is
+    replaced by the final result. It is installed as the prompt's bottom
+    toolbar, which repaints in place instead of scrolling the terminal, and the
+    toolbar is removed again while there is nothing to show.
+    """
+
+    __slots__ = ("_text", "_session")
+
+    def __init__(self) -> None:
+        self._text = ""
+        self._session = None
+
+    def attach(self, session) -> None:
+        """Bind the prompt session; safe when ``None`` (off-TTY)."""
+        self._session = session
+        self._apply()
+
+    def set(self, text: str) -> None:
+        self._text = " ".join(str(text or "").split())
+        self._apply()
+        self.invalidate()
+
+    def clear(self) -> None:
+        self._text = ""
+        self._apply()
+        self.invalidate()
+
+    def _apply(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        with contextlib.suppress(Exception):
+            # ``None`` hides the toolbar entirely, so an idle prompt keeps the
+            # same layout it had before voice mode.
+            session.bottom_toolbar = self.render if self._text else None
+
+    def render(self) -> str:
+        return f"🎙 {self._text}" if self._text else ""
+
+    def invalidate(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        app = getattr(session, "app", None)
+        if app is not None and bool(getattr(app, "is_running", False)):
+            with contextlib.suppress(Exception):
+                app.invalidate()
+
+
+def _build_prompt_session(subtitle=None):
     """Return an interactive prompt_toolkit session, or ``None`` off-TTY.
 
     ``prompt_toolkit`` owns the input line for the whole read. That is what
     makes a proactive message safe to print while the person is typing: the
     editor buffer is never read or restored from another thread, and the
     prompt is redrawn by the same component that owns it.
+
+    ``subtitle`` (voice mode only) is a :class:`_PartialSubtitle`; attaching it
+    makes recognized speech appear while the person is still talking instead
+    of only after the final result.
     """
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
@@ -3013,9 +3080,12 @@ def _build_prompt_session():
     except Exception:
         return None
     try:
-        return PromptSession()
+        session = PromptSession()
     except Exception:
         return None
+    if subtitle is not None:
+        subtitle.attach(session)
+    return session
 
 
 def _print_proactive_line(text: str) -> None:

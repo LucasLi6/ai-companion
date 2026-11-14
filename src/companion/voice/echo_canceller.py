@@ -47,6 +47,7 @@ import time
 from array import array
 from collections import Counter, deque
 from dataclasses import dataclass
+from enum import Enum
 from math import sqrt
 from typing import Any, Callable, Deque, Optional, Tuple
 
@@ -75,6 +76,23 @@ class EchoCancellerUnavailable(RuntimeError):
 
 class AECFormatError(ValueError):
     """The canceller accepted a frame but returned an unusable result."""
+
+
+class AECState(str, Enum):
+    """Coarse lifecycle of the echo-cancellation channel.
+
+    ``GAP`` is deliberately distinct from ``FAILED``: while a generation is
+    still playing, a missing far-end reference is just TTS silence between
+    sentences, not evidence that AEC broke. Only a real engine error, a
+    permanent format/unavailable problem, or a missing reference *after*
+    playback ended is a ``FAILED``. Keeping the two apart is what lets barge-in
+    survive a normal sentence pause instead of falling back permanently.
+    """
+
+    IDLE = "IDLE"
+    ACTIVE = "ACTIVE"
+    GAP = "GAP"
+    FAILED = "FAILED"
 
 
 @dataclass(frozen=True)
@@ -278,6 +296,7 @@ class EchoCancellationPipeline:
         self._factory_ok = False
         self._failed = False
         self._degraded = False
+        self._gap = False
         self._unavailable_reason = ""
         self._last_error = ""
         self._resampler = StreamingResampler(
@@ -308,6 +327,11 @@ class EchoCancellationPipeline:
 
         self._playback_frames = 0
         self._playback_dropped = 0
+        # Per-generation counters. Only these decide whether *this* generation
+        # failed; the lifetime totals above stay diagnostics for ``/mic
+        # status`` and must never make a fresh generation look broken.
+        self._generation_playback_frames = 0
+        self._generation_aec_errors = 0
         self._mic_blocks = 0
         self._valid_blocks = 0
         self._invalid_blocks = 0
@@ -352,6 +376,17 @@ class EchoCancellationPipeline:
         return self._factory_ok and not self._failed and not self._degraded
 
     @property
+    def state(self) -> AECState:
+        """Lifecycle state; ``GAP`` (TTS silence) is not a failure."""
+        if not self._factory_ok or self._failed or self._degraded:
+            return AECState.FAILED
+        if not self._active and not self._tail_active:
+            return AECState.IDLE
+        if self._gap:
+            return AECState.GAP
+        return AECState.ACTIVE
+
+    @property
     def degraded(self) -> bool:
         return self._degraded or self._failed
 
@@ -378,6 +413,7 @@ class EchoCancellationPipeline:
             self._reset_audio_state_locked()
         with self._queue_lock:
             self._active = True
+            self._gap = False
         return True
 
     def stop(self, generation: Optional[int] = None) -> None:
@@ -416,7 +452,10 @@ class EchoCancellationPipeline:
         self._consecutive_invalid_seconds = 0.0
         self._failed = False
         self._degraded = False
+        self._gap = False
         self._last_error = ""
+        self._generation_playback_frames = 0
+        self._generation_aec_errors = 0
         self._tail_active = False
         self._tail_generation = None
         self._tail_started_at = None
@@ -447,6 +486,7 @@ class EchoCancellationPipeline:
             self._tail_frames = 0
             self._invalid_run_started = None
             self._consecutive_invalid_seconds = 0.0
+            self._gap = False
         return True
 
     def end_echo_tail(self) -> None:
@@ -483,6 +523,7 @@ class EchoCancellationPipeline:
             self._playback.append((int(generation), float(timestamp), data))
         with self._stats_lock:
             self._playback_frames += 1
+            self._generation_playback_frames += 1
             if dropped:
                 self._playback_dropped += 1
         return True
@@ -757,6 +798,7 @@ class EchoCancellationPipeline:
 
         self._last_consumed_sequence = candidate.sequence
         self._reference_consumed += 1
+        self._gap = False
         self._last_alignment_offset_ms = round(
             (candidate.timestamp - target) * 1000.0, 2
         )
@@ -794,10 +836,19 @@ class EchoCancellationPipeline:
         self._consecutive_invalid_seconds = max(
             0.0, now - self._invalid_run_started
         )
+        # A missing reference while playback is still in progress is a normal
+        # TTS silence between sentences (a gap), never evidence of a broken
+        # AEC channel. Treating it as a failure here is what permanently
+        # disabled barge-in after the first few sentences.
+        if self._active:
+            self._gap = True
+            return
         # Only declare persistent failure after playback actually produced a
-        # reference at least once; a slow TTS handshake is not a failure.
+        # reference at least once in *this* generation; a slow TTS handshake is
+        # not a failure, and a previous generation's frames must not make a
+        # fresh generation look broken.
         if (
-            self._playback_frames > 0
+            self._generation_playback_frames > 0
             and self._consecutive_invalid_seconds
             >= self._fallback_after_invalid_seconds
             and not self._degraded
@@ -815,11 +866,15 @@ class EchoCancellationPipeline:
     def _aec_error_locked(self, exc: Exception) -> None:
         with self._stats_lock:
             self._aec_errors += 1
+            self._generation_aec_errors += 1
+            generation_errors = self._generation_aec_errors
         detail = str(exc).strip()
         self._last_error = f"aec:{type(exc).__name__}"
         if detail:
             self._last_error = f"{self._last_error}:{detail[:80]}"
-        if self._aec_errors >= 3:
+        # ``_aec_errors`` is a lifetime diagnostic; only this generation's
+        # errors may mark the current generation as failed.
+        if generation_errors >= 3:
             self._failed = True
 
     # ------------------------------------------------------------------ stats
@@ -836,6 +891,8 @@ class EchoCancellationPipeline:
                 near = list(self._near_rms)
                 clean = list(self._clean_rms)
                 playback_frames = self._playback_frames
+                generation_playback_frames = self._generation_playback_frames
+                generation_aec_errors = self._generation_aec_errors
                 playback_dropped = self._playback_dropped
                 mic_blocks = self._mic_blocks
                 valid_blocks = self._valid_blocks
@@ -859,6 +916,7 @@ class EchoCancellationPipeline:
             "healthy": self.healthy,
             "aec_valid": self.healthy,
             "degraded": self.degraded,
+            "state": self.state.value,
             "reason": self.unavailable_reason or None,
             "active": active,
             "generation": generation,
@@ -867,6 +925,8 @@ class EchoCancellationPipeline:
                 self.timeline_offset_seconds * 1000.0, 2
             ),
             "playback_frames": playback_frames,
+            "generation_playback_frames": generation_playback_frames,
+            "generation_aec_errors": generation_aec_errors,
             "playback_dropped": playback_dropped,
             "pending_playback_frames": pending_playback,
             "reference_frames": reference_frames,
@@ -909,6 +969,7 @@ def _mean(values: list[float]) -> float:
 __all__ = [
     "AEC_SAMPLE_RATE",
     "AECFormatError",
+    "AECState",
     "EchoCancellationPipeline",
     "EchoCancellerUnavailable",
     "FRAME_BYTES",

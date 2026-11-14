@@ -504,9 +504,10 @@ def test_prompt_budget_is_bounded_and_labelled_as_an_estimate():
     )
     # V0.9.6's base prompt is deliberately longer (continuity + information
     # digestion rules), and V0.9.9.8 adds the shared understanding/priority
-    # section. The ceiling moves with the base prompt; the per-section caps are
-    # unchanged and still bound the turn.
-    assert budget["total_tokens_estimate"] < 3800
+    # section. V0.9.9.27 adds the short/long break distinction inside the
+    # continuity section. The ceiling moves with the base prompt; the
+    # per-section caps are unchanged and still bound the turn.
+    assert budget["total_tokens_estimate"] < 3900
 
 
 async def test_runtime_inspect_shows_metadata_without_conversation_text(

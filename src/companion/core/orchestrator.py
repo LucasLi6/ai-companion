@@ -1914,10 +1914,18 @@ class Orchestrator:
         )
         if self.runtime_snapshot_builder is not None:
             try:
+                # A proactive turn happens *now*; the triggers it carries
+                # (source event, action) are older. The time block must
+                # describe the silence as of this generation, measured from
+                # the newest real user message — without writing a fake user
+                # event or refreshing the source event's timestamp.
+                moment = utcnow()
                 snapshot = await self.runtime_snapshot_builder.build(
                     source_event,
                     allow_external_ai=True,
                     persist=False,
+                    received_at=moment,
+                    temporal_now=moment,
                 )
                 context = self._attach_runtime_snapshot(context, snapshot)
             except Exception as exc:

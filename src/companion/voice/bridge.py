@@ -25,7 +25,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
-from companion.asr.manager import FinalUtterance, SpeechActivity
+from companion.asr.manager import (
+    FinalUtterance,
+    PartialTranscript,
+    SpeechActivity,
+)
 
 
 @dataclass(frozen=True)
@@ -48,7 +52,13 @@ class BridgeFailure:
     message: str
 
 
-VoiceItem = Union[FinalUtterance, SpeechActivity, TurnClosed, BridgeFailure]
+VoiceItem = Union[
+    FinalUtterance,
+    SpeechActivity,
+    TurnClosed,
+    BridgeFailure,
+    PartialTranscript,
+]
 
 _STOP = None
 _SEEN_LIMIT = 256
@@ -78,6 +88,11 @@ class VoiceBridge:
         self.dropped = 0
         self.dropped_finals = 0
         self.duplicate_finals = 0
+        self.dropped_partials = 0
+        # At most one partial per utterance is queued at a time. Provisional
+        # updates arrive many times per second; without this the bounded queue
+        # would fill with stale partials and delay a real final.
+        self._partial_pending: set[int] = set()
 
     # -------------------------------------------------------------- publishers
     def publish_final(self, final: FinalUtterance) -> bool:
@@ -86,6 +101,10 @@ class VoiceBridge:
 
     def publish_speech(self, activity: SpeechActivity) -> bool:
         return self._post(activity)
+
+    def publish_partial(self, partial: PartialTranscript) -> bool:
+        """Deliver one provisional transcript line (display only)."""
+        return self._post(partial)
 
     def publish_turn_closed(self, utterance_id: int, ok: bool) -> bool:
         return self._post(TurnClosed(int(utterance_id), bool(ok)))
@@ -118,6 +137,13 @@ class VoiceBridge:
             if item.utterance_id in self._seen_closed_set:
                 return
             self._remember(item.utterance_id, self._seen_closed, self._seen_closed_set)
+        elif isinstance(item, PartialTranscript):
+            if item.utterance_id in self._partial_pending:
+                # A newer revision supersedes the queued one; dropping it keeps
+                # the display current and the queue free for finals.
+                self.dropped_partials += 1
+                return
+            self._partial_pending.add(item.utterance_id)
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
@@ -126,6 +152,9 @@ class VoiceBridge:
             self.dropped += 1
             if isinstance(item, FinalUtterance):
                 self.dropped_finals += 1
+            elif isinstance(item, PartialTranscript):
+                self._partial_pending.discard(item.utterance_id)
+                self.dropped_partials += 1
 
     @staticmethod
     def _remember(
@@ -143,7 +172,12 @@ class VoiceBridge:
 
     async def next_item(self) -> Optional[VoiceItem]:
         """Wait for the next item; ``None`` means the bridge was closed."""
-        return await self._queue.get()
+        item = await self._queue.get()
+        if isinstance(item, PartialTranscript):
+            # The slot frees as soon as the consumer has it, so the next
+            # revision may be queued while this one is being displayed.
+            self._partial_pending.discard(item.utterance_id)
+        return item
 
     def close(self) -> None:
         """Stop accepting events and wake the consumer (loop thread)."""
@@ -172,6 +206,7 @@ class VoiceBridge:
 
 __all__ = [
     "BridgeFailure",
+    "PartialTranscript",
     "TurnClosed",
     "VoiceBridge",
     "VoiceItem",
