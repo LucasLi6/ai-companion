@@ -42,8 +42,15 @@ DEFAULT_MIN_SPEECH_MS = 160
 DEFAULT_END_SILENCE_MS = 700
 DEFAULT_PRE_ROLL_MS = 350
 
+# Connection/handshake bound for the provider client (seconds).
 DEFAULT_TIMEOUT_SECONDS = 30.0
+# After all audio was sent and stop() was called, how long to wait for the
+# final result.
 DEFAULT_FINAL_TIMEOUT_SECONDS = 10.0
+# While audio is being uploaded, how long the server may stay silent (no
+# event of any kind) before the stream is declared dead. Kept below the
+# DashScope SDK's internal 23 s no-audio timeout so our failure is explicit.
+DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_CONCURRENT_SESSIONS = 2
 
 # Bounded queues keep a slow network or terminal from blocking capture.
@@ -77,6 +84,7 @@ class ASRConfig:
     vad_model_path: str = ""
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     final_timeout_seconds: float = DEFAULT_FINAL_TIMEOUT_SECONDS
+    stream_idle_timeout_seconds: float = DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS
     max_concurrent_sessions: int = DEFAULT_MAX_CONCURRENT_SESSIONS
     mic_queue_windows: int = DEFAULT_MIC_QUEUE_WINDOWS
     asr_send_queue_frames: int = DEFAULT_ASR_SEND_QUEUE_FRAMES
@@ -245,6 +253,10 @@ def load_asr_config(
         env, "AVA_ASR_FINAL_TIMEOUT",
         DEFAULT_FINAL_TIMEOUT_SECONDS, minimum=0.0,
     )
+    stream_idle_timeout_seconds = _float_env(
+        env, "AVA_ASR_STREAM_IDLE_TIMEOUT",
+        DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS, minimum=0.0,
+    )
     max_concurrent = _int_env(
         env, "AVA_ASR_MAX_SESSIONS",
         DEFAULT_MAX_CONCURRENT_SESSIONS, minimum=1,
@@ -270,6 +282,7 @@ def load_asr_config(
         vad_model_path=_env(env, "AVA_ASR_VAD_MODEL", ""),
         timeout_seconds=timeout_seconds,
         final_timeout_seconds=final_timeout_seconds,
+        stream_idle_timeout_seconds=stream_idle_timeout_seconds,
         max_concurrent_sessions=max_concurrent,
         debug=debug,
     )

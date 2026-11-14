@@ -407,6 +407,29 @@ class ProactiveMessageRepository:
             (message_id,),
         )
 
+    async def reopen(self, message: ProactiveMessageRecord) -> None:
+        """Reuse a CANCELLED (or orphaned GENERATED) row for one retry.
+
+        ``proactive_messages`` enforces one row per ``(source_event_id, mode)``.
+        A cancelled round is retryable, but it must not insert a duplicate
+        row: the retry reopens the same message id, resets its text/status to
+        the newly generated attempt, and leaves the one-row-per-stage
+        invariant intact.
+        """
+        await self.db.execute(
+            "UPDATE proactive_messages SET text = ?, status = ?,"
+            " finish_reason = ?, model = ?, created_at = ?"
+            " WHERE message_id = ?",
+            (
+                message.text,
+                message.status,
+                message.finish_reason,
+                message.model,
+                _iso(message.created_at),
+                message.message_id,
+            ),
+        )
+
     async def update_status(self, message_id: str, status: str) -> None:
         """Promote a generated row once its delivery was really acknowledged.
 

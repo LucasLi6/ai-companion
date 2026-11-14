@@ -544,9 +544,17 @@ def test_send_queue_holds_a_whole_documented_utterance() -> None:
 
 
 def test_long_upload_backpressure_truncates_instead_of_losing_the_turn() -> None:
-    """The old path aborted the utterance when the queue filled."""
+    """A truncated upload is an explicit incomplete turn, never a success.
+
+    V0.9.9.27 kept the recognized prefix and finalized it as a normal user
+    message even though later audio was never uploaded. V0.9.9.28 forbids
+    that: the turn must close as incomplete (no FinalUtterance, no Router
+    text, no success mark), while the recognized prefix stays visible only
+    as an explicitly unsubmitted reference line.
+    """
     import test_asr_manager as asr_tests
 
+    renderer, _out, status = asr_tests.make_renderer()
     running = asr_tests.start(
         [
             asr_tests.start_group(),
@@ -562,6 +570,8 @@ def test_long_upload_backpressure_truncates_instead_of_losing_the_turn() -> None
                 send_delay=0.15,
             )
         ],
+        renderer=renderer,
+        status=status,
         cfg=asr_tests.config(asr_send_queue_frames=2, max_utterance_seconds=0),
     )
     try:
@@ -571,10 +581,17 @@ def test_long_upload_backpressure_truncates_instead_of_losing_the_turn() -> None
         )
         running.feed(1)
         assert asr_tests.wait_for(
-            lambda: running.renderer.confirmed == ["你好世界"], timeout=6.0
+            lambda: running.manager.stats.unfinished == 1, timeout=6.0
         )
+        text = status.getvalue()
+        assert "本次语音未完整识别" in text
+        # The prefix is shown for reference only and explicitly marked as
+        # not submitted; it must never become a confirmed final.
+        assert "已识别部分（未提交）：你好世界" in text
+        assert renderer.confirmed == []
+        assert running.manager.stats.finalized == 0
+        # Truncation is an incomplete turn, not an abort/worker failure.
         assert running.manager.stats.aborted == 0
-        assert running.manager.stats.finalized == 1
     finally:
         running.stop()
 

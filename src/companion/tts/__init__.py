@@ -11,6 +11,7 @@ Both paths share one generation token, one bounded audio queue and one player.
 
 from companion.tts.manager import (
     PlaybackEvent,
+    PlaybackTiming,
     SpeechJob,
     TTSManager,
     TTSStatus,
@@ -19,6 +20,7 @@ from companion.tts.manager import (
 
 __all__ = [
     "PlaybackEvent",
+    "PlaybackTiming",
     "SpeechJob",
     "TTSManager",
     "TTSStatus",

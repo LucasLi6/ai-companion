@@ -408,7 +408,14 @@ class VoiceCoordinator:
         self._partial_listener = listener
 
     def _accept_partial(self, partial: PartialTranscript) -> None:
-        if self._state not in (VoiceState.RECORDING, VoiceState.LISTENING):
+        # Only the turn currently being recorded owns the live subtitle. An
+        # older utterance's delayed partial must never overwrite a newer turn.
+        if self._state is not VoiceState.RECORDING:
+            return
+        if (
+            self._current_uid is not None
+            and partial.utterance_id != self._current_uid
+        ):
             return
         listener = self._partial_listener
         if listener is None:
@@ -430,6 +437,11 @@ class VoiceCoordinator:
         more" from "no partial yet" and repaint its subtitle.
         """
         self._partial_sequence.pop(int(utterance_id), None)
+        current = self._current_uid
+        if current is not None and int(utterance_id) != current:
+            # A late final/close from an older utterance must not erase the
+            # subtitle of the turn that is recording now.
+            return
         listener = self._partial_listener
         if listener is None:
             return

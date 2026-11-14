@@ -64,6 +64,19 @@ DEFAULT_PLAYBACK_QUEUE_FRAMES = 64
 DEFAULT_SYNC_TOLERANCE_SECONDS = 0.10
 DEFAULT_FALLBACK_AFTER_INVALID_SECONDS = 2.0
 DEFAULT_TAIL_MAX_SECONDS = 2.0
+# How long the absence of a new far-end frame is still treated as "the audio
+# chunk is on its way" (synthesis burst gaps) rather than confirmed silence.
+DEFAULT_SYNTHESIS_GAP_SECONDS = 0.35
+# A reply needs some time before its first audio arrives. Missing references
+# during this window are UNKNOWN, never a fault.
+DEFAULT_START_GRACE_SECONDS = 0.5
+# Right after playback reports "finished", the device may still hold buffered
+# audio: the far end is not silent yet.
+DEFAULT_PLAYBACK_TAIL_GRACE_SECONDS = 0.25
+# Missing references while the playback timeline says audio *is* expected are
+# a synchronization fault, not a sentence pause. Bound both by time and by
+# frames so a stalled/looping caller cannot hide a broken reference channel.
+DEFAULT_SYNC_FAILURE_SECONDS = 0.6
 # A captured chunk whose start jumped further than this from the expected
 # continuation is a device/timebase discontinuity, not normal jitter.
 DEFAULT_MIC_JUMP_SECONDS = 0.15
@@ -76,6 +89,23 @@ class EchoCancellerUnavailable(RuntimeError):
 
 class AECFormatError(ValueError):
     """The canceller accepted a frame but returned an unusable result."""
+
+
+class ReferenceStatus(str, Enum):
+    """Whether the playback timeline expects a far-end reference right now.
+
+    ``AUDIO_EXPECTED`` means the playback timeline covers this microphone
+    block (or TTS is actively writing audio), so a missing reference is a real
+    synchronization fault. ``KNOWN_SILENCE`` means playback is genuinely
+    paused/over: the far end is silent and AEC may run with zero references.
+    ``UNKNOWN`` means the channel cannot tell yet (reply start, a short gap
+    between synthesis bursts, the device tail after "finished"): be
+    conservative, but do not count it as a fault.
+    """
+
+    AUDIO_EXPECTED = "AUDIO_EXPECTED"
+    KNOWN_SILENCE = "KNOWN_SILENCE"
+    UNKNOWN = "UNKNOWN"
 
 
 class AECState(str, Enum):
@@ -126,6 +156,10 @@ class MicProcessingResult:
     generation: Optional[int] = None
     near_rms: float = 0.0
     clean_rms: float = 0.0
+    # True only when near_rms/clean_rms were actually measured for a valid,
+    # reference-aligned block. A fake/partial pipeline that cannot meter the
+    # signal must not have that absence count as a barge-in confirmation.
+    metrics_valid: bool = True
 
 
 _NUMPY: Any = None
@@ -251,6 +285,10 @@ class EchoCancellationPipeline:
             DEFAULT_FALLBACK_AFTER_INVALID_SECONDS
         ),
         tail_max_seconds: float = DEFAULT_TAIL_MAX_SECONDS,
+        synthesis_gap_seconds: float = DEFAULT_SYNTHESIS_GAP_SECONDS,
+        start_grace_seconds: float = DEFAULT_START_GRACE_SECONDS,
+        playback_tail_grace_seconds: float = DEFAULT_PLAYBACK_TAIL_GRACE_SECONDS,
+        sync_failure_seconds: float = DEFAULT_SYNC_FAILURE_SECONDS,
         canceller_factory: Optional[Callable[[int, int, int], Any]] = None,
     ) -> None:
         if sample_rate <= 0 or playback_sample_rate <= 0:
@@ -273,6 +311,15 @@ class EchoCancellationPipeline:
             0.1, float(fallback_after_invalid_seconds)
         )
         self._tail_max_seconds = max(0.01, float(tail_max_seconds))
+        self._synthesis_gap_seconds = max(0.0, float(synthesis_gap_seconds))
+        self._start_grace_seconds = max(0.0, float(start_grace_seconds))
+        self._playback_tail_grace_seconds = max(
+            0.0, float(playback_tail_grace_seconds)
+        )
+        self._sync_failure_seconds = max(0.0, float(sync_failure_seconds))
+        self._sync_failure_frames = max(
+            3, int(round(self._sync_failure_seconds / self.frame_seconds))
+        )
         self._factory = canceller_factory or _default_canceller_factory
 
         # Lock order: _queue_lock (short, never held while waiting for audio)
@@ -314,6 +361,30 @@ class EchoCancellationPipeline:
         self._last_valid_at: Optional[float] = None
         self._invalid_run_started: Optional[float] = None
         self._consecutive_invalid_seconds = 0.0
+        # Playback timeline evidence. ``_started_at``/``_playback_activity_at``
+        # are wall-clock monotonic values; ``_ref_frame_ts`` is the far-end
+        # playback clock. The three reference-status counters are per
+        # generation and decide failure; they are never lifetime diagnostics.
+        self._started_at = time.monotonic()
+        self._playback_activity_at: Optional[float] = None
+        self._playback_finished_at: Optional[float] = None
+        # Set only by frame_submitted/frame_write_completed. Unlike
+        # ``_playback_activity_at`` (which also notes device open/close), this
+        # proves the player is *writing audio right now*, so a reference that
+        # is missing then is a sync fault rather than a synthesis pause.
+        self._timing_activity_at: Optional[float] = None
+        self._reference_status = ReferenceStatus.UNKNOWN
+        self._known_silence_frames = 0
+        self._known_silence_seconds = 0.0
+        self._known_silence_run_started: Optional[float] = None
+        self._known_silence_last_at: Optional[float] = None
+        self._consecutive_expected_reference_errors = 0
+        self._expected_error_run_started: Optional[float] = None
+        self._consecutive_unknown_reference_frames = 0
+        self._unknown_run_started: Optional[float] = None
+        self._reference_sync_errors = 0
+        self._mic_jump_pending = False
+        self._timing_events = 0
         # Last pairing diagnostics (``/mic status`` only; never logged per
         # frame, so terminal I/O cannot add latency).
         self._last_alignment_offset_ms: Optional[float] = None
@@ -456,6 +527,23 @@ class EchoCancellationPipeline:
         self._last_error = ""
         self._generation_playback_frames = 0
         self._generation_aec_errors = 0
+        # Playback-timeline evidence is per generation: a previous reply's
+        # finish time or activity must never classify a fresh generation.
+        self._started_at = time.monotonic()
+        self._playback_activity_at = None
+        self._playback_finished_at = None
+        self._timing_activity_at = None
+        self._reference_status = ReferenceStatus.UNKNOWN
+        self._known_silence_frames = 0
+        self._known_silence_seconds = 0.0
+        self._known_silence_run_started = None
+        self._known_silence_last_at = None
+        self._consecutive_expected_reference_errors = 0
+        self._expected_error_run_started = None
+        self._consecutive_unknown_reference_frames = 0
+        self._unknown_run_started = None
+        self._reference_sync_errors = 0
+        self._mic_jump_pending = False
         self._tail_active = False
         self._tail_generation = None
         self._tail_started_at = None
@@ -513,6 +601,7 @@ class EchoCancellationPipeline:
         except Exception:  # noqa: BLE001 - defensive
             return False
         dropped = False
+        seen_at = time.monotonic()
         with self._queue_lock:
             current = self._generation
             if current is None or not self._active or int(generation) != current:
@@ -521,12 +610,69 @@ class EchoCancellationPipeline:
                 self._playback.popleft()
                 dropped = True
             self._playback.append((int(generation), float(timestamp), data))
+            self._playback_activity_at = seen_at
         with self._stats_lock:
             self._playback_frames += 1
             self._generation_playback_frames += 1
             if dropped:
                 self._playback_dropped += 1
         return True
+
+    # ------------------------------------------------------ playback timeline
+    def note_playback_timing(self, timing: Any) -> None:
+        """Receive one ``PlaybackTiming`` notice from the TTS player thread.
+
+        Independent of the PCM listener: even if the far-end reference frames
+        are lost, the player still tells the pipeline that audio was submitted
+        and written. That is what lets a dropped reference be classified as a
+        sync fault instead of being mistaken for TTS silence. Fast and
+        exception-free; never blocks playback.
+        """
+        try:
+            generation = getattr(timing, "generation", None)
+            kind = str(getattr(timing, "kind", "") or "").strip().lower()
+            now = time.monotonic()
+            with self._queue_lock:
+                current = self._generation
+                if current is None:
+                    return
+                if generation is not None and int(generation) != current:
+                    return
+                self._playback_activity_at = now
+                if kind in ("frame_submitted", "frame_write_completed"):
+                    # Continuous writes with no matching reference frames is
+                    # exactly the dropped-reference fault this channel exists
+                    # to expose.
+                    self._timing_activity_at = now
+            with self._stats_lock:
+                self._timing_events += 1
+        except Exception:  # noqa: BLE001 - optional side channel
+            return
+
+    def note_playback_event(
+        self, kind: str, generation: Optional[int] = None
+    ) -> None:
+        """Record a playback end notice (``finished``/``failed``/``cancelled``).
+
+        Only the current generation may change the timeline. A finished reply
+        keeps a short device-tail grace of UNKNOWN; after that the far end is
+        definitely silent and AEC runs with zero references instead of being
+        declared broken.
+        """
+        try:
+            kind = str(kind or "").strip().lower()
+            with self._queue_lock:
+                current = self._generation
+                if current is None:
+                    return
+                if generation is not None and int(generation) != current:
+                    return
+                if kind in ("finished", "failed", "cancelled", "stopped"):
+                    self._playback_finished_at = time.monotonic()
+                if kind in ("started", "playing", "submitted"):
+                    self._playback_activity_at = time.monotonic()
+        except Exception:  # noqa: BLE001 - optional side channel
+            return
 
     def _take_pending_playback(self) -> list[Tuple[int, float, bytes]]:
         with self._queue_lock:
@@ -591,6 +737,10 @@ class EchoCancellationPipeline:
                     abs(block_start - expected) > DEFAULT_MIC_JUMP_SECONDS
                 ):
                     self._mic_discontinuities += 1
+                    # A device/timebase jump invalidates far/near alignment.
+                    # Never treat the resulting mismatch as a sync fault or as
+                    # TTS silence: it is UNKNOWN until the next clean pairing.
+                    self._mic_jump_pending = True
                 self._mic_buffer_ts = block_start
             self._mic_expected_end = float(timestamp)
             self._mic_buffer.extend(data)
@@ -670,6 +820,7 @@ class EchoCancellationPipeline:
                     generation=generation,
                     near_rms=_mean(near_values),
                     clean_rms=_mean(clean_values),
+                    metrics_valid=False,
                 )
             self._mic_blocks += len(blocks)
             return MicProcessingResult(
@@ -784,21 +935,31 @@ class EchoCancellationPipeline:
             break
 
         if candidate is None:
-            return self._missing_reference_locked("no_reference")
+            return self._missing_reference_locked(target, "no_reference")
         if len(candidate.pcm) != self.frame_bytes:
-            return self._missing_reference_locked("bad_reference")
+            return self._missing_reference_locked(target, "bad_reference")
 
         behind = target - candidate.timestamp
         if behind > tolerance:
-            return self._missing_reference_locked("stale_reference")
+            return self._missing_reference_locked(target, "stale_reference")
         if -behind > tolerance and not self._tail_active:
             # The next frame has not arrived yet; never pass a future frame off
             # as the current one during detection.
-            return self._missing_reference_locked("ahead_reference")
+            return self._missing_reference_locked(target, "ahead_reference")
 
         self._last_consumed_sequence = candidate.sequence
         self._reference_consumed += 1
         self._gap = False
+        self._mic_jump_pending = False
+        # A real pairing proves the channel is synchronized: clear every
+        # per-kind error run so an isolated hiccup never accumulates.
+        self._reference_status = ReferenceStatus.AUDIO_EXPECTED
+        self._consecutive_expected_reference_errors = 0
+        self._expected_error_run_started = None
+        self._consecutive_unknown_reference_frames = 0
+        self._unknown_run_started = None
+        self._invalid_run_started = None
+        self._consecutive_invalid_seconds = 0.0
         self._last_alignment_offset_ms = round(
             (candidate.timestamp - target) * 1000.0, 2
         )
@@ -807,8 +968,84 @@ class EchoCancellationPipeline:
         )
         return candidate.pcm, ""
 
+    def _reference_status_locked(self, target: float) -> ReferenceStatus:
+        """Classify why a microphone block has no matching reference frame.
+
+        The old code treated *every* missing reference during an active
+        generation as a harmless gap. That hid a real sync fault (audio is
+        playing, but its reference frames were dropped) and left the user
+        unable to interrupt while AEC still reported healthy. This splits the
+        three cases explicitly using the playback timeline.
+        """
+        if self._mic_jump_pending:
+            return ReferenceStatus.UNKNOWN
+        now = time.monotonic()
+        last_end = self._ref_frame_ts
+        tolerance = self.sync_tolerance_seconds
+        activity_age = (
+            None
+            if self._playback_activity_at is None
+            else max(0.0, now - self._playback_activity_at)
+        )
+        finished_age = (
+            None
+            if self._playback_finished_at is None
+            else max(0.0, now - self._playback_finished_at)
+        )
+        timing_age = (
+            None
+            if self._timing_activity_at is None
+            else max(0.0, now - self._timing_activity_at)
+        )
+        # The player reported writing frames moments ago. Frames are written in
+        # short bursts during continuous playback, so this proves audio is
+        # playing *now*; a missing reference here cannot be a sentence pause.
+        writing_now = (
+            timing_age is not None
+            and timing_age <= self._synthesis_gap_seconds
+        )
+        in_device_tail = (
+            finished_age is not None
+            and finished_age <= self._playback_tail_grace_seconds
+        )
+        if last_end is not None:
+            if target <= last_end + tolerance:
+                # The known playback timeline covers this block, yet no
+                # reference survived to pair with it.
+                return ReferenceStatus.AUDIO_EXPECTED
+            if writing_now:
+                # The player is actively writing audio past the known
+                # reference timeline: the reference channel lost frames.
+                return ReferenceStatus.AUDIO_EXPECTED
+            if in_device_tail:
+                return ReferenceStatus.UNKNOWN
+            if (
+                activity_age is not None
+                and activity_age <= self._synthesis_gap_seconds
+            ):
+                # A synthesis burst gap: the next chunk is on its way.
+                return ReferenceStatus.UNKNOWN
+            return ReferenceStatus.KNOWN_SILENCE
+        # Nothing has reached the reference timeline in this generation yet.
+        if in_device_tail:
+            return ReferenceStatus.UNKNOWN
+        if writing_now and now - self._started_at > self._start_grace_seconds:
+            # The player is writing, yet not one reference frame arrived after
+            # the start grace: the reference channel is broken.
+            return ReferenceStatus.AUDIO_EXPECTED
+        if activity_age is not None:
+            if activity_age <= self._synthesis_gap_seconds:
+                return ReferenceStatus.UNKNOWN
+            # TTS is writing audio but no reference frame ever arrived.
+            return ReferenceStatus.AUDIO_EXPECTED
+        if now - self._started_at <= self._start_grace_seconds:
+            return ReferenceStatus.UNKNOWN
+        # No audio was ever submitted: TTS is legitimately silent (e.g. the
+        # reply contained no speakable text).
+        return ReferenceStatus.KNOWN_SILENCE
+
     def _missing_reference_locked(
-        self, reason: str
+        self, target: float, reason: str
     ) -> Tuple[Optional[bytes], str]:
         if (
             self._tail_active
@@ -826,35 +1063,84 @@ class EchoCancellationPipeline:
             # the confirmed user turn stays continuous.
             self._tail_frames += 1
             return self._zero_reference, ""
-        self._note_invalid_time()
+
+        status = self._reference_status_locked(target)
+        self._reference_status = status
+        now = time.monotonic()
+
+        if status is ReferenceStatus.KNOWN_SILENCE:
+            # Confirmed TTS silence: AEC stays alive with a zero far end, so
+            # the user's speech during a sentence pause is still recognized.
+            if self._known_silence_run_started is None:
+                self._known_silence_run_started = now
+            self._known_silence_frames += 1
+            self._known_silence_seconds = max(
+                0.0, now - self._known_silence_run_started
+            )
+            self._consecutive_expected_reference_errors = 0
+            self._expected_error_run_started = None
+            self._consecutive_unknown_reference_frames = 0
+            self._unknown_run_started = None
+            self._invalid_run_started = None
+            self._consecutive_invalid_seconds = 0.0
+            self._gap = True
+            self._known_silence_last_at = now
+            return self._zero_reference, ""
+
+        if status is ReferenceStatus.AUDIO_EXPECTED:
+            self._known_silence_run_started = None
+            if self._expected_error_run_started is None:
+                self._expected_error_run_started = now
+            self._consecutive_expected_reference_errors += 1
+            self._reference_sync_errors += 1
+            self._unknown_run_started = None
+            self._consecutive_unknown_reference_frames = 0
+            elapsed = now - self._expected_error_run_started
+            if (
+                (
+                    self._consecutive_expected_reference_errors
+                    >= self._sync_failure_frames
+                    or elapsed >= self._sync_failure_seconds
+                )
+                and not self._failed
+            ):
+                # Audio is playing but its reference is gone: barge-in no
+                # longer has a valid echo model. Fail loudly and fall back to
+                # half-duplex for the rest of this generation only.
+                self._failed = True
+                self._last_error = "reference_sync_failure"
+            self._gap = False
+            return None, reason
+
+        # UNKNOWN: be conservative for barge-in, but never count this as a
+        # fault. It is bounded by the start grace / synthesis gap / device
+        # tail and always resolves to AUDIO_EXPECTED or KNOWN_SILENCE, so it
+        # cannot persist indefinitely. Audio that *is* expected but has no
+        # reference is handled (and failed) in the AUDIO_EXPECTED branch.
+        self._known_silence_run_started = None
+        # Break the fault run: only consecutive AUDIO_EXPECTED observations
+        # may accumulate toward a declared sync failure. A declared failure
+        # (``_failed``) is never cleared here.
+        self._consecutive_expected_reference_errors = 0
+        self._expected_error_run_started = None
+        if self._unknown_run_started is None:
+            self._unknown_run_started = now
+        self._consecutive_unknown_reference_frames += 1
+        self._gap = True
         return None, reason
 
     def _note_invalid_time(self) -> None:
+        """Legacy diagnostic hook kept for callers/tests.
+
+        Missing-reference policy now lives in :meth:`_missing_reference_locked`;
+        this only tracks the generic invalid duration for stats.
+        """
         now = time.monotonic()
         if self._invalid_run_started is None:
             self._invalid_run_started = now
         self._consecutive_invalid_seconds = max(
             0.0, now - self._invalid_run_started
         )
-        # A missing reference while playback is still in progress is a normal
-        # TTS silence between sentences (a gap), never evidence of a broken
-        # AEC channel. Treating it as a failure here is what permanently
-        # disabled barge-in after the first few sentences.
-        if self._active:
-            self._gap = True
-            return
-        # Only declare persistent failure after playback actually produced a
-        # reference at least once in *this* generation; a slow TTS handshake is
-        # not a failure, and a previous generation's frames must not make a
-        # fresh generation look broken.
-        if (
-            self._generation_playback_frames > 0
-            and self._consecutive_invalid_seconds
-            >= self._fallback_after_invalid_seconds
-            and not self._degraded
-        ):
-            self._degraded = True
-            self._last_error = "reference_missing"
 
     def _count_invalid_block(
         self, reason: str, near_rms: float, clean_rms: float
@@ -910,6 +1196,14 @@ class EchoCancellationPipeline:
             tail_active = self._tail_active
             alignment_ms = self._last_alignment_offset_ms
             reference_age_ms = self._last_reference_age_ms
+            reference_status = self._reference_status.value
+            expected_errors = self._consecutive_expected_reference_errors
+            unknown_frames = self._consecutive_unknown_reference_frames
+            known_silence_frames = self._known_silence_frames
+            known_silence_seconds = self._known_silence_seconds
+            sync_errors = self._reference_sync_errors
+            playback_finished = self._playback_finished_at is not None
+            timing_events = self._timing_events
         total = valid_blocks + invalid_blocks
         return {
             "available": self._factory_ok,
@@ -939,6 +1233,14 @@ class EchoCancellationPipeline:
             "near_sequence": mic_blocks + invalid_blocks,
             "alignment_offset_ms": alignment_ms,
             "reference_age_ms": reference_age_ms,
+            "reference_status": reference_status,
+            "consecutive_expected_reference_errors": expected_errors,
+            "consecutive_unknown_reference_frames": unknown_frames,
+            "known_silence_frames": known_silence_frames,
+            "known_silence_seconds": round(known_silence_seconds, 4),
+            "reference_sync_errors": sync_errors,
+            "playback_finished": playback_finished,
+            "playback_timing_events": timing_events,
             "tail_active": tail_active,
             "tail_frames": tail_frames,
             "mic_blocks": mic_blocks + invalid_blocks,
@@ -977,5 +1279,6 @@ __all__ = [
     "FRAME_SAMPLES",
     "MicProcessingResult",
     "ReferenceFrame",
+    "ReferenceStatus",
     "_aec_process_frame",
 ]

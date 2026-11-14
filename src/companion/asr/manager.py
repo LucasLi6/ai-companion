@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 import time
 import unicodedata
+from array import array
+from math import sqrt
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional, Protocol
@@ -53,6 +56,31 @@ from companion.asr.vad import (
 # The provider accepts small frames; ~100 ms mono 16-bit PCM is 3200 bytes.
 SEND_FRAME_BYTES = 3200
 SEND_FRAME_SECONDS = 0.1
+# AEC processes 20 ms frames; evidence duration is never shorter than one
+# frame, which keeps the fused Silero/AEC timeline honest for short chunks.
+AEC_FRAME_MS = 20.0
+
+
+def _pcm_rms(pcm: bytes) -> float:
+    """Root-mean-square level of mono int16 PCM (0.0 for silence).
+
+    Used only when a pipeline returns a valid block without reporting its own
+    levels. This is a real measurement of the returned PCM, never a
+    VAD-only confirmation.
+    """
+    usable = len(pcm) - (len(pcm) % 2)
+    if usable <= 0:
+        return 0.0
+    samples = array("h")
+    samples.frombytes(pcm[:usable])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return 0.0
+    total = 0.0
+    for sample in samples:
+        total += float(sample) * float(sample)
+    return sqrt(total / len(samples))
 
 
 class InputMode(str, Enum):
@@ -125,8 +153,14 @@ class ASRStats:
     errors: int = 0
     deferred: int = 0
     truncations: int = 0
+    unfinished: int = 0
     dropped_control_events: int = 0
     final_latencies_ms: list[float] = field(default_factory=list)
+    # Live queue/link diagnostics (updated on the sender/control threads).
+    queued_audio_ms: float = 0.0
+    oldest_audio_age_ms: Optional[float] = None
+    sender_throughput_bps: Optional[float] = None
+    connection_open_latency_ms: Optional[float] = None
 
 
 # --------------------------------------------------------------- control items
@@ -279,39 +313,158 @@ class SpeechActivity:
     generation: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class NearEndEvidence:
+    """One timestamp-aligned near-end observation for the barge-in gate.
+
+    AEC produces 20 ms frames, Silero VAD makes decisions on 32 ms windows.
+    Evidence joins them on the microphone timeline instead of comparing two
+    unrelated raw energy values: ``duration_ms`` and ``vad_probability`` come
+    from the VAD window(s) overlapping this AEC chunk, while ``near_rms`` and
+    ``clean_rms`` are that chunk's measured levels. ``metrics_valid`` is false
+    when no trustworthy energy measurement exists; ``reference_valid`` is
+    false when the block had no usable far-end reference. Neither may ever
+    confirm barge-in.
+    """
+
+    generation: Optional[int]
+    start_at: float
+    duration_ms: float
+    vad_probability: Optional[float]
+    near_rms: float
+    clean_rms: float
+    metrics_valid: bool
+    reference_valid: bool
+
+
 class NearEndSpeechGate:
     """Confirm that barge-in speech is the user, not Ava's own leaked echo.
 
     The AEC pipeline reports, per processed chunk, the pre-cancellation
     ``near_rms`` and the post-cancellation ``clean_rms``. When the near end is
-    mostly Ava's echo, cancellation removes it and ``clean_rms`` collapses
-    relative to ``near_rms``; a real user interjection survives cancellation,
-    so ``clean_rms`` stays a meaningful fraction of ``near_rms``. A barge-in is
-    only *confirmed* after ``confirm_windows`` consecutive qualifying chunks,
-    matching the VAD ``min_speech_ms``, so a single burst of leaked echo can
-    never stop Ava. This is a deterministic energy rule: no LLM, no fake
-    WebRTC API.
+    mostly Ava's echo, cancellation removes it and ``clean_rms`` collapses;
+    a real user interjection survives cancellation, so ``clean_rms`` stays
+    well above the *adaptive background/residual-echo floor*.
+
+    Confirmation needs both a minimum amount of evidence time (fused with the
+    Silero probability where available) and several consecutive qualifying
+    windows, so one echo burst can never stop Ava. Silero's probability is
+    used to reject clearly non-speech loud windows (background noise/TV) and
+    to slightly relax the energy margin for confident speech; it is never
+    sufficient by itself.
+
+    Metrics are mandatory. The previous fallback confirmed barge-in on VAD
+    alone when the pipeline did not report energy; that is exactly how Ava's
+    own voice was re-recognized as the user, so it is gone. A missing metric
+    or a missing far-end reference means *no* confirmation.
     """
 
     def __init__(
         self,
         *,
         confirm_windows: int = 6,
-        clean_rms_floor: float = 400.0,
-        echo_ratio: float = 0.5,
+        clean_rms_floor: Optional[float] = None,
+        echo_ratio: Optional[float] = None,
+        noise_ratio: float = 3.0,
+        initial_noise_floor: float = 60.0,
+        confirm_duration_ms: Optional[float] = None,
     ) -> None:
         self.confirm_windows = max(1, int(confirm_windows))
-        self.clean_rms_floor = float(clean_rms_floor)
-        self.echo_ratio = float(echo_ratio)
+        # Legacy knobs are accepted for compatibility but no longer decide
+        # anything: a fixed absolute floor and a fixed near/clean ratio cannot
+        # adapt to microphone gain or residual echo.
+        self.clean_rms_floor = clean_rms_floor
+        self.echo_ratio = echo_ratio
+        self.noise_ratio = max(1.0, float(noise_ratio))
+        self.initial_noise_floor = max(1.0, float(initial_noise_floor))
+        self.confirm_duration_ms = (
+            max(1.0, float(confirm_duration_ms))
+            if confirm_duration_ms is not None
+            else self.confirm_windows * 20.0
+        )
+        self._noise_floor = self.initial_noise_floor
         self._streak = 0
-        self._unmetered = 0
+        self._accumulated_ms = 0.0
+        self._observations = 0
+        self._generation: Optional[int] = None
+        self._last_evidence: Optional[NearEndEvidence] = None
+        # Diagnostics only; these never confirm anything.
+        self.unmetered_rejections = 0
+        self.echo_rejections = 0
+        self.noise_rejections = 0
 
     @property
     def confirmed(self) -> bool:
         return (
             self._streak >= self.confirm_windows
-            or self._unmetered >= self.confirm_windows
+            and self._accumulated_ms >= self.confirm_duration_ms
         )
+
+    @property
+    def noise_floor(self) -> float:
+        return self._noise_floor
+
+    @property
+    def observations(self) -> int:
+        """Aligned evidence windows seen since the last reset."""
+        return self._observations
+
+    def observe_evidence(self, evidence: NearEndEvidence) -> bool:
+        """Consume one aligned AEC/VAD observation; True once confirmed."""
+        self._last_evidence = evidence
+        self._observations += 1
+        if (
+            evidence.generation is not None
+            and self._generation is not None
+            and evidence.generation != self._generation
+        ):
+            # Evidence from different replies must never accumulate into one
+            # confirmation, and an old reply's tail cannot poison a new one.
+            self.reset(generation=evidence.generation)
+        if evidence.generation is not None:
+            self._generation = evidence.generation
+
+        if not evidence.metrics_valid or not evidence.reference_valid:
+            self.unmetered_rejections += 1
+            self._streak = 0
+            self._accumulated_ms = 0.0
+            return False
+
+        probability = evidence.vad_probability
+        if probability is not None:
+            try:
+                probability = max(0.0, min(1.0, float(probability)))
+            except (TypeError, ValueError):
+                probability = None
+
+        level = float(evidence.clean_rms or 0.0)
+        threshold = self._noise_floor * self.noise_ratio
+        if probability is not None:
+            if probability < 0.3:
+                # Loud but not speech-like (door, TV, Ava's residual echo):
+                # learn it as background instead of confirming a user turn.
+                self.noise_rejections += 1
+                self._streak = 0
+                self._accumulated_ms = 0.0
+                self._adapt_noise(level)
+                return False
+            if probability >= 0.6:
+                # Confident Silero speech needs a smaller margin, but the
+                # energy must still be clearly above the learned floor.
+                threshold *= 0.75
+
+        survived = level >= threshold
+        if not survived:
+            self.echo_rejections += 1
+            self._streak = 0
+            self._accumulated_ms = 0.0
+            self._adapt_noise(level)
+            return False
+
+        self._streak += 1
+        duration = max(1.0, float(evidence.duration_ms or 0.0))
+        self._accumulated_ms += duration
+        return self.confirmed
 
     def observe(
         self,
@@ -319,30 +472,60 @@ class NearEndSpeechGate:
         near_rms: float,
         clean_rms: float,
         metrics_available: bool = True,
+        vad_probability: Optional[float] = None,
+        reference_valid: bool = True,
+        duration_ms: Optional[float] = None,
+        generation: Optional[int] = None,
+        start_at: Optional[float] = None,
     ) -> bool:
-        """Consume one processed chunk; True once the gate is satisfied.
+        """Compatibility wrapper that builds :class:`NearEndEvidence`.
 
-        A pipeline that does not report energy metrics (both levels stay at
-        zero) cannot be gated on energy. For those the gate degrades to the
-        previous behaviour — VAD alone after the same number of chunks — so
-        barge-in keeps working instead of being silently disabled.
+        Callers that predate the aligned evidence API still work, but a
+        missing metric now means "reject", never "confirm on VAD alone".
         """
-        if not metrics_available:
-            self._unmetered += 1
-            return self._unmetered >= self.confirm_windows
-        self._unmetered = 0
-        near = float(near_rms or 0.0)
-        clean = float(clean_rms or 0.0)
-        survived = (
-            clean >= self.clean_rms_floor
-            and clean >= self.echo_ratio * near
+        evidence = NearEndEvidence(
+            generation=generation,
+            start_at=time.monotonic() if start_at is None else float(start_at),
+            duration_ms=(
+                self.confirm_duration_ms / self.confirm_windows
+                if duration_ms is None
+                else float(duration_ms)
+            ),
+            vad_probability=vad_probability,
+            near_rms=float(near_rms or 0.0),
+            clean_rms=float(clean_rms or 0.0),
+            metrics_valid=bool(metrics_available),
+            reference_valid=bool(reference_valid),
         )
-        self._streak = self._streak + 1 if survived else 0
-        return self.confirmed
+        return self.observe_evidence(evidence)
 
-    def reset(self) -> None:
+    def _adapt_noise(self, level: float) -> None:
+        """Slowly track background/residual echo, never a speech level.
+
+        Adaptation is only applied to non-qualifying windows, so real speech
+        cannot raise the floor above itself. Upward steps are slower than
+        downward ones so a sudden echo burst cannot desensitize the gate
+        before the user actually speaks.
+        """
+        if level <= 0.0:
+            self._noise_floor = max(1.0, self._noise_floor * 0.98)
+            return
+        if level > self._noise_floor:
+            self._noise_floor += (level - self._noise_floor) * 0.10
+        else:
+            self._noise_floor += (level - self._noise_floor) * 0.25
+        # Stay bounded: a microphone gain change must not make the gate deaf
+        # forever, and an absurd floor must not disable barge-in permanently.
+        self._noise_floor = min(max(1.0, self._noise_floor), 12000.0)
+
+    def reset(self, generation: Optional[int] = None) -> None:
         self._streak = 0
-        self._unmetered = 0
+        self._accumulated_ms = 0.0
+        self._observations = 0
+        self._last_evidence = None
+        if generation is not None:
+            self._generation = generation
+
 
 
 class _Utterance:
@@ -393,12 +576,24 @@ class _Utterance:
         self.aborted = False
         self.stop_sent = False
         # The upload queue hit its bound while the person was still talking.
-        # The turn continues with the prefix that was already accepted; only
-        # the audio past this point is dropped (never the whole turn).
+        # The turn is retained for diagnostics only: it is an *incomplete*
+        # turn, never a successful final built from a truncated prefix.
         self.truncated = False
+        self.incomplete_reason: Optional[str] = None
         self.stop_requested = threading.Event()
         self.final_timer: Optional[threading.Timer] = None
         self.final_latency_ms: Optional[float] = None
+        # Queue/connection diagnostics. These show whether a slow turn is a
+        # one-off connection handshake or a sustained upload deficit, instead
+        # of hiding it behind a bigger buffer.
+        self.queued_bytes = 0
+        self.queued_since: Optional[float] = None
+        self.sent_bytes = 0
+        self.send_started_at: Optional[float] = None
+        self.open_latency_ms: Optional[float] = None
+        self.max_queued_bytes = 0
+        self.last_server_event_at: Optional[float] = None
+        self.last_audio_sent_at: Optional[float] = None
 
 
 class ASRManager:
@@ -488,6 +683,23 @@ class ASRManager:
         self._barge_in_tail = False
         self._barge_in_candidate_at: Optional[float] = None
         self._barge_gate = NearEndSpeechGate()
+        # VAD-thread candidate lifecycle. VAD can fire before the gate has
+        # accumulated enough evidence; instead of deleting that audio (and the
+        # user's first words with it), buffer the candidate until the gate
+        # confirms or fails. Nothing here ever reaches the control thread
+        # before confirmation.
+        self._barge_candidate_events: list[VADEvent] = []
+        self._barge_candidate_bytes = 0
+        self._barge_candidate_windows = 0
+        self._barge_candidate_started_at: Optional[float] = None
+        self._barge_candidate_max_seconds = 2.5
+        self._barge_candidate_max_bytes = 16000 * 2 * 3
+        # Bounded evidence window: an unconfirmed candidate must fail instead
+        # of waiting for VAD to end (echo can make VAD stay in speech forever).
+        self._barge_candidate_max_windows = max(
+            12, self._barge_gate.confirm_windows * 2
+        )
+        self._last_vad_probability: Optional[float] = None
         self._barge_in_unavailable_listener: Optional[
             Callable[[str], None]
         ] = None
@@ -641,6 +853,11 @@ class ASRManager:
         self._barge_in_detecting = True
         self._barge_in_tail = False
         self._barge_in_candidate_at = None
+        self._barge_candidate_events = []
+        self._barge_candidate_bytes = 0
+        self._barge_candidate_windows = 0
+        self._barge_candidate_started_at = None
+        self._last_vad_probability = None
         self._barge_gate.reset()
         self._barge_in_unavailable_reported = False
         with self._barge_stats_lock:
@@ -777,6 +994,7 @@ class ASRManager:
                 try:
                     event = self._control.get(timeout=0.1)
                 except queue.Empty:
+                    self._check_stream_idle()
                     continue
                 try:
                     self._handle(event)
@@ -887,34 +1105,51 @@ class ASRManager:
                     )
                     continue
                 for event in events:
-                    if (
-                        barge_in_audio
-                        and event.kind == SPEECH_STARTED
-                        and self._barge_in_detecting
-                        and not self._barge_gate.confirmed
-                    ):
-                        # The VAD fired on audio that did not survive echo
-                        # cancellation: this is Ava's own voice leaking back,
-                        # never a user turn. Reset the segmenter so the user's
-                        # next real words are detected from a clean state
-                        # instead of being folded into this rejected segment.
-                        self._barge_gate.reset()
-                        self._barge_in_candidate_at = None
-                        try:
-                            segmenter.reset()
-                        except Exception:  # noqa: BLE001 - best effort
-                            pass
-                        with self._barge_stats_lock:
-                            self._barge_stats["echo_rejected"] = (
-                                int(
-                                    self._barge_stats.get(
-                                        "echo_rejected", 0
-                                    )
-                                )
-                                + 1
-                            )
-                        continue
+                    if barge_in_audio and self._barge_in_detecting:
+                        if self._barge_candidate_events:
+                            if not self._barge_gate.confirmed:
+                                if event.kind == SPEECH_ENDED:
+                                    # The utterance ended before any evidence
+                                    # confirmed the user: Ava's own echo.
+                                    self._discard_barge_candidate(segmenter)
+                                    continue
+                                if not self._buffer_barge_candidate(event):
+                                    self._discard_barge_candidate(segmenter)
+                                continue
+                            # The gate confirmed while the VAD segment was in
+                            # progress: release the buffered pre-roll/audio so
+                            # the user's first words are part of the turn.
+                            if not self._flush_barge_candidate():
+                                self._discard_barge_candidate(segmenter)
+                                continue
+                        elif (
+                            event.kind == SPEECH_STARTED
+                            and not self._barge_gate.confirmed
+                        ):
+                            # VAD_SPEECH_CANDIDATE: wait for aligned evidence
+                            # instead of deleting the segment. Nothing leaves
+                            # the VAD thread until the gate confirms.
+                            if (
+                                self._barge_gate.observations
+                                >= self._barge_gate.confirm_windows + 2
+                            ):
+                                # Evidence was already conclusive against
+                                # this segment before VAD fired: Ava's echo.
+                                self._discard_barge_candidate(segmenter)
+                                continue
+                            self._start_barge_candidate(event)
+                            continue
                     self._dispatch_vad_event(event, barge_in=barge_in_audio)
+                if (
+                    barge_in_audio
+                    and self._barge_in_detecting
+                    and self._barge_candidate_events
+                ):
+                    if self._barge_gate.confirmed:
+                        if not self._flush_barge_candidate():
+                            self._discard_barge_candidate(segmenter)
+                    elif self._barge_candidate_expired():
+                        self._discard_barge_candidate(segmenter)
 
     def _sync_vad_mode(self, segmenter: Any) -> None:
         mode = self._input_mode
@@ -1004,6 +1239,8 @@ class ASRManager:
         """Record candidate latency; runs on the VAD thread, must be trivial."""
         if not self._barge_in_detecting:
             return
+        with self._barge_stats_lock:
+            self._last_vad_probability = float(probability)
         if probability >= self._barge_in_vad_threshold:
             if self._barge_in_candidate_at is None:
                 self._barge_in_candidate_at = time.monotonic()
@@ -1065,11 +1302,37 @@ class ASRManager:
             return b"", False, False
         near_rms = float(getattr(result, "near_rms", 0.0) or 0.0)
         clean_rms = float(getattr(result, "clean_rms", 0.0) or 0.0)
+        reported_metrics = bool(
+            getattr(result, "metrics_valid", True)
+        ) and (near_rms > 0.0 or clean_rms > 0.0)
+        if not reported_metrics:
+            # The pipeline accepted the block but did not report levels.
+            # Measure the actual near/clean PCM instead of trusting VAD
+            # alone. (The old ``_unmetered`` path confirmed on VAD only.)
+            clean_pcm = bytes(getattr(result, "pcm", b"") or b"")
+            near_rms = _pcm_rms(item.pcm)
+            clean_rms = _pcm_rms(clean_pcm)
+            metrics_valid = near_rms > 0.0 or clean_rms > 0.0
+        else:
+            metrics_valid = True
         if self._barge_in_detecting:
-            self._barge_gate.observe(
-                near_rms=near_rms,
-                clean_rms=clean_rms,
-                metrics_available=bool(near_rms > 0.0 or clean_rms > 0.0),
+            sample_rate = int(getattr(item, "sample_rate", 16000) or 16000)
+            channels = max(1, int(getattr(item, "channels", 1) or 1))
+            duration_ms = max(
+                AEC_FRAME_MS,
+                len(item.pcm) / (2.0 * channels * max(1, sample_rate)) * 1000.0,
+            )
+            self._barge_gate.observe_evidence(
+                NearEndEvidence(
+                    generation=self._barge_in_generation,
+                    start_at=float(item.timestamp) - duration_ms / 1000.0,
+                    duration_ms=duration_ms,
+                    vad_probability=self._last_vad_probability,
+                    near_rms=near_rms,
+                    clean_rms=clean_rms,
+                    metrics_valid=metrics_valid,
+                    reference_valid=True,
+                )
             )
         return bytes(getattr(result, "pcm", b"") or b""), True, True
 
@@ -1092,8 +1355,76 @@ class ASRManager:
                 pass
         return bytes(item.pcm), True, False
 
+    # -------------------------------------------------- VAD candidate lifecycle
+    def _start_barge_candidate(self, event: VADEvent) -> None:
+        """Hold a VAD segment until the near-end gate has enough evidence."""
+        self._barge_candidate_events = [event]
+        self._barge_candidate_bytes = len(getattr(event, "audio", b"") or b"")
+        self._barge_candidate_windows = 1
+        self._barge_candidate_started_at = time.monotonic()
+
+    def _buffer_barge_candidate(self, event: VADEvent) -> bool:
+        """Accumulate one VAD event; False when the candidate must be dropped.
+
+        Buffering is bounded in both time and bytes, so an unconfirmed
+        candidate can never grow without limit or stall recognition.
+        """
+        if self._barge_candidate_started_at is None:
+            self._barge_candidate_started_at = time.monotonic()
+        if self._barge_candidate_expired():
+            return False
+        if self._barge_candidate_windows >= self._barge_candidate_max_windows:
+            return False
+        size = len(getattr(event, "audio", b"") or b"")
+        if self._barge_candidate_bytes + size > self._barge_candidate_max_bytes:
+            return False
+        self._barge_candidate_events.append(event)
+        self._barge_candidate_bytes += size
+        self._barge_candidate_windows += 1
+        return True
+
+    def _barge_candidate_expired(self) -> bool:
+        started = self._barge_candidate_started_at
+        if started is None:
+            return False
+        return (time.monotonic() - started) > self._barge_candidate_max_seconds
+
+    def _flush_barge_candidate(self) -> bool:
+        """Release a confirmed candidate to the control thread, in order."""
+        events = self._barge_candidate_events
+        self._barge_candidate_events = []
+        self._barge_candidate_bytes = 0
+        self._barge_candidate_windows = 0
+        self._barge_candidate_started_at = None
+        if not events:
+            return False
+        for event in events:
+            self._dispatch_vad_event(event, barge_in=True)
+        return True
+
+    def _discard_barge_candidate(self, segmenter: Any) -> None:
+        """FAILED candidate: drop its audio and re-arm from a clean VAD state."""
+        self._barge_candidate_events = []
+        self._barge_candidate_bytes = 0
+        self._barge_candidate_windows = 0
+        self._barge_candidate_started_at = None
+        self._barge_in_candidate_at = None
+        self._barge_gate.reset()
+        try:
+            segmenter.reset()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        with self._barge_stats_lock:
+            self._barge_stats["echo_rejected"] = (
+                int(self._barge_stats.get("echo_rejected", 0)) + 1
+            )
+
     def _reset_barge_in_candidate(self, segmenter: Any) -> None:
         """Drop an unfinished candidate after a gap in valid AEC audio."""
+        self._barge_candidate_events = []
+        self._barge_candidate_bytes = 0
+        self._barge_candidate_windows = 0
+        self._barge_candidate_started_at = None
         self._barge_in_candidate_at = None
         self._barge_gate.reset()
         try:
@@ -1161,8 +1492,13 @@ class ASRManager:
             bind = getattr(session, "bind_utterance", None)
             if callable(bind):
                 bind(utterance.uid)
+            open_started = time.monotonic()
             session.open()
             opened_ok = True
+            open_ms = (time.monotonic() - open_started) * 1000.0
+            utterance.open_latency_ms = round(open_ms, 1)
+            self.stats.connection_open_latency_ms = round(open_ms, 1)
+            utterance.send_started_at = time.monotonic()
             utterance.opened.set()
             buffer = bytearray()
             first_buffered_at: Optional[float] = None
@@ -1175,6 +1511,13 @@ class ASRManager:
                     item = utterance.send_queue.get(timeout=0.02)
                 except queue.Empty:
                     item = None
+                if isinstance(item, (bytes, bytearray)):
+                    utterance.queued_bytes = max(
+                        0, utterance.queued_bytes - len(item)
+                    )
+                    if utterance.send_queue.empty():
+                        utterance.queued_since = None
+                    self._update_queue_metrics(utterance)
                 if item is None and utterance.stop_requested.is_set():
                     # The control thread could not enqueue the stop sentinel
                     # (the queue was full of accepted audio). Everything ahead
@@ -1251,6 +1594,7 @@ class ASRManager:
             try:
                 for event in session.events():
                     now = time.monotonic()
+                    utterance.last_server_event_at = now
                     if event.kind == "error":
                         utterance.abort_event.set()
                         self._put_control(
@@ -1334,6 +1678,26 @@ class ASRManager:
             chunk = bytes(buffer[:SEND_FRAME_BYTES])
             del buffer[:SEND_FRAME_BYTES]
             session.send_audio(chunk)
+            utterance.sent_bytes += len(chunk)
+            utterance.last_audio_sent_at = time.monotonic()
+        if utterance.send_started_at is not None:
+            elapsed = time.monotonic() - utterance.send_started_at
+            if elapsed > 0.0:
+                self.stats.sender_throughput_bps = round(
+                    utterance.sent_bytes / elapsed, 1
+                )
+        self._update_queue_metrics(utterance)
+
+    def _update_queue_metrics(self, utterance: _Utterance) -> None:
+        """Expose queue backpressure without changing the queue budget."""
+        now = time.monotonic()
+        # 16 kHz mono int16: 32 bytes per millisecond.
+        self.stats.queued_audio_ms = round(utterance.queued_bytes / 32.0, 1)
+        self.stats.oldest_audio_age_ms = (
+            None
+            if utterance.queued_since is None
+            else round((now - utterance.queued_since) * 1000.0, 1)
+        )
 
     # ------------------------------------------------------------ event handlers
     def _handle(self, event: Any) -> None:
@@ -1561,6 +1925,51 @@ class ASRManager:
         )
         self._maybe_finish(utterance)
 
+    def _check_stream_idle(self) -> None:
+        """Fail an upload stream the server stopped answering.
+
+        A slow *connection handshake* is a queue/age diagnostic
+        (``connection_open_latency_ms``/``oldest_audio_age_ms``), not this
+        timeout: this only triggers when the sender has been uploading and
+        the server produced no event at all for the configured window.
+        """
+        timeout = float(
+            getattr(self.config, "stream_idle_timeout_seconds", 0.0)
+        )
+        if timeout <= 0.0:
+            return
+        now = time.monotonic()
+        for utterance in list(self._utterances.values()):
+            if (
+                utterance.finalized
+                or not utterance.started
+                or utterance.session_done
+                or utterance.abort_event.is_set()
+            ):
+                continue
+            anchors = [
+                value
+                for value in (
+                    utterance.send_started_at,
+                    utterance.last_audio_sent_at,
+                    utterance.last_server_event_at,
+                )
+                if value is not None
+            ]
+            if not anchors:
+                continue
+            if now - max(anchors) <= timeout:
+                continue
+            message = (
+                f"识别连接长时间无响应（超过 {timeout:.0f} 秒），"
+                "本次语音未完整识别。"
+            )
+            utterance.abort_event.set()
+            self._close_session(
+                utterance, origin=CLOSE_ORIGIN_LOCAL_TIMEOUT
+            )
+            self._finish(utterance, message, now)
+
     def _handle_input_closed(self, event: _InputClosed) -> None:
         """All audio was sent and ``stop()`` was called: start final timing."""
         utterance = self._utterances.get(event.uid)
@@ -1713,13 +2122,28 @@ class ASRManager:
         merged = _merge_turn_text(
             [fragment for _, fragment in utterance.finals]
         )
-        ok = merged != "" and not error
+        # A truncated upload, a timeout or a session that closed without a
+        # confirmed final is an *incomplete* turn. Its recognized prefix is
+        # never submitted as a user message, never answered, never stored in
+        # memory and never used for speaker learning.
+        incomplete = utterance.incomplete_reason or ""
+        ok = merged != "" and not error and not incomplete
         # Tell the optional voice-print hook whether this utterance may ever
         # contribute a sample. This is separate from VAD end: the speaker side
         # may already have analysed the audio, but learning waits for this
         # final outcome. The call is non-blocking.
         self._speaker_finalized(utterance.uid, ok)
-        if merged:
+        if incomplete:
+            self.stats.unfinished += 1
+            self._render_status(
+                f"[asr] {incomplete}", is_error=True
+            )
+            if merged and self.render_finals:
+                # Visible for reference, explicitly not a user message.
+                self._render_status(
+                    f"[asr] #{utterance.uid} 已识别部分（未提交）：{merged}"
+                )
+        elif merged:
             self.stats.finalized += 1
             if self.render_finals:
                 self._render(
@@ -1845,26 +2269,38 @@ class ASRManager:
         if not data or utterance.finalized:
             return False
         if utterance.truncated:
-            # Past the upload budget: keep the recognized prefix and stop
-            # growing the queue. The turn still ends (and is finalized)
-            # normally when the person stops speaking.
+            # Past the upload budget: keep draining the microphone but never
+            # pretend the partial prefix is the whole utterance. The turn is
+            # finalized as incomplete (no Final, no Router, no memory).
             return False
         try:
-            utterance.send_queue.put_nowait(bytes(data))
+            data = bytes(data)
+            utterance.send_queue.put_nowait(data)
+            utterance.queued_bytes += len(data)
+            utterance.max_queued_bytes = max(
+                utterance.max_queued_bytes, utterance.queued_bytes
+            )
+            if utterance.queued_since is None:
+                utterance.queued_since = time.monotonic()
             return True
         except queue.Full:
             # The link cannot keep up (typically the session handshake is
-            # still in progress). Dropping only the tail keeps the turn; the
-            # old behaviour aborted it and lost everything the person said.
+            # still in progress). This is not recoverable by dropping the
+            # tail: everything after this point is lost, so the turn is
+            # explicitly incomplete instead of silently truncated.
             first = not utterance.truncated
             utterance.truncated = True
             if first:
+                utterance.incomplete_reason = (
+                    "本次语音未完整识别，后续音频丢失；已识别部分仅供参考。"
+                )
                 self.stats.truncations += 1
                 self._log_lifecycle(utterance, "truncated")
                 if self.config.debug:
                     self._render_status(
-                        f"#{utterance.uid} 音频缓冲已满，后续音频不再上传；"
-                        "已识别的部分仍会提交。"
+                        f"[asr] 本次语音未完整识别，后续音频丢失；"
+                        f"已识别部分仅供参考。(#{utterance.uid})",
+                        is_error=True,
                     )
             return False
 
@@ -2132,6 +2568,8 @@ __all__ = [
     "ASRManager",
     "ASRStats",
     "FinalUtterance",
+    "NearEndEvidence",
+    "NearEndSpeechGate",
     "PartialTranscript",
     "SpeechActivity",
 ]

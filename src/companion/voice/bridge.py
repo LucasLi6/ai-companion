@@ -91,8 +91,16 @@ class VoiceBridge:
         self.dropped_partials = 0
         # At most one partial per utterance is queued at a time. Provisional
         # updates arrive many times per second; without this the bounded queue
-        # would fill with stale partials and delay a real final.
+        # would fill with stale partials and delay a real final. The newest
+        # revision is kept in ``_partial_latest`` and supersedes the queued one
+        # (late/older sequences are dropped, never shown out of order).
         self._partial_pending: set[int] = set()
+        self._partial_latest: dict[int, PartialTranscript] = {}
+        # Highest revision already handed to the consumer. A late, older
+        # revision that arrives after its newer sibling was displayed must be
+        # dropped instead of moving the subtitle backwards.
+        self._partial_delivered: dict[int, int] = {}
+        self.replaced_partials = 0
 
     # -------------------------------------------------------------- publishers
     def publish_final(self, final: FinalUtterance) -> bool:
@@ -128,33 +136,63 @@ class VoiceBridge:
     def _deliver(self, item: VoiceItem) -> None:
         if self._closed:
             return
+        if isinstance(item, PartialTranscript):
+            uid = item.utterance_id
+            if item.sequence <= self._partial_delivered.get(uid, -1):
+                # An older revision arrived after a newer one (possibly
+                # already displayed): never move the subtitle backwards.
+                self.dropped_partials += 1
+                return
+            latest = self._partial_latest.get(uid)
+            if latest is not None and latest.sequence > item.sequence:
+                # An older revision arrived after a newer one: never move the
+                # subtitle backwards.
+                self.dropped_partials += 1
+                return
+            if uid in self._partial_pending:
+                # The queued text is replaced by this newer revision. Storing
+                # it here (rather than dropping the newest) keeps the display
+                # current without growing the bounded queue.
+                self._partial_latest[uid] = item
+                self.replaced_partials += 1
+                return
+            self._partial_latest[uid] = item
+            self._partial_pending.add(uid)
+            try:
+                self._queue.put_nowait(item)
+            except asyncio.QueueFull:
+                self.dropped += 1
+                self._partial_pending.discard(uid)
+                self._partial_latest.pop(uid, None)
+                self.dropped_partials += 1
+            return
         if isinstance(item, FinalUtterance):
             if item.utterance_id in self._seen_final_set:
                 self.duplicate_finals += 1
                 return
-            self._remember(item.utterance_id, self._seen_finals, self._seen_final_set)
         elif isinstance(item, TurnClosed):
             if item.utterance_id in self._seen_closed_set:
                 return
-            self._remember(item.utterance_id, self._seen_closed, self._seen_closed_set)
-        elif isinstance(item, PartialTranscript):
-            if item.utterance_id in self._partial_pending:
-                # A newer revision supersedes the queued one; dropping it keeps
-                # the display current and the queue free for finals.
-                self.dropped_partials += 1
-                return
-            self._partial_pending.add(item.utterance_id)
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
             # The consumer is stalled: drop the newest, count it, and keep the
-            # queue bounded instead of growing without limit.
+            # queue bounded instead of growing without limit. A Final/close is
+            # *not* marked seen, so a retry can still be delivered.
             self.dropped += 1
             if isinstance(item, FinalUtterance):
                 self.dropped_finals += 1
-            elif isinstance(item, PartialTranscript):
-                self._partial_pending.discard(item.utterance_id)
-                self.dropped_partials += 1
+            return
+        # Mark reliable events seen only after the enqueue succeeded, so a
+        # dropped Final is retried instead of being suppressed as a duplicate.
+        if isinstance(item, FinalUtterance):
+            self._remember(
+                item.utterance_id, self._seen_finals, self._seen_final_set
+            )
+        elif isinstance(item, TurnClosed):
+            self._remember(
+                item.utterance_id, self._seen_closed, self._seen_closed_set
+            )
 
     @staticmethod
     def _remember(
@@ -174,9 +212,19 @@ class VoiceBridge:
         """Wait for the next item; ``None`` means the bridge was closed."""
         item = await self._queue.get()
         if isinstance(item, PartialTranscript):
+            uid = item.utterance_id
             # The slot frees as soon as the consumer has it, so the next
             # revision may be queued while this one is being displayed.
-            self._partial_pending.discard(item.utterance_id)
+            self._partial_pending.discard(uid)
+            latest = self._partial_latest.get(uid)
+            self._partial_latest.pop(uid, None)
+            if latest is not None and latest.sequence >= item.sequence:
+                # A newer revision arrived while this one waited in the queue;
+                # supersede it instead of showing stale text first.
+                item = latest
+            self._partial_delivered[uid] = max(
+                self._partial_delivered.get(uid, -1), item.sequence
+            )
         return item
 
     def close(self) -> None:

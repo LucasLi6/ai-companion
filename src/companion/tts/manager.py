@@ -76,6 +76,33 @@ class PlaybackEvent:
 
 
 @dataclass(frozen=True)
+class PlaybackTiming:
+    """One far-end timing sample from the player thread.
+
+    This is a *separate*, richer channel from :class:`PlaybackEvent` and from
+    the PCM listener. The echo canceller uses it to know when TTS audio was
+    submitted to the device (``frame_submitted``), when the device accepted it
+    (``frame_write_completed``), and when the reply ended or was invalidated
+    (``playback_finished`` / ``playback_cancelled``). A dropped far reference
+    can then be distinguished from real TTS silence even when no PCM frame
+    reached the canceller.
+
+    ``kind`` is one of ``frame_submitted``, ``frame_write_completed``,
+    ``playback_finished``, ``playback_cancelled``, ``playback_failed`` or
+    ``output_device_changed``. ``sequence`` counts frames within a generation;
+    ``at`` is ``time.monotonic()``. The listener must not block.
+    """
+
+    kind: str
+    generation: int
+    at: float = 0.0
+    sequence: int = 0
+    frame_bytes: int = 0
+    sample_rate: int = 0
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class TTSStatus:
     enabled: bool
     state: str
@@ -430,6 +457,12 @@ class TTSManager:
         self._playback_pcm_listener: Optional[
             Callable[[int, bytes, float], None]
         ] = None
+        # Optional far-end *timing* observer. Unlike the PCM listener this
+        # still fires when the reference frame itself is lost, so the AEC can
+        # tell "TTS is silent" from "a reference frame was dropped".
+        self._playback_timing_listener: Optional[
+            Callable[[PlaybackTiming], None]
+        ] = None
         # Every stream that has not finished yet. Superseded streams are
         # cancelled without joining on the chat path; this set lets explicit
         # teardown join them within one bounded deadline.
@@ -451,6 +484,47 @@ class TTSManager:
     def last_error(self) -> Optional[str]:
         with self._lock:
             return self._last_error
+
+    def playback_outcome(self, generation: int) -> Optional[str]:
+        """Terminal playback outcome for one submitted reply generation.
+
+        ``"finished"`` means every queued frame was written to the device;
+        ``"cancelled"`` means a newer reply, an explicit stop or a barge-in cut
+        it short; ``"failed"`` means the device/write failed. ``None`` means
+        this generation was never submitted or has not ended yet. Callers use
+        it to avoid marking a partially played reply as fully delivered.
+        """
+        with self._lock:
+            timings = self._timings.get(int(generation)) or {}
+            return self._outcome_locked(timings)
+
+    def playback_outcome_for(self, response_id: Optional[str]) -> Optional[str]:
+        """Playback outcome of the reply submitted for ``response_id``.
+
+        Used by surfaces that only know which message they sent, not the
+        internal TTS generation. Returns ``None`` when that reply was never
+        submitted to TTS (text-only delivery) or has not ended yet.
+        """
+        if not response_id:
+            return None
+        with self._lock:
+            match = None
+            for generation, info in self._playback_info.items():
+                if info and info[0] == response_id:
+                    match = generation
+            if match is None:
+                return None
+            return self._outcome_locked(self._timings.get(match) or {})
+
+    @staticmethod
+    def _outcome_locked(timings: dict) -> Optional[str]:
+        if "playback_finished_at" in timings:
+            return "finished"
+        if "playback_cancelled_at" in timings:
+            return "cancelled"
+        if "playback_failed_at" in timings:
+            return "failed"
+        return None
 
     # -------------------------------------------------------------- listeners
     def add_playback_listener(
@@ -493,6 +567,52 @@ class TTSManager:
         with self._lock:
             self._playback_pcm_listener = None
 
+    def set_playback_timing_listener(
+        self, listener: Optional[Callable[[PlaybackTiming], None]]
+    ) -> None:
+        """Observe far-end playback timing on the player thread.
+
+        Receives a :class:`PlaybackTiming` for every submitted/written frame
+        and for each reply end. It is independent of the PCM reference
+        listener: a dropped reference frame never hides the fact that audio
+        was submitted. The callback must return immediately and must not call
+        back into this manager; exceptions are swallowed.
+        """
+        with self._lock:
+            self._playback_timing_listener = listener
+
+    def remove_playback_timing_listener(self) -> None:
+        with self._lock:
+            self._playback_timing_listener = None
+
+    def _notify_timing(
+        self,
+        kind: str,
+        generation: int,
+        *,
+        sequence: int = 0,
+        frame_bytes: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            listener = self._playback_timing_listener
+            config = self._config
+        if listener is None:
+            return
+        timing = PlaybackTiming(
+            kind=kind,
+            generation=generation,
+            at=time.monotonic(),
+            sequence=sequence,
+            frame_bytes=frame_bytes,
+            sample_rate=int(getattr(config, "sample_rate", 0) or 0),
+            error=error,
+        )
+        try:
+            listener(timing)
+        except Exception:  # noqa: BLE001 - optional side channel
+            pass
+
     def _notify_playback(
         self,
         kind: str,
@@ -500,6 +620,30 @@ class TTSManager:
         *,
         error: Optional[str] = None,
     ) -> None:
+        # The timing channel is independent of the reply-end listeners: the
+        # echo canceller must learn that playback stopped even when nothing
+        # else subscribes to PlaybackEvent.
+        timing_kind = {
+            "finished": "playback_finished",
+            "cancelled": "playback_cancelled",
+            "failed": "playback_failed",
+        }.get(kind)
+        if timing_kind is not None:
+            # Remember the terminal outcome per generation so a caller can
+            # tell "played to the end" from "interrupted halfway". A finished
+            # marker is authoritative: a later stop of the same generation must
+            # never rewrite it.
+            with self._lock:
+                timings = self._timings.setdefault(generation, {})
+                timings.setdefault(
+                    {
+                        "finished": "playback_finished_at",
+                        "cancelled": "playback_cancelled_at",
+                        "failed": "playback_failed_at",
+                    }[kind],
+                    time.monotonic(),
+                )
+            self._notify_timing(timing_kind, generation, error=error)
         with self._lock:
             listeners = list(self._playback_listeners)
             info = self._playback_info.get(generation)
@@ -566,6 +710,9 @@ class TTSManager:
             worker, player_thread = self._worker, self._player_thread
         worker.start()
         player_thread.start()
+        # A (re)opened output device can change the true far/echo latency.
+        # Notify after the threads exist so the listener never races start.
+        self._notify_timing("output_device_changed", self.generation)
 
     def enable(self) -> tuple[bool, str]:
         """``/tts on``: enable only after successful initialization."""
@@ -1064,6 +1211,19 @@ class TTSManager:
                             "first_audio_write_started_at", timestamp
                         )
                         self._status = "playing"
+            with self._lock:
+                timings = self._timings.setdefault(generation, {})
+                sequence = int(timings.get("frames_submitted", 0.0)) + 1
+                timings["frames_submitted"] = float(sequence)
+            # Announced *before* the blocking write: this frame is about to
+            # reach the speaker, so echo cancellation must expect far audio
+            # even if the PCM reference side channel drops it.
+            self._notify_timing(
+                "frame_submitted",
+                generation,
+                sequence=sequence,
+                frame_bytes=len(frame),
+            )
             if listener is not None:
                 # Must be a fast enqueue; a slow observer must never delay or
                 # break playback. A cancelled generation is already filtered
@@ -1082,6 +1242,12 @@ class TTSManager:
             if player is None:
                 raise RuntimeError("音频输出设备已关闭")
             player.write(frame)
+            self._notify_timing(
+                "frame_write_completed",
+                generation,
+                sequence=sequence,
+                frame_bytes=len(frame),
+            )
             if first:
                 with self._lock:
                     if generation == self._generation:

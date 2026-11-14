@@ -2294,6 +2294,36 @@ async def cmd_repl(args) -> int:
                                         )
                                     )
                                 )
+                                # Timing is independent of the PCM
+                                # reference: even a dropped reference frame
+                                # still tells the AEC that playback was
+                                # submitted, so real TTS silence and a
+                                # reference sync fault are distinguishable.
+                                timing_setter = getattr(
+                                    tts_manager,
+                                    "set_playback_timing_listener",
+                                    None,
+                                )
+                                if callable(timing_setter):
+                                    timing_setter(
+                                        echo_pipeline.note_playback_timing
+                                    )
+                                event_adder = getattr(
+                                    tts_manager,
+                                    "add_playback_listener",
+                                    None,
+                                )
+                                if callable(event_adder):
+                                    event_adder(
+                                        lambda event: (
+                                            echo_pipeline.note_playback_event(
+                                                getattr(event, "kind", ""),
+                                                getattr(
+                                                    event, "generation", None
+                                                ),
+                                            )
+                                        )
+                                    )
                             else:
                                 echo_pipeline = None
                                 barge_in_config = None
@@ -2372,8 +2402,17 @@ async def cmd_repl(args) -> int:
                     # Part 3: show what ASR has recognized so far under the
                     # prompt. Runs on the loop (the coordinator consumer), and
                     # an empty text clears the line again.
+                    _partial_sequence = 0
+
                     def _show_partial(_uid: int, text: str) -> None:
-                        voice_subtitle.set(text)
+                        nonlocal _partial_sequence
+                        if not text:
+                            voice_subtitle.clear_if_current(_uid)
+                            return
+                        _partial_sequence += 1
+                        voice_subtitle.set_partial(
+                            _uid, _partial_sequence, text
+                        )
 
                     coordinator.set_partial_listener(_show_partial)
 
@@ -3018,16 +3057,49 @@ class _PartialSubtitle:
     toolbar is removed again while there is nothing to show.
     """
 
-    __slots__ = ("_text", "_session")
+    __slots__ = ("_text", "_session", "_uid", "_sequence")
 
     def __init__(self) -> None:
         self._text = ""
         self._session = None
+        self._uid: Optional[int] = None
+        self._sequence = 0
 
     def attach(self, session) -> None:
         """Bind the prompt session; safe when ``None`` (off-TTY)."""
         self._session = session
         self._apply()
+
+    @property
+    def active_utterance_id(self) -> Optional[int]:
+        return self._uid
+
+    def set_partial(self, utterance_id: int, sequence: int, text: str) -> None:
+        """Show one provisional revision, scoped to the recording turn.
+
+        Only the active utterance may update the subtitle. An older
+        utterance's late partial (or an older sequence of the current one) is
+        ignored, so a new turn cannot inherit a previous turn's text.
+        """
+        uid = int(utterance_id)
+        seq = int(sequence)
+        if self._uid is not None and uid != self._uid:
+            self._uid = uid
+            self._sequence = seq
+        elif self._uid == uid and seq < self._sequence:
+            return
+        else:
+            self._uid = uid
+            self._sequence = seq
+        self.set(text)
+
+    def clear_if_current(self, utterance_id: int) -> None:
+        """Clear only if the event belongs to the turn being displayed."""
+        if self._uid is not None and int(utterance_id) != self._uid:
+            return
+        self._uid = None
+        self._sequence = 0
+        self.clear()
 
     def set(self, text: str) -> None:
         self._text = " ".join(str(text or "").split())
@@ -3180,10 +3252,37 @@ async def _render_proactive_event(
     return True
 
 
-async def _ack_proactive_event(manager, event, *, delivered: bool, reason: str) -> None:
-    """Report whether one proactive message really reached the surface."""
+async def _ack_proactive_event(
+    manager,
+    event,
+    *,
+    delivered: bool,
+    reason: str,
+    stage: str = "text_displayed",
+) -> None:
+    """Report whether one proactive message really reached the surface.
+
+    Prefers the async, database-confirmed acknowledgement so a write failure
+    is not reported as a fully successful delivery. The synchronous methods
+    remain as a compatibility fallback for embedders/tests.
+    """
     if manager is None or event is None:
         return
+    acknowledge = getattr(manager, "acknowledge_delivery", None)
+    if callable(acknowledge):
+        try:
+            await acknowledge(
+                event,
+                delivered=delivered,
+                reason=reason,
+                stage=stage,
+            )
+            return
+        except TypeError:
+            # Older/simpler manager implementations take a shorter signature.
+            pass
+        except Exception:  # noqa: BLE001 - acknowledgement never breaks chat
+            return
     try:
         if delivered and hasattr(manager, "note_proactive_delivered"):
             manager.note_proactive_delivered(event)
@@ -3269,8 +3368,43 @@ async def _deliver_proactive_voice(
             )
             # Resume only after the real playback-complete event.
             await coordinator.wait_until_proactive_allowed()
+        # Telegram/terminal text delivery is not the same as a fully played
+        # voice message. A barge-in or a stop halfway through playback must be
+        # a cancellation (no round consumed, retry allowed), never a full
+        # delivery just because the text line was printed.
+        outcome = None
+        if tts_manager is not None:
+            getter = getattr(tts_manager, "playback_outcome_for", None)
+            if callable(getter):
+                with contextlib.suppress(Exception):
+                    outcome = getter(getattr(event, "response_id", None))
+        if outcome in ("cancelled", "failed"):
+            await _ack_proactive_event(
+                manager,
+                event,
+                delivered=False,
+                reason="tts_interrupted",
+                stage="tts_playback_completed",
+            )
+            log.info(
+                "proactive_voice_interrupted conversation_id=%s"
+                " source_event_id=%s message_id=%s outcome=%s",
+                getattr(event, "conversation_id", None),
+                getattr(event, "event_id", None),
+                getattr(event, "response_id", None),
+                outcome,
+            )
+            return False
         await _ack_proactive_event(
-            manager, event, delivered=True, reason="delivered"
+            manager,
+            event,
+            delivered=True,
+            reason="delivered",
+            stage=(
+                "tts_playback_completed"
+                if outcome == "finished"
+                else "text_displayed"
+            ),
         )
         log.info(
             "proactive_voice_delivered conversation_id=%s"
@@ -3344,7 +3478,10 @@ async def _read_line_with_prompt_session(
                     manager,
                     event,
                     delivered=delivered,
-                    reason="render_failed",
+                    reason=(
+                        "delivered" if delivered else "render_failed"
+                    ),
+                    stage="text_displayed",
                 )
     finally:
         if not input_future.done():
@@ -3387,7 +3524,10 @@ async def _read_line_with_thread(manager, *, tts_manager=None) -> str:
                     manager,
                     event,
                     delivered=delivered,
-                    reason="render_failed",
+                    reason=(
+                        "delivered" if delivered else "render_failed"
+                    ),
+                    stage="text_displayed",
                 )
     finally:
         if not input_future.done():

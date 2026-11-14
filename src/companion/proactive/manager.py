@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import secrets
@@ -298,16 +299,12 @@ class ProactiveManager:
 
     # -- delivery acknowledgements ----------------------------------------
 
-    def note_proactive_delivered(self, event: Optional[ResponseEvent]) -> bool:
-        """The surface really showed/spoke this proactive message.
-
-        Only this acknowledgement advances ``last_delivered_at`` and the
-        unanswered counter, so the next interval is measured from real
-        delivery instead of model completion. Returns False for duplicate,
-        stale or foreign events.
-        """
+    def _validate_ack(
+        self, event: Optional[ResponseEvent]
+    ) -> Optional[tuple[_ConversationState, str, Optional[str]]]:
+        """Shared, non-mutating validation for delivery acknowledgements."""
         if self._closed or event is None:
-            return False
+            return None
         conversation_id = getattr(event, "conversation_id", None)
         source_event_id = getattr(event, "event_id", None)
         message_id = getattr(event, "response_id", None)
@@ -317,66 +314,220 @@ class ProactiveManager:
                 "proactive_ack_ignored conversation_id=%s reason=no_state",
                 conversation_id,
             )
-            return False
+            return None
         if source_event_id != state.latest_user_event_id:
             self.logger.info(
                 "proactive_ack_ignored conversation_id=%s reason=stale_event",
                 conversation_id,
             )
-            return False
+            return None
         if message_id is not None and message_id == state.last_ack_message_id:
-            return False
+            # Duplicate acknowledgement: never count the same delivery twice.
+            return None
+        if (
+            message_id is not None
+            and state.pending_message_id is not None
+            and message_id != state.pending_message_id
+        ):
+            # A late ack for an older message must not clear the current
+            # pending round or advance its budget.
+            self.logger.info(
+                "proactive_ack_ignored conversation_id=%s reason=stale_message",
+                conversation_id,
+            )
+            return None
+        return state, str(conversation_id or ""), message_id
+
+    def _apply_delivered(
+        self,
+        state: _ConversationState,
+        conversation_id: str,
+        message_id: Optional[str],
+        *,
+        stage: str = "text_displayed",
+    ) -> str:
+        """Mutate post-delivery state and return the delivered mode.
+
+        Only a *delivered* LONG_IDLE round advances ``unanswered``. The mode
+        comes from ``delivered_mode``/the pending mode for this message; an
+        immediate remark, a judge refusal or an unknown mode never counts.
+        """
+        delivered_mode = (
+            state.pending_modes.pop(message_id, "") if message_id else ""
+        )
         state.last_ack_message_id = message_id
         state.last_delivered_at = _loop_time()
         state.next_attempt_at = None
         state.pending_message_id = None
-        delivered_mode = (
-            state.pending_modes.pop(message_id, "") if message_id else ""
-        )
-        if message_id:
-            self._mark_persisted(message_id, "COMPLETED")
-        # A long-idle round already advanced ``unanswered`` when it generated
-        # its message; the acknowledgement confirms it was really heard and
-        # must not slow the schedule a second time. An immediate remark never
-        # counts as an unanswered long-idle round.
         state.delivery_event.set()
+        if (
+            message_id
+            and delivered_mode.startswith(MODE_LONG_IDLE)
+        ):
+            state.unanswered += 1
         self.logger.info(
-            "proactive_delivery_confirmed conversation_id=%s source_event_id=%s"
-            " message_id=%s mode=%s unanswered=%d next_interval=%s",
+            "proactive_delivery_confirmed conversation_id=%s message_id=%s"
+            " mode=%s stage=%s unanswered=%d next_interval=%s",
             conversation_id,
-            source_event_id,
             message_id,
             delivered_mode or "-",
+            stage,
             state.unanswered,
             self._interval_bounds(state.unanswered),
         )
+        return delivered_mode
+
+    def _apply_cancelled(
+        self,
+        state: _ConversationState,
+        conversation_id: str,
+        message_id: Optional[str],
+        reason: str,
+        *,
+        stage: str = "not_delivered",
+    ) -> None:
+        """Release a pending message without advancing any delivery budget."""
+        if message_id:
+            state.pending_modes.pop(message_id, None)
+            if state.pending_message_id == message_id:
+                state.pending_message_id = None
+        self.logger.info(
+            "proactive_delivery_cancelled conversation_id=%s message_id=%s"
+            " reason=%s stage=%s",
+            conversation_id,
+            message_id,
+            reason,
+            stage,
+        )
+
+    def note_proactive_delivered(self, event: Optional[ResponseEvent]) -> bool:
+        """Synchronous compatibility acknowledgement (text surfaced).
+
+        Prefer :meth:`acknowledge_delivery` when the surface can await the
+        database write. This keeps the historical contract for embedders: the
+        in-memory state advances immediately and the row update is scheduled.
+        """
+        validated = self._validate_ack(event)
+        if validated is None:
+            return False
+        state, conversation_id, message_id = validated
+        delivered_mode = self._apply_delivered(
+            state, conversation_id, message_id, stage="text_displayed"
+        )
+        if message_id:
+            self._mark_persisted(message_id, "COMPLETED")
+        self.logger.info(
+            "proactive_delivery_mode conversation_id=%s message_id=%s mode=%s",
+            conversation_id,
+            message_id,
+            delivered_mode or "-",
+        )
         return True
+
+    async def acknowledge_delivery(
+        self,
+        event: Optional[ResponseEvent],
+        *,
+        delivered: bool,
+        reason: str = "",
+        stage: str = "text_displayed",
+    ) -> bool:
+        """Acknowledge delivery after the database write actually succeeded.
+
+        ``stage`` distinguishes ``text_displayed``, ``tts_submitted`` and
+        ``tts_playback_completed``. A partially played message interrupted by
+        the user is a cancellation, not a completed delivery: callers must
+        pass ``delivered=False`` with a reason in that case.
+
+        This never calls ``asyncio.run``; it either runs on the loop or awaits
+        an awaitable repository method directly.
+        """
+        if self._closed or event is None:
+            return False
+        validated = self._validate_ack(event)
+        if validated is None:
+            if not delivered:
+                # Still release a cancelled/duplicate event's pending slot.
+                conversation_id = getattr(event, "conversation_id", None)
+                state = self._states.get(conversation_id or "")
+                if state is not None:
+                    message_id = getattr(event, "response_id", None)
+                    self._apply_cancelled(
+                        state,
+                        str(conversation_id or ""),
+                        message_id,
+                        reason or "cancelled",
+                        stage=stage,
+                    )
+            return False
+        state, conversation_id, message_id = validated
+
+        if not delivered:
+            if message_id:
+                await self._persist_status(message_id, "CANCELLED")
+            self._apply_cancelled(
+                state, conversation_id, message_id, reason or "cancelled",
+                stage=stage,
+            )
+            return True
+
+        if message_id:
+            persisted = await self._persist_status(message_id, "COMPLETED")
+            if not persisted:
+                # The delivery happened, but history/state must not claim a
+                # durable success that was not written. Keep the row pending so
+                # a retry can still complete the acknowledgement.
+                self.logger.warning(
+                    "proactive_ack_persist_failed conversation_id=%s"
+                    " message_id=%s stage=%s",
+                    conversation_id,
+                    message_id,
+                    stage,
+                )
+                return False
+        self._apply_delivered(
+            state, conversation_id, message_id, stage=stage
+        )
+        return True
+
+    async def _persist_status(self, message_id: str, status: str) -> bool:
+        """Await one status write; False when it could not be confirmed."""
+        repo = getattr(self.repos, "proactive", None)
+        update = getattr(repo, "update_status", None)
+        if not callable(update):
+            return True
+        try:
+            result = update(message_id, status)
+            if inspect.isawaitable(result):
+                result = await result
+            return result is not False
+        except Exception:  # noqa: BLE001 - reported, never raised to the UI
+            self.logger.warning(
+                "proactive_status_write_failed message_id=%s status=%s",
+                message_id,
+                status,
+            )
+            return False
 
     def note_proactive_cancelled(
         self, event: Optional[ResponseEvent], reason: str = "cancelled"
     ) -> None:
         """The surface could not deliver this proactive message.
 
-        The row stays ``GENERATED`` (it was never heard), and a later round may
-        try again once the delivery path is available.
+        The row is marked ``CANCELLED`` (not delivered), nothing advances, and
+        a later round may retry the same source event.
         """
         if event is None:
             return
         message_id = getattr(event, "response_id", None)
         conversation_id = getattr(event, "conversation_id", None) or ""
         state = self._states.get(conversation_id)
-        if state is not None and message_id:
-            state.pending_modes.pop(message_id, None)
-            if state.pending_message_id == message_id:
-                state.pending_message_id = None
-        self.logger.info(
-            "proactive_delivery_cancelled conversation_id=%s source_event_id=%s"
-            " message_id=%s reason=%s",
-            conversation_id,
-            getattr(event, "event_id", None),
-            message_id,
-            reason,
-        )
+        if state is not None:
+            self._apply_cancelled(
+                state, conversation_id, message_id, reason
+            )
+        if message_id:
+            self._mark_persisted(message_id, "CANCELLED")
 
     async def can_deliver(self, event: Optional[ResponseEvent]) -> bool:
         """Re-check a queued event just before its deferred delivery.
@@ -634,6 +785,29 @@ class ProactiveManager:
         low, high = self._interval_bounds(unanswered)
         return float(secrets.randbelow(high - low + 1) + low)
 
+    def _blocks_retry(
+        self, record: Optional[ProactiveMessageRecord], state: _ConversationState
+    ) -> bool:
+        """Dedupe semantics for one persisted proactive round.
+
+        COMPLETED is terminal and is never retried. A GENERATED row blocks a
+        duplicate only while this process is still waiting for its delivery
+        acknowledgement. CANCELLED (or a GENERATED row orphaned by a restart)
+        may be retried.
+        """
+        if record is None:
+            return False
+        status = str(getattr(record, "status", "") or "")
+        if status == "COMPLETED":
+            return True
+        if status == "GENERATED":
+            message_id = getattr(record, "message_id", None)
+            return bool(
+                state.pending_message_id
+                and message_id == state.pending_message_id
+            )
+        return False
+
     async def _attempt(
         self,
         cycle: _Cycle,
@@ -660,16 +834,21 @@ class ProactiveManager:
             return
 
         # One utterance per persistence round per triggering turn, including
-        # across a restart that lost the in-memory state.
-        if await self.repos.proactive.get_for_source_event(
+        # across a restart that lost the in-memory state. Deduplication depends
+        # on the row's status: COMPLETED is terminal, GENERATED while this
+        # process is waiting for its delivery ack blocks a second message, and
+        # CANCELLED (or a GENERATED row orphaned by a restart) may be retried.
+        existing = await self.repos.proactive.get_for_source_event(
             cycle.source_event_id, storage_mode
-        ):
+        )
+        if self._blocks_retry(existing, state):
             return
         if storage_mode == f"{MODE_LONG_IDLE}_1":
             # Compatibility with rows written before round suffixes existed.
-            if await self.repos.proactive.get_for_source_event(
+            legacy = await self.repos.proactive.get_for_source_event(
                 cycle.source_event_id, MODE_LONG_IDLE
-            ):
+            )
+            if self._blocks_retry(legacy, state):
                 return
 
         source_event = await self.repos.utterance.get(cycle.source_event_id)
@@ -755,8 +934,25 @@ class ProactiveManager:
         if not await self._still_valid(cycle):
             return
 
+        # The table enforces one row per (source_event_id, mode). A retry of a
+        # CANCELLED round (or of an orphaned GENERATED row from a restart) may
+        # not insert a second row: it reopens the existing one instead.
+        reopen = getattr(self.repos.proactive, "reopen", None)
+        retry_existing = (
+            existing is not None
+            and str(getattr(existing, "status", "") or "") in (
+                "CANCELLED",
+                "GENERATED",
+            )
+        )
+        reuse_row = bool(
+            retry_existing and callable(reopen)
+        )
         message = ProactiveMessageRecord(
-            message_id=new_id("pmsg"),
+            message_id=(
+                existing.message_id if reuse_row and existing is not None
+                else new_id("pmsg")
+            ),
             conversation_id=cycle.conversation_id,
             person_id=cycle.person_id,
             source_event_id=cycle.source_event_id,
@@ -771,7 +967,13 @@ class ProactiveManager:
             model=str(generated.get("model") or ""),
             created_at=utcnow(),
         )
-        await self.repos.proactive.save(message)
+        if reuse_row:
+            await reopen(message)
+        else:
+            if retry_existing and existing is not None:
+                # Older repository implementation without ``reopen``.
+                await self.repos.proactive.delete(existing.message_id)
+            await self.repos.proactive.save(message)
 
         # A new user message may have arrived while the row was being written.
         # Stale output must not be shown; remove the un-delivered record so it
@@ -799,12 +1001,10 @@ class ProactiveManager:
         state.pending_modes[message.message_id] = storage_mode
         state.pending_message_id = message.message_id
         state.next_attempt_at = None
-        if storage_mode.startswith(MODE_LONG_IDLE):
-            # Every long-idle round Ava actually speaks into counts toward the
-            # back-off budget, whether or not the user answers it. Counting a
-            # round only on delivery acknowledgement let undelivered rounds
-            # repeat at the shortest interval forever.
-            state.unanswered += 1
+        # The back-off budget advances only when the surface confirms that a
+        # long-idle message was really delivered. Generating text is not
+        # speaking it: a message cancelled before display must not consume a
+        # round, and a duplicate ack must not consume two.
         self.logger.info(
             "proactive_generated conversation_id=%s source_event_id=%s"
             " mode=%s message_id=%s chars=%d awaiting_delivery_ack=true",

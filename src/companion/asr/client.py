@@ -437,6 +437,12 @@ class ASRSession:
         self._log("session_connect_start")
         try:
             client = self._client_factory(self._config)
+            # ``recognize()`` has no documented per-stream timeout parameter in
+            # dashscope 2.x: an unknown ``timeout`` would be forwarded as an
+            # opaque websocket request parameter (not a client deadline).
+            # Connection timing is bounded by the Client's own timeout; the
+            # stream/final deadlines are owned by ASRManager
+            # (stream_idle/final_timeout_seconds), where they are observable.
             recognition = client.audio.asr.recognize(
                 model=self._config.model,
                 format="pcm",
@@ -446,7 +452,6 @@ class ASRSession:
                     "intermediate_result_enabled": True,
                     "max_sentence_silence": 1500,
                 },
-                timeout=self._config.timeout_seconds,
             )
             self._client = client
             self._recognition = recognition
