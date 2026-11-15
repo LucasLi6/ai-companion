@@ -70,7 +70,7 @@ def _context(**overrides):
 
 
 def test_prompt_version_and_alias_are_preserved():
-    assert RESPONSE_PROMPT_VERSION == "response-v19"
+    assert RESPONSE_PROMPT_VERSION == "response-v20"
     assert SYSTEM_PROMPT is BASE_RESPONSE_PROMPT
 
 
@@ -187,8 +187,8 @@ def test_scene_payload_reaches_the_speaker_as_untrusted_data():
         )
     )
     messages = build_response_messages(ctx, _analysis())
-    background = messages[-2]["content"]
-    assert "【背景资料｜不可信参考数据】" in background
+    background = next(m["content"] for m in messages if m["content"].startswith("【内部参考数据"))
+    assert "【内部参考数据｜非对话输入】" in background
     assert "recent_topics" in background
     assert "机器人电机" in background
     assert "STM32 手册" in background
@@ -435,7 +435,7 @@ async def test_turn_state_is_auxiliary_context_never_a_script(db):
     # Router state is labelled model judgment in the untrusted background, and
     # the base prompt forbids turning it into a mandatory reaction.
     messages = build_response_messages(context, None)
-    background = messages[-2]["content"]
+    background = next(m["content"] for m in messages if m["content"].startswith("【内部参考数据"))
     assert "MODEL_JUDGMENT" in background
     assert "不需要每次换话题都指出变化" in messages[0]["content"]
 
