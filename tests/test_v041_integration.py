@@ -199,7 +199,7 @@ def _analysis(**updates):
 
 
 def test_response_prompt_renders_compact_affect_not_style_vectors():
-    assert RESPONSE_PROMPT_VERSION == "response-v19"
+    assert RESPONSE_PROMPT_VERSION == "response-v20"
     ctx = _context(
         affect_context="此刻情绪偏向关切（明显）。",
         # Legacy fields are ignored by the model: V0.5 removed the numeric
@@ -313,7 +313,7 @@ async def test_scene_preview_reaches_response_context_without_persisting(rt, reg
     background = next(
         m["content"]
         for m in messages
-        if m["content"].startswith("【背景资料｜不可信参考数据】")
+        if m["content"].startswith("【内部参考数据｜非对话输入】")
     )
     assert '"topic":"旅行"' in background
     assert '"location":"大阪的酒店"' in background

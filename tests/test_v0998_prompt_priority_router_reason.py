@@ -78,7 +78,7 @@ def _background(messages):
 
 
 def test_prompt_version_reflects_the_reorganisation():
-    assert RESPONSE_PROMPT_VERSION == "response-v19"
+    assert RESPONSE_PROMPT_VERSION == "response-v20"
 
 
 def test_sections_follow_understanding_then_expression_order():

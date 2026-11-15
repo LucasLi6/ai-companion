@@ -118,8 +118,8 @@ async def test_persona_core_leads_the_response_request(db):
     assert "【交流边界】" in request
     # Identity precedes any untrusted background data; boundaries stay
     # authoritative in the system message.
-    if "【背景资料" in request:
-        assert request.index("【角色身份】") < request.index("【背景资料")
+    if "【内部参考数据" in request:
+        assert request.index("【角色身份】") < request.index("【内部参考数据")
 
 
 async def test_full_description_import_is_admin_revisioned(db):

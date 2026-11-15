@@ -85,7 +85,7 @@ def test_native_roles_and_current_user_message():
     assert messages[3]["content"] == "最近有点累"
     assert messages[4]["content"] == "那就慢一点。"
     assert messages[-1]["content"] == "现在呢"
-    assert RESPONSE_PROMPT_VERSION == "response-v19"
+    assert RESPONSE_PROMPT_VERSION == "response-v20"
 
 
 def test_no_flattened_dialogue_or_cognitive_json_in_the_request():
@@ -123,7 +123,7 @@ def test_wait_and_ignore_never_become_assistant_messages():
     # V0.6.1 no longer serializes past non-response actions into the prompt at
     # all, so there is no background message for this turn.
     assert all(
-        not m["content"].startswith("【背景资料｜不可信参考数据】")
+        not m["content"].startswith("【内部参考数据｜非对话输入】")
         for m in messages
     )
     assert all("final_action" not in m["content"] for m in messages)
