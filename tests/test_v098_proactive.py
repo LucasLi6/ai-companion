@@ -337,9 +337,14 @@ async def test_proactive_generation_uses_no_synthetic_user_message(db):
         reason_code=ReasonCode.DIRECT_AGENT_ADDRESS,
         reply_necessity=ReplyNecessity.USEFUL,
     )
+    # A retrieved memory forces an internal reference payload, which must not
+    # become the last user-like input in a spontaneous generation.
+    context = context.model_copy(update={"memories": [{"kind": "preference", "content": "用户喜欢牛羊肉"}]})
     messages = build_proactive_response_messages(context, analysis)
 
     assert messages[0]["role"] == "system"
+    assert messages[1]["content"].startswith("【内部参考数据｜非对话输入】")
+    assert "用户喜欢牛羊肉" in messages[1]["content"]
     assert "本轮生成模式：主动发言" in messages[0]["content"]
     assert messages[-1]["role"] == "assistant"
     contents = "\n".join(str(message.get("content", "")) for message in messages)
