@@ -46,7 +46,7 @@ DEFAULT_PRE_ROLL_MS = 350
 DEFAULT_TIMEOUT_SECONDS = 30.0
 # After all audio was sent and stop() was called, how long to wait for the
 # final result.
-DEFAULT_FINAL_TIMEOUT_SECONDS = 10.0
+DEFAULT_FINAL_TIMEOUT_SECONDS = 15.0
 # While audio is being uploaded, how long the server may stay silent (no
 # event of any kind) before the stream is declared dead. Kept below the
 # DashScope SDK's internal 23 s no-audio timeout so our failure is explicit.
