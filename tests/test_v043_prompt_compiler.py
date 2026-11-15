@@ -126,7 +126,7 @@ def test_memory_is_used_only_when_relevant_and_outcomes_are_truthful():
     background = next(
         m["content"]
         for m in messages
-        if m["role"] == "user" and m["content"].startswith("【背景资料")
+        if m["role"] == "user" and m["content"].startswith("【内部参考数据")
     )
 
     # Memories are untrusted reference data, never trusted system text.

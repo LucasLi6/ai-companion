@@ -541,7 +541,7 @@ async def test_full_chain_request_capture_order_and_versions(db):
     # Scene context is untrusted background data, not trusted system text.
     background = response_call["messages"][1]
     assert background["role"] == "user"
-    assert background["content"].startswith("【背景资料｜不可信参考数据】")
+    assert background["content"].startswith("【内部参考数据｜非对话输入】")
     assert "【当前场景】" not in response_system
     assert "【语用理解】" not in response_system
     assert "【认知分析】" not in response_system

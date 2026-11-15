@@ -583,6 +583,16 @@ def test_long_upload_backpressure_truncates_instead_of_losing_the_turn() -> None
         assert asr_tests.wait_for(
             lambda: running.manager.stats.unfinished == 1, timeout=6.0
         )
+        # The counter is bumped before the render queue delivers the status
+        # lines, so wait for the observable contract itself; under a loaded
+        # full-suite run the queued line can land a few milliseconds later.
+        assert asr_tests.wait_for(
+            lambda: (
+                "本次语音未完整识别" in status.getvalue()
+                and "已识别部分（未提交）：你好世界" in status.getvalue()
+            ),
+            timeout=6.0,
+        ), status.getvalue()
         text = status.getvalue()
         assert "本次语音未完整识别" in text
         # The prefix is shown for reference only and explicitly marked as

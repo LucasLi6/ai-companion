@@ -74,7 +74,7 @@ def _analysis_json():
 def _background(messages):
     for message in messages:
         if message["role"] == "user" and message["content"].startswith(
-            "【背景资料"
+            "【内部参考数据"
         ):
             return message["content"]
     return None

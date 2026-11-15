@@ -70,7 +70,7 @@ def test_a_memory_is_context_not_an_instruction():
 
     assert system.startswith(SYSTEM_PROMPT)
     assert memory not in system
-    assert background.startswith("【背景资料｜不可信参考数据】")
+    assert background.startswith("【内部参考数据｜非对话输入】")
     assert memory in background
     assert memory not in messages[-1]["content"]
     # The trusted system keeps local authority, and the background block is
