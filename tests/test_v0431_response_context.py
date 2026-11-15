@@ -58,7 +58,7 @@ def _ctx(**overrides):
 def _background(messages):
     for message in messages:
         if message["role"] == "user" and message["content"].startswith(
-            "【背景资料"
+            "【内部参考数据"
         ):
             return message["content"]
     return None
@@ -332,3 +332,16 @@ async def test_neutral_turn_has_no_filler_but_keeps_state_and_tts(db):
     )
     assert plan is not None
     assert 0.5 <= plan.speaking_rate <= 1.6
+
+
+def test_internal_reference_precedes_real_dialogue_and_does_not_own_last_turn():
+    ctx = _ctx(memories=[{"kind": "preference", "content": "用户喜欢牛羊肉"}])
+    messages = build_response_messages(ctx, _analysis())
+
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"  # untrusted transport, not a real turn
+    assert messages[1]["content"].startswith("【内部参考数据｜非对话输入】")
+    assert "用户喜欢牛羊肉" in messages[1]["content"]
+    assert messages[2] == {"role": "user", "content": "我去了日本"}
+    assert messages[-1] == {"role": "user", "content": "后来我还去了大阪"}
+    assert "对方的爱好不是你的爱好" in messages[0]["content"]
