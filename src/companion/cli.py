@@ -2316,6 +2316,32 @@ async def cmd_repl(args) -> int:
                     return None
                 speaker_store = store
                 return store
+
+            def _link_service():
+                """Human-only Speaker -> Person -> Profile link service.
+
+                Defined outside the voice-only block so ``/speaker profile``
+                and ``/speaker link`` keep working in text-only sessions.
+                """
+                from companion.people.speaker_profile_link import (
+                    SpeakerProfileLinkService,
+                )
+
+                store = _identity_store()
+                if (
+                    store is None
+                    or rt.speaker_bindings is None
+                    or rt.profile_service is None
+                ):
+                    return None
+                return SpeakerProfileLinkService(
+                    rt.speaker_bindings,
+                    rt.repos.person,
+                    store,
+                    rt.profile_service,
+                    audit=rt.repos.audit,
+                )
+
             coordinator = None
             voice_output = (
                 _PromptTurnOutput(repl_session)
@@ -2592,27 +2618,6 @@ async def cmd_repl(args) -> int:
                         ]
 
                     return pick(0.50), pick(0.95)
-
-                def _link_service():
-                    """Human-only Speaker -> Person -> Profile link service."""
-                    from companion.people.speaker_profile_link import (
-                        SpeakerProfileLinkService,
-                    )
-
-                    store = _identity_store()
-                    if (
-                        store is None
-                        or rt.speaker_bindings is None
-                        or rt.profile_service is None
-                    ):
-                        return None
-                    return SpeakerProfileLinkService(
-                        rt.speaker_bindings,
-                        rt.repos.person,
-                        store,
-                        rt.profile_service,
-                        audit=rt.repos.audit,
-                    )
 
                 def _observe_registration(result, *, utterance_id=None):
                     """Feed one speaker result to the guided flow, if active.

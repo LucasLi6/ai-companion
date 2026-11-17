@@ -364,3 +364,43 @@ async def test_unlink_unknown_voice_is_a_refusal_not_a_deletion(rt, store):
     # An unbound but existing voice is a quiet no-op.
     speaker_id = stable(store)
     assert await link.unlink(speaker_id) is False
+
+
+class _BrokenBindings:
+    """A binding lookup that errors must refuse, never look unbound."""
+
+    async def bindings_for_speaker_ids(self, speaker_ids):
+        raise RuntimeError("binding table unavailable")
+
+    async def get_binding(self, speaker_id):
+        raise RuntimeError("binding table unavailable")
+
+    async def unbind_speaker(self, speaker_id, *, related_speaker_ids=None):
+        raise RuntimeError("binding table unavailable")
+
+    async def bind_speaker(self, *args, **kwargs):
+        raise RuntimeError("binding table unavailable")
+
+
+async def test_binding_store_errors_fail_closed(rt, store):
+    speaker_id = stable(store)
+    owner = await person(rt)
+    link = SpeakerProfileLinkService(
+        _BrokenBindings(),
+        rt.repos.person,
+        store,
+        rt.profile_service,
+        audit=rt.repos.audit,
+    )
+
+    with pytest.raises(SpeakerLinkError) as preview_error:
+        await link.preview_link(speaker_id, owner.person_id)
+    assert preview_error.value.code == "link_lookup_failed"
+
+    with pytest.raises(SpeakerLinkError) as resolve_error:
+        await link.resolve_profile(speaker_id)
+    assert resolve_error.value.code == "link_lookup_failed"
+
+    with pytest.raises(SpeakerLinkError) as unlink_error:
+        await link.unlink(speaker_id)
+    assert unlink_error.value.code == "link_lookup_failed"

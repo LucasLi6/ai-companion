@@ -199,6 +199,21 @@ class SpeakerProfileLinkService:
         except Exception:  # noqa: BLE001 - preview only
             return None
 
+    async def _bindings_for(self, speaker_ids: list[str]) -> list[dict]:
+        """Read binding rows; a DB failure is a refusal, never "unbound"."""
+        try:
+            return await self.bindings.bindings_for_speaker_ids(speaker_ids)
+        except Exception as exc:  # noqa: BLE001
+            raise SpeakerLinkError(LINK_LOOKUP_FAILED) from exc
+
+    async def _unbind(self, canonical: str, related: list[str]) -> bool:
+        try:
+            return await self.bindings.unbind_speaker(
+                canonical, related_speaker_ids=related
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SpeakerLinkError(LINK_LOOKUP_FAILED) from exc
+
     async def _person_view(
         self, person_id: Optional[str]
     ) -> tuple[Optional[Any], bool, Optional[Any]]:
@@ -279,7 +294,7 @@ class SpeakerProfileLinkService:
                 reason=LINK_UNKNOWN_SPEAKER,
             )
 
-        rows = await self.bindings.bindings_for_speaker_ids(speaker_ids)
+        rows = await self._bindings_for(speaker_ids)
         bound_person_ids = tuple(
             sorted(
                 {
@@ -289,7 +304,10 @@ class SpeakerProfileLinkService:
                 }
             )
         )
-        binding = await self.bindings.get_binding(canonical)
+        try:
+            binding = await self.bindings.get_binding(canonical)
+        except Exception as exc:  # noqa: BLE001 - a DB failure is a refusal
+            raise SpeakerLinkError(LINK_LOOKUP_FAILED) from exc
         effective_person = target or (
             bound_person_ids[0] if len(bound_person_ids) == 1 else None
         )
@@ -470,7 +488,7 @@ class SpeakerProfileLinkService:
         speaker_ids = list(closure.speaker_ids)
         if canonical not in speaker_ids:
             speaker_ids.insert(0, canonical)
-        rows = await self.bindings.bindings_for_speaker_ids(speaker_ids)
+        rows = await self._bindings_for(speaker_ids)
         person_ids = {
             str(item.get("person_id") or "").strip()
             for item in rows
@@ -579,9 +597,7 @@ class SpeakerProfileLinkService:
         related = list(closure.speaker_ids)
         if canonical not in related:
             related.insert(0, canonical)
-        removed = await self.bindings.unbind_speaker(
-            canonical, related_speaker_ids=related
-        )
+        removed = await self._unbind(canonical, related)
         if removed and self.audit is not None:
             await self.audit.record(
                 actor=actor,
@@ -596,6 +612,8 @@ class SpeakerProfileLinkService:
 __all__ = [
     "LINK_ALIAS_UNRESOLVED",
     "LINK_BINDING_CONFLICT",
+    "LINK_LOOKUP_FAILED",
+    "LINK_NO_PERSON",
     "LINK_OK",
     "LINK_PERSON_INACTIVE",
     "LINK_PERSON_MISSING",

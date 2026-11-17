@@ -423,3 +423,80 @@ async def test_a_post_timeout_revision_is_only_displayed():
             await asyncio.wait_for(coordinator.next_accepted_turn(), 0.1)
     finally:
         await coordinator.shutdown()
+
+
+# ---------------------------------------------------- local link commands
+def test_repl_link_preview_requires_an_explicit_confirmation(
+    tmp_path, capsys, monkeypatch
+):
+    """``/speaker link`` previews, refuses to bind, then binds on confirm."""
+    from companion.cli import main
+    from companion.speaker_id.store import SpeakerStore
+
+    db = str(tmp_path / "cli.db")
+    speaker_db = tmp_path / "speakers.sqlite3"
+    monkeypatch.setenv("AVA_SPEAKER_DB", str(speaker_db))
+    store = SpeakerStore(speaker_db)
+    store.initialize()
+    temporary = store.create_candidate()
+    store.close()
+
+    main(["--db", db, "init"])
+    main([
+        "--db", db, "person", "add", "--name", "Owner", "--role", "owner",
+        "--allow-processing", "--allow-persistence", "--allow-memory-learning",
+    ])
+    person_id = capsys.readouterr().out.strip().splitlines()[-1]
+
+    lines = iter([
+        f"/speaker link {temporary} {person_id}",
+        f"/speaker profile {temporary}",
+        "/speaker link confirm",
+        f"/speaker profile {temporary}",
+        "/quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(lines))
+
+    assert main(["--db", db, "repl", "--person", person_id]) == 0
+    out = capsys.readouterr().out
+
+    assert "link refused" not in out
+    assert "nothing is bound yet" in out
+    assert f"linked speaker {temporary} -> {person_id}" in out
+    assert "person: none" in out  # before confirmation
+    assert f"person: {person_id} (Owner)" in out
+    assert "profile: ready" in out
+
+
+def test_repl_link_cancel_binds_nothing(tmp_path, capsys, monkeypatch):
+    from companion.cli import main
+    from companion.speaker_id.store import SpeakerStore
+
+    db = str(tmp_path / "cli.db")
+    speaker_db = tmp_path / "speakers.sqlite3"
+    monkeypatch.setenv("AVA_SPEAKER_DB", str(speaker_db))
+    store = SpeakerStore(speaker_db)
+    store.initialize()
+    temporary = store.create_candidate()
+    store.close()
+
+    main(["--db", db, "init"])
+    main([
+        "--db", db, "person", "add", "--name", "Owner", "--role", "owner",
+        "--allow-processing", "--allow-persistence",
+    ])
+    person_id = capsys.readouterr().out.strip().splitlines()[-1]
+
+    lines = iter([
+        f"/speaker link {temporary} {person_id}",
+        "/speaker link cancel",
+        "/speaker link confirm",
+        "/quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(lines))
+
+    assert main(["--db", db, "repl", "--person", person_id]) == 0
+    out = capsys.readouterr().out
+    assert "nothing was bound" in out
+    assert "no pending link preview" in out
+    assert "linked speaker" not in out
