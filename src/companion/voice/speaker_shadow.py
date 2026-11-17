@@ -82,6 +82,7 @@ class ReplSpeakerObserver(DeferredSpeakerObserver):
         self._revision_order: deque[int] = deque(maxlen=_MAX_TRACKED_REVISIONS)
         super().__init__(
             config,
+            on_result=self._on_result_shadow,
             enrollment_policy=enrollment_policy,
             **kwargs,
         )

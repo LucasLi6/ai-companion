@@ -220,6 +220,29 @@ def test_active_mode_default_observer_publishes_run_scoped_updates(tmp_path):
         observer.shutdown()
 
 
+def test_engine_results_are_wired_to_the_formal_callback(tmp_path):
+    """The observer must register its own result hook, not just expose it."""
+    from companion.voice.speaker_shadow import ReplSpeakerObserver
+
+    speaker_config = load_speaker_config(
+        env={}, db_path=tmp_path / "speaker.sqlite3"
+    )
+    observer = ReplSpeakerObserver(speaker_config, run_id="run-wired")
+    received = []
+    observer.set_speaker_update_callback(received.append)
+    try:
+        # ``_forward`` is the callback the engine actually holds; going through
+        # it would have been a no-op before the hook was registered.
+        observer._forward(sample_result())
+
+        assert observer._on_result is not None
+        assert len(received) == 1
+        assert received[0].run_id == "run-wired"
+        assert received[0].result.speaker_id == "S-0003"
+    finally:
+        observer.shutdown()
+
+
 def test_update_callback_failure_never_escapes_the_speaker_thread(tmp_path):
     from companion.voice.speaker_shadow import ReplSpeakerObserver
 

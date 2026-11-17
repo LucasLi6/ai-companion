@@ -3247,7 +3247,8 @@ async def cmd_repl(args) -> int:
                                 logging.getLogger("companion.identity").info(
                                     "identity_decision run_id=%s uid=%s"
                                     " state=%s reason=%s raw=%s canonical=%s"
-                                    " person=%s revision=%s"
+                                    " person=%s revision=%s status=%s"
+                                    " quality=%s similarity=%s margin=%s"
                                     " final_to_decision_ms=%.1f resolve_ms=%.1f",
                                     run_id,
                                     final.utterance_id,
@@ -3257,6 +3258,10 @@ async def cmd_repl(args) -> int:
                                     identity.canonical_speaker_id,
                                     identity.person_id,
                                     revision,
+                                    getattr(result, "status", None),
+                                    getattr(result, "reid_quality", None),
+                                    getattr(result, "similarity", None),
+                                    getattr(result, "margin", None),
                                     final_to_decision_ms,
                                     decide_ms,
                                 )
