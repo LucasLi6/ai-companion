@@ -597,10 +597,21 @@ def test_truncated_upload_is_incomplete_and_never_emits_a_final() -> None:
         assert finals == []
         assert renderer.confirmed == []
         assert running.manager.stats.finalized == 0
-        assert "本次语音未完整识别" in status.getvalue()
-        assert closed and closed[-1][1] is False
+        # The status line is rendered by a separate thread. Waiting only for
+        # ``stats.unfinished`` can observe the counter before the text is
+        # flushed (this raced on Python 3.12 in CI). Wait for the observable
+        # output instead of asserting immediately.
+        assert asr_tests.wait_for(
+            lambda: "本次语音未完整识别" in status.getvalue(), timeout=6.0
+        )
+        assert asr_tests.wait_for(
+            lambda: bool(closed) and closed[-1][1] is False
+        )
         # No voice-print sample is learned from a truncated turn.
-        assert observer.finalized and observer.finalized[-1][1] is False
+        assert asr_tests.wait_for(
+            lambda: bool(observer.finalized)
+            and observer.finalized[-1][1] is False
+        )
     finally:
         running.stop()
 
@@ -634,8 +645,12 @@ def test_stream_idle_timeout_fails_explicitly_without_a_final() -> None:
         assert finals == []
         assert renderer.confirmed == []
         assert running.manager.stats.finalized == 0
-        assert "长时间无响应" in status.getvalue()
-        assert closed and closed[-1][1] is False
+        assert asr_tests.wait_for(
+            lambda: "长时间无响应" in status.getvalue(), timeout=6.0
+        )
+        assert asr_tests.wait_for(
+            lambda: bool(closed) and closed[-1][1] is False, timeout=6.0
+        )
     finally:
         running.stop()
 
