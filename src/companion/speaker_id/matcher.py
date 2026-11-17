@@ -26,6 +26,7 @@ evaluated without touching recognition behaviour.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from companion.speaker_id.config import SpeakerConfig
 from companion.speaker_id.models import (
     AMBIGUOUS,
     CANDIDATE_MATCH,
+    ERROR,
     INSUFFICIENT_AUDIO,
     KNOWN,
     NEW_CANDIDATE,
@@ -73,6 +75,11 @@ class MatchDecision:
     speaker_id: Optional[str]
     similarity: Optional[float]
     margin: Optional[float]
+    # True only when no second identity existed, so ``margin`` is None
+    # because there is nothing to compare — not because the value was lost.
+    # Downstream identity code must not reject this legitimate case, while a
+    # ``margin=None`` without this flag stays malformed evidence.
+    singleton_match: bool = False
 
 
 def _cosine(left, right) -> float:
@@ -169,11 +176,16 @@ class SpeakerMatcher:
             key=lambda item: item[0],
             reverse=True,
         )
+        if not all(math.isfinite(score) for score, _ in scored):
+            # NaN/Infinity would make every threshold comparison silently
+            # false and could turn a broken vector into a "new speaker".
+            return MatchDecision(ERROR, None, None, None)
         best_score, best = scored[0]
         second_score = scored[1][0] if len(scored) > 1 else None
         margin = (
             best_score - second_score if second_score is not None else None
         )
+        singleton = second_score is None
 
         cfg = self.config
         if best_score >= cfg.candidate_match_threshold:
@@ -186,10 +198,18 @@ class SpeakerMatcher:
                 and best.status == "KNOWN"
             ):
                 return MatchDecision(
-                    KNOWN, best.speaker_id, best_score, margin
+                    KNOWN,
+                    best.speaker_id,
+                    best_score,
+                    margin,
+                    singleton_match=singleton,
                 )
             return MatchDecision(
-                CANDIDATE_MATCH, best.speaker_id, best_score, margin
+                CANDIDATE_MATCH,
+                best.speaker_id,
+                best_score,
+                margin,
+                singleton_match=singleton,
             )
         if best_score >= cfg.new_candidate_threshold:
             # Close to an existing identity but not close enough: this is
@@ -249,6 +269,10 @@ class SpeakerMatcher:
             for candidate in candidates
             if candidate.speaker_id != locked_speaker_id
         ]
+        if not math.isfinite(locked_score) or not all(
+            math.isfinite(score) for score in others
+        ):
+            return MatchDecision(ERROR, None, None, None)
         other_best = max(others) if others else None
         margin = (
             locked_score - other_best if other_best is not None else None
@@ -265,7 +289,13 @@ class SpeakerMatcher:
             and locked_score >= cfg.known_match_threshold
             else CANDIDATE_MATCH
         )
-        return MatchDecision(status, locked.speaker_id, locked_score, margin)
+        return MatchDecision(
+            status,
+            locked.speaker_id,
+            locked_score,
+            margin,
+            singleton_match=other_best is None,
+        )
 
     def _score(
         self,

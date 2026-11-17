@@ -21,6 +21,7 @@ utterance". It is *not* biometric authentication for a sensitive operation.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
@@ -36,6 +37,11 @@ from companion.speaker_id.models import (
     QUALITY_RANK,
     SpeakerResult,
 )
+from companion.speaker_id.store import (
+    ALIAS_REASON_BROKEN_CHAIN,
+    ALIAS_REASON_UNKNOWN,
+    AliasClosure,
+)
 
 # Stable reason codes. They are logged and may be asserted in tests; keep them
 # free of free-form text and personal data.
@@ -47,6 +53,7 @@ REASON_MODEL_UNAVAILABLE = "speaker_model_unavailable"
 REASON_BINDING_CONFLICT = "binding_conflict"
 REASON_CONSENT_MISSING = "consent_missing"
 REASON_PERSON_INACTIVE = "person_inactive"
+REASON_ALIAS_RESOLUTION_FAILED = "alias_resolution_failed"
 
 UNKNOWN_DISPLAY_NAME = "Unknown"
 
@@ -103,10 +110,32 @@ class IdentityTrustPolicy:
         if QUALITY_RANK.get(quality, 0) < QUALITY_RANK.get(minimum, 0):
             return False
         # A decided match without both values is malformed evidence. Never
-        # interpret a missing score as trustworthy.
-        if getattr(result, "similarity", None) is None:
+        # interpret a missing score as trustworthy. The one legitimate
+        # exception is a singleton match: when no second identity exists,
+        # there is no runner-up to compare against, so ``margin`` is absent by
+        # construction — but only the matcher may claim that, via the explicit
+        # ``singleton_match`` flag.
+        similarity = getattr(result, "similarity", None)
+        if similarity is None:
             return False
-        if getattr(result, "margin", None) is None:
+        try:
+            if not math.isfinite(float(similarity)):
+                return False
+        except (TypeError, ValueError):
+            return False
+        singleton = bool(getattr(result, "singleton_match", False))
+        margin = getattr(result, "margin", None)
+        if margin is None:
+            return singleton
+        try:
+            margin_value = float(margin)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(margin_value) or margin_value < 0.0:
+            return False
+        if singleton:
+            # A "no runner-up" claim alongside a numeric margin contradicts
+            # itself; refuse rather than pick the convenient half.
             return False
         return True
 
@@ -135,21 +164,26 @@ class IdentityResolver:
             return UNKNOWN_DISPLAY_NAME
         return f"speaker {speaker_id}"
 
-    def _store_ids(self, speaker_id: str) -> tuple[Optional[str], list[str]]:
-        """Return ``(canonical, related_ids)``; raises only on store errors."""
+    def _alias_closure(self, speaker_id: str) -> AliasClosure:
+        """Canonical id plus related aliases, with an explicit completeness bit."""
         store = self.speaker_store
         if store is None:
-            return speaker_id, [speaker_id]
-        canonical = store.resolve_canonical_speaker_id(speaker_id)
-        if canonical is None:
+            return AliasClosure(speaker_id, (speaker_id,), True, None)
+        resolver = getattr(store, "resolve_alias_closure", None)
+        if resolver is None:
+            # A store that cannot prove the alias set is complete must not be
+            # used for a person decision. Never degrade to checking one id.
+            return AliasClosure(
+                None, (), False, ALIAS_REASON_BROKEN_CHAIN
+            )
+        return resolver(speaker_id)
+
+    def _store_ids(self, speaker_id: str) -> tuple[Optional[str], list[str]]:
+        """Return ``(canonical, related_ids)``; raises only on store errors."""
+        closure = self._alias_closure(speaker_id)
+        if closure.canonical is None:
             return None, []
-        try:
-            related = list(store.related_speaker_ids(canonical) or [canonical])
-        except Exception:  # noqa: BLE001 - alias lookup is advisory
-            related = [canonical]
-        if canonical not in related:
-            related.insert(0, canonical)
-        return canonical, related
+        return closure.canonical, list(closure.speaker_ids)
 
     async def resolve(
         self,
@@ -221,18 +255,35 @@ class IdentityResolver:
             )
 
         try:
-            canonical, related = self._store_ids(raw)
+            closure = self._alias_closure(raw)
         except Exception:  # noqa: BLE001 - store failure is never identity
             return self._unknown(
-                run_id, uid, raw, None, REASON_MODEL_UNAVAILABLE
+                run_id, uid, raw, None, REASON_ALIAS_RESOLUTION_FAILED
             )
-        if canonical is None:
-            # A deleted speaker, a broken alias chain or a cycle has no safe
-            # identity. Do not fall back to the old id.
+        if closure.canonical is None:
+            # A deleted or never-existing speaker id has no identity to bind.
+            # A broken/cyclic chain is an alias-resolution failure, not "this
+            # voice is simply unbound".
+            reason = (
+                REASON_SPEAKER_UNBOUND
+                if closure.reason == ALIAS_REASON_UNKNOWN
+                else REASON_ALIAS_RESOLUTION_FAILED
+            )
+            return self._unknown(run_id, uid, raw, None, reason)
+        if not closure.complete:
+            # A truncated traversal could miss a binding on an alias, so
+            # checking only the ids we found is not safe.
             return self._unknown(
-                run_id, uid, raw, None, REASON_SPEAKER_UNBOUND
+                run_id,
+                uid,
+                raw,
+                closure.canonical,
+                REASON_ALIAS_RESOLUTION_FAILED,
             )
-        related = [canonical] + [sid for sid in related if sid != canonical]
+        canonical = closure.canonical
+        related = [canonical] + [
+            sid for sid in closure.speaker_ids if sid != canonical
+        ]
 
         try:
             rows = await self.bindings.bindings_for_speaker_ids(related)
@@ -320,6 +371,7 @@ __all__ = [
     "IdentityResolver",
     "IdentityState",
     "IdentityTrustPolicy",
+    "REASON_ALIAS_RESOLUTION_FAILED",
     "REASON_AMBIGUOUS_MATCH",
     "REASON_BINDING_CONFLICT",
     "REASON_CONSENT_MISSING",

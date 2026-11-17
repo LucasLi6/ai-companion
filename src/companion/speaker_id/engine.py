@@ -1039,6 +1039,9 @@ class SpeakerEngine:
             status = decision.status
         similarity = None if created_by_this_utterance else decision.similarity
         margin = None if created_by_this_utterance else decision.margin
+        singleton_match = (
+            decision.singleton_match and not created_by_this_utterance
+        )
 
         result = self._build_result(
             uid,
@@ -1049,6 +1052,7 @@ class SpeakerEngine:
             margin=margin,
             inference_ms=inference_ms,
             final=final,
+            singleton_match=singleton_match,
         )
         self._publish(uid, result)
         self._record_observation(
@@ -1315,6 +1319,7 @@ class SpeakerEngine:
         margin: Optional[float],
         inference_ms: Optional[float],
         final: bool,
+        singleton_match: bool = False,
     ) -> SpeakerResult:
         return SpeakerResult(
             utterance_id=int(uid),
@@ -1329,6 +1334,7 @@ class SpeakerEngine:
             model_id=self.model_key,
             inference_ms=inference_ms,
             completed_at=self._clock(),
+            singleton_match=bool(singleton_match),
         )
 
     @property

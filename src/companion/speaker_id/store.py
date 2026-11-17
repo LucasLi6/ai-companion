@@ -31,6 +31,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
@@ -58,6 +59,29 @@ CONSENT_STATUSES = (
     CONSENT_REVOKED,
     CONSENT_LEGACY_READ_ONLY,
 )
+
+# Alias-closure outcome codes. ``complete=False`` means the caller must not
+# treat the returned ids as the full set of identities that could carry a
+# person binding.
+ALIAS_REASON_UNKNOWN = "unknown_id"
+ALIAS_REASON_BROKEN_CHAIN = "broken_alias_chain"
+ALIAS_REASON_LIMIT = "alias_limit_exceeded"
+
+
+@dataclass(frozen=True)
+class AliasClosure:
+    """Canonical id plus every alias reachable from it, with completeness.
+
+    A bounded traversal may stop before the alias graph is exhausted. Silently
+    returning the truncated list would let a caller check only a subset of the
+    ids that could be bound to a person, so truncation is reported explicitly
+    instead of looking like "no other alias".
+    """
+
+    canonical: Optional[str]
+    speaker_ids: tuple[str, ...] = ()
+    complete: bool = False
+    reason: Optional[str] = None
 
 
 class SpeakerStoreError(Exception):
@@ -958,18 +982,30 @@ class SpeakerStore:
             ).fetchone()
             return current if live is not None else None
 
-    def related_speaker_ids(
+    def resolve_alias_closure(
         self, speaker_id: str, *, max_ids: int = 64
-    ) -> list[str]:
-        """Canonical id plus every alias that resolves to it.
+    ) -> AliasClosure:
+        """Canonical id and all related aliases, or why that set is unknown.
 
-        Used to check every human binding that could apply to one voice. The
-        traversal is bounded and returns just the canonical id when no alias
-        exists, so a caller never has to guess.
+        Every person-binding decision must use a *complete* closure: if the
+        traversal hits its bound, or the chain is missing/cyclic, checking only
+        the ids that happened to be returned could miss a binding on an alias
+        and silently confirm the wrong person.
         """
-        canonical = self.resolve_canonical_speaker_id(speaker_id)
+        requested = str(speaker_id or "").strip()
+        canonical = self.resolve_canonical_speaker_id(requested)
         if canonical is None:
-            return []
+            reason = ALIAS_REASON_UNKNOWN
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT 1 FROM speaker_aliases WHERE alias_speaker_id = ?",
+                    (requested,),
+                ).fetchone()
+            if row is not None:
+                # The id exists as an alias but does not lead to a live
+                # profile: a deleted parent or a cycle.
+                reason = ALIAS_REASON_BROKEN_CHAIN
+            return AliasClosure(None, (), False, reason)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT alias_speaker_id, canonical_speaker_id"
@@ -979,20 +1015,41 @@ class SpeakerStore:
             str(row["alias_speaker_id"]): str(row["canonical_speaker_id"])
             for row in rows
         }
+        limit = max(1, int(max_ids))
         found = [canonical]
         seen = {canonical}
         frontier = [canonical]
-        while frontier and len(found) < max(1, int(max_ids)):
+        truncated = False
+        while frontier:
             target = frontier.pop(0)
             for alias, parent in mapping.items():
                 if parent != target or alias in seen:
                     continue
+                if len(found) >= limit:
+                    truncated = True
+                    break
                 seen.add(alias)
                 found.append(alias)
                 frontier.append(alias)
-                if len(found) >= max(1, int(max_ids)):
-                    break
-        return found
+            if truncated:
+                break
+        if truncated:
+            return AliasClosure(
+                canonical, tuple(found), False, ALIAS_REASON_LIMIT
+            )
+        return AliasClosure(canonical, tuple(found), True, None)
+
+    def related_speaker_ids(
+        self, speaker_id: str, *, max_ids: int = 64
+    ) -> list[str]:
+        """Compatibility wrapper; see :meth:`resolve_alias_closure`.
+
+        New identity/binding code must use the closure so it can detect an
+        incomplete traversal instead of assuming completeness.
+        """
+        return list(
+            self.resolve_alias_closure(speaker_id, max_ids=max_ids).speaker_ids
+        )
 
     # ---------------------------------------------------- enrollment consent
     def set_enrollment_consent(

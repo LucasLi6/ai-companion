@@ -15,6 +15,7 @@ from companion.domain.enums import RegistrationStatus
 from companion.people.identity_resolver import (
     IdentityResolver,
     IdentityState,
+    REASON_ALIAS_RESOLUTION_FAILED,
     REASON_BINDING_CONFLICT,
     REASON_SPEAKER_UNBOUND,
 )
@@ -177,6 +178,115 @@ def test_deleted_or_unknown_id_has_no_canonical(store):
     temporary = store.create_candidate()
     store.delete_speaker(temporary)
     assert store.resolve_canonical_speaker_id(temporary) is None
+
+
+# -------------------------------------------------- alias closure completeness
+def test_alias_closure_is_complete_for_a_normal_merge(store):
+    canonical = stable(store)
+    merged = store.create_candidate()
+    assert store.merge_speakers(canonical, merged) is True
+
+    closure = store.resolve_alias_closure(canonical)
+    assert closure.complete is True
+    assert closure.canonical == canonical
+    assert merged in closure.speaker_ids
+    assert set(closure.speaker_ids) == {
+        canonical,
+        merged,
+        *(
+            row["alias_speaker_id"]
+            for row in store.aliases()
+            if row["canonical_speaker_id"] == canonical
+        ),
+    }
+    assert closure.reason is None
+
+
+def test_alias_closure_reports_a_truncated_traversal(store):
+    canonical = stable(store)
+    merged = store.create_candidate()
+    store.merge_speakers(canonical, merged)
+
+    closure = store.resolve_alias_closure(canonical, max_ids=1)
+    assert closure.complete is False
+    assert closure.canonical == canonical
+    assert closure.speaker_ids == (canonical,)
+    assert closure.reason == "alias_limit_exceeded"
+
+
+def test_alias_closure_reports_unknown_and_broken_chains(store):
+    unknown = store.resolve_alias_closure("S-9999")
+    assert unknown.complete is False
+    assert unknown.canonical is None
+    assert unknown.reason == "unknown_id"
+
+    live = stable(store)
+    conn = store._connection
+    # A live profile that is also an alias of a deleted parent: the chain
+    # cannot reach a live canonical id.
+    conn.execute(
+        "INSERT OR REPLACE INTO speaker_aliases(canonical_speaker_id,"
+        " alias_speaker_id, created_at) VALUES ('S-9999', ?, 0.0)",
+        (live,),
+    )
+    broken = store.resolve_alias_closure(live)
+    assert broken.complete is False
+    assert broken.canonical is None
+    assert broken.reason == "broken_alias_chain"
+
+
+class _CanonicalOnlyStore:
+    """A store that can answer the old API but cannot prove completeness."""
+
+    def resolve_canonical_speaker_id(self, speaker_id):
+        return speaker_id
+
+    def related_speaker_ids(self, speaker_id):
+        return [speaker_id]
+
+
+async def test_resolver_never_degrades_to_canonical_only_lookup(rt, store):
+    speaker_id = stable(store)
+    owner = await person(rt)
+    await rt.speaker_bindings.bind_speaker(
+        owner.person_id, speaker_id, "explicit_confirmation"
+    )
+
+    identity = await resolver(rt, _CanonicalOnlyStore()).resolve(
+        result(speaker_id), run_id="run", utterance_id=1
+    )
+
+    assert identity.state is IdentityState.UNKNOWN
+    assert identity.person_id is None
+    assert identity.reason == REASON_ALIAS_RESOLUTION_FAILED
+
+
+async def test_alias_cycle_fails_closed_with_an_explicit_reason(rt, store):
+    first = stable(store)
+    second = stable(store)
+    owner = await person(rt)
+    await rt.speaker_bindings.bind_speaker(
+        owner.person_id, first, "explicit_confirmation"
+    )
+    conn = store._connection
+    conn.execute(
+        "INSERT OR REPLACE INTO speaker_aliases(canonical_speaker_id,"
+        " alias_speaker_id, created_at) VALUES (?, ?, 0.0)",
+        (second, first),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO speaker_aliases(canonical_speaker_id,"
+        " alias_speaker_id, created_at) VALUES (?, ?, 0.0)",
+        (first, second),
+    )
+
+    identity = await resolver(rt, store).resolve(
+        result(first), run_id="run", utterance_id=1
+    )
+
+    assert identity.state is IdentityState.UNKNOWN
+    assert identity.person_id is None
+    assert identity.reason == REASON_ALIAS_RESOLUTION_FAILED
 
 
 # ------------------------------------------------------------------ merge

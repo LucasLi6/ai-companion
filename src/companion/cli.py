@@ -2783,12 +2783,14 @@ async def cmd_repl(args) -> int:
                     if rt.speaker_bindings is None:
                         return ["speaker bindings unavailable"]
                     requested, person_id = parts[2], parts[3]
-                    canonical = store.resolve_canonical_speaker_id(requested)
-                    if canonical is None:
+                    closure = store.resolve_alias_closure(requested)
+                    if closure.canonical is None or not closure.complete:
                         return [
                             f"speaker id unusable: {requested}"
-                            " (unknown, deleted, or broken alias chain)"
+                            " (unknown, deleted, broken alias chain, or alias"
+                            " set too large to verify)"
                         ]
+                    canonical = closure.canonical
                     person_obj = await rt.registry.get(person_id)
                     if person_obj is None:
                         return [f"person not found: {person_id}"]
@@ -2797,7 +2799,7 @@ async def cmd_repl(args) -> int:
                             f"person not active: {person_id}"
                             f" ({person_obj.registration_status.value})"
                         ]
-                    related = store.related_speaker_ids(canonical) or [canonical]
+                    related = list(closure.speaker_ids)
                     existing = await rt.speaker_bindings.bindings_for_speaker_ids(
                         related
                     )
@@ -2854,15 +2856,16 @@ async def cmd_repl(args) -> int:
                         return ["speaker store unavailable"]
                     if rt.speaker_bindings is None:
                         return ["speaker bindings unavailable"]
-                    canonical = store.resolve_canonical_speaker_id(parts[2])
-                    if canonical is None:
+                    closure = store.resolve_alias_closure(parts[2])
+                    if closure.canonical is None or not closure.complete:
                         return [
                             f"speaker id unusable: {parts[2]}"
-                            " (unknown, deleted, or broken alias chain)"
+                            " (unknown, deleted, broken alias chain, or alias"
+                            " set too large to verify)"
                         ]
-                    related = store.related_speaker_ids(canonical) or [canonical]
+                    canonical = closure.canonical
                     removed = await rt.speaker_bindings.unbind_speaker(
-                        canonical, related_speaker_ids=related
+                        canonical, related_speaker_ids=list(closure.speaker_ids)
                     )
                     if not removed:
                         return [f"no binding for speaker {canonical}"]

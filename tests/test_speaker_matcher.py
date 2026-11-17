@@ -337,3 +337,57 @@ def test_locked_variant_match_still_needs_a_margin() -> None:
     )
     assert decision.status == "AMBIGUOUS"
     assert decision.speaker_id is None
+
+
+# ------------------------------------------------- singleton margin semantics
+def test_singleton_known_match_is_decided_without_a_margin() -> None:
+    """One stored identity means there is no runner-up to compare with."""
+    candidate = SpeakerCandidate("S-0001", "KNOWN", (unit(1, 0),))
+
+    decision = matcher().match(unit(1, 0.03), [candidate], quality=HIGH)
+
+    assert decision.status == "KNOWN"
+    assert decision.speaker_id == "S-0001"
+    assert decision.margin is None
+    assert decision.singleton_match is True
+
+
+def test_two_identities_produce_a_real_margin_not_a_singleton_claim() -> None:
+    candidates = [
+        SpeakerCandidate("S-0001", "KNOWN", (unit(1, 0),)),
+        SpeakerCandidate("S-0002", "KNOWN", (unit(0, 1),)),
+    ]
+
+    decision = matcher().match(unit(1, 0.05), candidates, quality=HIGH)
+
+    assert decision.status == "KNOWN"
+    assert decision.singleton_match is False
+    assert decision.margin is not None and decision.margin > 0.9
+
+
+def test_locked_singleton_match_is_also_marked_as_singleton() -> None:
+    candidate = SpeakerCandidate("S-0001", "KNOWN", (unit(1, 0),))
+
+    decision = matcher().match(
+        unit(1, 0.02),
+        [candidate],
+        quality=HIGH,
+        locked_speaker_id="S-0001",
+    )
+
+    assert decision.status == "KNOWN"
+    assert decision.margin is None
+    assert decision.singleton_match is True
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_non_finite_scores_are_an_error_not_a_new_speaker(value) -> None:
+    vector = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    vector[0] = value
+    candidate = SpeakerCandidate("S-0001", "KNOWN", (vector,))
+
+    decision = matcher().match(unit(1, 0), [candidate], quality=HIGH)
+
+    assert decision.status == "ERROR"
+    assert decision.speaker_id is None
+    assert decision.similarity is None

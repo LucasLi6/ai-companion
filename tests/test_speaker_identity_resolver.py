@@ -15,6 +15,7 @@ from companion.people.identity_resolver import (
     IdentityResolver,
     IdentityState,
     IdentityTrustPolicy,
+    REASON_ALIAS_RESOLUTION_FAILED,
     REASON_AMBIGUOUS_MATCH,
     REASON_BINDING_CONFLICT,
     REASON_CONSENT_MISSING,
@@ -24,6 +25,8 @@ from companion.people.identity_resolver import (
     REASON_SPEAKER_UNBOUND,
     REASON_TRUSTED_BINDING,
 )
+from companion.speaker_id.config import EMBEDDING_DIM, load_speaker_config
+from companion.speaker_id.matcher import SpeakerCandidate, SpeakerMatcher
 from companion.speaker_id.models import (
     AMBIGUOUS,
     CANDIDATE_MATCH,
@@ -37,7 +40,16 @@ from companion.speaker_id.models import (
     QUALITY_MEDIUM,
     SpeakerResult,
 )
+from companion.speaker_id.quality import VoiceQuality
 from companion.speaker_id.store import SpeakerStore
+
+import numpy as np
+
+
+def unit(*values: float) -> np.ndarray:
+    vector = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    vector[: len(values)] = values
+    return vector / np.linalg.norm(vector)
 
 
 def make_store(tmp_path) -> SpeakerStore:
@@ -190,6 +202,132 @@ async def test_missing_similarity_or_margin_is_not_reliable(rt, store):
     assert no_similarity.state is IdentityState.UNKNOWN
 
 
+# ------------------------------------- real matcher -> result -> resolver
+def speech(decision, *, quality=QUALITY_HIGH, uid=1) -> SpeakerResult:
+    """Turn a real matcher decision into the snapshot the engine publishes."""
+    return SpeakerResult(
+        utterance_id=uid,
+        speaker_id=decision.speaker_id,
+        person_id=None,
+        status=decision.status,
+        reid_quality=quality,
+        similarity=decision.similarity,
+        margin=decision.margin,
+        voiced_seconds=2.4,
+        provisional=False,
+        model_id="fake",
+        inference_ms=1.0,
+        completed_at=0.0,
+        singleton_match=decision.singleton_match,
+    )
+
+
+def decide(query, candidates, *, locked=None):
+    return SpeakerMatcher(load_speaker_config(env={})).match(
+        query,
+        candidates,
+        quality=VoiceQuality(True, 2.5, QUALITY_HIGH, None),
+        locked_speaker_id=locked,
+    )
+
+
+async def test_singleton_known_match_confirms_through_the_real_matcher(
+    rt, store
+):
+    """No runner-up is not missing data: one KNOWN profile is a valid match."""
+    speaker_id = stable_speaker(store)
+    owner = await person(rt)
+    await rt.speaker_bindings.bind_speaker(
+        owner.person_id, speaker_id, "owner"
+    )
+    candidate = SpeakerCandidate(speaker_id, "KNOWN", (unit(1, 0),))
+
+    decision = decide(unit(1, 0.03), [candidate])
+    assert decision.status == KNOWN
+    assert decision.margin is None
+    assert decision.singleton_match is True
+
+    identity = await resolve(rt, store, speech(decision))
+
+    assert identity.state is IdentityState.CONFIRMED
+    assert identity.person_id == owner.person_id
+
+
+async def test_two_candidate_conflict_never_confirms_through_the_matcher(
+    rt, store
+):
+    first = stable_speaker(store)
+    second = stable_speaker(store)
+    owner = await person(rt)
+    await rt.speaker_bindings.bind_speaker(
+        owner.person_id, first, "owner"
+    )
+    candidates = [
+        SpeakerCandidate(first, "KNOWN", (unit(1, 0),)),
+        SpeakerCandidate(second, "KNOWN", (unit(0, 1),)),
+    ]
+
+    decision = decide(unit(0.9, 0.9), candidates)
+    assert decision.status == AMBIGUOUS
+
+    identity = await resolve(rt, store, speech(decision))
+
+    assert identity.state is IdentityState.UNKNOWN
+    assert identity.person_id is None
+    assert identity.reason == REASON_AMBIGUOUS_MATCH
+
+
+async def test_singleton_flag_cannot_be_used_with_a_numeric_margin(rt, store):
+    speaker_id = stable_speaker(store)
+    owner = await person(rt)
+    await rt.speaker_bindings.bind_speaker(
+        owner.person_id, speaker_id, "owner"
+    )
+
+    identity = await resolve(
+        rt,
+        store,
+        SpeakerResult(
+            utterance_id=1,
+            speaker_id=speaker_id,
+            person_id=None,
+            status=KNOWN,
+            reid_quality=QUALITY_HIGH,
+            similarity=0.8,
+            margin=0.2,
+            voiced_seconds=2.4,
+            provisional=False,
+            model_id="fake",
+            inference_ms=1.0,
+            completed_at=0.0,
+            singleton_match=True,
+        ),
+    )
+
+    assert identity.state is IdentityState.UNKNOWN
+    assert identity.reason == REASON_PROVISIONAL_MATCH
+
+
+async def test_non_finite_evidence_is_never_identity(rt, store):
+    speaker_id = stable_speaker(store)
+    owner = await person(rt)
+    await rt.speaker_bindings.bind_speaker(
+        owner.person_id, speaker_id, "owner"
+    )
+
+    for similarity, margin in (
+        (float("nan"), 0.2),
+        (0.8, float("nan")),
+        (0.8, float("inf")),
+        (0.8, -0.1),
+    ):
+        identity = await resolve(
+            rt, store, result(speaker_id, similarity=similarity, margin=margin)
+        )
+        assert identity.state is IdentityState.UNKNOWN
+        assert identity.reason == REASON_PROVISIONAL_MATCH
+
+
 # --------------------------------------------------------- tentative/unknown
 async def test_candidate_match_is_tentative_and_grants_no_person(rt, store):
     speaker_id = stable_speaker(store)
@@ -320,6 +458,7 @@ async def test_limit_preserves_stable_reason_codes():
         REASON_BINDING_CONFLICT,
         REASON_CONSENT_MISSING,
         REASON_PERSON_INACTIVE,
+        REASON_ALIAS_RESOLUTION_FAILED,
     } == {
         "trusted_binding",
         "speaker_unbound",
@@ -329,4 +468,5 @@ async def test_limit_preserves_stable_reason_codes():
         "binding_conflict",
         "consent_missing",
         "person_inactive",
+        "alias_resolution_failed",
     }
