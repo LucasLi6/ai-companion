@@ -35,8 +35,14 @@ from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
 from companion.speaker_id.matcher import SpeakerCandidate
+from companion.speaker_id.voice_profiles import (
+    ORIGIN_AUTO,
+    ORIGIN_LEGACY,
+    ORIGINS,
+    VoiceSample,
+)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEGACY_SESSION_ID = "legacy"
 
 
@@ -159,6 +165,19 @@ class SpeakerStore:
                 connection.execute(
                     "ALTER TABLE speaker_embeddings ADD COLUMN"
                     " source_utterance_id INTEGER"
+                )
+            # Schema v3: where a sample came from and whether it is currently
+            # distrusted. Old rows are ``legacy`` and never trusted more than
+            # they were before the upgrade.
+            if "origin" not in embedding_columns:
+                connection.execute(
+                    "ALTER TABLE speaker_embeddings ADD COLUMN"
+                    " origin TEXT NOT NULL DEFAULT 'legacy'"
+                )
+            if "quarantined" not in embedding_columns:
+                connection.execute(
+                    "ALTER TABLE speaker_embeddings ADD COLUMN"
+                    " quarantined INTEGER NOT NULL DEFAULT 0"
                 )
 
             if "session_id" not in observation_columns:
@@ -340,6 +359,7 @@ class SpeakerStore:
         source_session_id: Optional[str] = None,
         source_utterance_id: Optional[int] = None,
         is_verified_reference: bool = False,
+        origin: str = ORIGIN_AUTO,
     ) -> str:
         """Store one normalized voice print, keeping the sample set useful.
 
@@ -357,7 +377,12 @@ class SpeakerStore:
         """
         from companion.speaker_id.embedding import validate_embedding
 
+        # Validate (and normalize) with the model's fixed dimension here; the
+        # profile module must not be the only line of defence for the store.
         array = validate_embedding(vector)
+        chosen_origin = str(origin or ORIGIN_AUTO).strip().lower()
+        if chosen_origin not in ORIGINS:
+            chosen_origin = ORIGIN_AUTO
         with self._lock, self._transaction() as connection:
             profile = connection.execute(
                 "SELECT model_id, embedding_version FROM speaker_profiles"
@@ -413,8 +438,8 @@ class SpeakerStore:
                 "INSERT INTO speaker_embeddings"
                 " (speaker_id, vector, quality, voiced_seconds, created_at,"
                 "  is_verified_reference, source_session_id,"
-                "  source_utterance_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "  source_utterance_id, origin, quarantined)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 (
                     speaker_id,
                     array.astype("<f4").tobytes(),
@@ -426,6 +451,7 @@ class SpeakerStore:
                     else str(source_session_id),
                     None if source_utterance_id is None
                     else int(source_utterance_id),
+                    chosen_origin,
                 ),
             )
             connection.execute(
@@ -453,6 +479,7 @@ class SpeakerStore:
         rows = connection.execute(
             "SELECT embedding_id, vector, quality, is_verified_reference"
             " FROM speaker_embeddings WHERE speaker_id = ?"
+            "   AND quarantined = 0"
             " ORDER BY embedding_id ASC",
             (speaker_id,),
         ).fetchall()
@@ -494,6 +521,7 @@ class SpeakerStore:
         rows = connection.execute(
             "SELECT embedding_id, vector, quality, is_verified_reference,"
             " created_at FROM speaker_embeddings WHERE speaker_id = ?"
+            "   AND quarantined = 0"
             " ORDER BY embedding_id ASC",
             (speaker_id,),
         ).fetchall()
@@ -635,6 +663,58 @@ class SpeakerStore:
             return False
 
 
+    def revoke_sample(self, sample_id: int) -> bool:
+        """Delete one sample by id. Idempotent: a second call returns False.
+
+        Unlike :meth:`revoke_embedding` this does not need the source keys, so
+        a later correction can remove a sample that was trusted at write time.
+        Deleting an unknown or already deleted sample is a no-op.
+        """
+        with self._lock, self._transaction() as connection:
+            row = connection.execute(
+                "SELECT speaker_id FROM speaker_embeddings"
+                " WHERE embedding_id = ?",
+                (int(sample_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "DELETE FROM speaker_embeddings WHERE embedding_id = ?",
+                (int(sample_id),),
+            )
+            connection.execute(
+                "UPDATE speaker_profiles SET updated_at = ?"
+                " WHERE speaker_id = ?",
+                (self._clock(), str(row["speaker_id"])),
+            )
+            return True
+
+    def quarantine_sample(
+        self, sample_id: int, *, quarantined: bool = True
+    ) -> bool:
+        """Stop (or resume) using one sample without deleting its history.
+
+        A quarantined sample is excluded from matching, duplicate detection
+        and the retention trim, so a suspect sample cannot drag the remaining
+        references toward it. The row keeps its id and origin for diagnosis.
+        """
+        with self._lock, self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE speaker_embeddings SET quarantined = ?"
+                " WHERE embedding_id = ?",
+                (1 if quarantined else 0, int(sample_id)),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    "UPDATE speaker_profiles SET updated_at = ?"
+                    " WHERE speaker_id = ("
+                    "  SELECT speaker_id FROM speaker_embeddings"
+                    "  WHERE embedding_id = ?)",
+                    (self._clock(), int(sample_id)),
+                )
+                return True
+            return False
+
     def record_observation(
         self,
         utterance_id: int,
@@ -725,43 +805,43 @@ class SpeakerStore:
                 ):
                     incompatible += 1
                     continue
-                vectors = self._load_vectors(str(profile["speaker_id"]))
-                if not vectors:
+                samples = self._load_samples(str(profile["speaker_id"]))
+                if not samples:
                     continue
                 candidates.append(
                     SpeakerCandidate(
                         speaker_id=str(profile["speaker_id"]),
                         status=str(profile["status"]),
-                        vectors=tuple(vectors),
+                        vectors=tuple(sample.vector for sample in samples),
+                        samples=tuple(samples),
                     )
                 )
             return candidates, incompatible
 
-    def _load_vectors(self, speaker_id: str) -> list:
-        import numpy as np
-
+    def _load_samples(self, speaker_id: str) -> list[VoiceSample]:
         rows = self._conn.execute(
-            "SELECT vector FROM speaker_embeddings WHERE speaker_id = ?"
+            "SELECT embedding_id, vector, quality, created_at, origin,"
+            " quarantined FROM speaker_embeddings WHERE speaker_id = ?"
+            "   AND quarantined = 0"
             " ORDER BY embedding_id ASC",
             (speaker_id,),
         ).fetchall()
-        vectors = []
+        samples = []
         for row in rows:
-            try:
-                vector = np.frombuffer(row["vector"], dtype="<f4").astype(
-                    np.float32
+            vector = self._decode_vector(row["vector"])
+            if vector is None:
+                continue
+            samples.append(
+                VoiceSample(
+                    sample_id=int(row["embedding_id"]),
+                    vector=vector,
+                    created_at=float(row["created_at"]),
+                    quality=str(row["quality"]),
+                    origin=str(row["origin"] or ORIGIN_LEGACY),
+                    quarantined=bool(int(row["quarantined"] or 0)),
                 )
-            except (TypeError, ValueError):
-                continue
-            if vector.ndim != 1 or vector.size == 0:
-                continue
-            if not np.all(np.isfinite(vector)):
-                continue
-            norm = float(np.linalg.norm(vector))
-            if norm < 1e-6:
-                continue
-            vectors.append((vector / norm).astype(np.float32))
-        return vectors
+            )
+        return samples
 
     def list_speakers(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -967,7 +1047,9 @@ CREATE TABLE IF NOT EXISTS speaker_embeddings (
     created_at REAL NOT NULL,
     is_verified_reference INTEGER NOT NULL DEFAULT 0,
     source_session_id TEXT,
-    source_utterance_id INTEGER
+    source_utterance_id INTEGER,
+    origin TEXT NOT NULL DEFAULT 'legacy',
+    quarantined INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_speaker_embeddings_speaker

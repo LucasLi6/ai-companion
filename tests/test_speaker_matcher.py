@@ -170,3 +170,170 @@ def test_multiple_samples_use_the_best_match() -> None:
     )
     decision = matcher().match(unit(1, 0.05), [candidate], quality=HIGH)
     assert decision.status == "CANDIDATE_MATCH"
+
+
+# ------------------------------------------------------- V2 profile strategies
+import math
+
+from companion.speaker_id.voice_profiles import VoiceSample
+
+
+def voice_sample(sample_id: int, degrees: float) -> VoiceSample:
+    radians = math.radians(degrees)
+    vector = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    vector[0] = math.cos(radians)
+    vector[1] = math.sin(radians)
+    return VoiceSample(sample_id=sample_id, vector=vector, created_at=sample_id)
+
+
+def angle(degrees: float) -> np.ndarray:
+    radians = math.radians(degrees)
+    vector = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    vector[0] = math.cos(radians)
+    vector[1] = math.sin(radians)
+    return vector
+
+
+def variant_matcher(**env) -> SpeakerMatcher:
+    settings = {"AVA_SPEAKER_MATCH_STRATEGY": "variant_centroid"}
+    settings.update(env)
+    return SpeakerMatcher(load_speaker_config(env=settings))
+
+
+def test_legacy_strategy_still_uses_the_best_single_sample() -> None:
+    candidate = SpeakerCandidate(
+        "TEMP-0001",
+        "CANDIDATE",
+        (angle(-15), angle(15)),
+        (voice_sample(1, -15), voice_sample(2, 15)),
+    )
+    decision = matcher().match(angle(15), [candidate], quality=HIGH)
+    assert decision.similarity == pytest.approx(
+        math.cos(math.radians(0)), abs=1e-5
+    )
+
+
+def test_variant_strategy_uses_the_cluster_centroid() -> None:
+    candidate = SpeakerCandidate(
+        "TEMP-0001",
+        "CANDIDATE",
+        (angle(-15), angle(15)),
+        (voice_sample(1, -15), voice_sample(2, 15)),
+    )
+    decision = variant_matcher().match(angle(0), [candidate], quality=HIGH)
+    assert decision.status == "CANDIDATE_MATCH"
+    assert decision.similarity == pytest.approx(1.0, abs=1e-5)
+
+
+def test_variants_mode_selects_variant_scoring_by_default() -> None:
+    config = load_speaker_config(env={"AVA_SPEAKER_PROFILE_MODE": "variants"})
+    assert config.match_strategy == "variant_centroid"
+    matcher_v2 = SpeakerMatcher(config)
+    candidate = SpeakerCandidate(
+        "TEMP-0001",
+        "CANDIDATE",
+        (angle(-15), angle(15)),
+        (voice_sample(1, -15), voice_sample(2, 15)),
+    )
+    decision = matcher_v2.match(angle(0), [candidate], quality=HIGH)
+    assert decision.similarity == pytest.approx(1.0, abs=1e-5)
+
+
+def test_shadow_mode_returns_the_legacy_verdict_and_records_the_difference() -> None:
+    shadow = SpeakerMatcher(
+        load_speaker_config(env={"AVA_SPEAKER_PROFILE_MODE": "shadow"})
+    )
+    # 0.40 is inside the uncertainty band for the raw max (0.40), while the
+    # centroid of the two samples sits at 15 degrees and scores ~0.966.
+    candidate = SpeakerCandidate(
+        "TEMP-0001",
+        "CANDIDATE",
+        (angle(-15), angle(15)),
+        (voice_sample(1, -15), voice_sample(2, 15)),
+    )
+    decision = shadow.match(angle(0), [candidate], quality=HIGH)
+    # Legacy verdict is returned unchanged: raw max is 0.966, so match.
+    assert decision.status == "CANDIDATE_MATCH"
+    stats = shadow.shadow_stats()
+    assert stats["agree"] + stats["disagree"] == 1
+    assert stats["mode"] == "shadow"
+
+
+def test_shadow_mode_never_changes_the_threshold_band() -> None:
+    shadow = SpeakerMatcher(
+        load_speaker_config(env={"AVA_SPEAKER_PROFILE_MODE": "shadow"})
+    )
+    candidate = SpeakerCandidate("TEMP-0001", "CANDIDATE", (unit(1, 0),))
+    decision = shadow.match(
+        unit(0.35, 0.93675), [candidate], quality=HIGH
+    )
+    assert decision.status == "AMBIGUOUS"
+    assert decision.speaker_id is None
+
+
+def test_second_place_is_always_a_different_person_under_variants() -> None:
+    first = SpeakerCandidate(
+        "TEMP-0001",
+        "CANDIDATE",
+        (angle(-15), angle(15)),
+        (voice_sample(1, -15), voice_sample(2, 15)),
+    )
+    second = SpeakerCandidate(
+        "TEMP-0002",
+        "CANDIDATE",
+        (angle(-15), angle(15)),
+        (voice_sample(3, -15), voice_sample(4, 15)),
+    )
+    decision = variant_matcher().match(angle(0), [first, second], quality=HIGH)
+    # Equal scores: the margin is zero, so the honest answer is AMBIGUOUS.
+    assert decision.status == "AMBIGUOUS"
+    assert decision.margin == pytest.approx(0.0, abs=1e-6)
+
+
+def test_singleton_penalty_can_be_configured_without_touching_thresholds() -> None:
+    strict = variant_matcher(
+        AVA_SPEAKER_SINGLETON_PENALTY="0.10",
+    )
+    candidate = SpeakerCandidate(
+        "TEMP-0001",
+        "CANDIDATE",
+        (angle(0),),
+        (voice_sample(1, 0),),
+    )
+    # Raw/variant score is 0.50 in the uncertainty band; a 0.10 singleton
+    # penalty pushes it below the new-candidate gate.
+    decision = strict.match(angle(60), [candidate], quality=HIGH)
+    assert decision.similarity == pytest.approx(0.40, abs=1e-6)
+    assert decision.status == "AMBIGUOUS"
+
+
+def test_variant_scoring_uses_the_profile_cache() -> None:
+    matcher_v2 = variant_matcher()
+    candidate = SpeakerCandidate(
+        "TEMP-0001",
+        "CANDIDATE",
+        (angle(-15), angle(15)),
+        (voice_sample(1, -15), voice_sample(2, 15)),
+    )
+    for _ in range(3):
+        matcher_v2.match(angle(0), [candidate], quality=HIGH)
+    stats = matcher_v2.profile_stats()
+    assert stats["misses"] == 1
+    assert stats["hits"] == 2
+
+
+def test_locked_variant_match_still_needs_a_margin() -> None:
+    matcher_v2 = variant_matcher()
+    candidates = [
+        SpeakerCandidate(
+            "TEMP-0001", "CANDIDATE", (angle(0),), (voice_sample(1, 0),)
+        ),
+        SpeakerCandidate(
+            "TEMP-0002", "CANDIDATE", (angle(10),), (voice_sample(2, 10),)
+        ),
+    ]
+    decision = matcher_v2.match(
+        angle(5), candidates, quality=HIGH, locked_speaker_id="TEMP-0001"
+    )
+    assert decision.status == "AMBIGUOUS"
+    assert decision.speaker_id is None

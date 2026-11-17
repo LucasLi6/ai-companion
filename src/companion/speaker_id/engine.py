@@ -43,6 +43,11 @@ from companion.speaker_id.models import (
     pending_result,
 )
 from companion.speaker_id.quality import VoiceQuality, evaluate_voice_quality
+from companion.speaker_id.tracker import (
+    PendingSampleBuffer,
+    SpeakerTrackManager,
+)
+from companion.speaker_id.voice_profiles import ORIGIN_AUTO, ORIGIN_BOOTSTRAP
 
 _STOP = object()
 
@@ -145,6 +150,13 @@ class _UtteranceState:
     # ``None`` until ASR reports the final outcome; only ``True`` may learn.
     asr_success: Optional[bool] = None
     first_identity_at: Optional[float] = None
+    # V2 diagnostics: what the last analysed window decided and which
+    # provisional track it belonged to. Never part of ``SpeakerResult``.
+    last_status: Optional[str] = None
+    last_similarity: Optional[float] = None
+    last_margin: Optional[float] = None
+    last_voiced_seconds: float = 0.0
+    track_id: Optional[str] = None
 
 
 class SpeakerEngine:
@@ -167,6 +179,25 @@ class SpeakerEngine:
         self._clock = clock
         self.sample_rate = config.sample_rate
         self.model_key = config.model_key
+        self.profile_mode = config.profile_mode
+        # The tracker is a V2 diagnostic/continuity layer. In ``legacy`` mode
+        # it is not constructed at all, so the old path stays byte-for-byte
+        # free of extra work.
+        self._tracker: Optional[SpeakerTrackManager] = None
+        self._pending: Optional[PendingSampleBuffer] = None
+        if config.profile_mode != "legacy" and config.tracking_enabled:
+            self._tracker = SpeakerTrackManager(
+                expiry_seconds=config.track_expiry_seconds,
+                recent_turns=config.track_recent_turns,
+                min_turns=config.new_id_min_turns,
+                min_voiced_seconds=config.new_id_min_voiced_seconds,
+                continuity_threshold=config.candidate_match_threshold,
+                clock=clock,
+            )
+            self._pending = PendingSampleBuffer(
+                max_count=config.pending_max_count,
+                clock=clock,
+            )
 
         self._lock = threading.RLock()
         self._states: dict[int, _UtteranceState] = {}
@@ -307,6 +338,8 @@ class SpeakerEngine:
                     # ASR failed after the state was already committed/removed:
                     # revoke any sample that carries this utterance's source.
                     self._queue_revocation_locked(uid)
+                    if self._tracker is not None:
+                        self._tracker.cancel(uid)
                 return
             state.asr_success = bool(success)
             if not success:
@@ -325,6 +358,8 @@ class SpeakerEngine:
                 self._cancelled.add(uid)
                 self._cancelled_order.append(uid)
             self._queue_revocation_locked(uid)
+            if self._tracker is not None:
+                self._tracker.cancel(uid)
         self._wake()
 
     def _queue_revocation_locked(self, uid: int) -> None:
@@ -392,6 +427,29 @@ class SpeakerEngine:
                     for name, samples in self._timings.items()
                 },
                 "session_id": self.session_id,
+                "profile": {
+                    "mode": self.config.profile_mode,
+                    "match_strategy": self._matcher.active_strategy,
+                    "algorithm_version": (
+                        self.config.profile_algorithm_version
+                    ),
+                    "variant_max_count": self.config.variant_max_count,
+                    "variant_merge_threshold": (
+                        self.config.variant_merge_threshold
+                    ),
+                    "singleton_penalty": self.config.singleton_penalty,
+                    "auto_learn_enabled": self.config.auto_learn_enabled,
+                    "cache": self._matcher.profile_stats(),
+                },
+                "shadow": self._matcher.shadow_stats(),
+                "tracker": (
+                    self._tracker.stats() if self._tracker is not None
+                    else {"enabled": False}
+                ),
+                "pending_samples": (
+                    self._pending.stats() if self._pending is not None
+                    else {"enabled": False}
+                ),
             }
 
     def _record_learning(self, outcome: Optional[str]) -> None:
@@ -618,6 +676,14 @@ class SpeakerEngine:
             block_reason = state.enrollment_block_reason
             bootstrap_learning = state.bootstrap_learning
 
+        # The tracker confirms one turn only when ASR succeeded; a failed or
+        # cancelled utterance contributes no continuity evidence.
+        if self._tracker is not None:
+            if success:
+                self._tracker.finalize(uid, success=True)
+            else:
+                self._tracker.cancel(uid)
+
         # Process (write/revoke) before removing the state so a caller that
         # observes the utterance as finished can also observe its effect.
         # ``_enroll`` registers the source first, so a cancellation racing
@@ -779,6 +845,23 @@ class SpeakerEngine:
             candidate.speaker_id: candidate.status for candidate in candidates
         }
 
+        matched_status = decision.status in (CANDIDATE_MATCH, KNOWN)
+        track = None
+        if self._tracker is not None:
+            track = self._tracker.observe(
+                uid,
+                speaker_id=(
+                    decision.speaker_id if matched_status else None
+                ),
+                status=decision.status,
+                similarity=decision.similarity,
+                margin=decision.margin,
+                voiced_seconds=quality.voiced_seconds,
+                quality_rank=quality.rank,
+                vector=vector,
+                final=False,
+            )
+
         speaker_id = decision.speaker_id
         assigned = locked_id
         created_now = False
@@ -788,17 +871,47 @@ class SpeakerEngine:
                 # The assignment survives a noisy window, but only while the
                 # identity still exists (it may have been deleted/merged).
                 speaker_id = locked_id
+                if track is not None:
+                    self._tracker.bind_identity(track.track_id, locked_id)
             else:
+                if (
+                    self._tracker is not None
+                    and self.profile_mode == "variants"
+                    and not self._tracker.can_persist(
+                        track,
+                        extra_turns=1,
+                        extra_voiced_seconds=quality.voiced_seconds,
+                    )
+                ):
+                    # A new voice must be heard consistently across turns
+                    # before it earns a permanent id. Nothing is written.
+                    self._defer_new_identity(
+                        uid,
+                        vector,
+                        quality,
+                        decision,
+                        track,
+                        total_seconds,
+                        inference_ms,
+                        final,
+                    )
+                    return
                 speaker_id = self._create_candidate(uid)
                 if speaker_id is None:
                     self._advance(uid, total_seconds)
                     return
+                if track is not None:
+                    self._tracker.bind_identity(track.track_id, speaker_id)
+                    if self._pending is not None:
+                        self._pending.drop_track(track.track_id)
                 assigned = speaker_id
                 created_now = True
                 created_by_this_utterance = True
-        elif decision.status in (CANDIDATE_MATCH, KNOWN):
+        elif matched_status:
             speaker_id = decision.speaker_id
             assigned = speaker_id
+            if track is not None and speaker_id is not None:
+                self._tracker.bind_identity(track.track_id, speaker_id)
 
         # A contradiction between windows of the same utterance invalidates
         # every sample from it, even an earlier high-scoring one.
@@ -819,7 +932,7 @@ class SpeakerEngine:
         pending: Optional[_PendingEnrollment] = None
         enroll_bootstrap = False
         block_reason: Optional[str] = None
-        if speaker_id and created_now:
+        if speaker_id and created_now and self.config.auto_learn_enabled:
             # The identity must exist immediately so the next analysis of this
             # same utterance can lock onto it. This provisional sample is the
             # utterance's own audio; it is unverified, carries its source key,
@@ -828,6 +941,7 @@ class SpeakerEngine:
             enroll_bootstrap = True
         elif (
             speaker_id
+            and self.config.auto_learn_enabled
             and not created_by_this_utterance
             and decision.status in (CANDIDATE_MATCH, KNOWN)
         ):
@@ -852,7 +966,11 @@ class SpeakerEngine:
         bootstrap_learning: Optional[str] = None
         if enroll_bootstrap:
             bootstrap_learning = self._enroll(
-                speaker_id, vector, quality, source_utterance_id=uid
+                speaker_id,
+                vector,
+                quality,
+                source_utterance_id=uid,
+                origin=ORIGIN_BOOTSTRAP,
             )
 
         with self._lock:
@@ -866,6 +984,12 @@ class SpeakerEngine:
             if enroll_bootstrap:
                 state.enrolled = True
                 state.bootstrap_learning = bootstrap_learning
+            state.last_status = decision.status
+            state.last_similarity = decision.similarity
+            state.last_margin = decision.margin
+            state.last_voiced_seconds = quality.voiced_seconds
+            if track is not None:
+                state.track_id = track.track_id
             if conflict:
                 state.identity_conflict = True
                 state.pending_enrollment = None
@@ -912,6 +1036,59 @@ class SpeakerEngine:
         self._advance(uid, total_seconds)
         if assigned:
             self._note_first_identity(uid)
+
+    def _defer_new_identity(
+        self,
+        uid: int,
+        vector,
+        quality: VoiceQuality,
+        decision: MatchDecision,
+        track,
+        total_seconds: float,
+        inference_ms: Optional[float],
+        final: bool,
+    ) -> None:
+        """Publish an honest "new voice, no permanent id yet" result.
+
+        This is the variants-mode path for the first N turns of a new voice.
+        The permanent store must not receive an id or a sample yet; only the
+        bounded in-memory pending buffer records the embedding for diagnostics
+        (it is never used for matching).
+        """
+        track_id = track.track_id if track is not None else None
+        if self._pending is not None and track_id is not None:
+            self._pending.add(
+                track_id,
+                vector,
+                quality=quality.quality,
+                voiced_seconds=quality.voiced_seconds,
+            )
+        with self._lock:
+            state = self._states.get(uid)
+            if state is None or state.cancelled:
+                return
+            state.last_status = decision.status
+            state.last_similarity = decision.similarity
+            state.last_margin = decision.margin
+            state.last_voiced_seconds = quality.voiced_seconds
+            state.track_id = track_id
+            state.pending_enrollment = None
+            state.enrollment_block_reason = None
+        result = self._build_result(
+            uid,
+            status=NEW_CANDIDATE,
+            speaker_id=None,
+            quality=quality,
+            similarity=decision.similarity,
+            margin=decision.margin,
+            inference_ms=inference_ms,
+            final=final,
+        )
+        self._publish(uid, result)
+        self._record_observation(
+            uid, None, NEW_CANDIDATE, decision.similarity, decision.margin
+        )
+        self._advance(uid, total_seconds)
 
     def _eligible_for_enrollment(
         self,
@@ -992,6 +1169,7 @@ class SpeakerEngine:
         quality: VoiceQuality,
         *,
         source_utterance_id: int,
+        origin: str = ORIGIN_AUTO,
     ) -> str:
         """Write at most one sample and report exactly what the store did."""
         required = QUALITY_RANK.get(
@@ -1015,6 +1193,7 @@ class SpeakerEngine:
                 source_session_id=self.session_id,
                 source_utterance_id=int(source_utterance_id),
                 is_verified_reference=False,
+                origin=origin,
             )
         except Exception:  # noqa: BLE001 - a lost sample must not stop ASR
             self.logger.debug(

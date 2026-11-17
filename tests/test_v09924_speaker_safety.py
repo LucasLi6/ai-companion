@@ -491,15 +491,18 @@ def test_legacy_store_migrates_without_losing_rows(tmp_path) -> None:
             ).fetchone()
             sample = check.execute(
                 "SELECT is_verified_reference, source_session_id,"
-                " source_utterance_id FROM speaker_embeddings"
+                " source_utterance_id, origin, quarantined"
+                " FROM speaker_embeddings"
             ).fetchone()
             version = check.execute(
                 "SELECT value FROM speaker_meta"
                 " WHERE key = 'schema_version'"
             ).fetchone()[0]
         assert observation == ("legacy", 3, "CANDIDATE_MATCH")
-        assert sample == (0, None, None)
-        assert version == "2"
+        # V2 migration: old samples are marked legacy and stay trusted no
+        # more than before; neither new column may change the vector.
+        assert sample == (0, None, None, "legacy", 0)
+        assert version == "3"
         assert store.create_candidate() == "TEMP-0005"
     finally:
         store.close()

@@ -40,6 +40,8 @@ Usage::
     .venv/bin/python scripts/benchmark_speaker.py --device mps --repeats 5
     .venv/bin/python scripts/benchmark_speaker.py --dataset /path/to/clips \
         --continuous-learning --learning-stages 1,3,5,10,20 --json /tmp/spk.json
+    .venv/bin/python scripts/benchmark_speaker.py --dataset /path/to/clips \
+        --profile-experiments --profile-stages 3,5,10,20
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ import tempfile
 import threading
 import time
 import wave
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -500,6 +503,207 @@ def benchmark_continuous_learning(
     }
 
 
+DEFAULT_PROFILE_STAGES = (3, 5, 10, 20)
+
+# Isolated comparisons for the V2 voice-profile work. Tracking is off for the
+# first two so only the scoring strategy differs; the third adds continuity.
+PROFILE_SCENARIOS = (
+    (
+        "legacy",
+        {
+            "profile_mode": "legacy",
+            "match_strategy": "legacy_max_sample",
+            "tracking_enabled": False,
+        },
+    ),
+    (
+        "variant_centroid_no_tracker",
+        {
+            "profile_mode": "variants",
+            "match_strategy": "variant_centroid",
+            "tracking_enabled": False,
+        },
+    ),
+    (
+        "variant_centroid_tracker",
+        {
+            "profile_mode": "variants",
+            "match_strategy": "variant_centroid",
+            "tracking_enabled": True,
+        },
+    ),
+)
+
+
+def _profile_scenario(
+    config,
+    model,
+    usable: dict[str, list[Path]],
+    stage: int,
+) -> dict:
+    """One scenario x learning-stage run with a strictly independent test set.
+
+    Split per speaker: ``files[0]`` enrols, ``files[1:-1]`` is the learning pool
+    (cycled for ``stage`` rounds), and ``files[-1]`` is *never* fed to the
+    engine with ``learn=True``. Recognition on it therefore cannot benefit from
+    having already seen that exact recording.
+    """
+    with tempfile.TemporaryDirectory(prefix="ava-speaker-profile-") as tmp:
+        engine = TempEngine(config, model, Path(tmp))
+        try:
+            enrolled: dict[str, Optional[str]] = {}
+            enrollment_turns: dict[str, int] = {}
+            uid = 0
+            continuity = (
+                config.profile_mode == "variants" and config.tracking_enabled
+            )
+            for label, files in usable.items():
+                expected = None
+                attempts = 0
+                # A deferred new identity needs consecutive turns. Three is the
+                # bound; the real voiced-seconds gate may still refuse it.
+                for _ in range(3 if continuity else 1):
+                    attempts += 1
+                    uid += 1
+                    result = engine.run(uid, read_wav(files[0]))
+                    expected = result.speaker_id
+                    if expected is not None:
+                        break
+                enrolled[label] = expected
+                enrollment_turns[label] = attempts
+
+            attempted_learning = 0
+            for round_index in range(int(stage)):
+                for label, files in usable.items():
+                    pool = files[1:-1] or [files[0]]
+                    clip = pool[round_index % len(pool)]
+                    uid += 1
+                    engine.run(uid, read_wav(clip))
+                    attempted_learning += 1
+
+            stats_after_learning = engine.engine.stats()
+            stored = sum(
+                int(item.get("samples") or 0)
+                for item in engine.store.list_speakers()
+            )
+
+            tests = reid = false_match = false_new = deferred = other = 0
+            for label, files in usable.items():
+                uid += 1
+                result = engine.identify(uid, read_wav(files[-1]))
+                tests += 1
+                expected = enrolled[label]
+                if expected is None:
+                    other += 1
+                elif result.status in (KNOWN, CANDIDATE_MATCH):
+                    if result.speaker_id == expected:
+                        reid += 1
+                    else:
+                        false_match += 1
+                elif result.status == NEW_CANDIDATE:
+                    if result.speaker_id is None:
+                        deferred += 1
+                    else:
+                        false_new += 1
+                else:
+                    other += 1
+
+            stats_after_tests = engine.engine.stats()
+        finally:
+            engine.close()
+
+    ratio = lambda value: (value / tests) if tests else None  # noqa: E731
+    learning = dict(stats_after_learning.get("learning", {}))
+    return {
+        "stage": int(stage),
+        "enrollment_turns": enrollment_turns,
+        "learning_rounds": attempted_learning,
+        "stored_embedding_count": stored,
+        "tests": tests,
+        "reid_success": reid,
+        "recognition_accuracy": ratio(reid),
+        "false_match_rate": ratio(false_match),
+        "false_new_rate": ratio(false_new),
+        "deferred_new_identity_rate": ratio(deferred),
+        "other_rate": ratio(other),
+        "added_samples": int(learning.get("added", 0)),
+        "rejected_samples_by_reason": {
+            key: value for key, value in learning.items() if key != "added"
+        },
+        "latency_ms": stats_after_tests.get("timings_ms", {}),
+        "profile_stats": stats_after_tests.get("profile", {}),
+        "pending_samples": stats_after_tests.get("pending_samples", {}),
+    }
+
+
+def benchmark_profile_experiments(
+    config,
+    model,
+    dataset: dict[str, list[Path]],
+    stages=DEFAULT_PROFILE_STAGES,
+) -> dict:
+    """Experiment A/B/C over a labelled dataset, real model only.
+
+    A: legacy max-sample vs variant-centroid scoring.
+    B: variant scoring without vs with the cross-utterance tracker.
+    C: learning stages (default 3/5/10/20 rounds per speaker) with an
+       independent test clip that never participated in learning.
+
+    Duplicate-ID reduction cannot be measured on single-speaker labelled clips;
+    that metric is explicitly reported as NOT_EVALUATED rather than inferred.
+    """
+    usable = {
+        label: files for label, files in dataset.items() if len(files) >= 3
+    }
+    if len(usable) < 2:
+        return {
+            "status": "untested",
+            "accuracy": "NOT_EVALUATED",
+            "reason": (
+                "每位说话人至少需要三段音频（登记、学习池、独立测试），"
+                "且至少两位说话人；未用随机向量代替。"
+            ),
+        }
+
+    scenarios = {}
+    for name, changes in PROFILE_SCENARIOS:
+        scenario_config = replace(config, **changes)
+        results = [
+            _profile_scenario(scenario_config, model, usable, stage)
+            for stage in stages
+        ]
+        scenarios[name] = {
+            "profile_mode": scenario_config.profile_mode,
+            "match_strategy": scenario_config.match_strategy,
+            "tracking_enabled": scenario_config.tracking_enabled,
+            "algorithm_version": scenario_config.profile_algorithm_version,
+            "stages": results,
+        }
+
+    return {
+        "status": "measured",
+        "speakers": sorted(usable),
+        "split": {
+            "enrollment": "files[0]",
+            "learning_pool": "files[1:-1]",
+            "independent_test": "files[-1] (never learnt)",
+        },
+        "scenarios": scenarios,
+        "duplicate_id_rate": {
+            "status": "NOT_EVALUATED",
+            "reason": (
+                "单说话人分段数据集无法测量“同一人产生多个 ID”；需要带说话人"
+                "与轮次标注的连续对话音频。"
+            ),
+        },
+        "note": (
+            "所有数字均来自该标注数据集上的真实模型推理；不同设备、噪声"
+            "和语种下不可外推。存储样本上限仍为 AVA_SPEAKER_MAX_EMBEDDINGS，"
+            "学习轮次增加不等于样本数增加。"
+        ),
+    }
+
+
 def benchmark_calibration(model, dataset: dict[str, list[Path]]) -> dict:
     """Pairwise score distributions plus conservative threshold suggestions.
 
@@ -616,6 +820,15 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="comma-separated cumulative learning counts per speaker",
     )
     parser.add_argument(
+        "--profile-experiments", action="store_true",
+        help="with --dataset, compare legacy vs variant scoring and tracker "
+        "on/off with an independent test clip",
+    )
+    parser.add_argument(
+        "--profile-stages", default="3,5,10,20",
+        help="comma-separated learning rounds for --profile-experiments",
+    )
+    parser.add_argument(
         "--audio", default=None,
         help="optional 16 kHz WAV used instead of synthetic timing audio",
     )
@@ -647,6 +860,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         return 2
     if not learning_stages or any(stage < 1 for stage in learning_stages):
         print("错误: --learning-stages 每项必须大于等于 1。", file=sys.stderr)
+        return 2
+    try:
+        profile_stages = tuple(
+            int(part) for part in args.profile_stages.split(",") if part.strip()
+        )
+    except ValueError:
+        print("错误: --profile-stages 必须是逗号分隔的整数。", file=sys.stderr)
+        return 2
+    if not profile_stages or any(stage < 1 for stage in profile_stages):
+        print("错误: --profile-stages 每项必须大于等于 1。", file=sys.stderr)
         return 2
 
     config = load_speaker_config(device=args.device)
@@ -707,6 +930,19 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 config.minimum_enrollment_quality
             ),
         },
+        "profile": {
+            "mode": config.profile_mode,
+            "match_strategy": config.match_strategy,
+            "algorithm_version": config.profile_algorithm_version,
+            "variant_max_count": config.variant_max_count,
+            "variant_merge_threshold": config.variant_merge_threshold,
+            "singleton_penalty": config.singleton_penalty,
+            "tracking_enabled": config.tracking_enabled,
+            "new_id_min_turns": config.new_id_min_turns,
+            "new_id_min_voiced_seconds": config.new_id_min_voiced_seconds,
+            "auto_learn_enabled": config.auto_learn_enabled,
+            "max_embeddings_per_speaker": config.max_embeddings_per_speaker,
+        },
         "load_ms": load_ms,
         "warmup_ms": warmup_ms,
         "inference": benchmark_model(model, audio_by_duration, args.repeats),
@@ -752,6 +988,21 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 "reason": (
                     "持续学习准确率需要带说话人标签且已获同意的数据集"
                     "（--dataset），未使用随机向量代替。"
+                ),
+            }
+
+    if args.profile_experiments:
+        if dataset:
+            report["profile_experiments"] = benchmark_profile_experiments(
+                config, model, dataset, profile_stages
+            )
+        else:
+            report["profile_experiments"] = {
+                "status": "untested",
+                "accuracy": "NOT_EVALUATED",
+                "reason": (
+                    "V2 对照评估需要带说话人标签且已获同意的数据集"
+                    "（--dataset）；未提供时不做任何准确率推断。"
                 ),
             }
 

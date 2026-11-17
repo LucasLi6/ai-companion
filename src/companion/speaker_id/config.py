@@ -9,6 +9,7 @@ results over creating new identities.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,33 @@ DEFAULT_GAIN_PREPROCESSING = False
 GAIN_PREPROCESSING_VERSION = "gain-v1"
 DEFAULT_MAX_GAIN_DB = 12.0
 
+# ------------------------------------------------------------ voice profiles
+# V2 modes. ``legacy`` is the default so existing installations behave exactly
+# as before; ``shadow`` computes the new score next to the old one and returns
+# the old verdict; ``variants`` uses clustered sample centroids and the
+# cross-utterance tracker.
+PROFILE_MODES = ("legacy", "shadow", "variants")
+DEFAULT_PROFILE_MODE = "legacy"
+
+MATCH_STRATEGIES = ("legacy_max_sample", "variant_centroid")
+DEFAULT_MATCH_STRATEGY = "legacy_max_sample"
+PROFILE_ALGORITHM_VERSION = "voice-profile-v2"
+
+# A cluster merge threshold is a *starting point*, not a calibrated constant:
+# it sits at the enrollment similarity floor. Run the benchmark on labelled
+# data before treating it as optimal. It is deliberately not Speakr's 0.72.
+DEFAULT_VARIANT_MAX_COUNT = 4
+DEFAULT_VARIANT_MERGE_THRESHOLD = 0.55
+DEFAULT_SINGLETON_PENALTY = 0.0
+
+DEFAULT_TRACKING_ENABLED = True
+DEFAULT_TRACK_EXPIRY_SECONDS = 15.0
+DEFAULT_TRACK_RECENT_TURNS = 4
+DEFAULT_NEW_ID_MIN_TURNS = 2
+DEFAULT_NEW_ID_MIN_VOICED_SECONDS = 3.0
+DEFAULT_PENDING_MAX_COUNT = 12
+DEFAULT_AUTO_LEARN_ENABLED = True
+
 
 class SpeakerConfigError(Exception):
     """Missing or invalid speaker configuration (display-safe)."""
@@ -133,6 +161,21 @@ class SpeakerConfig:
 
     max_embeddings_per_speaker: int = DEFAULT_MAX_EMBEDDINGS_PER_SPEAKER
     max_centers_per_speaker: int = DEFAULT_MAX_CENTERS_PER_SPEAKER
+
+    # ---------------------------------------------------------- V2 profiles
+    profile_mode: str = DEFAULT_PROFILE_MODE
+    match_strategy: str = DEFAULT_MATCH_STRATEGY
+    variant_max_count: int = DEFAULT_VARIANT_MAX_COUNT
+    variant_merge_threshold: float = DEFAULT_VARIANT_MERGE_THRESHOLD
+    singleton_penalty: float = DEFAULT_SINGLETON_PENALTY
+    tracking_enabled: bool = DEFAULT_TRACKING_ENABLED
+    track_expiry_seconds: float = DEFAULT_TRACK_EXPIRY_SECONDS
+    track_recent_turns: int = DEFAULT_TRACK_RECENT_TURNS
+    new_id_min_turns: int = DEFAULT_NEW_ID_MIN_TURNS
+    new_id_min_voiced_seconds: float = DEFAULT_NEW_ID_MIN_VOICED_SECONDS
+    pending_max_count: int = DEFAULT_PENDING_MAX_COUNT
+    auto_learn_enabled: bool = DEFAULT_AUTO_LEARN_ENABLED
+    profile_algorithm_version: str = PROFILE_ALGORITHM_VERSION
 
     debug: bool = False
 
@@ -197,6 +240,60 @@ def _env_bool(
     if raw in ("0", "false", "no", "off"):
         return False
     raise SpeakerConfigError(f"{name} 必须是 true/false。")
+
+
+def _env_float_tolerant(
+    env: Mapping[str, str],
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Read a V2 tuning value without ever breaking voice input.
+
+    A malformed or out-of-range *new* profile setting falls back to the
+    conservative default instead of raising: a typo must not disable the ASR
+    demo. Existing (pre-V2) settings keep their strict behaviour.
+    """
+    raw = str(env.get(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return min(max(value, float(minimum)), float(maximum))
+
+
+def _env_int_tolerant(
+    env: Mapping[str, str],
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = str(env.get(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, int(minimum)), int(maximum))
+
+
+def _env_choice(
+    env: Mapping[str, str],
+    name: str,
+    default: str,
+    allowed: tuple[str, ...],
+) -> str:
+    raw = str(env.get(name, "") or "").strip().lower()
+    return raw if raw in allowed else default
 
 
 def load_speaker_config(
@@ -335,6 +432,59 @@ def load_speaker_config(
         DEFAULT_MAX_CENTERS_PER_SPEAKER, minimum=0,
     )
 
+    profile_mode = _env_choice(
+        env, "AVA_SPEAKER_PROFILE_MODE", DEFAULT_PROFILE_MODE, PROFILE_MODES
+    )
+    if str(env.get("AVA_SPEAKER_MATCH_STRATEGY", "") or "").strip():
+        match_strategy = _env_choice(
+            env, "AVA_SPEAKER_MATCH_STRATEGY",
+            DEFAULT_MATCH_STRATEGY, MATCH_STRATEGIES,
+        )
+    elif profile_mode == "variants":
+        # Turning on variants mode alone must actually use variants; the
+        # scoring strategy stays overridable for the A/B experiment.
+        match_strategy = "variant_centroid"
+    else:
+        match_strategy = DEFAULT_MATCH_STRATEGY
+    variant_max_count = _env_int_tolerant(
+        env, "AVA_SPEAKER_VARIANT_MAX_COUNT",
+        DEFAULT_VARIANT_MAX_COUNT, minimum=1, maximum=8,
+    )
+    variant_merge_threshold = _env_float_tolerant(
+        env, "AVA_SPEAKER_VARIANT_MERGE_THRESHOLD",
+        DEFAULT_VARIANT_MERGE_THRESHOLD, minimum=0.0, maximum=1.0,
+    )
+    singleton_penalty = _env_float_tolerant(
+        env, "AVA_SPEAKER_SINGLETON_PENALTY",
+        DEFAULT_SINGLETON_PENALTY, minimum=0.0, maximum=0.5,
+    )
+    tracking_enabled = _env_bool(
+        env, "AVA_SPEAKER_TRACK_ENABLED", DEFAULT_TRACKING_ENABLED
+    )
+    track_expiry_seconds = _env_float_tolerant(
+        env, "AVA_SPEAKER_TRACK_EXPIRY_SECONDS",
+        DEFAULT_TRACK_EXPIRY_SECONDS, minimum=1.0, maximum=600.0,
+    )
+    track_recent_turns = _env_int_tolerant(
+        env, "AVA_SPEAKER_TRACK_RECENT_TURNS",
+        DEFAULT_TRACK_RECENT_TURNS, minimum=1, maximum=20,
+    )
+    new_id_min_turns = _env_int_tolerant(
+        env, "AVA_SPEAKER_NEW_ID_MIN_TURNS",
+        DEFAULT_NEW_ID_MIN_TURNS, minimum=1, maximum=10,
+    )
+    new_id_min_voiced_seconds = _env_float_tolerant(
+        env, "AVA_SPEAKER_NEW_ID_MIN_VOICED_SECONDS",
+        DEFAULT_NEW_ID_MIN_VOICED_SECONDS, minimum=0.0, maximum=60.0,
+    )
+    pending_max_count = _env_int_tolerant(
+        env, "AVA_SPEAKER_PENDING_MAX_COUNT",
+        DEFAULT_PENDING_MAX_COUNT, minimum=1, maximum=64,
+    )
+    auto_learn_enabled = _env_bool(
+        env, "AVA_SPEAKER_AUTO_LEARN_ENABLED", DEFAULT_AUTO_LEARN_ENABLED
+    )
+
     return SpeakerConfig(
         db_path=chosen_db,
         model_id=model_id,
@@ -360,6 +510,18 @@ def load_speaker_config(
         max_gain_db=max_gain_db,
         max_embeddings_per_speaker=max_embeddings,
         max_centers_per_speaker=max_centers,
+        profile_mode=profile_mode,
+        match_strategy=match_strategy,
+        variant_max_count=variant_max_count,
+        variant_merge_threshold=variant_merge_threshold,
+        singleton_penalty=singleton_penalty,
+        tracking_enabled=tracking_enabled,
+        track_expiry_seconds=track_expiry_seconds,
+        track_recent_turns=track_recent_turns,
+        new_id_min_turns=new_id_min_turns,
+        new_id_min_voiced_seconds=new_id_min_voiced_seconds,
+        pending_max_count=pending_max_count,
+        auto_learn_enabled=auto_learn_enabled,
         debug=debug,
     )
 
