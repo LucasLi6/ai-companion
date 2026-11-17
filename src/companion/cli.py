@@ -23,7 +23,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -2234,6 +2234,12 @@ async def cmd_repl(args) -> int:
             # annotates this record, never the submitted UtteranceEvent.
             identity_ledger: "OrderedDict[tuple[str, int], dict]" = OrderedDict()
             _IDENTITY_LEDGER_MAX = 128
+            # ASR Final -> Identity Confirmed latency samples (ms), and how
+            # many accepted turns were refused because the bounded identity
+            # wait expired. In-memory only; never contains transcripts.
+            _identity_latency_ms: "deque[float]" = deque(maxlen=512)
+            _identity_discards = 0
+            _identity_wait_timeouts = 0
             # Late identity notices are display-only tasks; they are cancelled
             # on exit so no task outlives the event loop.
             _late_identity_tasks: set[asyncio.Task] = set()
@@ -2507,6 +2513,20 @@ async def cmd_repl(args) -> int:
                         return 0.3
                     return max(0.0, min(2.0, value))
 
+                def _identity_wait_seconds() -> float:
+                    """Bounded wait for a speaker decision after the ASR final.
+
+                    250 ms by default; a human can raise it to 500 ms while
+                    the value is being validated on real devices. Never
+                    unbounded: an unresolved voice is refused, not stalled.
+                    """
+                    raw = os.environ.get("AVA_IDENTITY_WAIT_MS", "250")
+                    try:
+                        value = float(raw)
+                    except (TypeError, ValueError):
+                        return 0.25
+                    return max(0.0, min(500.0, value)) / 1000.0
+
                 def _voice_notice(text: str) -> None:
                     try:
                         asyncio.create_task(voice_output.write(text + "\n"))
@@ -2545,6 +2565,70 @@ async def cmd_repl(args) -> int:
                         utterance_id=int(utterance_id),
                     )
 
+                def _speaker_result_pending(result) -> bool:
+                    """True while the worker has not published its final verdict."""
+                    if result is None:
+                        return True
+                    if str(getattr(result, "status", "") or "") == "PENDING":
+                        return True
+                    return bool(getattr(result, "provisional", False))
+
+                def _latency_percentiles(samples):
+                    if not samples:
+                        return None, None
+                    ordered = sorted(samples)
+
+                    def pick(fraction: float) -> float:
+                        index = int(round(fraction * (len(ordered) - 1)))
+                        return ordered[
+                            max(0, min(len(ordered) - 1, index))
+                        ]
+
+                    return pick(0.50), pick(0.95)
+
+                async def _apply_late_identity(entry: dict, identity) -> None:
+                    """Display-only update of an already-decided turn.
+
+                    Runs after the reply decision. It never re-submits ASR,
+                    never calls the Router/TTS, never rewrites the submitted
+                    event or appends memory; a submitted turn's person is
+                    immutable, and two contradictory confirmed people are
+                    reported as a conflict instead of silently choosing the
+                    newer one. The rules live in a pure planner so they can be
+                    tested without a REPL.
+                    """
+                    from companion.voice.identity_updates import (
+                        CONFIRMED as LATE_CONFIRMED,
+                        CONFLICT_PENDING,
+                        CONFLICT_SUBMITTED,
+                        plan_late_identity,
+                    )
+
+                    plan = plan_late_identity(entry, identity)
+                    if plan is None:
+                        return
+                    if plan.kind in (CONFLICT_PENDING, CONFLICT_SUBMITTED):
+                        entry["identity_conflict"] = True
+                    else:
+                        if plan.state is not None:
+                            entry["state"] = (
+                                IdentityState.CONFIRMED
+                                if plan.state == "CONFIRMED"
+                                else IdentityState.TENTATIVE
+                            )
+                            entry["last_displayed_state"] = entry["state"]
+                        if plan.speaker_id is not None:
+                            entry["last_displayed_speaker_id"] = (
+                                plan.speaker_id
+                            )
+                        if plan.person_id is not None:
+                            entry["last_displayed_person_id"] = (
+                                plan.person_id
+                            )
+                        if plan.kind == LATE_CONFIRMED:
+                            entry["late_identity"] = identity
+                    await voice_output.write(plan.message)
+
                 def _on_speaker_update(update) -> None:
                     """Annotate an already-displayed turn; never reply again."""
                     if not formal_identity:
@@ -2555,22 +2639,12 @@ async def cmd_repl(args) -> int:
                         # No final accepted yet; the main loop reads the
                         # coordinator's latest cached revision itself.
                         return
-                    if entry.get("state") is IdentityState.CONFIRMED:
+                    revision = int(update.revision)
+                    if revision <= int(entry.get("last_revision", 0)):
                         return
-                    if update.revision <= int(entry.get("lift_revision", 0)):
-                        return
-                    entry["lift_revision"] = int(update.revision)
+                    entry["last_revision"] = revision
 
                     async def _lift() -> None:
-                        identity = await _resolve_identity(
-                            update.result,
-                            update.run_id,
-                            update.utterance_id,
-                        )
-                        if identity is None or identity.state is IdentityState.UNKNOWN:
-                            return
-                        if entry.get("lifted"):
-                            return
                         latest = (
                             coordinator.speaker_update(
                                 update.run_id, update.utterance_id
@@ -2578,15 +2652,18 @@ async def cmd_repl(args) -> int:
                             if coordinator is not None
                             else None
                         )
-                        if latest is not None and latest.revision > update.revision:
+                        if latest is not None and latest.revision > revision:
                             # A newer revision is already on its way; let it
                             # produce the single notice.
                             return
-                        entry["lifted"] = True
-                        entry["late_identity"] = identity
-                        await voice_output.write(
-                            f"[id] 本轮声音已识别为 {identity.display_name}\n"
+                        identity = await _resolve_identity(
+                            update.result,
+                            update.run_id,
+                            update.utterance_id,
                         )
+                        if identity is None:
+                            return
+                        await _apply_late_identity(entry, identity)
 
                     try:
                         task = asyncio.create_task(
@@ -2681,6 +2758,36 @@ async def cmd_repl(args) -> int:
                         lines.append(
                             "storage consent: authorized="
                             f"{snap['authorized']} armed={snap['armed']}"
+                        )
+                    latency_p50, latency_p95 = _latency_percentiles(
+                        _identity_latency_ms
+                    )
+                    if latency_p50 is not None:
+                        lines.append(
+                            "identity latency (ASR Final -> CONFIRMED):"
+                            f" n={len(_identity_latency_ms)}"
+                            f" p50={latency_p50:.0f}ms"
+                            f" p95={float(latency_p95 or 0.0):.0f}ms"
+                        )
+                    if coordinator is not None:
+                        timings = coordinator.speaker_timings()
+                        wait_p50 = timings.get("wait_p50_ms")
+                        wait_p95 = timings.get("wait_p95_ms")
+                        if wait_p50 is not None:
+                            lines.append(
+                                "identity wait:"
+                                f" p50={wait_p50:.0f}ms"
+                                f" p95={float(wait_p95 or 0.0):.0f}ms"
+                                " timeouts="
+                                f"{timings.get('timeouts', 0)}"
+                                " ratio="
+                                f"{float(timings.get('wait_timeout_ratio') or 0.0):.2f}"
+                            )
+                    if _identity_wait_timeouts or _identity_discards:
+                        lines.append(
+                            "identity refusal:"
+                            f" wait_timeouts={_identity_wait_timeouts}"
+                            f" refused_turns={_identity_discards}"
                         )
                     if identity_ledger:
                         latest = next(reversed(identity_ledger.values()))
@@ -3317,6 +3424,7 @@ async def cmd_repl(args) -> int:
                             # above the live input line. Partials are never
                             # echoed or persisted.
                             if formal_identity:
+                                decision_started = time.monotonic()
                                 update = coordinator.speaker_update(
                                     run_id, final.utterance_id
                                 )
@@ -3328,13 +3436,47 @@ async def cmd_repl(args) -> int:
                                 revision = (
                                     update.revision if update is not None else 0
                                 )
-                                decide_started = time.monotonic()
                                 identity = await _resolve_identity(
                                     result, run_id, final.utterance_id
                                 )
+                                # The ASR final frequently wins the race against
+                                # the speaker worker's own final analysis. Wait
+                                # a bounded, event-driven moment for it instead
+                                # of refusing a person who is about to be
+                                # confirmed; nothing blocks the audio path.
+                                wait_budget = _identity_wait_seconds()
+                                wait_deadline = time.monotonic() + wait_budget
+                                wait_expired = False
+                                while (
+                                    identity.state
+                                    is not IdentityState.CONFIRMED
+                                    and wait_budget > 0.0
+                                    and _speaker_result_pending(result)
+                                ):
+                                    remaining = (
+                                        wait_deadline - time.monotonic()
+                                    )
+                                    if remaining <= 0.0:
+                                        wait_expired = True
+                                        break
+                                    waited = await coordinator.wait_for_speaker_update(
+                                        run_id,
+                                        final.utterance_id,
+                                        after_revision=revision,
+                                        timeout=remaining,
+                                    )
+                                    if waited is None:
+                                        wait_expired = True
+                                        break
+                                    update = waited
+                                    revision = waited.revision
+                                    result = waited.result
+                                    identity = await _resolve_identity(
+                                        result, run_id, final.utterance_id
+                                    )
                                 decide_ms = max(
                                     0.0,
-                                    (time.monotonic() - decide_started) * 1000.0,
+                                    (time.monotonic() - decision_started) * 1000.0,
                                 )
                                 final_to_decision_ms = max(
                                     0.0,
@@ -3381,9 +3523,26 @@ async def cmd_repl(args) -> int:
                                         "revision": revision,
                                         "submitted": False,
                                         "authorized": False,
-                                        "lifted": False,
+                                        "wait_expired": wait_expired,
+                                        "last_revision": revision,
+                                        "last_displayed_state": (
+                                            identity.state
+                                        ),
+                                        "last_displayed_speaker_id": (
+                                            identity.canonical_speaker_id
+                                            or identity.raw_speaker_id
+                                        ),
+                                        "last_displayed_person_id": (
+                                            identity.person_id
+                                        ),
                                     },
                                 )
+                                if identity.state is IdentityState.CONFIRMED:
+                                    _identity_latency_ms.append(
+                                        final_to_decision_ms
+                                    )
+                                elif wait_expired:
+                                    _identity_wait_timeouts += 1
                                 label = identity.display_name
                             else:
                                 label = "you"
@@ -3392,6 +3551,7 @@ async def cmd_repl(args) -> int:
                             )
                             if formal_identity:
                                 if identity.state is not IdentityState.CONFIRMED:
+                                    _identity_discards += 1
                                     if identity.reason == "binding_conflict":
                                         notice = (
                                             "[id] 该声纹同时绑定到多个不同人物，"
@@ -3407,6 +3567,11 @@ async def cmd_repl(args) -> int:
                                         notice = (
                                             "[id] 该声音绑定的人物未授权处理与保存，"
                                             "本条未提交。\n"
+                                        )
+                                    elif wait_expired:
+                                        notice = (
+                                            "[id] 声纹分析在等待窗口内仍未完成，"
+                                            "本条未提交；可重说或用键盘继续。\n"
                                         )
                                     else:
                                         notice = (

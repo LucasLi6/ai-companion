@@ -273,3 +273,153 @@ async def test_pending_snapshot_never_falls_back_to_a_person():
         assert coordinator.speaker_update("run-a", 8).result.person_id is None
     finally:
         await coordinator.shutdown()
+
+
+# ------------------------------------------------ bounded identity waiting
+async def test_wait_returns_a_newer_revision_of_the_same_turn():
+    coordinator, fakes = await make_coordinator(["run-a"])
+    assert (await coordinator.enable())[0]
+    try:
+        fakes[0].speaker("run-a", 7, 1)
+        await settle()
+
+        waiter = asyncio.create_task(
+            coordinator.wait_for_speaker_update(
+                "run-a", 7, after_revision=1, timeout=1.0
+            )
+        )
+        await asyncio.sleep(0.02)
+        fakes[0].speaker("run-a", 7, 2)
+
+        latest = await asyncio.wait_for(waiter, 1.0)
+        assert latest is not None and latest.revision == 2
+        timings = coordinator.speaker_timings()
+        assert timings["waits"] == 1
+        assert timings["woken"] == 1
+        assert timings["timeouts"] == 0
+        assert timings["wait_p50_ms"] is not None
+    finally:
+        await coordinator.shutdown()
+
+
+async def test_wait_times_out_without_blocking_the_loop():
+    coordinator, fakes = await make_coordinator(["run-a"])
+    assert (await coordinator.enable())[0]
+    try:
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            for _ in range(10):
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        tick_task = asyncio.create_task(ticker())
+        result = await coordinator.wait_for_speaker_update(
+            "run-a", 7, after_revision=0, timeout=0.05
+        )
+        await tick_task
+
+        assert result is None
+        # Event-based waiting leaves the loop free for other tasks.
+        assert ticks == 10
+        timings = coordinator.speaker_timings()
+        assert timings["timeouts"] == 1
+        assert timings["wait_timeout_ratio"] == 1.0
+    finally:
+        await coordinator.shutdown()
+
+
+async def test_wait_is_scoped_to_one_run_and_utterance():
+    coordinator, fakes = await make_coordinator(["run-a"])
+    assert (await coordinator.enable())[0]
+    try:
+        waiter = asyncio.create_task(
+            coordinator.wait_for_speaker_update(
+                "run-a", 7, after_revision=0, timeout=0.2
+            )
+        )
+        await asyncio.sleep(0.02)
+        # Another utterance in the same run, and the same id from a previous
+        # microphone session, must not satisfy this wait.
+        fakes[0].speaker("run-a", 8, 5)
+        fakes[0].speaker("run-old", 7, 9)
+        await settle()
+
+        assert await asyncio.wait_for(waiter, 1.0) is None
+        assert coordinator.speaker_timings()["timeouts"] == 1
+    finally:
+        await coordinator.shutdown()
+
+
+async def test_two_waits_never_cross_talk():
+    coordinator, fakes = await make_coordinator(["run-a"])
+    assert (await coordinator.enable())[0]
+    try:
+        first = asyncio.create_task(
+            coordinator.wait_for_speaker_update(
+                "run-a", 7, after_revision=0, timeout=1.0
+            )
+        )
+        second = asyncio.create_task(
+            coordinator.wait_for_speaker_update(
+                "run-a", 8, after_revision=0, timeout=1.0
+            )
+        )
+        await asyncio.sleep(0.02)
+        fakes[0].speaker("run-a", 8, 1)
+
+        assert (await asyncio.wait_for(second, 1.0)).utterance_id == 8
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert coordinator.speaker_timings()["cancelled"] == 1
+    finally:
+        await coordinator.shutdown()
+
+
+async def test_mic_restart_releases_a_waiter_without_an_answer():
+    coordinator, fakes = await make_coordinator(["run-a", "run-b"])
+    assert (await coordinator.enable())[0]
+    waiter = asyncio.create_task(
+        coordinator.wait_for_speaker_update(
+            "run-a", 7, after_revision=0, timeout=5.0
+        )
+    )
+    await asyncio.sleep(0.02)
+
+    await coordinator.disable()
+    assert await asyncio.wait_for(waiter, 1.0) is None
+
+    assert (await coordinator.enable())[0]
+    try:
+        # A new session's update for the same numeric utterance id must not
+        # resurrect the old run's turn.
+        fakes[1].speaker("run-b", 7, 1)
+        await settle()
+        assert coordinator.speaker_update("run-a", 7) is None
+        assert coordinator.speaker_update("run-b", 7).revision == 1
+    finally:
+        await coordinator.shutdown()
+
+
+async def test_a_post_timeout_revision_is_only_displayed():
+    coordinator, fakes = await make_coordinator(["run-a"])
+    assert (await coordinator.enable())[0]
+    try:
+        assert (
+            await coordinator.wait_for_speaker_update(
+                "run-a", 7, after_revision=0, timeout=0.02
+            )
+            is None
+        )
+        fakes[0].speaker("run-a", 7, 3)
+        await settle()
+
+        # The late revision is cached for annotation, but it cannot create a
+        # second accepted turn.
+        assert coordinator.speaker_update("run-a", 7).revision == 3
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(coordinator.next_accepted_turn(), 0.1)
+    finally:
+        await coordinator.shutdown()

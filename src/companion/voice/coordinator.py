@@ -46,6 +46,16 @@ DEFAULT_COOLDOWN_SECONDS = 0.3
 MAX_COOLDOWN_SECONDS = 2.0
 _MAX_SPEAKER_CACHE = 64
 _SPEAKER_CACHE_TTL_SECONDS = 120.0
+# Bound on retained wait-duration samples used for P50/P95 reporting.
+_MAX_WAIT_SAMPLES = 512
+
+
+def _percentile(values: list[float], fraction: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = int(round(fraction * (len(ordered) - 1)))
+    return ordered[max(0, min(len(ordered) - 1, index))]
 
 
 @dataclass(frozen=True)
@@ -72,7 +82,6 @@ class VoiceStats:
     stale_finals: int = 0
     turn_errors: int = 0
     playback_events: int = 0
-
 
 class VoiceCoordinator:
     """Owns mic lifecycle, half-duplex state and input pacing.
@@ -145,6 +154,21 @@ class VoiceCoordinator:
         self._speaker_listener: Optional[
             Callable[[SpeakerUpdate], None]
         ] = None
+        # Event-driven waiters for a confirmation that arrives after the ASR
+        # final. No polling: the consumer sets the event when it caches a
+        # newer revision for exactly this (run, utterance) key.
+        self._speaker_waiters: dict[
+            tuple[str, int], set[asyncio.Event]
+        ] = {}
+        self._speaker_wait_stats: dict[str, Any] = {
+            "waits": 0,
+            "woken": 0,
+            "timeouts": 0,
+            "cancelled": 0,
+        }
+        self._speaker_wait_samples: deque[float] = deque(
+            maxlen=_MAX_WAIT_SAMPLES
+        )
         self._speaker_stats: dict[str, Any] = {
             "accepted": 0,
             "stale": 0,
@@ -277,7 +301,11 @@ class VoiceCoordinator:
 
         bridge = VoiceBridge(self._loop)
         run_id = secrets.token_hex(8)
+        # A waiter belongs to the old microphone session; it must never be
+        # satisfied by the new run's updates, so switch the run id before
+        # releasing it.
         self._run_id = run_id
+        self._wake_all_speaker_waiters()
         self._speaker_updates.clear()
         self._speaker_update_order.clear()
         self._speaker_update_times.clear()
@@ -383,6 +411,8 @@ class VoiceCoordinator:
         self._playback_terminal_generation = None
         self._barge_armed = False
         self._interrupted_generation = None
+        # Release waiters bound to this run: no later revision can arrive.
+        self._wake_all_speaker_waiters()
         await self._stop_manager()
         self._run_id = None
         self._speaker_updates.clear()
@@ -514,6 +544,9 @@ class VoiceCoordinator:
                 listener(update)
             except Exception:  # noqa: BLE001 - display must not break voice
                 pass
+        # Wake exactly the waiters for this turn. A waiter for another
+        # utterance (or for a previous microphone run) is never reached.
+        self._wake_speaker_waiters(key)
 
     def _prune_speaker_updates(self, now: float) -> None:
         while self._speaker_update_order:
@@ -525,6 +558,7 @@ class VoiceCoordinator:
             self._speaker_updates.pop(key, None)
             self._speaker_update_times.pop(key, None)
             self._speaker_stats["evicted"] += 1
+            self._wake_speaker_waiters(key)
         while (
             len(self._speaker_updates) > _MAX_SPEAKER_CACHE
             and self._speaker_update_order
@@ -535,6 +569,88 @@ class VoiceCoordinator:
             self._speaker_updates.pop(key, None)
             self._speaker_update_times.pop(key, None)
             self._speaker_stats["evicted"] += 1
+            self._wake_speaker_waiters(key)
+
+    def _wake_speaker_waiters(self, key: tuple[str, int]) -> None:
+        waiters = self._speaker_waiters.pop(key, None)
+        if not waiters:
+            return
+        for event in waiters:
+            event.set()
+
+    def _wake_all_speaker_waiters(self) -> None:
+        waiters = self._speaker_waiters
+        self._speaker_waiters = {}
+        for events in waiters.values():
+            for event in events:
+                event.set()
+
+    async def wait_for_speaker_update(
+        self,
+        run_id: str,
+        utterance_id: int,
+        *,
+        after_revision: int,
+        timeout: float,
+    ) -> Optional[SpeakerUpdate]:
+        """Wait (bounded) for a newer identity revision of *this* turn.
+
+        Used when the ASR final is ready but the speaker worker has not yet
+        published its final analysis. The wait is event-driven — the ASR and
+        speaker threads never block — and is cancelled by a mic stop/restart
+        or by another turn's updates, which cannot satisfy it. Returns
+        ``None`` on timeout, cancellation or a run change; the caller must
+        then handle the turn with whatever evidence it already has.
+        """
+        key = (str(run_id), int(utterance_id))
+        threshold = int(after_revision)
+
+        def current() -> Optional[SpeakerUpdate]:
+            if self._run_id != str(run_id):
+                # The microphone session that produced this utterance is
+                # gone; its cached update is no longer a live answer.
+                return None
+            latest = self._speaker_updates.get(key)
+            if latest is not None and latest.revision > threshold:
+                return latest
+            return None
+
+        latest = current()
+        if latest is not None:
+            return latest
+        if timeout <= 0.0 or self._run_id != str(run_id):
+            self._speaker_wait_stats["timeouts"] += 1
+            return None
+
+        event = asyncio.Event()
+        self._speaker_waiters.setdefault(key, set()).add(event)
+        self._speaker_wait_stats["waits"] += 1
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=float(timeout))
+        except asyncio.TimeoutError:
+            self._speaker_wait_stats["timeouts"] += 1
+            self._record_wait(started, "timeout")
+            return None
+        except asyncio.CancelledError:
+            self._speaker_wait_stats["cancelled"] += 1
+            raise
+        finally:
+            waiters = self._speaker_waiters.get(key)
+            if waiters is not None:
+                waiters.discard(event)
+                if not waiters:
+                    self._speaker_waiters.pop(key, None)
+        latest = current()
+        self._speaker_wait_stats["woken"] += 1
+        self._record_wait(started, "update" if latest is not None else "closed")
+        return latest
+
+    def _record_wait(self, started: float, outcome: str) -> None:
+        self._speaker_wait_samples.append(
+            max(0.0, (time.monotonic() - started) * 1000.0)
+        )
+        self._speaker_wait_stats["last_outcome"] = outcome
 
     def speaker_update(
         self, run_id: str, utterance_id: int
@@ -545,7 +661,19 @@ class VoiceCoordinator:
         )
 
     def speaker_timings(self) -> dict[str, Any]:
-        return dict(self._speaker_stats)
+        samples = list(self._speaker_wait_samples)
+        waits = int(self._speaker_wait_stats["waits"])
+        timeouts = int(self._speaker_wait_stats["timeouts"])
+        return {
+            **self._speaker_stats,
+            **self._speaker_wait_stats,
+            "wait_p50_ms": _percentile(samples, 0.50),
+            "wait_p95_ms": _percentile(samples, 0.95),
+            "wait_timeout_ratio": (
+                round(timeouts / waits, 4) if waits else 0.0
+            ),
+            "wait_samples": len(samples),
+        }
 
     def _accept_partial(self, partial: PartialTranscript) -> None:
         # Only the turn currently being recorded owns the live subtitle. An
