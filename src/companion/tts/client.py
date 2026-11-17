@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import time
 from typing import Any, Callable, Iterator, Optional
 
 from companion.tts.config import TTSConfig
@@ -23,6 +24,33 @@ from companion.tts.errors import (
 
 # Provider failures are isolated here: the manager converts them into a status
 # entry and the text reply is already on screen by then.
+
+# One transport retry, never more. A reply that produced no audio can be asked
+# for again safely: nothing was played, so a second attempt cannot repeat
+# sound the user already heard. Once any PCM has been yielded the request is
+# never retried, because that would replay the beginning of the reply.
+_TRANSPORT_RETRY_DELAY_SECONDS = 0.3
+
+
+class _TransportFailure(TTSClientError):
+    """Connection/DNS/socket failure, as opposed to a provider status error."""
+
+
+def _describe_failure(prefix: str, exc: BaseException) -> str:
+    """``prefix`` plus the class chain, e.g. ``WebSocketAddressException/gaierror``.
+
+    Only class names are reported: exception text may echo provider details or
+    reply content, while the class chain is what tells a DNS failure apart
+    from a closed socket.
+    """
+    names: list[str] = []
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen and len(names) < 3:
+        seen.add(id(current))
+        names.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+    return f"{prefix}: {'/'.join(names)}"
 
 
 def _decode_audio(value: Any) -> bytes:
@@ -166,9 +194,35 @@ class TTSClient:
 
         Raises :class:`TTSClientError` on transport/provider failure and
         :class:`TTSEmptyAudioError` when the stream yields no audio at all.
+
+        A transport failure that happened before the first PCM chunk is
+        retried exactly once (see ``_TRANSPORT_RETRY_DELAY_SECONDS``): the
+        observed failure mode on this machine is a transient websocket
+        address/DNS error, and nothing has been played at that point. Any
+        later failure is raised unchanged — never silently retried.
         """
+        produced = False
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                for chunk in self._stream_attempt(text):
+                    produced = True
+                    yield chunk
+                return
+            except _TransportFailure:
+                if produced or attempt >= 2:
+                    raise
+                time.sleep(_TRANSPORT_RETRY_DELAY_SECONDS)
+
+    def _stream_attempt(self, text: str) -> Iterator[bytes]:
+        """One provider request; raises ``_TransportFailure`` for retryable I/O."""
         client = self._sdk()
-        method = getattr(getattr(getattr(client, "audio", None), "tts", None), "stream", None)
+        method = getattr(
+            getattr(getattr(client, "audio", None), "tts", None),
+            "stream",
+            None,
+        )
         if not callable(method):
             raise TTSClientError("DashScope SDK 不支持 audio.tts.stream")
 
@@ -183,8 +237,8 @@ class TTSClient:
                 parameters=self._provider_parameters(),
             )
         except Exception as exc:  # noqa: BLE001 - sanitized
-            raise TTSClientError(
-                f"TTS 请求失败: {type(exc).__name__}"
+            raise _TransportFailure(
+                _describe_failure("TTS 请求失败", exc)
             ) from exc
 
         produced = False
@@ -203,8 +257,8 @@ class TTSClient:
         except TTSError:
             raise
         except Exception as exc:  # noqa: BLE001 - streaming transport failure
-            raise TTSClientError(
-                f"TTS 音频流中断: {type(exc).__name__}"
+            raise _TransportFailure(
+                _describe_failure("TTS 音频流中断", exc)
             ) from exc
 
         if not produced:
@@ -221,7 +275,22 @@ class TTSClient:
         DashScope SDK; ``start()`` opens the websocket and waits for the
         task-started handshake, which ``send_text`` requires. This blocks the
         calling (TTS) thread only, never the chat loop.
+
+        Establishing the session is retried once on failure: no text has been
+        sent and no audio exists yet, so a second handshake cannot duplicate
+        anything. A second failure is raised unchanged.
         """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self._open_stream_attempt()
+            except _TransportFailure:
+                if attempt >= 2:
+                    raise
+                time.sleep(_TRANSPORT_RETRY_DELAY_SECONDS)
+
+    def _open_stream_attempt(self) -> Any:
         client = self._sdk()
         method = getattr(
             getattr(getattr(client, "audio", None), "tts", None),
@@ -240,8 +309,8 @@ class TTSClient:
                 parameters=self._provider_parameters(),
             )
         except Exception as exc:  # noqa: BLE001 - sanitized
-            raise TTSClientError(
-                f"TTS 会话建立失败: {type(exc).__name__}"
+            raise _TransportFailure(
+                _describe_failure("TTS 会话建立失败", exc)
             ) from exc
 
         starter = getattr(session, "start", None)
@@ -255,8 +324,8 @@ class TTSClient:
                         closer()
                     except Exception:  # noqa: BLE001 - cleanup must not raise
                         pass
-                raise TTSClientError(
-                    f"TTS 会话建立失败: {type(exc).__name__}"
+                raise _TransportFailure(
+                    _describe_failure("TTS 会话建立失败", exc)
                 ) from exc
         return session
 

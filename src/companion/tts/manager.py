@@ -36,7 +36,12 @@ from companion.tts.config import (
     describe_tts_config,
     load_tts_config,
 )
-from companion.tts.errors import TTSError
+from companion.tts.errors import (
+    TTSEmptyAudioError,
+    TTSEmptyTextError,
+    TTSError,
+    TTSPlayerError,
+)
 from companion.tts.player import PyAudioPlayer
 from companion.tts.segmenter import TextSegmenter
 
@@ -73,6 +78,10 @@ class PlaybackEvent:
     conversation_id: Optional[str] = None
     at: float = 0.0
     error: Optional[str] = None
+    # ``"SESSION"`` for connect/synthesis/empty-audio failures, ``"PLAYBACK"``
+    # for output-device failures. ``None`` for a clean finish or a cancelling
+    # stop. Diagnostics must name the stage so a silent speaker is traceable.
+    stage: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -117,10 +126,19 @@ class TTSStatus:
     speech_rate: float = DEFAULT_SPEECH_RATE
     flush_strategy: str = DEFAULT_FLUSH_STRATEGY
     output_device: str = "system default"
+    # Terminal result of the most recent generation. Kept separate from the
+    # current generation so the next turn never erases the evidence of a
+    # failed one.
+    last_generation: Optional[int] = None
+    last_outcome: Optional[str] = None
+    last_failure_stage: Optional[str] = None
+    pcm_received_bytes: int = 0
+    pcm_written_bytes: int = 0
+    output_error: Optional[str] = None
 
     def lines(self) -> list[str]:
         """Display lines for ``/tts status``; contains no credentials."""
-        return [
+        lines = [
             f"tts: {'on' if self.enabled else 'off'} ({self.state})",
             f"model: {self.model}  voice: {self.voice}"
             f"  rate: {self.speech_rate}  flush: {self.flush_strategy}"
@@ -129,8 +147,22 @@ class TTSStatus:
             f"  sample_rate: {self.sample_rate} Hz"
             f"  waiting_jobs: {self.waiting_jobs}"
             f"  queued_audio_chunks: {self.queued_audio_chunks}",
-            f"last_error: {self.last_error or '-'}",
         ]
+        if self.last_generation is not None:
+            lines.append(f"last_generation: {self.last_generation}")
+            lines.append(f"last_outcome: {self.last_outcome}")
+            if self.last_failure_stage:
+                lines.append(
+                    f"last_failure_stage: {self.last_failure_stage}"
+                )
+            lines.append(
+                f"pcm_received_bytes: {self.pcm_received_bytes}"
+                f"  pcm_written_bytes: {self.pcm_written_bytes}"
+            )
+        lines.append(f"last_error: {self.last_error or '-'}")
+        if self.output_error:
+            lines.append(f"output_error: {self.output_error}")
+        return lines
 
 
 def _ms(start: Optional[float], end: Optional[float]) -> Optional[float]:
@@ -182,12 +214,24 @@ class TTSStream:
         self._sender: Optional[threading.Thread] = None
         self._receiver: Optional[threading.Thread] = None
         self._closer: Optional[threading.Thread] = None
+        # Thread/session life cycle. ``cancel_requested`` is not ``done``: a
+        # session is only done once its threads actually exited and its
+        # socket was closed, otherwise a cancelled stream would be pruned out
+        # of the manager while its sender still blocks in ``open_stream()``.
+        self._started = False
+        self._sender_exited = False
+        self._receiver_exited = False
+        self._session_closed = False
+        self._closing = False
+        self._stop_called = False
+        self._close_lock = threading.Lock()
 
     @property
     def cancelled(self) -> bool:
         return self._cancelled
 
     def start(self) -> None:
+        self._started = True
         self._sender = threading.Thread(
             target=self._send_loop,
             name="ava-tts-sender",
@@ -250,8 +294,13 @@ class TTSStream:
                 daemon=True,
             )
             self._closer.start()
-        elif self._receiver is None:
-            self._done.set()
+        elif not self._started:
+            # No thread will ever run for this stream, so there is nothing
+            # left to wait for.
+            self._mark_done()
+        # Otherwise the sender owns the session teardown: it checks
+        # ``cancelled`` right after ``open_stream()`` returns and closes there.
+        # The stream stays tracked (``done`` is False) until that happens.
 
     def join(self, timeout: float = 3.0) -> None:
         deadline = time.monotonic() + timeout
@@ -264,6 +313,20 @@ class TTSStream:
     @property
     def done(self) -> bool:
         return self._done.is_set()
+
+    def _mark_done(self) -> None:
+        self._done.set()
+
+    def _maybe_done(self) -> None:
+        """Complete only when every thread exited and the session is closed."""
+        with self._condition:
+            if self._started and not self._sender_exited:
+                return
+            if self._receiver is not None and not self._receiver_exited:
+                return
+            if self._session is not None and not self._session_closed:
+                return
+        self._done.set()
 
     # --------------------------------------------------------------- sender
     def _send_loop(self) -> None:
@@ -285,13 +348,18 @@ class TTSStream:
             self._manager._record(
                 self.generation, "tts_session_started_at"
             )
-            self._receiver = threading.Thread(
+            self._manager._bump(
+                self.generation, "session_started", boolean=True
+            )
+            receiver = threading.Thread(
                 target=self._receive_loop,
                 args=(session,),
                 name="ava-tts-receiver",
                 daemon=True,
             )
-            self._receiver.start()
+            with self._condition:
+                self._receiver = receiver
+            receiver.start()
 
             while True:
                 with self._condition:
@@ -329,8 +397,8 @@ class TTSStream:
             if session is not None:
                 self._close_session(session)
         finally:
-            if self._receiver is None:
-                self._done.set()
+            self._sender_exited = True
+            self._maybe_done()
 
     def _send_segment(self, session: Any, segment: str) -> bool:
         if not segment or not self._manager._is_current(self.generation):
@@ -339,6 +407,12 @@ class TTSStream:
             self.generation, "first_segment_ready_at"
         )
         session.send_text(segment)
+        self._manager._bump(
+            self.generation, "text_segments_sent", amount=1
+        )
+        self._manager._bump(
+            self.generation, "text_chars_sent", amount=len(segment)
+        )
         self._manager._record(
             self.generation, "first_segment_sent_at"
         )
@@ -367,6 +441,13 @@ class TTSStream:
                 ) else b""
                 if not data:
                     continue
+                self._manager._bump(
+                    self.generation, "pcm_chunks_received", amount=1
+                )
+                self._manager._bump(
+                    self.generation, "pcm_bytes_received",
+                    amount=len(data),
+                )
                 self._manager._record(
                     self.generation, "first_audio_received_at"
                 )
@@ -379,34 +460,96 @@ class TTSStream:
                 self._manager._fail(self.generation, exc)
             self._failed.set()
         finally:
-            if (
+            self._manager._bump(
+                self.generation, "receiver_completed", boolean=True
+            )
+            # A stream that ends without a single PCM byte is not a finished
+            # reply: the provider closed early, the handshake produced no
+            # audio, or nothing synthesizable was ever submitted. Reporting
+            # ``finished`` here is exactly the "Ava says she spoke but the
+            # room stayed silent" fault.
+            deliverable = (
                 not self._cancelled
                 and not self._failed.is_set()
                 and self._manager._is_current(self.generation)
-            ):
-                self._manager._put_audio(
-                    self.generation, _END_OF_AUDIO
+            )
+            if deliverable:
+                stats = self._manager._generation_stats.get(
+                    self.generation, {}
                 )
+                if not stats.get("pcm_chunks_received"):
+                    if not stats.get("text_segments_sent"):
+                        self._manager._fail(
+                            self.generation,
+                            TTSEmptyTextError("TTS 未提交任何可合成文本"),
+                            stage="SESSION",
+                        )
+                    else:
+                        self._manager._fail(
+                            self.generation,
+                            TTSEmptyAudioError("TTS_EMPTY_AUDIO"),
+                            stage="SESSION",
+                        )
+                    self._failed.set()
+                else:
+                    self._manager._put_audio(
+                        self.generation, _END_OF_AUDIO
+                    )
             self._close_session(session)
-            self._done.set()
+            self._receiver_exited = True
+            self._maybe_done()
 
     # --------------------------------------------------------------- session
     def _stop_session(self, session: Any) -> None:
         stop = getattr(session, "stop", None)
-        if callable(stop):
-            try:
-                stop()
-            except Exception:  # noqa: BLE001 - best effort
-                pass
+        if not callable(stop):
+            return
+        self._stop_called = True
+        try:
+            stop()
+        except Exception as exc:  # noqa: BLE001 - must not be silent
+            # Failing to submit the end-of-text signal can truncate the last
+            # sentence. Keep the diagnostic attached to this generation.
+            self._manager._record_session_error(
+                self.generation,
+                f"TTS_SESSION_STOP_FAILED: {type(exc).__name__}",
+            )
+            return
+        self._manager._bump(
+            self.generation, "session_stopped", boolean=True
+        )
 
     def _close_session(self, session: Any) -> None:
-        for name in ("stop", "close"):
-            method = getattr(session, name, None)
-            if callable(method):
-                try:
-                    method()
-                except Exception:  # noqa: BLE001 - cleanup
-                    pass
+        with self._close_lock:
+            # ``_closing`` prevents a second caller from entering while the
+            # first is still inside a blocking stop()/close(); only after both
+            # calls return is the session genuinely closed.
+            if self._closing or self._session_closed:
+                return
+            self._closing = True
+        try:
+            # ``stop()`` was already submitted by the sender for a normal
+            # completion; calling it twice is what some SDK builds reject.
+            names = ("close",) if self._stop_called else ("stop", "close")
+            for name in names:
+                method = getattr(session, name, None)
+                if callable(method):
+                    try:
+                        method()
+                    except Exception as exc:  # noqa: BLE001 - cleanup
+                        self._manager._record_session_error(
+                            self.generation,
+                            f"TTS_SESSION_CLOSE_FAILED({name}): "
+                            f"{type(exc).__name__}",
+                        )
+            self._manager._bump(
+                self.generation, "session_closed", boolean=True
+            )
+        finally:
+            with self._close_lock:
+                self._closing = False
+                self._session_closed = True
+        self._maybe_done()
 
 
 class TTSManager:
@@ -463,10 +606,21 @@ class TTSManager:
         self._playback_timing_listener: Optional[
             Callable[[PlaybackTiming], None]
         ] = None
-        # Every stream that has not finished yet. Superseded streams are
-        # cancelled without joining on the chat path; this set lets explicit
-        # teardown join them within one bounded deadline.
+        # Every stream that has not fully exited yet (threads down and socket
+        # closed). Superseded streams are cancelled without joining on the
+        # chat path; this set lets explicit teardown join them within one
+        # bounded deadline.
         self._streams: set[TTSStream] = set()
+        # True while the player thread is inside a device write for a live
+        # generation. ``stop()`` uses it (with the queued audio and the state)
+        # to decide whether the device really needs a physical flush.
+        self._writing_frame = False
+        # Per-generation speech statistics: text sent, PCM received/written,
+        # session milestones and the terminal outcome. Kept per generation so
+        # a later stop or a new reply never overwrites the evidence.
+        self._generation_stats: dict[int, dict] = {}
+        self._results: dict[int, dict] = {}
+        self._last_result_generation: Optional[int] = None
 
     # ------------------------------------------------------------------ state
     @property
@@ -619,6 +773,7 @@ class TTSManager:
         generation: int,
         *,
         error: Optional[str] = None,
+        stage: Optional[str] = None,
     ) -> None:
         # The timing channel is independent of the reply-end listeners: the
         # echo canceller must learn that playback stopped even when nothing
@@ -630,10 +785,18 @@ class TTSManager:
         }.get(kind)
         if timing_kind is not None:
             # Remember the terminal outcome per generation so a caller can
-            # tell "played to the end" from "interrupted halfway". A finished
-            # marker is authoritative: a later stop of the same generation must
-            # never rewrite it.
+            # tell "played to the end" from "interrupted halfway". The first
+            # terminal result wins: a later stop must never rewrite a
+            # finished reply, and a late END marker must never turn a failed
+            # one into "finished".
+            duplicate = False
             with self._lock:
+                if generation in self._results:
+                    # Exactly one terminal result per generation: a stop that
+                    # races the natural end (or a late END marker after a
+                    # failure) must not emit a second notice.
+                    duplicate = True
+                now = time.monotonic()
                 timings = self._timings.setdefault(generation, {})
                 timings.setdefault(
                     {
@@ -641,8 +804,25 @@ class TTSManager:
                         "cancelled": "playback_cancelled_at",
                         "failed": "playback_failed_at",
                     }[kind],
-                    time.monotonic(),
+                    now,
                 )
+                self._results.setdefault(
+                    generation,
+                    {
+                        "outcome": kind.upper(),
+                        "stage": stage,
+                        "error": error,
+                        "at": now,
+                    },
+                )
+                stats = self._generation_stats.get(generation)
+                if stats is not None:
+                    stats.setdefault("terminal_outcome", kind.upper())
+                    if stage:
+                        stats.setdefault("failure_stage", stage)
+                self._last_result_generation = generation
+            if duplicate:
+                return
             self._notify_timing(timing_kind, generation, error=error)
         with self._lock:
             listeners = list(self._playback_listeners)
@@ -657,6 +837,7 @@ class TTSManager:
             conversation_id=conversation_id,
             at=time.monotonic(),
             error=error,
+            stage=stage,
         )
         for listener in listeners:
             try:
@@ -752,6 +933,12 @@ class TTSManager:
                 "streaming",
                 "synthesizing",
             )
+            # Physical flush is only needed when this reply's PCM is in the
+            # device or still queued for it. An idle player (the common case:
+            # every new user input) must not be stop_stream()/start_stream()ed
+            # — repeated device restarts are exactly the kind of output
+            # life-cycle churn that can leave PortAudio running but silent.
+            needs_flush = self._device_needs_flush_locked()
             self._generation += 1
             self._queued_generation = None
             player = self._player
@@ -771,6 +958,24 @@ class TTSManager:
                 stream.join(min(self._join_timeout, 1.0))
         self._drain(self._text_queue)
         self._drain(self._audio_queue)
+        if needs_flush:
+            self._interrupt_player(player)
+
+    def _device_needs_flush_locked(self) -> bool:
+        """Whether the output device still holds this generation's audio.
+
+        ``_status == "idle"`` alone is not trusted: the player thread may be
+        inside a device write, or frames may still sit in the audio queue.
+        Called with ``self._lock`` held.
+        """
+        if self._writing_frame:
+            return True
+        if not self._audio_queue.empty():
+            return True
+        return self._status == "playing"
+
+    @staticmethod
+    def _interrupt_player(player: Any) -> None:
         interrupt = getattr(player, "interrupt", None)
         if callable(interrupt):
             try:
@@ -834,6 +1039,9 @@ class TTSManager:
                 response_id,
                 conversation_id,
             )
+            self._generation_stats[generation] = _new_generation_stats(
+                generation, response_id
+            )
             self._prune_timings()
             config = self._config
             client = self._client
@@ -884,6 +1092,44 @@ class TTSManager:
                 return
             timings.setdefault(name, time.monotonic())
 
+    def _bump(
+        self,
+        generation: int,
+        name: str,
+        *,
+        amount: int = 0,
+        boolean: bool = False,
+    ) -> None:
+        """Update one per-generation speech statistic.
+
+        Statistics are keyed by generation, so a stale stream can only ever
+        touch its own row — never the reply that replaced it.
+        """
+        with self._lock:
+            stats = self._generation_stats.get(generation)
+            if stats is None:
+                return
+            if boolean:
+                stats[name] = True
+            else:
+                stats[name] = int(stats.get(name, 0)) + int(amount)
+
+    def _record_session_error(self, generation: int, message: str) -> None:
+        """Keep a session teardown diagnostic for this generation.
+
+        Close/stop failures are display-safe codes. They are kept on the
+        generation row (and as ``last_error``) so a later ``/tts status`` can
+        still explain a truncated or silent reply.
+        """
+        with self._lock:
+            self._last_error = message
+            stats = self._generation_stats.get(generation)
+            if stats is None:
+                return
+            errors = stats.setdefault("session_errors", [])
+            if len(errors) < 5:
+                errors.append(message)
+
     def _is_current(self, generation: int) -> bool:
         with self._lock:
             return (
@@ -904,7 +1150,9 @@ class TTSManager:
             return
         with self._lock:
             active = stream is self._active_stream
+            needs_flush = False
             if active:
+                needs_flush = self._device_needs_flush_locked()
                 self._active_stream = None
                 self._generation += 1
                 self._queued_generation = None
@@ -916,12 +1164,8 @@ class TTSManager:
             return
         self._notify_playback("cancelled", stream.generation)
         self._drain(self._audio_queue)
-        interrupt = getattr(player, "interrupt", None)
-        if callable(interrupt):
-            try:
-                interrupt()
-            except Exception:  # noqa: BLE001 - best effort
-                pass
+        if needs_flush:
+            self._interrupt_player(player)
 
     # ---------------------------------------------------------------- submit
     def submit(self, job: SpeechJob) -> bool:
@@ -971,6 +1215,9 @@ class TTSManager:
             self._playback_info[generation] = (
                 job.response_id,
                 job.conversation_id,
+            )
+            self._generation_stats[generation] = _new_generation_stats(
+                generation, job.response_id
             )
             self._prune_timings()
         if previous is not None:
@@ -1047,6 +1294,10 @@ class TTSManager:
                     if first_chunk:
                         timings["first_audio_received_at"] = time.monotonic()
                         first_chunk = False
+                self._bump(job.generation, "pcm_chunks_received", amount=1)
+                self._bump(
+                    job.generation, "pcm_bytes_received", amount=len(chunk)
+                )
                 if not self._put_audio(job.generation, chunk):
                     return
         except Exception as exc:  # noqa: BLE001 - TTS-isolated
@@ -1056,7 +1307,21 @@ class TTSManager:
         with self._lock:
             if job.generation != self._generation:
                 return
-            timings["tts_stream_finished_at"] = time.monotonic()
+            empty_audio = not self._generation_stats.get(
+                job.generation, {}
+            ).get("pcm_chunks_received")
+            if not empty_audio:
+                timings["tts_stream_finished_at"] = time.monotonic()
+        if empty_audio:
+            # Synthesis "completed" without one audio byte: never report this
+            # as a spoken reply. ``_fail`` runs outside the lock so its
+            # queue cleanup cannot deadlock against the player thread.
+            self._fail(
+                job.generation,
+                TTSEmptyAudioError("TTS_EMPTY_AUDIO"),
+                stage="SESSION",
+            )
+            return
         # End marker lets the player report playback completion and go idle.
         self._put_audio(job.generation, _END_OF_AUDIO)
 
@@ -1076,7 +1341,9 @@ class TTSManager:
             except queue.Full:
                 continue
 
-    def _fail(self, generation: int, exc: Exception) -> None:
+    def _fail(
+        self, generation: int, exc: Exception, *, stage: str = "SESSION"
+    ) -> None:
         with self._lock:
             if generation != self._generation:
                 return
@@ -1085,7 +1352,9 @@ class TTSManager:
             self._status = "error"
             self._invalidate_locked(generation)
         self._discard_audio_generation(generation)
-        self._notify_playback("failed", generation, error=message)
+        self._notify_playback(
+            "failed", generation, error=message, stage=stage
+        )
 
     def _invalidate_locked(self, generation: int) -> None:
         """Invalidate ``generation`` without cancelling a newer queued reply."""
@@ -1131,6 +1400,7 @@ class TTSManager:
             if data is _STOP:
                 return
             finished = False
+            silent_end = False
             with self._lock:
                 if (
                     not self._started
@@ -1139,17 +1409,49 @@ class TTSManager:
                     continue
                 player = self._player
                 if data is _END_OF_AUDIO:
-                    timings = self._timings.setdefault(generation, {})
-                    timings["playback_finished_at"] = time.monotonic()
-                    self._last_finished_generation = generation
-                    self._status = "idle"
-                    finished = True
+                    written = int(
+                        self._generation_stats.get(generation, {}).get(
+                            "pcm_bytes_written", 0
+                        )
+                    )
+                    if written <= 0:
+                        # The end marker is only valid for audio that actually
+                        # reached the device. Treat it as a playback failure
+                        # instead of reporting a silent reply as successful.
+                        self._last_error = (
+                            "TTS_PLAYBACK_ERROR: 未写入任何音频"
+                        )
+                        self._status = "error"
+                        self._invalidate_locked(generation)
+                        silent_end = True
+                    else:
+                        timings = self._timings.setdefault(generation, {})
+                        timings["playback_finished_at"] = time.monotonic()
+                        self._last_finished_generation = generation
+                        self._status = "idle"
+                        finished = True
             if finished:
                 # Listeners run outside the lock: they only marshal the notice
                 # onto their own event loop.
                 self._notify_playback("finished", generation)
                 continue
+            if silent_end:
+                self._discard_audio_generation(generation)
+                self._notify_playback(
+                    "failed",
+                    generation,
+                    error="TTS_PLAYBACK_ERROR: 未写入任何音频",
+                    stage="PLAYBACK",
+                )
+                continue
 
+            with self._lock:
+                if (
+                    not self._started
+                    or generation != self._generation
+                ):
+                    continue
+                self._writing_frame = True
             try:
                 self._write_playback(generation, data)
             except Exception as exc:  # noqa: BLE001 - TTS-isolated
@@ -1164,9 +1466,15 @@ class TTSManager:
                 self._discard_audio_generation(generation)
                 if failed:
                     self._notify_playback(
-                        "failed", generation, error=message
+                        "failed",
+                        generation,
+                        error=message,
+                        stage="PLAYBACK",
                     )
                 continue
+            finally:
+                with self._lock:
+                    self._writing_frame = False
 
     def _playback_frame_bytes(self) -> int:
         """Bytes in one ~20 ms frame of the configured TTS output."""
@@ -1242,6 +1550,12 @@ class TTSManager:
             if player is None:
                 raise RuntimeError("音频输出设备已关闭")
             player.write(frame)
+            with self._lock:
+                stats = self._generation_stats.get(generation)
+                if stats is not None:
+                    stats["pcm_bytes_written"] = int(
+                        stats.get("pcm_bytes_written", 0)
+                    ) + len(frame)
             self._notify_timing(
                 "frame_write_completed",
                 generation,
@@ -1252,6 +1566,10 @@ class TTSManager:
                 with self._lock:
                     if generation == self._generation:
                         timings = self._timings.setdefault(generation, {})
+                        # Semantics: the first frame was *accepted by the
+                        # output device* (write returned), not the instant the
+                        # speaker physically produced sound. The field name is
+                        # kept for compatibility with existing reports.
                         timings.setdefault(
                             "first_audio_played_at", time.monotonic()
                         )
@@ -1262,6 +1580,18 @@ class TTSManager:
     def status(self) -> TTSStatus:
         described = self._description()
         with self._lock:
+            result_generation = self._last_result_generation
+            result = (
+                self._results.get(result_generation, {})
+                if result_generation is not None
+                else {}
+            )
+            stats = (
+                self._generation_stats.get(result_generation, {})
+                if result_generation is not None
+                else {}
+            )
+            player = self._player
             return TTSStatus(
                 enabled=self._enabled,
                 state=self._status,
@@ -1276,6 +1606,12 @@ class TTSManager:
                 speech_rate=described["rate"],
                 flush_strategy=described["flush_strategy"],
                 output_device=described["output_device"],
+                last_generation=result_generation,
+                last_outcome=result.get("outcome"),
+                last_failure_stage=result.get("stage"),
+                pcm_received_bytes=int(stats.get("pcm_bytes_received", 0)),
+                pcm_written_bytes=int(stats.get("pcm_bytes_written", 0)),
+                output_error=getattr(player, "last_error", None),
             )
 
     def _output_device_name(self) -> str:
@@ -1433,6 +1769,12 @@ class TTSManager:
         for key in list(self._playback_info):
             if key not in self._timings:
                 self._playback_info.pop(key, None)
+        for key in list(self._generation_stats):
+            if key not in self._timings:
+                self._generation_stats.pop(key, None)
+        for key in list(self._results):
+            if key not in self._timings:
+                self._results.pop(key, None)
 
     # --------------------------------------------------------------- cleanup
     def _teardown_threads(self) -> None:
@@ -1440,6 +1782,7 @@ class TTSManager:
             self._started = False
             self._stop_event.set()
             self._queued_generation = None
+            self._writing_frame = False
             stream = self._active_stream
             self._active_stream = None
             streams = list(self._streams)
@@ -1498,6 +1841,34 @@ class TTSManager:
                 closer()
             except Exception:  # noqa: BLE001 - cleanup must never raise
                 pass
+
+
+def _new_generation_stats(
+    generation: int, response_id: Optional[str]
+) -> dict:
+    """Zeroed per-generation speech statistics.
+
+    These counters are what makes "the reply played" falsifiable: text was
+    actually submitted, PCM actually arrived and PCM actually reached the
+    output device. Any generation that ends without audio on both sides is an
+    explicit failure, never a finished reply.
+    """
+    return {
+        "generation": generation,
+        "response_id": response_id,
+        "text_segments_sent": 0,
+        "text_chars_sent": 0,
+        "pcm_chunks_received": 0,
+        "pcm_bytes_received": 0,
+        "pcm_bytes_written": 0,
+        "session_started": False,
+        "session_stopped": False,
+        "session_closed": False,
+        "receiver_completed": False,
+        "terminal_outcome": None,
+        "failure_stage": None,
+        "session_errors": [],
+    }
 
 
 def _looks_like_protocol_header(text: str) -> bool:

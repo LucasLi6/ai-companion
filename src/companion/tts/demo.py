@@ -16,27 +16,29 @@ from __future__ import annotations
 
 import sys
 import time
+from typing import Optional
 
 from companion.tts.manager import SpeechJob, TTSManager
 
 
 def _wait_for_playback(
     manager: TTSManager, generation: int, timeout: float = 60.0
-) -> bool:
+) -> Optional[str]:
+    """Wait for the terminal outcome of exactly this generation.
+
+    Reading the manager-wide ``state`` would misreport every reply after the
+    first failure: ``state`` stays ``"error"`` until some later reply
+    finishes, so a healthy new generation would look failed the moment it was
+    submitted. The per-generation outcome answers the only question that
+    matters here: did *this* reply play to the end?
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        status = manager.status()
-        if status.state == "error":
-            return False
-        metrics = manager.metrics()
-        if (
-            metrics is not None
-            and metrics["generation"] >= generation
-            and metrics["playback_finished"]
-        ):
-            return True
+        outcome = manager.playback_outcome(generation)
+        if outcome is not None:
+            return outcome
         time.sleep(0.05)
-    return False
+    return None
 
 
 def main(argv: list[str]) -> int:
@@ -73,14 +75,17 @@ def main(argv: list[str]) -> int:
                 print(f"未提交: {manager.last_error}")
                 continue
             generation = manager.generation
-            finished = _wait_for_playback(manager, generation)
-            metrics = manager.metrics()
+            outcome = _wait_for_playback(manager, generation)
+            finished = outcome == "finished"
+            metrics = manager.metrics(generation)
             print(
-                f"finished={finished} state={manager.status().state} "
-                f"metrics={metrics}"
+                f"finished={finished} outcome={outcome} "
+                f"state={manager.status().state} metrics={metrics}"
             )
-            if not finished:
+            if outcome == "failed":
                 print("last_error:", manager.last_error)
+            elif outcome is None:
+                print("timed out waiting for this reply to finish")
     finally:
         manager.shutdown()
     return 0

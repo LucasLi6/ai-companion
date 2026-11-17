@@ -2200,6 +2200,7 @@ async def cmd_repl(args) -> int:
         # local audio device: no Alibaba connection or cost happens until the
         # first reply that actually produces speech.
         tts_manager = TTSManager()
+        _register_tts_failure_reporter(tts_manager)
         if tts_enabled_by_default():
             ok, message = tts_manager.enable()
             if ok:
@@ -2943,6 +2944,33 @@ async def _handle_mic_command(parts: list[str], voice_mode: bool, coordinator) -
         print("选择设备：设置 AVA_ASR_DEVICE（索引或名称片段）后重新开启监听。")
     else:
         print("usage: /mic on|off|status|devices")
+
+
+def _register_tts_failure_reporter(manager) -> None:
+    """Print one diagnostic line when a spoken reply fails.
+
+    ``[tts] Speaking...`` only proves the pipeline started, not that audio
+    reached the speaker. Ordinary turns stay silent on the terminal; a failed
+    generation is always named with its stage and display-safe reason so a
+    silent reply is never mistaken for a working one.
+    """
+    adder = getattr(manager, "add_playback_listener", None)
+    if not callable(adder):
+        return
+
+    def report(event) -> None:
+        if getattr(event, "kind", "") != "failed":
+            return
+        stage = getattr(event, "stage", None) or "PLAYBACK"
+        reason = getattr(event, "error", None) or "UNKNOWN"
+        print(
+            f"[tts error] generation={getattr(event, 'generation', '?')} "
+            f"stage={stage} reason={reason}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    adder(report)
 
 
 def _handle_tts_command(manager, parts: list[str]) -> list[str]:

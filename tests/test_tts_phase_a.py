@@ -281,10 +281,158 @@ def test_client_provider_error_and_empty_audio_are_tts_errors():
     with pytest.raises(TTSClientError) as excinfo:
         list(TTSClient(CONFIG, client_factory=lambda: bad).stream_pcm("hi"))
     assert "401" in str(excinfo.value)
+    # A provider status error is not a transport failure: never retried.
+    assert len(calls) == 1
 
     empty = _fake_sdk([], calls)
     with pytest.raises(TTSEmptyAudioError):
         list(TTSClient(CONFIG, client_factory=lambda: empty).stream_pcm("hi"))
+
+
+class _FlakyStream:
+    """First N calls fail before any audio; later calls yield ``chunks``."""
+
+    def __init__(self, failures: int, chunks=(b"pcm-1", b"pcm-2"), after=None):
+        self.failures = failures
+        self.chunks = chunks
+        self.after = after
+        self.calls = 0
+
+    def __call__(self, text, **kwargs):
+        self.calls += 1
+        if self.calls <= self.failures:
+            if self.after:
+                def failing():
+                    for chunk in self.after:
+                        yield chunk
+                    raise OSError("getaddrinfo failed")
+                return failing()
+
+            def failing():
+                raise OSError("getaddrinfo failed")
+                yield  # pragma: no cover - generator shape
+            return failing()
+        return iter(self.chunks)
+
+
+def _flaky_client(stream):
+    sdk = SimpleNamespace(
+        audio=SimpleNamespace(tts=SimpleNamespace(stream=stream))
+    )
+    return TTSClient(CONFIG, client_factory=lambda: sdk)
+
+
+def test_transport_failure_before_audio_is_retried_once(monkeypatch):
+    slept = []
+    monkeypatch.setattr(
+        "companion.tts.client.time.sleep", lambda seconds: slept.append(seconds)
+    )
+    stream = _FlakyStream(failures=1)
+    client = _flaky_client(stream)
+    assert list(client.stream_pcm("你好")) == [b"pcm-1", b"pcm-2"]
+    assert stream.calls == 2
+    assert slept == [0.3]
+
+
+def test_transport_failure_after_audio_is_never_retried(monkeypatch):
+    slept = []
+    monkeypatch.setattr(
+        "companion.tts.client.time.sleep", lambda seconds: slept.append(seconds)
+    )
+    stream = _FlakyStream(failures=1, after=[b"first"])
+    client = _flaky_client(stream)
+    chunks = []
+    with pytest.raises(TTSClientError) as excinfo:
+        for chunk in client.stream_pcm("你好"):
+            chunks.append(chunk)
+    assert chunks == [b"first"]
+    assert stream.calls == 1
+    assert slept == []
+    assert "OSError" in str(excinfo.value)
+
+
+def test_a_second_transport_failure_is_reported_not_retried_forever(monkeypatch):
+    slept = []
+    monkeypatch.setattr(
+        "companion.tts.client.time.sleep", lambda seconds: slept.append(seconds)
+    )
+    stream = _FlakyStream(failures=2)
+    client = _flaky_client(stream)
+    with pytest.raises(TTSClientError) as excinfo:
+        list(client.stream_pcm("你好"))
+    assert stream.calls == 2
+    assert slept == [0.3]
+    assert "TTS 音频流中断: OSError" in str(excinfo.value)
+
+
+def test_transport_error_reports_the_root_cause_class(monkeypatch):
+    """A bare class name cannot tell DNS from a closed socket."""
+
+    monkeypatch.setattr("companion.tts.client.time.sleep", lambda seconds: None)
+
+    class WrappedStream:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, text, **kwargs):
+            self.calls += 1
+
+            def failing():
+                try:
+                    try:
+                        raise OSError("getaddrinfo failed")
+                    except OSError:
+                        raise RuntimeError("websocket layer")
+                except RuntimeError as exc:
+                    raise ValueError("address") from exc
+                yield  # pragma: no cover - generator shape
+
+            return failing()
+
+    stream = WrappedStream()
+    with pytest.raises(TTSClientError) as excinfo:
+        list(_flaky_client(stream).stream_pcm("你好"))
+    message = str(excinfo.value)
+    assert message.startswith("TTS 音频流中断: ValueError/RuntimeError/OSError")
+    assert stream.calls == 2
+
+
+def test_open_stream_retries_the_handshake_once(monkeypatch):
+    slept = []
+    monkeypatch.setattr(
+        "companion.tts.client.time.sleep", lambda seconds: slept.append(seconds)
+    )
+
+    class Session:
+        def __init__(self, fail: bool) -> None:
+            self.fail = fail
+            self.closed = False
+            self.started = False
+
+        def start(self):
+            if self.fail:
+                raise OSError("address not found")
+            self.started = True
+
+        def close(self):
+            self.closed = True
+
+    sessions: list[Session] = []
+
+    def connect(**kwargs):
+        session = Session(fail=not sessions)
+        sessions.append(session)
+        return session
+
+    sdk = SimpleNamespace(
+        audio=SimpleNamespace(tts=SimpleNamespace(connect=connect))
+    )
+    client = TTSClient(CONFIG, client_factory=lambda: sdk)
+    session = client.open_stream()
+    assert len(sessions) == 2
+    assert sessions[0].closed is True
+    assert session.started is True
+    assert slept == [0.3]
 
 
 # ------------------------------------------------------------------- manager
@@ -685,7 +833,10 @@ def test_demo_prints_last_error_when_playback_fails(monkeypatch, capsys):
         def status(self):
             return SimpleNamespace(state="error")
 
-        def metrics(self):
+        def playback_outcome(self, generation):
+            return "failed"
+
+        def metrics(self, generation=None):
             return None
 
         def shutdown(self):
@@ -696,6 +847,45 @@ def test_demo_prints_last_error_when_playback_fails(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "finished=False" in output
     assert "last_error: TTS 请求失败" in output
+
+
+def test_demo_does_not_inherit_an_earlier_generations_error(monkeypatch, capsys):
+    """A stale ``state=error`` must not turn a healthy reply into a failure.
+
+    ``TTSManager`` keeps ``state == "error"`` from an earlier failed reply
+    until a later reply finishes. The demo must judge the generation it
+    submitted, not that manager-wide flag.
+    """
+    import companion.tts.demo as demo
+
+    class StubManager:
+        generation = 7
+        last_error = "TTS 音频流中断: WebSocketAddressException"
+
+        def enable(self):
+            return True, "tts: on"
+
+        def submit(self, job):
+            return True
+
+        def status(self):
+            return SimpleNamespace(state="error")
+
+        def playback_outcome(self, generation):
+            assert generation == 7
+            return "finished"
+
+        def metrics(self, generation=None):
+            return {"generation": generation, "playback_finished": True}
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(demo, "TTSManager", StubManager)
+    assert demo.main(["你好"]) == 0
+    output = capsys.readouterr().out
+    assert "finished=True outcome=finished" in output
+    assert "last_error:" not in output
 
 
 # ----------------------------------------------------------------------- CLI

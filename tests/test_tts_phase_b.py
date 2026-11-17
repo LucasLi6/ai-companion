@@ -550,7 +550,9 @@ def test_open_stream_start_failure_closes_the_session():
     with pytest.raises(TTSClientError) as excinfo:
         TTSClient(CONFIG, client_factory=lambda: sdk).open_stream()
     assert "RuntimeError" in str(excinfo.value)
-    assert closed == [True]
+    # One bounded retry re-opens the handshake; every failed session is
+    # closed, and the second failure is still reported.
+    assert closed == [True, True]
 
 
 def test_open_stream_omits_instruction_when_disabled():

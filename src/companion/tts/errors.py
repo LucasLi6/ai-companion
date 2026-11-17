@@ -20,6 +20,10 @@ class TTSEmptyAudioError(TTSError):
     """The provider completed without producing any audio."""
 
 
+class TTSEmptyTextError(TTSError):
+    """Nothing synthesizable was submitted for this reply."""
+
+
 class TTSPlayerError(TTSError):
     """Audio device / PyAudio failure."""
 
@@ -27,6 +31,7 @@ class TTSPlayerError(TTSError):
 __all__ = [
     "TTSClientError",
     "TTSEmptyAudioError",
+    "TTSEmptyTextError",
     "TTSError",
     "TTSPlayerError",
 ]
