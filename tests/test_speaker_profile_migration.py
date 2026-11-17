@@ -129,7 +129,9 @@ def columns(path, table: str) -> set[str]:
         }
 
 
-def test_v2_store_migrates_to_v3_preserving_every_row(tmp_path) -> None:
+def test_v2_store_migrates_to_current_schema_preserving_every_row(
+    tmp_path,
+) -> None:
     path = tmp_path / "v2.sqlite3"
     build_v2(path)
 
@@ -159,7 +161,7 @@ def test_v2_store_migrates_to_v3_preserving_every_row(tmp_path) -> None:
         ).fetchone()
 
     assert stage == "schema setup"
-    assert version == str(SCHEMA_VERSION) == "3"
+    assert version == str(SCHEMA_VERSION) == "4"
     assert samples == [
         (1, "TEMP-0001", "HIGH", 1, "session-a", 0, "legacy", 0),
         (2, "TEMP-0001", "MEDIUM", 0, "session-a", 1, "legacy", 0),
@@ -194,7 +196,7 @@ def test_v3_columns_are_added_only_once_and_migration_is_idempotent(tmp_path) ->
         count = connection.execute(
             "SELECT COUNT(*) FROM speaker_embeddings"
         ).fetchone()[0]
-    assert version == "3"
+    assert version == str(SCHEMA_VERSION)
     assert count == 2
     assert columns(path, "speaker_embeddings") == before["speaker_embeddings"]
 

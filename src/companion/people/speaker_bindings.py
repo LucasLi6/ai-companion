@@ -61,12 +61,20 @@ class SpeakerBindingService:
         person_id: str,
         speaker_id: str,
         verified_by: str,
+        *,
+        related_speaker_ids: Optional[list[str]] = None,
     ) -> dict:
         """Record a human-confirmed speaker -> person binding.
 
         Re-binding the same speaker to the same person is idempotent. Moving a
         binding to another person is refused: it needs an explicit unbind (and
         the human decision that goes with it), never a silent overwrite.
+
+        ``related_speaker_ids`` (the canonical id plus its historical aliases)
+        is supplied by callers that can see the speaker store. If any of them
+        is already bound to a different person, the whole request is refused
+        with ``speaker_alias_bound_elsewhere``: two people cannot be joined by
+        a voice-print merge.
         """
         person_id = str(person_id or "").strip()
         speaker_id = str(speaker_id or "").strip()
@@ -76,7 +84,21 @@ class SpeakerBindingService:
         person = await self.persons.get(person_id)
         if person is None or person.registration_status is not RegistrationStatus.ACTIVE:
             raise SpeakerBindingError("person_not_active")
+        ids = self._normalize_ids(speaker_id, related_speaker_ids)
         existing = await self.get_binding(speaker_id)
+        if existing is not None and existing["person_id"] != person_id:
+            # The exact id is already bound elsewhere: this is the historical
+            # refusal code and needs an explicit unbind.
+            raise SpeakerBindingError("speaker_already_bound")
+        rows = await self.bindings_for_speaker_ids(ids)
+        if any(
+            row["speaker_id"] != speaker_id
+            and row["person_id"] != person_id
+            for row in rows
+        ):
+            # An alias of this voice is bound to another person. Refuse and
+            # require a human to unbind/merge explicitly.
+            raise SpeakerBindingError("speaker_alias_bound_elsewhere")
         now = utcnow().isoformat()
         if existing is not None:
             if existing["person_id"] != person_id:
@@ -95,15 +117,70 @@ class SpeakerBindingService:
         )
         return await self.get_binding(speaker_id)  # type: ignore[return-value]
 
-    async def unbind_speaker(self, speaker_id: str) -> bool:
+    async def unbind_speaker(
+        self,
+        speaker_id: str,
+        *,
+        related_speaker_ids: Optional[list[str]] = None,
+    ) -> bool:
         speaker_id = str(speaker_id or "").strip()
         if not speaker_id:
             return False
-        cur = await self.db.execute(
-            "DELETE FROM person_speaker_bindings WHERE speaker_id = ?",
-            (speaker_id,),
+        if related_speaker_ids is None:
+            cur = await self.db.execute(
+                "DELETE FROM person_speaker_bindings WHERE speaker_id = ?",
+                (speaker_id,),
+            )
+            return bool(cur.rowcount)
+        return bool(
+            await self.unbind_speaker_ids(
+                self._normalize_ids(speaker_id, related_speaker_ids)
+            )
         )
-        return bool(cur.rowcount)
+
+    async def unbind_speaker_ids(self, speaker_ids: list[str]) -> int:
+        """Delete bindings for every id; returns the number removed."""
+        ids = self._normalize_ids("", speaker_ids)
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        cur = await self.db.execute(
+            "DELETE FROM person_speaker_bindings"
+            f" WHERE speaker_id IN ({placeholders})",
+            tuple(ids),
+        )
+        return int(cur.rowcount or 0)
+
+    @staticmethod
+    def _normalize_ids(
+        speaker_id: str, related_speaker_ids: Optional[list[str]]
+    ) -> list[str]:
+        """Deduplicate and bound an alias set before a SQL ``IN`` query."""
+        values: list[str] = []
+        for value in [speaker_id, *(related_speaker_ids or [])]:
+            sid = str(value or "").strip()
+            if sid and sid not in values:
+                values.append(sid)
+            if len(values) >= 64:
+                break
+        return values
+
+    async def bindings_for_speaker_ids(
+        self, speaker_ids: list[str]
+    ) -> list[dict]:
+        """Return every human binding that could apply to one voice."""
+        ids = self._normalize_ids("", speaker_ids)
+        if not ids:
+            return []
+        placeholders = ", ".join("?" for _ in ids)
+        cur = await self.db.execute(
+            "SELECT speaker_id, person_id, verified_by, created_at, updated_at"
+            " FROM person_speaker_bindings"
+            f" WHERE speaker_id IN ({placeholders})"
+            " ORDER BY created_at ASC, speaker_id ASC",
+            tuple(ids),
+        )
+        return [dict(row) for row in await cur.fetchall()]
 
     async def get_binding(self, speaker_id: str) -> Optional[dict]:
         cur = await self.db.execute(

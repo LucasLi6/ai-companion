@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from companion.speaker_id.config import SpeakerConfig
+from companion.speaker_id.consent import EnrollmentPolicy
 from companion.speaker_id.embedding import validate_embedding
 from companion.speaker_id.matcher import MatchDecision, SpeakerMatcher
 from companion.speaker_id.models import (
@@ -76,6 +77,7 @@ LEARN_LOW_MARGIN = "LOW_MARGIN"
 LEARN_IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
 LEARN_ASR_FAILED = "ASR_FAILED"
 LEARN_STORE_ERROR = "STORE_ERROR"
+LEARN_NOT_AUTHORIZED = "NOT_AUTHORIZED"
 
 _LEARNING_KEYS = {
     LEARN_ADDED: "added",
@@ -86,6 +88,7 @@ _LEARNING_KEYS = {
     LEARN_IDENTITY_CONFLICT: "identity_conflict",
     LEARN_ASR_FAILED: "asr_failed",
     LEARN_STORE_ERROR: "store_error",
+    LEARN_NOT_AUTHORIZED: "not_authorized",
 }
 
 
@@ -170,10 +173,12 @@ class SpeakerEngine:
         store: Any,
         on_result: Optional[Callable[[SpeakerResult], None]] = None,
         clock: Callable[[], float] = time.monotonic,
+        enrollment_policy: Optional[EnrollmentPolicy] = None,
     ) -> None:
         self.config = config
         self._embedding = embedding_model
         self._store = store
+        self._enrollment_policy = enrollment_policy
         self._matcher = SpeakerMatcher(config)
         self._on_result = on_result
         self._clock = clock
@@ -449,6 +454,11 @@ class SpeakerEngine:
                 "pending_samples": (
                     self._pending.stats() if self._pending is not None
                     else {"enabled": False}
+                ),
+                "enrollment_consent": (
+                    self._enrollment_policy.snapshot()
+                    if self._enrollment_policy is not None
+                    else {"strict": False, "authorized": None, "armed": None}
                 ),
             }
 
@@ -874,7 +884,11 @@ class SpeakerEngine:
                 if track is not None:
                     self._tracker.bind_identity(track.track_id, locked_id)
             else:
-                if (
+                consent_blocks_new = (
+                    self._enrollment_policy is not None
+                    and not self._enrollment_policy.allow_new_identity()
+                )
+                tracker_blocks_new = (
                     self._tracker is not None
                     and self.profile_mode == "variants"
                     and not self._tracker.can_persist(
@@ -882,9 +896,11 @@ class SpeakerEngine:
                         extra_turns=1,
                         extra_voiced_seconds=quality.voiced_seconds,
                     )
-                ):
-                    # A new voice must be heard consistently across turns
-                    # before it earns a permanent id. Nothing is written.
+                )
+                if consent_blocks_new or tracker_blocks_new:
+                    # A new voice must be heard consistently across turns and
+                    # needs explicit storage consent before it earns a
+                    # permanent id. Nothing is written on this path.
                     self._defer_new_identity(
                         uid,
                         vector,
@@ -897,6 +913,11 @@ class SpeakerEngine:
                     )
                     return
                 speaker_id = self._create_candidate(uid)
+                if speaker_id is not None and self._enrollment_policy is not None:
+                    # The human explicitly armed this one enrollment; the new
+                    # id is now allowed to receive its bootstrap sample. The
+                    # arm is consumed so a later unknown voice stays private.
+                    self._enrollment_policy.note_created(speaker_id)
                 if speaker_id is None:
                     self._advance(uid, total_seconds)
                     return
@@ -1177,6 +1198,14 @@ class SpeakerEngine:
         )
         if quality.rank < required:
             return LEARN_LOW_QUALITY
+        if (
+            self._enrollment_policy is not None
+            and not self._enrollment_policy.is_authorized(speaker_id)
+        ):
+            # No durable voiceprint is written without explicit consent. This
+            # is checked at the single write point, so every learning path
+            # (bootstrap, pending enrollment, future callers) is covered.
+            return LEARN_NOT_AUTHORIZED
         # Register the source *before* the write so a cancellation racing the
         # commit is still able to revoke the sample.
         with self._lock:

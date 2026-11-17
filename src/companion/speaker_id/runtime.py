@@ -36,6 +36,7 @@ from collections import deque
 from typing import Any, Callable, Optional
 
 from companion.speaker_id.config import SpeakerConfig
+from companion.speaker_id.consent import EnrollmentPolicy
 from companion.speaker_id.engine import SpeakerEngine
 from companion.speaker_id.models import (
     ERROR,
@@ -65,11 +66,13 @@ class DeferredSpeakerObserver:
         store: Any = None,
         on_result: Optional[Callable[[SpeakerResult], None]] = None,
         clock: Callable[[], float] = time.monotonic,
+        enrollment_policy: Optional[EnrollmentPolicy] = None,
     ) -> None:
         self.config = config
         self._embedding_model = embedding_model
         self._store = store
         self._on_result = on_result
+        self._enrollment_policy = enrollment_policy
         self._clock = clock
         self._lock = threading.RLock()
         self._ready = threading.Event()
@@ -157,6 +160,8 @@ class DeferredSpeakerObserver:
 
             store = self._store or self._build_store()
             store.initialize()
+            if self._enrollment_policy is not None:
+                self._enrollment_policy.load_from_store(store)
 
             engine = SpeakerEngine(
                 self.config,
@@ -164,6 +169,7 @@ class DeferredSpeakerObserver:
                 store=store,
                 on_result=self._forward,
                 clock=self._clock,
+                enrollment_policy=self._enrollment_policy,
             )
             engine.start()
 

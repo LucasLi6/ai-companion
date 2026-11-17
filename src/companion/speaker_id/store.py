@@ -42,7 +42,7 @@ from companion.speaker_id.voice_profiles import (
     VoiceSample,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LEGACY_SESSION_ID = "legacy"
 
 
@@ -871,6 +871,139 @@ class SpeakerStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    # ------------------------------------------------------- canonical identity
+    def resolve_canonical_speaker_id(
+        self, speaker_id: str, *, max_hops: int = 16
+    ) -> Optional[str]:
+        """Follow a promotion/merge alias chain to the live speaker id.
+
+        A current profile id resolves to itself. A historical alias follows
+        ``speaker_aliases`` to its final canonical id. A missing id, a deleted
+        canonical id, or a malformed/cyclic chain returns ``None``: there is no
+        safe identity to use. The walk is bounded and never guesses.
+        """
+        sid = str(speaker_id or "").strip()
+        if not sid:
+            return None
+        with self._lock:
+            profile = self._conn.execute(
+                "SELECT 1 FROM speaker_profiles WHERE speaker_id = ?",
+                (sid,),
+            ).fetchone()
+            alias = self._conn.execute(
+                "SELECT canonical_speaker_id FROM speaker_aliases"
+                " WHERE alias_speaker_id = ?",
+                (sid,),
+            ).fetchone()
+            if profile is not None and alias is None:
+                return sid
+            if alias is None:
+                return None
+            current = sid
+            visited: set[str] = set()
+            for _ in range(max(1, int(max_hops))):
+                if current in visited:
+                    return None
+                visited.add(current)
+                step = self._conn.execute(
+                    "SELECT canonical_speaker_id FROM speaker_aliases"
+                    " WHERE alias_speaker_id = ?",
+                    (current,),
+                ).fetchone()
+                if step is None:
+                    break
+                nxt = str(step["canonical_speaker_id"] or "").strip()
+                if not nxt or nxt == current:
+                    return None
+                current = nxt
+            else:
+                # The hop budget was exhausted; do not claim a canonical id.
+                return None
+            # ``current`` was added to ``visited`` on the iteration whose
+            # lookup found no further alias (the terminal node), so it must
+            # not be mistaken for a cycle here.
+            live = self._conn.execute(
+                "SELECT 1 FROM speaker_profiles WHERE speaker_id = ?",
+                (current,),
+            ).fetchone()
+            return current if live is not None else None
+
+    def related_speaker_ids(
+        self, speaker_id: str, *, max_ids: int = 64
+    ) -> list[str]:
+        """Canonical id plus every alias that resolves to it.
+
+        Used to check every human binding that could apply to one voice. The
+        traversal is bounded and returns just the canonical id when no alias
+        exists, so a caller never has to guess.
+        """
+        canonical = self.resolve_canonical_speaker_id(speaker_id)
+        if canonical is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT alias_speaker_id, canonical_speaker_id"
+                " FROM speaker_aliases"
+            ).fetchall()
+        mapping = {
+            str(row["alias_speaker_id"]): str(row["canonical_speaker_id"])
+            for row in rows
+        }
+        found = [canonical]
+        seen = {canonical}
+        frontier = [canonical]
+        while frontier and len(found) < max(1, int(max_ids)):
+            target = frontier.pop(0)
+            for alias, parent in mapping.items():
+                if parent != target or alias in seen:
+                    continue
+                seen.add(alias)
+                found.append(alias)
+                frontier.append(alias)
+                if len(found) >= max(1, int(max_ids)):
+                    break
+        return found
+
+    # ---------------------------------------------------- enrollment consent
+    def set_enrollment_consent(
+        self, speaker_id: str, *, granted_by: str
+    ) -> bool:
+        """Explicitly authorise long-term voiceprint storage for one id."""
+        sid = str(speaker_id or "").strip()
+        if not sid:
+            return False
+        now = self._clock()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO speaker_enrollment_consents"
+                " (speaker_id, granted_by, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(speaker_id) DO UPDATE SET"
+                " granted_by=excluded.granted_by,"
+                " updated_at=excluded.updated_at",
+                (sid, str(granted_by or "local_confirmation"), now, now),
+            )
+        return True
+
+    def revoke_enrollment_consent(self, speaker_id: str) -> bool:
+        sid = str(speaker_id or "").strip()
+        if not sid:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM speaker_enrollment_consents WHERE speaker_id = ?",
+                (sid,),
+            )
+        return bool(cur.rowcount)
+
+    def enrollment_consents(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT speaker_id, granted_by, created_at, updated_at"
+                " FROM speaker_enrollment_consents ORDER BY created_at ASC"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     # --------------------------------------------------------------- deletion
     def delete_speaker(self, speaker_id: str) -> bool:
         with self._lock, self._transaction() as connection:
@@ -953,6 +1086,14 @@ class SpeakerStore:
                 " VALUES (?, ?, ?)",
                 (canonical_speaker_id, alias_speaker_id, now),
             )
+            # Flatten history: aliases that used to point at the merged id now
+            # point at the surviving canonical id. Without this a later lookup
+            # would stop at a profile row that no longer exists.
+            connection.execute(
+                "UPDATE speaker_aliases SET canonical_speaker_id = ?"
+                " WHERE canonical_speaker_id = ? AND alias_speaker_id != ?",
+                (canonical_speaker_id, alias_speaker_id, canonical_speaker_id),
+            )
             connection.execute(
                 "DELETE FROM speaker_profiles WHERE speaker_id = ?",
                 (alias_speaker_id,),
@@ -1007,6 +1148,14 @@ class SpeakerStore:
                 " (canonical_speaker_id, alias_speaker_id, created_at)"
                 " VALUES (?, ?, ?)",
                 (new_id, speaker_id, now),
+            )
+            # A temporary id may already have been the canonical target of an
+            # earlier alias. Keep those historical mappings resolvable by
+            # pointing them at the newly promoted id in the same transaction.
+            connection.execute(
+                "UPDATE speaker_aliases SET canonical_speaker_id = ?"
+                " WHERE canonical_speaker_id = ? AND alias_speaker_id != ?",
+                (new_id, speaker_id, new_id),
             )
             connection.execute(
                 "DELETE FROM speaker_profiles WHERE speaker_id = ?",
@@ -1072,6 +1221,16 @@ CREATE TABLE IF NOT EXISTS speaker_aliases (
     canonical_speaker_id TEXT NOT NULL,
     alias_speaker_id TEXT NOT NULL UNIQUE,
     created_at REAL NOT NULL
+);
+
+-- Schema v4: separate, explicit authorisation for long-term voiceprint
+-- storage. A binding records who a voice is; this records whether its
+-- embeddings may be kept at all. Both gates are independent.
+CREATE TABLE IF NOT EXISTS speaker_enrollment_consents (
+    speaker_id TEXT PRIMARY KEY,
+    granted_by TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
 );
 """
 

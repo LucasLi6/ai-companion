@@ -502,7 +502,7 @@ def test_legacy_store_migrates_without_losing_rows(tmp_path) -> None:
         # V2 migration: old samples are marked legacy and stay trusted no
         # more than before; neither new column may change the vector.
         assert sample == (0, None, None, "legacy", 0)
-        assert version == "3"
+        assert version == "4"
         assert store.create_candidate() == "TEMP-0005"
     finally:
         store.close()
