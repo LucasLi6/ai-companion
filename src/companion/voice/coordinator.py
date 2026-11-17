@@ -201,10 +201,22 @@ class VoiceCoordinator:
             )
             config = getattr(manager, "config", None)
             model = str(getattr(config, "model", "-"))
-        return (
+        description = (
             f"mic: {self._state.value.lower()}  device={device}"
             f"  model={model}"
         )
+        # Diagnostics only. Do not alter coordinator state or transcript.
+        shadow_status = getattr(manager, "speaker_shadow_status", None)
+        if callable(shadow_status):
+            try:
+                info = shadow_status()
+                description += (
+                    f"  speaker_shadow={info.get('state', 'UNKNOWN')}"
+                    f"  speaker_updates={info.get('updates', 0)}"
+                )
+            except Exception:  # noqa: BLE001 - optional sidecar
+                pass
+        return description
 
     def barge_in_status(self) -> dict[str, Any]:
         """Aggregated barge-in/AEC diagnostics for ``/mic status``."""

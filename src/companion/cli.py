@@ -2215,11 +2215,23 @@ async def cmd_repl(args) -> int:
             # line, so proactive / voice output can be printed above it
             # without ever reading or restoring the typed buffer.
             voice_mode = bool(getattr(args, "voice", False))
+            speaker_shadow_mode = "off"
+            if voice_mode:
+                # Lazy import: text-only REPL must not load speaker/ASR modules.
+                from companion.voice.speaker_shadow import repl_speaker_mode
+
+                speaker_shadow_mode = repl_speaker_mode()
             # Voice mode shows recognized speech under the prompt as it
             # arrives; text-only sessions keep the plain prompt.
             voice_subtitle = _PartialSubtitle() if voice_mode else None
             repl_session = _build_prompt_session(subtitle=voice_subtitle)
-            voice_binding_enabled = voice_mode and voice_person_binding_enabled()
+            # Shadow only observes: never authorize person resolution here,
+            # even if the legacy AVA_VOICE_PERSON_BINDING flag is on.
+            voice_binding_enabled = (
+                voice_mode
+                and voice_person_binding_enabled()
+                and speaker_shadow_mode != "shadow"
+            )
             coordinator = None
             voice_output = (
                 _PromptTurnOutput(repl_session)
@@ -2232,8 +2244,11 @@ async def cmd_repl(args) -> int:
                 # Imported lazily: text-only sessions must keep working even
                 # when the optional ASR dependencies are not installed.
                 from companion.asr.config import load_asr_config
-                from companion.asr.manager import ASRManager
                 from companion.voice import VoiceCoordinator
+                from companion.voice.speaker_shadow import (
+                    build_repl_asr_manager,
+                    log_shadow_final,
+                )
                 from companion.voice.barge_in_config import (
                     BargeInConfigError,
                     load_barge_in_config,
@@ -2329,11 +2344,23 @@ async def cmd_repl(args) -> int:
                                 echo_pipeline = None
                                 barge_in_config = None
 
+                if speaker_shadow_mode == "shadow":
+                    print(
+                        "speaker shadow: on (diagnostics only; "
+                        "person binding disabled)"
+                    )
+                speaker_shadow_run_id = None
+
                 def _make_asr_manager():
-                    manager = ASRManager(
-                        load_asr_config(
-                            debug=bool(getattr(args, "debug", False))
-                        )
+                    nonlocal speaker_shadow_run_id
+                    debug = bool(getattr(args, "debug", False))
+                    manager = build_repl_asr_manager(
+                        load_asr_config(debug=debug),
+                        shadow=(speaker_shadow_mode == "shadow"),
+                        speaker_debug=debug,
+                    )
+                    speaker_shadow_run_id = getattr(
+                        manager, "shadow_run_id", None
                     )
                     if echo_pipeline is not None and barge_in_config:
                         manager.attach_echo_canceller(
@@ -2733,6 +2760,11 @@ async def cmd_repl(args) -> int:
                             if proactive_task is not None:
                                 await _cancel_proactive()
                             final = final_future.result()
+                            if speaker_shadow_mode == "shadow":
+                                # Run on the REPL loop, never the audio path.
+                                log_shadow_final(
+                                    final, run_id=speaker_shadow_run_id
+                                )
                             # The ASR renderer does not print finals in the
                             # formal REPL; echo the accepted text exactly once,
                             # above the live input line. Partials are never
