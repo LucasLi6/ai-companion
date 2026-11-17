@@ -2726,10 +2726,23 @@ async def cmd_repl(args) -> int:
                         lines.append("speaker profiles: none")
                     for profile in profiles:
                         lines.append(
-                            "speaker: {} samples={} observations={}".format(
+                            "speaker: {} status={} samples={}"
+                            " observations={}".format(
                                 profile.get("speaker_id"),
+                                profile.get("status"),
                                 profile.get("samples", 0),
                                 profile.get("observation_count", 0),
+                            )
+                        )
+                    try:
+                        aliases = store.aliases()
+                    except Exception:  # noqa: BLE001 - display only
+                        aliases = []
+                    for row in aliases:
+                        lines.append(
+                            "alias: {} -> {}".format(
+                                row.get("alias_speaker_id"),
+                                row.get("canonical_speaker_id"),
                             )
                         )
                     try:
@@ -2851,6 +2864,77 @@ async def cmd_repl(args) -> int:
                     return [
                         f"unbound speaker {canonical} (and its aliases)"
                     ]
+                if action == "promote":
+                    if len(parts) != 3:
+                        return [
+                            "usage: /speaker promote <SPEAKER_ID>",
+                            "upgrades a TEMP voice cluster to a stable KNOWN"
+                            " id; person binding and storage consent are"
+                            " unchanged.",
+                        ]
+                    from companion.speaker_id.promotion import (
+                        ALREADY_KNOWN,
+                        NO_SAMPLES,
+                        PROMOTED,
+                        UNKNOWN_SPEAKER,
+                        promote_voice_profile,
+                    )
+
+                    store = _identity_store()
+                    if store is None:
+                        return ["speaker store unavailable"]
+                    result = promote_voice_profile(store, parts[2])
+                    if result.outcome == PROMOTED:
+                        # The policy caches authorisation in memory; carry the
+                        # grant to the new id now instead of at next start.
+                        if (
+                            enrollment_policy is not None
+                            and result.previous_id is not None
+                            and enrollment_policy.is_authorized(
+                                result.previous_id
+                            )
+                        ):
+                            enrollment_policy.authorize(result.speaker_id)
+                        with contextlib.suppress(Exception):
+                            await rt.repos.audit.record(
+                                actor="local_cli",
+                                action="promote_speaker",
+                                entity_type="speaker",
+                                entity_id=result.speaker_id,
+                                detail=(
+                                    f"previous={result.previous_id}"
+                                    " verified_by=local_cli_confirmation"
+                                ),
+                            )
+                        lines = [
+                            f"promoted voice profile {result.previous_id} ->"
+                            f" {result.speaker_id} (KNOWN)",
+                            f"note: {result.previous_id} is now an alias of"
+                            f" {result.speaker_id}; existing bindings keep"
+                            " resolving.",
+                            "binding and consent unchanged. bind locally:"
+                            f" /speaker bind {result.speaker_id} <PERSON_ID>",
+                        ]
+                        return lines
+                    if result.outcome == ALREADY_KNOWN:
+                        return [
+                            f"{result.speaker_id} is already a stable"
+                            " identity (KNOWN)"
+                        ]
+                    if result.outcome == NO_SAMPLES:
+                        return [
+                            f"cannot promote {result.previous_id}: no usable"
+                            " voice samples yet (speak a few more times)",
+                        ]
+                    if result.outcome == UNKNOWN_SPEAKER:
+                        return [
+                            f"speaker id unusable: {parts[2]}"
+                            " (unknown, deleted, or broken alias chain)"
+                        ]
+                    return [
+                        f"promotion failed for {parts[2]}"
+                        f" ({result.outcome}); run /speaker list"
+                    ]
                 if action == "enroll":
                     if len(parts) != 3:
                         return [
@@ -2885,7 +2969,7 @@ async def cmd_repl(args) -> int:
                     ]
                 return [
                     "usage: /speaker list|status|bind <S> <PERSON>|"
-                    "unbind <S>|enroll <PERSON>|off"
+                    "unbind <S>|promote <S>|enroll <PERSON>|off"
                 ]
 
             async def _handle_command(line: str) -> bool:
@@ -2969,7 +3053,7 @@ async def cmd_repl(args) -> int:
                     print(
                         "commands: /to agent|human|unknown  /quiet on|off"
                         "  /speech on|off  /tts on|off|stop|status"
-                        "  /speaker list|status|bind|unbind|enroll"
+                        "  /speaker list|status|bind|unbind|promote|enroll"
                         f"{voice_help}  /history  /status  /quit"
                     )
                 else:

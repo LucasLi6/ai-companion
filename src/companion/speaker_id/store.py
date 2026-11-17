@@ -1143,6 +1143,20 @@ class SpeakerStore:
                 " WHERE speaker_id = ?",
                 (new_id, speaker_id),
             )
+            # A storage grant belongs to the voiceprint data, which just moved
+            # to the new id. Keep it attached in the same transaction so the
+            # promoted profile does not silently lose consent.
+            connection.execute(
+                "INSERT OR REPLACE INTO speaker_enrollment_consents"
+                " (speaker_id, granted_by, created_at, updated_at)"
+                " SELECT ?, granted_by, created_at, ?"
+                " FROM speaker_enrollment_consents WHERE speaker_id = ?",
+                (new_id, now, speaker_id),
+            )
+            connection.execute(
+                "DELETE FROM speaker_enrollment_consents WHERE speaker_id = ?",
+                (speaker_id,),
+            )
             connection.execute(
                 "INSERT OR IGNORE INTO speaker_aliases"
                 " (canonical_speaker_id, alias_speaker_id, created_at)"
