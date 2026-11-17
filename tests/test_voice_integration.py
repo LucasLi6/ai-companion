@@ -740,3 +740,61 @@ def test_tts_playback_notice_carries_response_and_generation() -> None:
         assert finished.conversation_id == "conv-1"
     finally:
         manager.shutdown()
+
+
+# ------------------------------------------------ V0.9.9.31 accepted turns
+async def test_accepted_turn_carries_its_microphone_run_id():
+    class RunASR(FakeASR):
+        repl_run_id = "run-a"
+
+    fake = RunASR()
+    coordinator = VoiceCoordinator(
+        manager_factory=lambda: fake,
+        tts_manager=None,
+        cooldown_seconds=0.0,
+    )
+    assert (await coordinator.enable())[0]
+    try:
+        fake.speech(7)
+        await settle(1)
+        fake.final(7, "hello")
+        await settle()
+        accepted = await asyncio.wait_for(
+            coordinator.next_accepted_turn(), 1.0
+        )
+        assert accepted.run_id == "run-a"
+        assert accepted.final.utterance_id == 7
+    finally:
+        await coordinator.shutdown()
+
+
+async def test_next_final_remains_a_compatible_wrapper():
+    coordinator, fake = await make_coordinator()
+    assert (await coordinator.enable())[0]
+    try:
+        fake.speech(3)
+        await settle(1)
+        fake.final(3, "legacy")
+        await settle()
+        final = await asyncio.wait_for(coordinator.next_final(), 1.0)
+        assert final.utterance_id == 3
+        assert final.text == "legacy"
+    finally:
+        await coordinator.shutdown()
+
+
+async def test_discarded_turn_resumes_listening_without_a_reply():
+    coordinator, fake = await make_coordinator()
+    assert (await coordinator.enable())[0]
+    try:
+        fake.speech(1)
+        await settle(1)
+        fake.final(1, "unidentified")
+        await settle()
+        await asyncio.wait_for(coordinator.next_final(), 1.0)
+        assert coordinator.state is VoiceState.THINKING
+        coordinator.resume_after_discarded_turn()
+        await settle()
+        assert coordinator.state is VoiceState.LISTENING
+    finally:
+        await coordinator.shutdown()

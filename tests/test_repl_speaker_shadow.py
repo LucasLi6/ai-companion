@@ -11,6 +11,7 @@ from companion.asr.manager import ASRManager
 from companion.speaker_id.config import load_speaker_config
 from companion.speaker_id.models import ERROR, SpeakerResult
 from companion.voice.speaker_shadow import (
+    MODE_ACTIVE,
     MODE_OFF,
     MODE_SHADOW,
     ShadowASRManager,
@@ -59,12 +60,14 @@ def sample_result():
     )
 
 
-def test_flag_is_off_by_default_and_unknown_values_fail_closed(caplog):
-    assert repl_speaker_mode({}) == MODE_OFF
+def test_default_mode_is_active_and_unknown_values_fail_closed(caplog):
+    # Formal voice identity is the default; off/shadow are explicit rollbacks.
+    assert repl_speaker_mode({}) == MODE_ACTIVE
     assert repl_speaker_mode({"AVA_REPL_SPEAKER_MODE": "off"}) == MODE_OFF
     assert repl_speaker_mode({"AVA_REPL_SPEAKER_MODE": " SHADOW "}) == MODE_SHADOW
+    assert repl_speaker_mode({"AVA_REPL_SPEAKER_MODE": "active"}) == MODE_ACTIVE
     with caplog.at_level(logging.WARNING):
-        assert repl_speaker_mode({"AVA_REPL_SPEAKER_MODE": "active"}) == MODE_OFF
+        assert repl_speaker_mode({"AVA_REPL_SPEAKER_MODE": "typo"}) == MODE_OFF
     assert "speaker_shadow_invalid_mode" in caplog.text
 
 
@@ -192,3 +195,84 @@ def test_pending_final_then_late_result_are_logged_separately(tmp_path, caplog):
     assert any("speaker_shadow_final" in x and "PENDING" in x for x in lines)
     assert any("speaker_shadow_update" in x and "KNOWN" in x for x in lines)
     observer.shutdown()
+
+
+# ------------------------------------------------ V0.9.9.31 formal activation
+def test_active_mode_default_observer_publishes_run_scoped_updates(tmp_path):
+    from companion.voice.bridge import SpeakerUpdate
+    from companion.voice.speaker_shadow import ReplSpeakerObserver
+
+    speaker_config = load_speaker_config(
+        env={}, db_path=tmp_path / "speaker.sqlite3"
+    )
+    observer = ReplSpeakerObserver(speaker_config, run_id="run-formal")
+    received = []
+    observer.set_speaker_update_callback(received.append)
+    try:
+        observer._on_result_shadow(sample_result())
+        observer._on_result_shadow(sample_result())
+
+        assert [update.revision for update in received] == [1, 2]
+        assert all(isinstance(update, SpeakerUpdate) for update in received)
+        assert all(update.run_id == "run-formal" for update in received)
+        assert observer.diagnostics()["updates"] == 2
+    finally:
+        observer.shutdown()
+
+
+def test_update_callback_failure_never_escapes_the_speaker_thread(tmp_path):
+    from companion.voice.speaker_shadow import ReplSpeakerObserver
+
+    speaker_config = load_speaker_config(
+        env={}, db_path=tmp_path / "speaker.sqlite3"
+    )
+    observer = ReplSpeakerObserver(speaker_config, run_id="run-broken")
+    observer.set_speaker_update_callback(
+        lambda _update: (_ for _ in ()).throw(RuntimeError("sink died"))
+    )
+    try:
+        observer._on_result_shadow(sample_result())
+        assert observer.diagnostics()["updates"] == 1
+    finally:
+        observer.shutdown()
+
+
+def test_manager_forwards_the_formal_callback_and_status(tmp_path):
+    speaker_config = load_speaker_config(
+        env={}, db_path=tmp_path / "speaker.sqlite3"
+    )
+    observer = FakeObserver()
+    observer.run_id = "run-forward"
+    manager = ShadowASRManager(config(), speaker_observer=observer)
+    received = []
+
+    class FormalObserver:
+        run_id = "run-forward"
+
+        def start_loading(self):
+            observer.start_loading()
+
+        def shutdown(self):
+            observer.shutdown()
+
+        def set_speaker_update_callback(self, callback):
+            received.append(callback)
+
+        def diagnostics(self):
+            return {"run_id": self.run_id, "state": "READY", "updates": 3}
+
+    formal = FormalObserver()
+    manager = ShadowASRManager(config(), speaker_observer=formal)
+    callback = lambda _update: None
+    manager.set_speaker_update_callback(callback)
+    assert received == [callback]
+    assert manager.repl_run_id == "run-forward"
+    assert manager.speaker_status()["updates"] == 3
+    # Historical alias still works for older callers.
+    assert manager.speaker_shadow_status()["updates"] == 3
+
+
+def test_disabled_formal_manager_has_no_callback_surface():
+    manager = build_repl_asr_manager(config(), speaker_enabled=False)
+    assert type(manager) is ASRManager
+    assert getattr(manager, "set_speaker_update_callback", None) is None
