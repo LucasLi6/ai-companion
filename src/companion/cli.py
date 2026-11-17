@@ -2240,6 +2240,13 @@ async def cmd_repl(args) -> int:
             _identity_latency_ms: "deque[float]" = deque(maxlen=512)
             _identity_discards = 0
             _identity_wait_timeouts = 0
+            # Explicit, human-only Speaker -> Person link preview waiting for
+            # its confirmation, and the optional guided registration flow.
+            # Both live in memory and expire; neither is reachable from
+            # speech, the Router or the LLM.
+            _pending_link: Optional[dict] = None
+            registration_flow = None
+            _registration_signature: Optional[tuple] = None
             # Late identity notices are display-only tasks; they are cancelled
             # on exit so no task outlives the event loop.
             _late_identity_tasks: set[asyncio.Task] = set()
@@ -2586,6 +2593,74 @@ async def cmd_repl(args) -> int:
 
                     return pick(0.50), pick(0.95)
 
+                def _link_service():
+                    """Human-only Speaker -> Person -> Profile link service."""
+                    from companion.people.speaker_profile_link import (
+                        SpeakerProfileLinkService,
+                    )
+
+                    store = _identity_store()
+                    if (
+                        store is None
+                        or rt.speaker_bindings is None
+                        or rt.profile_service is None
+                    ):
+                        return None
+                    return SpeakerProfileLinkService(
+                        rt.speaker_bindings,
+                        rt.repos.person,
+                        store,
+                        rt.profile_service,
+                        audit=rt.repos.audit,
+                    )
+
+                def _observe_registration(result, *, utterance_id=None):
+                    """Feed one speaker result to the guided flow, if active.
+
+                    Only observations that can belong to this enrollment are
+                    passed: the flow's own candidate, or the new cluster the
+                    armed identity just created. Another person's voice can
+                    never fail or satisfy the registration.
+                    """
+                    nonlocal _registration_signature
+                    from companion.people.speaker_registration import (
+                        ACTIVE_STATES,
+                        SpeakerRegistrationError,
+                    )
+                    from companion.speaker_id.models import NEW_CANDIDATE
+
+                    flow = registration_flow
+                    if flow is None or flow.state not in ACTIVE_STATES:
+                        return
+                    if result is None:
+                        return
+                    speaker_id = str(
+                        getattr(result, "speaker_id", "") or ""
+                    ).strip()
+                    status = str(getattr(result, "status", "") or "")
+                    if flow.speaker_id is not None:
+                        if speaker_id != flow.speaker_id:
+                            return
+                    elif status != NEW_CANDIDATE:
+                        return
+                    try:
+                        step = flow.observe(
+                            result, utterance_id=utterance_id
+                        )
+                    except SpeakerRegistrationError:
+                        return
+                    signature = (step.state, step.reason)
+                    if signature == _registration_signature:
+                        return
+                    _registration_signature = signature
+                    try:
+                        asyncio.create_task(
+                            voice_output.write(step.message + "\n"),
+                            name="ava-registration-notice",
+                        )
+                    except RuntimeError:  # loop shutting down
+                        pass
+
                 async def _apply_late_identity(entry: dict, identity) -> None:
                     """Display-only update of an already-decided turn.
 
@@ -2633,6 +2708,11 @@ async def cmd_repl(args) -> int:
                     """Annotate an already-displayed turn; never reply again."""
                     if not formal_identity:
                         return
+                    # A guided registration consumes the voice it armed before
+                    # any conversation decision; it still never submits text.
+                    _observe_registration(
+                        update.result, utterance_id=update.utterance_id
+                    )
                     key = (update.run_id, int(update.utterance_id))
                     entry = identity_ledger.get(key)
                     if entry is None:
@@ -2744,6 +2824,8 @@ async def cmd_repl(args) -> int:
                 voiceprint storage. Nothing here is reachable from speech, the
                 Router, the LLM, or a SpeakerResult.
                 """
+                nonlocal _pending_link, registration_flow
+                nonlocal _registration_signature
                 action = parts[1].lower() if len(parts) > 1 else "status"
                 if action == "status":
                     lines = [
@@ -2758,6 +2840,30 @@ async def cmd_repl(args) -> int:
                         lines.append(
                             "storage consent: authorized="
                             f"{snap['authorized']} armed={snap['armed']}"
+                        )
+                    if _pending_link is not None:
+                        lines.append(
+                            "pending link: {} -> {} (confirm within {}s)"
+                            .format(
+                                _pending_link["speaker"],
+                                _pending_link["person"],
+                                max(
+                                    0,
+                                    int(
+                                        _pending_link["expires_at"]
+                                        - time.monotonic()
+                                    ),
+                                ),
+                            )
+                        )
+                    if registration_flow is not None:
+                        latest_step = registration_flow.expire_if_due()
+                        lines.append(
+                            "registration: {} person={} speaker={}".format(
+                                latest_step.state,
+                                latest_step.person_id or "-",
+                                latest_step.speaker_id or "-",
+                            )
                         )
                     latency_p50, latency_p95 = _latency_percentiles(
                         _identity_latency_ms
@@ -2875,6 +2981,322 @@ async def cmd_repl(args) -> int:
                     if withdrawn:
                         lines.append(
                             "storage not authorized: " + ", ".join(withdrawn)
+                        )
+                    return lines
+                if action == "profile":
+                    if len(parts) != 3:
+                        return ["usage: /speaker profile <SPEAKER_ID>"]
+                    from companion.people.speaker_profile_link import (
+                        PROFILE_BINDING_CONFLICT,
+                        PROFILE_CONSENT_MISSING,
+                        PROFILE_MISSING,
+                        PROFILE_NO_BINDING,
+                        PROFILE_PERSON_INACTIVE,
+                        PROFILE_PERSON_MISSING,
+                        PROFILE_READY,
+                        PROFILE_UNKNOWN_SPEAKER,
+                        SpeakerLinkError,
+                    )
+
+                    store = _identity_store()
+                    link = _link_service()
+                    if store is None or link is None:
+                        return ["speaker profile link unavailable"]
+                    try:
+                        resolution = await link.resolve_profile(parts[2])
+                    except SpeakerLinkError as exc:
+                        return [f"profile lookup refused: {exc.code}"]
+                    lines: list[str] = []
+                    canonical = resolution.canonical_speaker_id
+                    if canonical is not None:
+                        row = store.get_profile(canonical)
+                        if row is not None:
+                            consent = store.enrollment_consent(canonical)
+                            samples = 0
+                            try:
+                                samples = next(
+                                    (
+                                        int(item.get("samples", 0) or 0)
+                                        for item in store.list_speakers()
+                                        if item.get("speaker_id") == canonical
+                                    ),
+                                    0,
+                                )
+                            except Exception:  # noqa: BLE001 - display only
+                                samples = 0
+                            lines.append(
+                                "voice: {} status={} samples={}"
+                                " observations={} storage={}".format(
+                                    canonical,
+                                    row.get("status"),
+                                    samples,
+                                    row.get("observation_count", 0),
+                                    (consent or {}).get("status") or "none",
+                                )
+                            )
+                    if resolution.person_id is not None:
+                        lines.append(
+                            "person: {} ({})".format(
+                                resolution.person_id,
+                                resolution.display_name or "unknown",
+                            )
+                        )
+                    if resolution.state == PROFILE_READY:
+                        profile = resolution.profile
+                        lines.append(
+                            "profile: ready revision={} tier={}".format(
+                                getattr(
+                                    getattr(profile, "metadata", None),
+                                    "revision",
+                                    "?",
+                                ),
+                                getattr(
+                                    profile, "relationship_tier", "STRANGER"
+                                ),
+                            )
+                        )
+                        flags = resolution.consent_flags
+                        lines.append(
+                            "consent: processing={} persistence={}"
+                            " memory_learning={} external_ai={}".format(
+                                int(flags.get("processing", False)),
+                                int(flags.get("persistence", False)),
+                                int(flags.get("memory_learning", False)),
+                                int(flags.get("external_ai", False)),
+                            )
+                        )
+                        summary = str(
+                            getattr(profile, "compact_summary", "") or ""
+                        ).strip()
+                        if summary:
+                            lines.append(
+                                "summary: "
+                                + summary[:200]
+                                + ("..." if len(summary) > 200 else "")
+                            )
+                        entries = getattr(profile, "entries", {}) or {}
+                        lines.append(
+                            "entries: "
+                            + str(
+                                sum(
+                                    len(items)
+                                    for items in entries.values()
+                                    if isinstance(items, (list, tuple))
+                                )
+                            )
+                        )
+                    elif resolution.state == PROFILE_MISSING:
+                        lines.append(
+                            "profile: none yet (the person is known; linking"
+                            " never creates profile content)"
+                        )
+                    elif resolution.state == PROFILE_CONSENT_MISSING:
+                        lines.append(
+                            "profile: not readable (processing/persistence"
+                            " consent missing); the person is still known"
+                        )
+                    elif resolution.state == PROFILE_NO_BINDING:
+                        lines.append(
+                            "person: none; bind explicitly with"
+                            " /speaker link <SPEAKER_ID> <PERSON_ID>"
+                        )
+                    elif resolution.state == PROFILE_UNKNOWN_SPEAKER:
+                        lines.append("voice: unknown or deleted")
+                    elif resolution.state == PROFILE_BINDING_CONFLICT:
+                        lines.append(
+                            "person: conflict (aliases bound to different"
+                            " people); resolve with /speaker unbind first"
+                        )
+                    elif resolution.state == PROFILE_PERSON_INACTIVE:
+                        lines.append("person: inactive; voice turns are refused")
+                    elif resolution.state == PROFILE_PERSON_MISSING:
+                        lines.append(
+                            "person: binding points to a missing person"
+                        )
+                    else:
+                        lines.append(
+                            "voice id unusable: {} ({})".format(
+                                parts[2], resolution.reason
+                            )
+                        )
+                    return lines
+                if action == "link":
+                    from companion.people.speaker_profile_link import (
+                        SpeakerLinkError,
+                    )
+
+                    if len(parts) == 3 and parts[2].lower() == "cancel":
+                        _pending_link = None
+                        return ["pending link cleared; nothing was bound"]
+                    if len(parts) == 3 and parts[2].lower() == "confirm":
+                        pending = _pending_link
+                        if (
+                            pending is None
+                            or time.monotonic() > pending["expires_at"]
+                        ):
+                            _pending_link = None
+                            return [
+                                "no pending link preview (or it expired);"
+                                " run /speaker link <SPEAKER_ID> <PERSON_ID>"
+                                " again"
+                            ]
+                        link = _link_service()
+                        if link is None:
+                            return ["speaker profile link unavailable"]
+                        try:
+                            result = await link.confirm_link(
+                                pending["speaker"],
+                                pending["person"],
+                                verified_by="local_cli_confirmation",
+                            )
+                        except SpeakerLinkError as exc:
+                            _pending_link = None
+                            return [f"link refused: {exc.code}"]
+                        _pending_link = None
+                        person_obj = await rt.registry.get(
+                            result.binding["person_id"]
+                        )
+                        name = (
+                            person_obj.display_name
+                            if person_obj is not None
+                            else "MISSING"
+                        )
+                        return [
+                            "linked speaker {} -> {} ({})".format(
+                                result.binding["speaker_id"],
+                                result.binding["person_id"],
+                                name,
+                            ),
+                            "note: this binds identity only; voiceprint"
+                            " storage and memory learning are unchanged.",
+                        ]
+                    if len(parts) != 4:
+                        return [
+                            "usage: /speaker link <SPEAKER_ID> <PERSON_ID>",
+                            "       /speaker link confirm|cancel",
+                        ]
+                    link = _link_service()
+                    if link is None:
+                        return ["speaker profile link unavailable"]
+                    try:
+                        preview = await link.preview_link(parts[2], parts[3])
+                    except SpeakerLinkError as exc:
+                        return [f"link preview refused: {exc.code}"]
+                    lines = [
+                        "voice: {} (canonical {}) status={}".format(
+                            preview.canonical_speaker_id or parts[2],
+                            preview.canonical_speaker_id or "-",
+                            preview.speaker_status or "unknown",
+                        ),
+                        "person: {} ({}) active={}".format(
+                            preview.person_id or "-",
+                            preview.display_name or "-",
+                            int(preview.person_active),
+                        ),
+                        "storage consent: {}".format(
+                            preview.speaker_consent or "none"
+                        ),
+                        "profile: present={} revision={}".format(
+                            int(preview.profile_present),
+                            preview.profile_revision,
+                        ),
+                    ]
+                    if preview.consent_flags:
+                        lines.append(
+                            "person consent: processing={} persistence={}"
+                            " memory_learning={} external_ai={}".format(
+                                int(preview.consent_flags.get("processing", False)),
+                                int(preview.consent_flags.get("persistence", False)),
+                                int(
+                                    preview.consent_flags.get(
+                                        "memory_learning", False
+                                    )
+                                ),
+                                int(preview.consent_flags.get("external_ai", False)),
+                            )
+                        )
+                    lines.extend(f"warning: {text}" for text in preview.warnings)
+                    if preview.can_link:
+                        _pending_link = {
+                            "speaker": parts[2],
+                            "person": parts[3],
+                            "expires_at": time.monotonic() + 60.0,
+                        }
+                        lines.append(
+                            "run /speaker link confirm within 60s to bind"
+                            " (or /speaker link cancel); nothing is bound yet"
+                        )
+                    else:
+                        _pending_link = None
+                        lines.append(f"link refused: {preview.reason}")
+                    return lines
+                if action == "register":
+                    from companion.people.speaker_registration import (
+                        BOUND,
+                        COLLECTING,
+                        SpeakerRegistrationError,
+                        SpeakerRegistrationFlow,
+                    )
+
+                    if len(parts) == 3 and parts[2].lower() in (
+                        "confirm",
+                        "cancel",
+                        "status",
+                    ):
+                        if registration_flow is None:
+                            return ["no registration in progress"]
+                        sub = parts[2].lower()
+                        if sub == "status":
+                            step = registration_flow.expire_if_due()
+                            return [
+                                f"registration: {step.state}",
+                                step.message,
+                            ]
+                        if sub == "cancel":
+                            step = registration_flow.cancel()
+                            _registration_signature = None
+                            return [step.message, f"state={step.state}"]
+                        try:
+                            step = await registration_flow.confirm()
+                        except SpeakerRegistrationError as exc:
+                            return [f"registration refused: {exc.code}"]
+                        _registration_signature = None
+                        lines = [step.message, f"state={step.state}"]
+                        if step.state == BOUND:
+                            lines.append(
+                                "memory learning unchanged; try"
+                                f" /speaker profile {step.speaker_id}"
+                            )
+                        return lines
+                    if len(parts) != 3:
+                        return [
+                            "usage: /speaker register <PERSON_ID>",
+                            "       /speaker register confirm|cancel|status",
+                        ]
+                    if speaker_mode == "off":
+                        return [
+                            "speaker identity is off; start with --voice to"
+                            " register a voice"
+                        ]
+                    if enrollment_policy is None or not formal_identity:
+                        return ["formal speaker identity is unavailable"]
+                    store = _identity_store()
+                    link = _link_service()
+                    if store is None or link is None:
+                        return ["speaker registration unavailable"]
+                    registration_flow = SpeakerRegistrationFlow(
+                        store=store,
+                        persons=rt.repos.person,
+                        link=link,
+                        enrollment_policy=enrollment_policy,
+                    )
+                    _registration_signature = None
+                    step = await registration_flow.start(parts[2])
+                    lines = [step.message, f"state={step.state}"]
+                    if step.state == COLLECTING:
+                        lines.append(
+                            "exactly one new voice identity is armed; Ava's"
+                            " own TTS audio is never enrolled."
                         )
                     return lines
                 if action == "bind":
@@ -3091,8 +3513,10 @@ async def cmd_repl(args) -> int:
                         " speak now (one identity only).",
                     ]
                 return [
-                    "usage: /speaker list|status|bind <S> <PERSON>|"
-                    "unbind <S>|promote <S>|enroll <PERSON>|off"
+                    "usage: /speaker list|status|profile <S>|"
+                    "link <S> <PERSON>|link confirm|cancel|bind <S> <PERSON>|"
+                    "unbind <S>|promote <S>|enroll <PERSON>|off|"
+                    "register <PERSON>|register confirm|cancel|status"
                 ]
 
             async def _handle_command(line: str) -> bool:
