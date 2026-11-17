@@ -161,13 +161,59 @@ def test_v2_store_migrates_to_current_schema_preserving_every_row(
         ).fetchone()
 
     assert stage == "schema setup"
-    assert version == str(SCHEMA_VERSION) == "4"
+    assert version == str(SCHEMA_VERSION) == "5"
     assert samples == [
         (1, "TEMP-0001", "HIGH", 1, "session-a", 0, "legacy", 0),
         (2, "TEMP-0001", "MEDIUM", 0, "session-a", 1, "legacy", 0),
     ]
     assert observation == ("session-a", 0, "TEMP-0001", "CANDIDATE_MATCH")
     assert alias == ("TEMP-0001", "OLD-0009")
+
+
+def test_v4_consent_rows_migrate_as_grants_and_revocation_is_durable(
+    tmp_path,
+) -> None:
+    path = tmp_path / "v4.sqlite3"
+    build_v2(path)
+    connection = sqlite3.connect(path)
+    # The v4 consent table had no status column: every row was a grant.
+    connection.execute(
+        "CREATE TABLE speaker_enrollment_consents ("
+        " speaker_id TEXT PRIMARY KEY,"
+        " granted_by TEXT NOT NULL,"
+        " created_at REAL NOT NULL,"
+        " updated_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO speaker_enrollment_consents VALUES"
+        " ('TEMP-0001', 'local_cli', 1.0, 1.0)"
+    )
+    connection.execute(
+        "UPDATE speaker_meta SET value = '4' WHERE key = 'schema_version'"
+    )
+    connection.commit()
+    connection.close()
+
+    store = SpeakerStore(path)
+    store.initialize()
+    try:
+        rows = store.enrollment_consents()
+        assert [(row["speaker_id"], row["status"]) for row in rows] == [
+            ("TEMP-0001", "GRANTED")
+        ]
+        # A refusal is written as REVOKED, never by deleting the row, so a
+        # later restart cannot mistake silence for permission.
+        assert store.revoke_enrollment_consent("TEMP-0001") is True
+        assert store.enrollment_consent("TEMP-0001")["status"] == "REVOKED"
+    finally:
+        store.close()
+
+    reopened = SpeakerStore(path)
+    reopened.initialize()
+    try:
+        assert reopened.enrollment_consent("TEMP-0001")["status"] == "REVOKED"
+    finally:
+        reopened.close()
 
 
 def test_v3_columns_are_added_only_once_and_migration_is_idempotent(tmp_path) -> None:

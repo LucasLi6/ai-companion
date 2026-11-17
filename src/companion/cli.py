@@ -2749,12 +2749,25 @@ async def cmd_repl(args) -> int:
                         grants = store.enrollment_consents()
                     except Exception:  # noqa: BLE001 - display only
                         grants = []
-                    if grants:
+                    granted = [
+                        str(row["speaker_id"])
+                        for row in grants
+                        if str(row.get("status") or "").upper() == "GRANTED"
+                    ]
+                    withdrawn = [
+                        "{} ({})".format(
+                            row["speaker_id"], row.get("status")
+                        )
+                        for row in grants
+                        if str(row.get("status") or "").upper() != "GRANTED"
+                    ]
+                    if granted:
                         lines.append(
-                            "storage authorized: "
-                            + ", ".join(
-                                str(row["speaker_id"]) for row in grants
-                            )
+                            "storage authorized: " + ", ".join(granted)
+                        )
+                    if withdrawn:
+                        lines.append(
+                            "storage not authorized: " + ", ".join(withdrawn)
                         )
                     return lines
                 if action == "bind":

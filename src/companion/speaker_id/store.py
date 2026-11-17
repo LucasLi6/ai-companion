@@ -42,8 +42,22 @@ from companion.speaker_id.voice_profiles import (
     VoiceSample,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 LEGACY_SESSION_ID = "legacy"
+
+# Explicit, durable voiceprint-storage state. Presence in the old consent
+# table was treated as a grant, which made revocation impossible to persist:
+# a restart re-authorised every profile that had samples. A status column now
+# distinguishes an explicit grant, an explicit refusal, and historical data
+# that may be recognised but must not silently keep learning.
+CONSENT_GRANTED = "GRANTED"
+CONSENT_REVOKED = "REVOKED"
+CONSENT_LEGACY_READ_ONLY = "LEGACY_READ_ONLY"
+CONSENT_STATUSES = (
+    CONSENT_GRANTED,
+    CONSENT_REVOKED,
+    CONSENT_LEGACY_READ_ONLY,
+)
 
 
 class SpeakerStoreError(Exception):
@@ -148,6 +162,12 @@ class SpeakerStore:
                 "PRAGMA table_info(speaker_observations)"
             ).fetchall()
         }
+        consent_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(speaker_enrollment_consents)"
+            ).fetchall()
+        }
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -182,6 +202,16 @@ class SpeakerStore:
 
             if "session_id" not in observation_columns:
                 self._rebuild_observations(connection)
+
+            # Schema v5: every historical consent row was an explicit grant
+            # under the old UI, so it migrates to GRANTED. Profiles with
+            # samples but no row become LEGACY_READ_ONLY in the policy, not an
+            # implicit grant.
+            if "status" not in consent_columns:
+                connection.execute(
+                    "ALTER TABLE speaker_enrollment_consents ADD COLUMN"
+                    " status TEXT NOT NULL DEFAULT 'GRANTED'"
+                )
 
             # Sentinel samples are not automatically trusted after a version
             # upgrade: old rows keep ``is_verified_reference = 0``.
@@ -966,9 +996,40 @@ class SpeakerStore:
 
     # ---------------------------------------------------- enrollment consent
     def set_enrollment_consent(
-        self, speaker_id: str, *, granted_by: str
+        self,
+        speaker_id: str,
+        *,
+        granted_by: str,
+        status: str = CONSENT_GRANTED,
     ) -> bool:
-        """Explicitly authorise long-term voiceprint storage for one id."""
+        """Record an explicit, durable storage decision for one id."""
+        sid = str(speaker_id or "").strip()
+        chosen = str(status or "").strip().upper()
+        if not sid or chosen not in CONSENT_STATUSES:
+            return False
+        now = self._clock()
+        actor = str(granted_by or "local_confirmation")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO speaker_enrollment_consents"
+                " (speaker_id, granted_by, created_at, updated_at, status)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(speaker_id) DO UPDATE SET"
+                " granted_by=excluded.granted_by,"
+                " updated_at=excluded.updated_at,"
+                " status=excluded.status",
+                (sid, actor, now, now, chosen),
+            )
+        return True
+
+    def revoke_enrollment_consent(
+        self, speaker_id: str, *, actor: str = "local_confirmation"
+    ) -> bool:
+        """Persist a refusal that survives restarts.
+
+        The row is kept (not deleted) so a later reload can tell an explicit
+        revocation apart from historical data that was never granted.
+        """
         sid = str(speaker_id or "").strip()
         if not sid:
             return False
@@ -976,33 +1037,42 @@ class SpeakerStore:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO speaker_enrollment_consents"
-                " (speaker_id, granted_by, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?)"
+                " (speaker_id, granted_by, created_at, updated_at, status)"
+                " VALUES (?, ?, ?, ?, ?)"
                 " ON CONFLICT(speaker_id) DO UPDATE SET"
                 " granted_by=excluded.granted_by,"
-                " updated_at=excluded.updated_at",
-                (sid, str(granted_by or "local_confirmation"), now, now),
+                " updated_at=excluded.updated_at,"
+                " status=excluded.status",
+                (
+                    sid,
+                    str(actor or "local_confirmation"),
+                    now,
+                    now,
+                    CONSENT_REVOKED,
+                ),
             )
         return True
-
-    def revoke_enrollment_consent(self, speaker_id: str) -> bool:
-        sid = str(speaker_id or "").strip()
-        if not sid:
-            return False
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM speaker_enrollment_consents WHERE speaker_id = ?",
-                (sid,),
-            )
-        return bool(cur.rowcount)
 
     def enrollment_consents(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT speaker_id, granted_by, created_at, updated_at"
+                "SELECT speaker_id, granted_by, status, created_at, updated_at"
                 " FROM speaker_enrollment_consents ORDER BY created_at ASC"
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def enrollment_consent(self, speaker_id: str) -> Optional[dict[str, Any]]:
+        """One explicit consent row, or ``None`` when there is no record."""
+        sid = str(speaker_id or "").strip()
+        if not sid:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT speaker_id, granted_by, status, created_at, updated_at"
+                " FROM speaker_enrollment_consents WHERE speaker_id = ?",
+                (sid,),
+            ).fetchone()
+            return None if row is None else dict(row)
 
     # --------------------------------------------------------------- deletion
     def delete_speaker(self, speaker_id: str) -> bool:
@@ -1021,6 +1091,18 @@ class SpeakerStore:
                 "DELETE FROM speaker_observations WHERE speaker_id = ?",
                 (speaker_id,),
             )
+            # A deleted identity must not leave an orphan grant behind that a
+            # later id (or a reviewer) could mistake for a live authorisation.
+            # Read the alias list first: deleting the alias rows below would
+            # otherwise hide the ids whose grants also have to go.
+            connection.execute(
+                "DELETE FROM speaker_enrollment_consents"
+                " WHERE speaker_id = ?"
+                "   OR speaker_id IN ("
+                "       SELECT alias_speaker_id FROM speaker_aliases"
+                "       WHERE canonical_speaker_id = ?)",
+                (speaker_id, speaker_id),
+            )
             connection.execute(
                 "DELETE FROM speaker_aliases WHERE canonical_speaker_id = ?"
                 " OR alias_speaker_id = ?",
@@ -1033,7 +1115,7 @@ class SpeakerStore:
             return True
 
     def clear(self) -> int:
-        """Delete every profile, print, observation and alias."""
+        """Delete every profile, print, observation, alias and consent."""
         with self._lock, self._transaction() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) AS n FROM speaker_profiles"
@@ -1041,6 +1123,7 @@ class SpeakerStore:
             connection.execute("DELETE FROM speaker_embeddings")
             connection.execute("DELETE FROM speaker_observations")
             connection.execute("DELETE FROM speaker_aliases")
+            connection.execute("DELETE FROM speaker_enrollment_consents")
             connection.execute("DELETE FROM speaker_profiles")
             return int(row["n"]) if row is not None else 0
 
@@ -1080,6 +1163,15 @@ class SpeakerStore:
                 (canonical_speaker_id, alias_speaker_id),
             )
             now = self._clock()
+            # Consent is data, not recognition: merging two voice clusters
+            # must never widen what may be learned. Incompatible states keep
+            # the more restrictive one (REVOKED > LEGACY_READ_ONLY > GRANTED).
+            self._merge_consent(
+                connection,
+                canonical_speaker_id,
+                alias_speaker_id,
+                now=now,
+            )
             connection.execute(
                 "INSERT OR IGNORE INTO speaker_aliases"
                 " (canonical_speaker_id, alias_speaker_id, created_at)"
@@ -1106,6 +1198,82 @@ class SpeakerStore:
             )
             self._trim_embeddings(connection, canonical_speaker_id)
             return True
+
+    @staticmethod
+    def _consent_rank(status: str) -> int:
+        """Higher rank is more restrictive when two identities are merged."""
+        return {
+            CONSENT_GRANTED: 0,
+            CONSENT_LEGACY_READ_ONLY: 1,
+            CONSENT_REVOKED: 2,
+        }.get(str(status or "").upper(), 1)
+
+    def _merge_consent(
+        self,
+        connection: sqlite3.Connection,
+        canonical_speaker_id: str,
+        alias_speaker_id: str,
+        *,
+        now: float,
+    ) -> None:
+        rows = {
+            str(row["speaker_id"]): row
+            for row in connection.execute(
+                "SELECT speaker_id, granted_by, created_at, status"
+                " FROM speaker_enrollment_consents"
+                " WHERE speaker_id IN (?, ?)",
+                (canonical_speaker_id, alias_speaker_id),
+            ).fetchall()
+        }
+        canonical = rows.get(canonical_speaker_id)
+        alias = rows.get(alias_speaker_id)
+        if canonical is None and alias is None:
+            return
+
+        def effective(row) -> str:
+            if row is None:
+                return CONSENT_LEGACY_READ_ONLY
+            value = str(row["status"] or "").upper()
+            return (
+                value if value in CONSENT_STATUSES
+                else CONSENT_LEGACY_READ_ONLY
+            )
+
+        canonical_status = effective(canonical)
+        alias_status = effective(alias)
+        merged = (
+            canonical_status
+            if self._consent_rank(canonical_status)
+            >= self._consent_rank(alias_status)
+            else alias_status
+        )
+        source = canonical if canonical_status == merged else alias
+        if source is None:
+            source = canonical or alias
+        actor = (
+            str(source["granted_by"] or "merge")
+            if source is not None
+            else "merge"
+        )
+        created = (
+            float(source["created_at"]) if source is not None else now
+        )
+        connection.execute(
+            "DELETE FROM speaker_enrollment_consents WHERE speaker_id = ?",
+            (alias_speaker_id,),
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO speaker_enrollment_consents"
+            " (speaker_id, granted_by, created_at, updated_at, status)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                canonical_speaker_id,
+                actor,
+                created,
+                now,
+                merged,
+            ),
+        )
 
     def promote_speaker(self, speaker_id: str) -> Optional[str]:
         """Upgrade a temporary identity to a stable ``S-0001`` id."""
@@ -1148,8 +1316,8 @@ class SpeakerStore:
             # promoted profile does not silently lose consent.
             connection.execute(
                 "INSERT OR REPLACE INTO speaker_enrollment_consents"
-                " (speaker_id, granted_by, created_at, updated_at)"
-                " SELECT ?, granted_by, created_at, ?"
+                " (speaker_id, granted_by, created_at, updated_at, status)"
+                " SELECT ?, granted_by, created_at, ?, status"
                 " FROM speaker_enrollment_consents WHERE speaker_id = ?",
                 (new_id, now, speaker_id),
             )
@@ -1244,7 +1412,8 @@ CREATE TABLE IF NOT EXISTS speaker_enrollment_consents (
     speaker_id TEXT PRIMARY KEY,
     granted_by TEXT NOT NULL,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'GRANTED'
 );
 """
 

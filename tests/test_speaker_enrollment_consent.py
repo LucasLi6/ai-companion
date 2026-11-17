@@ -7,9 +7,11 @@ offline tests drive the real engine with a deterministic fake model and pin:
 * an unarmed strict policy creates no profile and writes no sample;
 * arming authorises exactly one new identity, then the arm is consumed;
 * the engine's single write point refuses unauthorized identities;
-* existing profiles stay usable without re-consent, and grants survive a
-  policy reload;
-* revocation stops later learning without deleting rows.
+* only an explicit ``GRANTED`` row survives a reload; historical samples are
+  recognisable but read-only, and ``REVOKED`` stays revoked across restarts;
+* revocation stops later learning without deleting rows, and deleted or
+  cleared identities leave no orphan grants;
+* merging two voices keeps the more restrictive consent.
 """
 
 from __future__ import annotations
@@ -222,13 +224,16 @@ def test_unauthorized_existing_identity_cannot_receive_a_new_sample(tmp_path):
         assert harness.samples() == 1
         profiles = store.list_speakers()
         assert [row["speaker_id"] for row in profiles] == [speaker_id]
+        # A durable observation row would itself be a long-term record of an
+        # unauthorized voice, so none is written for the identity either.
+        assert int(profiles[0]["observation_count"]) == 0
     finally:
         harness.close()
         store.close()
 
 
 # ---------------------------------------------------- persisted local grants
-def test_loading_the_store_authorizes_only_existing_profiles(tmp_path):
+def test_loading_the_store_never_infers_a_grant_from_samples(tmp_path):
     store = _store(tmp_path)
     try:
         existing = _seed_existing_profile(store)
@@ -236,44 +241,145 @@ def test_loading_the_store_authorizes_only_existing_profiles(tmp_path):
         policy = EnrollmentPolicy(strict=True)
         policy.load_from_store(store)
 
-        assert policy.is_authorized(existing) is True
-        # A profile with no samples is not prior collected data.
-        assert policy.is_authorized(empty) is False
+        # Sample count is history, not consent: the profile can still be
+        # recognised, but it cannot keep learning until a human grants it.
+        assert policy.is_authorized(existing) is False
+        assert policy.status_of(existing) == "LEGACY_READ_ONLY"
+        assert policy.status_of(empty) is None
         assert policy.allow_new_identity() is False
         assert policy.snapshot()["loaded"] is True
+
+        config = load_speaker_config(env={})
+        candidates, _ = store.load_candidates(
+            model_id=f"{config.model_id}@{config.model_revision}",
+            embedding_version=config.embedding_version,
+        )
+        assert [item.speaker_id for item in candidates] == [existing]
     finally:
         store.close()
 
 
-def test_explicit_grant_survives_a_policy_reload_and_revoke_removes_it(tmp_path):
+def test_revocation_is_durable_and_never_deletes_samples(tmp_path):
     store = _store(tmp_path)
     try:
         speaker_id = _seed_existing_profile(store)
         first = EnrollmentPolicy(strict=True)
-        first.revoke(speaker_id, store=store)
-        assert first.is_authorized(speaker_id) is False
-        assert store.enrollment_consents() == []
-
         first.authorize(speaker_id, store=store, actor="local_cli")
         assert first.is_authorized(speaker_id) is True
 
-        # A new REPL session loads the durable grant, not just the samples.
-        second = EnrollmentPolicy(strict=True)
-        second.load_from_store(store)
-        assert second.is_authorized(speaker_id) is True
-        assert any(
-            row["speaker_id"] == speaker_id
-            and row["granted_by"] == "local_cli"
-            for row in store.enrollment_consents()
-        )
+        reloaded = EnrollmentPolicy(strict=True)
+        reloaded.load_from_store(store)
+        assert reloaded.is_authorized(speaker_id) is True
 
-        second.revoke(speaker_id, store=store)
+        reloaded.revoke(speaker_id, store=store)
+        assert reloaded.is_authorized(speaker_id) is False
+        assert reloaded.status_of(speaker_id) == "REVOKED"
+
+        # The refusal is a row, not a deletion: a restart must not read the
+        # missing row as "never decided anything".
+        rows = store.enrollment_consents()
+        assert [(row["speaker_id"], row["status"]) for row in rows] == [
+            (speaker_id, "REVOKED")
+        ]
+
         third = EnrollmentPolicy(strict=True)
         third.load_from_store(store)
-        # Existing samples still make the profile usable, but the explicit
-        # grant row is gone and no new identity may be armed.
-        assert store.enrollment_consents() == []
+        assert third.is_authorized(speaker_id) is False
+        assert third.status_of(speaker_id) == "REVOKED"
         assert third.allow_new_identity() is False
+
+        # Historical biometrics are untouched and recognition still works.
+        profile = store.get_profile(speaker_id)
+        assert profile is not None
+        config = load_speaker_config(env={})
+        candidates, _ = store.load_candidates(
+            model_id=f"{config.model_id}@{config.model_revision}",
+            embedding_version=config.embedding_version,
+        )
+        assert [item.speaker_id for item in candidates] == [speaker_id]
+    finally:
+        store.close()
+
+
+def test_delete_and_clear_leave_no_orphan_grants(tmp_path):
+    store = _store(tmp_path)
+    try:
+        speaker_id = _seed_existing_profile(store)
+        store.set_enrollment_consent(speaker_id, granted_by="local_cli")
+
+        assert store.delete_speaker(speaker_id) is True
+        assert store.list_speakers() == []
+        assert store.enrollment_consents() == []
+
+        other = _seed_existing_profile(store)
+        store.set_enrollment_consent(other, granted_by="local_cli")
+        store.clear()
+        assert store.enrollment_consents() == []
+    finally:
+        store.close()
+
+
+def test_merge_keeps_the_most_restrictive_consent(tmp_path):
+    store = _store(tmp_path)
+    config = load_speaker_config(env={})
+    model = f"{config.model_id}@{config.model_revision}"
+    try:
+        canonical = _seed_existing_profile(store)
+        duplicate = store.create_candidate()
+        store.add_embedding(
+            duplicate,
+            unit(2, 0),
+            quality=QUALITY_HIGH,
+            voiced_seconds=2.0,
+            model_id=model,
+            embedding_version=config.embedding_version,
+            is_verified_reference=True,
+        )
+
+        store.set_enrollment_consent(canonical, granted_by="local_cli")
+        store.revoke_enrollment_consent(duplicate, actor="local_cli")
+
+        assert store.merge_speakers(canonical, duplicate) is True
+
+        statuses = {
+            row["speaker_id"]: row["status"]
+            for row in store.enrollment_consents()
+        }
+        # Merging two voices must never widen what may be learned.
+        assert statuses == {canonical: "REVOKED"}
+        policy = EnrollmentPolicy(strict=True)
+        policy.load_from_store(store)
+        assert policy.is_authorized(canonical) is False
+    finally:
+        store.close()
+
+
+def test_merge_of_a_grant_with_unrecorded_history_is_read_only(tmp_path):
+    store = _store(tmp_path)
+    config = load_speaker_config(env={})
+    model = f"{config.model_id}@{config.model_revision}"
+    try:
+        canonical = _seed_existing_profile(store)
+        duplicate = store.create_candidate()
+        store.add_embedding(
+            duplicate,
+            unit(2, 0),
+            quality=QUALITY_HIGH,
+            voiced_seconds=2.0,
+            model_id=model,
+            embedding_version=config.embedding_version,
+            is_verified_reference=True,
+        )
+        store.set_enrollment_consent(canonical, granted_by="local_cli")
+        # ``duplicate`` has samples but no explicit row: LEGACY_READ_ONLY.
+
+        assert store.merge_speakers(canonical, duplicate) is True
+
+        statuses = {
+            row["speaker_id"]: row["status"]
+            for row in store.enrollment_consents()
+        }
+        assert statuses == {canonical: "LEGACY_READ_ONLY"}
     finally:
         store.close()
 

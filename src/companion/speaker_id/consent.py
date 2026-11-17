@@ -5,13 +5,17 @@ may let Ava recognise their voice for one conversation without granting
 permission to keep a biometric template locally. This policy is the single
 gate the engine consults before any durable write:
 
-* existing profiles keep working, because their data was collected under the
-  previous policy and the new code must not silently invalidate it;
+* recognition always works: matching only reads profiles that already exist;
 * a *new* temporary identity is only created after ``arm_new_identity()``,
   which a human invokes explicitly (``/speaker enroll <PERSON_ID>``);
 * new samples for any identity, including a newly enrolled one, need
   ``is_authorized()`` to be true;
-* revoking an id stops all further learning without touching rows.
+* only an explicit ``GRANTED`` row restores that authorisation after a
+  restart. Profiles that merely have samples from an earlier version are
+  ``LEGACY_READ_ONLY``: they can still be recognised, but they cannot keep
+  learning until a human grants storage again;
+* ``REVOKED`` is durable. It is never inferred from a missing row, and a
+  restart cannot turn it back into a grant.
 
 The policy is thread-safe because the engine reads it from its worker thread
 while the REPL writes it on the asyncio loop.
@@ -19,10 +23,19 @@ while the REPL writes it on the asyncio loop.
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Optional
 
-from companion.speaker_id.store import SpeakerStore
+from companion.speaker_id.store import (
+    CONSENT_GRANTED,
+    CONSENT_LEGACY_READ_ONLY,
+    CONSENT_REVOKED,
+    CONSENT_STATUSES,
+    SpeakerStore,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class EnrollmentPolicy:
@@ -34,6 +47,11 @@ class EnrollmentPolicy:
         # The formal REPL always constructs a strict policy.
         self._strict = bool(strict)
         self._authorized: set[str] = set()
+        # Explicit durable state by speaker id. ``None`` means "no row".
+        self._statuses: dict[str, str] = {}
+        # Profiles that exist with samples but have no explicit row. They are
+        # recognisable history, not a licence to keep collecting.
+        self._legacy_profiles: set[str] = set()
         self._armed: Optional[str] = None  # person id awaiting one new voice
         self._loaded = False
 
@@ -47,25 +65,54 @@ class EnrollmentPolicy:
             return self._armed is not None
 
     def load_from_store(self, store: SpeakerStore) -> None:
-        """Load persisted grants and treat existing profiles as usable.
+        """Restore only explicitly recorded storage decisions.
 
-        Existing profiles are *not* new collection; they are data the user
-        already has. They become authorized so their samples can still be
-        consolidated, but no new profile can appear without an explicit arm.
+        Sample count is deliberately *not* used as a grant: a person who
+        revoked storage would otherwise be re-authorised by the very rows the
+        revocation left in place. The store is read outside the lock; the
+        result replaces the previous state atomically.
         """
-        grants = {
-            str(row["speaker_id"])
-            for row in store.enrollment_consents()
-        }
-        existing = {
-            str(row["speaker_id"])
+        authorized: set[str] = set()
+        statuses: dict[str, str] = {}
+        for row in store.enrollment_consents():
+            sid = str(row.get("speaker_id") or "").strip()
+            if not sid:
+                continue
+            status = str(row.get("status") or "").strip().upper()
+            if status not in CONSENT_STATUSES:
+                # An unreadable/missing status is historical data at most.
+                status = CONSENT_LEGACY_READ_ONLY
+            statuses[sid] = status
+            if status == CONSENT_GRANTED:
+                authorized.add(sid)
+        legacy = {
+            str(row.get("speaker_id"))
             for row in store.list_speakers()
             if int(row.get("samples") or 0) > 0
         }
         with self._lock:
-            self._authorized.update(grants)
-            self._authorized.update(existing)
+            self._authorized = authorized
+            self._statuses = statuses
+            self._legacy_profiles = legacy
             self._loaded = True
+
+    def status_of(self, speaker_id: Optional[str]) -> Optional[str]:
+        """Explicit consent status, or ``None`` when no record exists.
+
+        A profile with samples and no consent row reports
+        ``LEGACY_READ_ONLY`` so callers can display it honestly instead of
+        treating the absence of a row as permission.
+        """
+        sid = str(speaker_id or "").strip()
+        if not sid:
+            return None
+        with self._lock:
+            status = self._statuses.get(sid)
+            if status is not None:
+                return status
+            if sid in self._legacy_profiles:
+                return CONSENT_LEGACY_READ_ONLY
+            return None
 
     def allow_new_identity(self) -> bool:
         if not self._strict:
@@ -103,23 +150,54 @@ class EnrollmentPolicy:
         with self._lock:
             self._armed = None
 
-    def note_created(self, speaker_id: str) -> None:
-        """A new id was created under an armed consent; authorise it once."""
-        sid = str(speaker_id or "").strip()
-        if not sid:
-            return
-        with self._lock:
-            self._authorized.add(sid)
-            self._armed = None
+    def note_created(
+        self,
+        speaker_id: str,
+        *,
+        store: Any = None,
+        actor: str = "local_enrollment",
+    ) -> None:
+        """A new id was created under an armed consent; authorise it once.
 
-    def authorize(self, speaker_id: str, *, store: Any = None, actor: str = "local_confirmation") -> None:
+        The grant is persisted when a store is supplied, so the identity
+        created by an armed enrollment keeps working after a restart instead
+        of silently becoming read-only. A store failure is logged and leaves
+        only the in-memory grant; it never stops the caller.
+        """
         sid = str(speaker_id or "").strip()
         if not sid:
             return
         with self._lock:
             self._authorized.add(sid)
+            self._statuses[sid] = CONSENT_GRANTED
+            self._armed = None
         if store is not None:
-            store.set_enrollment_consent(sid, granted_by=actor)
+            try:
+                store.set_enrollment_consent(
+                    sid,
+                    granted_by=actor,
+                    status=CONSENT_GRANTED,
+                )
+            except Exception:  # noqa: BLE001 - consent cache still applies
+                logger.debug("speaker_consent_persist_failed speaker_id=%s", sid)
+
+    def authorize(
+        self,
+        speaker_id: str,
+        *,
+        store: Any = None,
+        actor: str = "local_confirmation",
+    ) -> None:
+        sid = str(speaker_id or "").strip()
+        if not sid:
+            return
+        with self._lock:
+            self._authorized.add(sid)
+            self._statuses[sid] = CONSENT_GRANTED
+        if store is not None:
+            store.set_enrollment_consent(
+                sid, granted_by=actor, status=CONSENT_GRANTED
+            )
 
     def revoke(self, speaker_id: str, *, store: Any = None) -> None:
         sid = str(speaker_id or "").strip()
@@ -127,6 +205,7 @@ class EnrollmentPolicy:
             return
         with self._lock:
             self._authorized.discard(sid)
+            self._statuses[sid] = CONSENT_REVOKED
         if store is not None:
             store.revoke_enrollment_consent(sid)
 
@@ -137,6 +216,11 @@ class EnrollmentPolicy:
                 "authorized": len(self._authorized),
                 "armed": self._armed is not None,
                 "loaded": self._loaded,
+                "revoked": sum(
+                    1
+                    for status in self._statuses.values()
+                    if status == CONSENT_REVOKED
+                ),
             }
 
 

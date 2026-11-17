@@ -916,8 +916,12 @@ class SpeakerEngine:
                 if speaker_id is not None and self._enrollment_policy is not None:
                     # The human explicitly armed this one enrollment; the new
                     # id is now allowed to receive its bootstrap sample. The
-                    # arm is consumed so a later unknown voice stays private.
-                    self._enrollment_policy.note_created(speaker_id)
+                    # arm is consumed so a later unknown voice stays private,
+                    # and the grant is persisted so the id does not silently
+                    # become read-only after a restart.
+                    self._enrollment_policy.note_created(
+                        speaker_id, store=self._store
+                    )
                 if speaker_id is None:
                     self._advance(uid, total_seconds)
                     return
@@ -1244,6 +1248,16 @@ class SpeakerEngine:
         similarity: Optional[float],
         margin: Optional[float],
     ) -> None:
+        if (
+            speaker_id is not None
+            and self._enrollment_policy is not None
+            and not self._enrollment_policy.is_authorized(speaker_id)
+        ):
+            # An observation row is a durable, personal record of when a
+            # voice was heard. An identity without storage consent may be
+            # matched transiently for this turn, but it must not accumulate a
+            # long-term profile of the person behind it.
+            return
         try:
             self._store.record_observation(
                 uid,
