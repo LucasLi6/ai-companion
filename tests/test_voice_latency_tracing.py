@@ -82,7 +82,11 @@ def test_voice_latency_reports_include_asr_and_identity_before_router():
     assert result["asr_to_identity_ms"] == pytest.approx(120)
     assert result["identity_to_router_ms"] == pytest.approx(1300)
     assert result["vad_to_first_audio_played_ms"] == pytest.approx(3150)
+    assert result["first_text_to_tts_connected_ms"] == pytest.approx(200)
+    assert result["tts_connected_to_first_segment_ms"] == pytest.approx(200)
+    assert result["response_to_tts_connected_ms"] == pytest.approx(500)
     report = _format_tts_metrics(result)
+    assert "Connected → first segment" in report
     assert "VAD end" in report
     assert "ASR final" in report
     assert "Identity" in report
