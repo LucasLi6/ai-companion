@@ -23,7 +23,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -2240,6 +2240,7 @@ async def cmd_repl(args) -> int:
             _identity_latency_ms: "deque[float]" = deque(maxlen=512)
             _identity_discards = 0
             _identity_wait_timeouts = 0
+            _identity_refusal_reasons: Counter[str] = Counter()
             # Explicit, human-only Speaker -> Person link preview waiting for
             # its confirmation, and the optional guided registration flow.
             # Both live in memory and expire; neither is reachable from
@@ -2949,6 +2950,16 @@ async def cmd_repl(args) -> int:
                             "identity refusal:"
                             f" wait_timeouts={_identity_wait_timeouts}"
                             f" refused_turns={_identity_discards}"
+                        )
+                    if _identity_refusal_reasons:
+                        lines.append(
+                            "identity refusal reasons: "
+                            + ", ".join(
+                                f"{reason}={count}"
+                                for reason, count in sorted(
+                                    _identity_refusal_reasons.items()
+                                )
+                            )
                         )
                     if identity_ledger:
                         latest = next(reversed(identity_ledger.values()))
@@ -4054,6 +4065,24 @@ async def cmd_repl(args) -> int:
                             if formal_identity:
                                 if identity.state is not IdentityState.CONFIRMED:
                                     _identity_discards += 1
+                                    diagnostic = (
+                                        coordinator.speaker_utterance_diagnostic(
+                                            run_id, final.utterance_id
+                                        )
+                                        if wait_expired
+                                        else {"reason": identity.reason}
+                                    )
+                                    failure_reason = str(
+                                        diagnostic.get("reason")
+                                        or "diagnostic_unavailable"
+                                    )
+                                    _identity_refusal_reasons[failure_reason] += 1
+                                    logging.getLogger("companion.identity").info(
+                                        "identity_refused run_id=%s uid=%s"
+                                        " cause=%s diagnostic=%s",
+                                        run_id, final.utterance_id,
+                                        failure_reason, diagnostic,
+                                    )
                                     if identity.reason == "binding_conflict":
                                         notice = (
                                             "[id] 该声纹同时绑定到多个不同人物，"
@@ -4071,9 +4100,21 @@ async def cmd_repl(args) -> int:
                                             "本条未提交。\n"
                                         )
                                     elif wait_expired:
+                                        if failure_reason == "model_not_ready":
+                                            detail = "声纹模型尚未加载完成"
+                                        elif failure_reason == "final_result_not_published":
+                                            detail = "声纹线程已结束但未发布最终结果"
+                                        elif failure_reason == "inference_timeout":
+                                            detail = "声纹计算仍未完成"
+                                        elif failure_reason == "model_error":
+                                            detail = "声纹模型返回错误"
+                                        elif failure_reason == "mic_session_changed":
+                                            detail = "麦克风会话已切换"
+                                        else:
+                                            detail = "声纹结果未在等待窗口内确认"
                                         notice = (
-                                            "[id] 声纹分析在等待窗口内仍未完成，"
-                                            "本条未提交；可重说或用键盘继续。\n"
+                                            f"[id] {detail}，本条未提交。"
+                                            "输入 /speaker status 查看原因统计。\n"
                                         )
                                     else:
                                         notice = (
