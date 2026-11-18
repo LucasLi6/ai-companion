@@ -117,6 +117,56 @@ class SpeakerBindingService:
         )
         return await self.get_binding(speaker_id)  # type: ignore[return-value]
 
+    async def canonicalize_alias_bindings(
+        self, canonical_speaker_id: str, related_speaker_ids: list[str]
+    ) -> int:
+        """Move trusted alias bindings onto the stable id, idempotently.
+
+        The caller must supply a verified COMPLETE alias closure. Keep the
+        original human verifier and creation timestamp; never infer a person
+        from a voice match, never reconcile conflicting people, and never
+        change consent or profiles. Both SQLite statements are atomic.
+        Returns the number of removed historical binding rows.
+        """
+        canonical = str(canonical_speaker_id or "").strip()
+        unique_ids = {
+            str(sid or "").strip() for sid in related_speaker_ids
+        }
+        if not canonical or not unique_ids or canonical not in unique_ids:
+            raise SpeakerBindingError("invalid_alias_closure")
+        if len(unique_ids) > 64:
+            raise SpeakerBindingError("alias_limit_exceeded")
+        ids = self._normalize_ids(canonical, list(unique_ids))
+        async with self.db.transaction(immediate=True):
+            rows = await self.bindings_for_speaker_ids(ids)
+            if not rows:
+                return 0
+            person_ids = {row["person_id"] for row in rows}
+            if len(person_ids) != 1:
+                raise SpeakerBindingError("speaker_alias_bound_elsewhere")
+            has_canonical = any(row["speaker_id"] == canonical for row in rows)
+            if not has_canonical:
+                # Preserve the original proof that a human verified this voice.
+                source = min(
+                    rows, key=lambda row: (
+                        row["created_at"], row["speaker_id"]
+                    )
+                )
+                await self.db.execute(
+                    "INSERT INTO person_speaker_bindings"
+                    " (speaker_id, person_id, verified_by, created_at,"
+                    " updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        canonical,
+                        source["person_id"],
+                        source["verified_by"],
+                        source["created_at"],
+                        utcnow().isoformat(),
+                    ),
+                )
+            historical = [sid for sid in ids if sid != canonical]
+            return await self.unbind_speaker_ids(historical)
+
     async def unbind_speaker(
         self,
         speaker_id: str,
