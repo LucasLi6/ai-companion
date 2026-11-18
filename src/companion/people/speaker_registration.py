@@ -194,6 +194,7 @@ class SpeakerRegistrationFlow:
         self.reason = None
         self.observed_samples = 0
         self.best_voiced_seconds = 0.0
+        self._seen_utterances = set()
 
         if self.enrollment_policy is None:
             return self._finish(
