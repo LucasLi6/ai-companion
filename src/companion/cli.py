@@ -4599,8 +4599,10 @@ def _format_tts_metrics(metrics: dict) -> str:
             row("Router", "user_to_router_ms")
         row("Preparation", "router_to_response_ms")
         row("Speaker first text", "response_to_first_text_ms")
-        row("First segment wait", "first_text_to_first_segment_ms")
+        row("First text → TTS connected", "first_text_to_tts_connected_ms")
         row("WebSocket handshake", "tts_connect_ms")
+        row("Connected → first segment", "tts_connected_to_first_segment_ms")
+        row("First text → first segment", "first_text_to_first_segment_ms")
         row("TTS first PCM", "first_segment_to_first_pcm_ms")
         row("Audio queue/playback", "first_pcm_to_write_ms")
         if not rows:
