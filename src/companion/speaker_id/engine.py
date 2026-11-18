@@ -25,7 +25,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
 from companion.speaker_id.config import SpeakerConfig
@@ -649,8 +649,51 @@ class SpeakerEngine:
                     self._record_observation(
                         uid, None, INSUFFICIENT_AUDIO, None, None
                     )
-            # Otherwise the last (non-final) analysis already stands and any
-            # eligible match is still held in ``pending_enrollment``.
+            else:
+                # A fresh model call would repeat almost the same audio, but
+                # simply keeping a provisional snapshot is NOT equivalent to
+                # finishing the utterance: the REPL then waits forever for a
+                # non-provisional identity and discards a correctly matched
+                # voice after AVA_IDENTITY_WAIT_MS.
+                with self._lock:
+                    previous = self._results.get(uid)
+                    current = self._states.get(uid)
+                    conflicted = bool(
+                        current is not None and current.identity_conflict
+                    )
+                if previous is None or previous.status == "PENDING":
+                    # No actual analysis has produced a reusable decision.
+                    # Do not turn PENDING into a final identity.
+                    self._analyze(uid, window, total_seconds, final=True)
+                elif conflicted and previous.status in (
+                    KNOWN, CANDIDATE_MATCH, NEW_CANDIDATE
+                ):
+                    # A later contradictory window can never gain trust simply
+                    # because the final 300 ms did not warrant another encode.
+                    self._publish(
+                        uid,
+                        replace(
+                            previous,
+                            status=AMBIGUOUS,
+                            speaker_id=None,
+                            similarity=None,
+                            margin=None,
+                            singleton_match=False,
+                            provisional=False,
+                            completed_at=self._clock(),
+                        ),
+                    )
+                elif previous.provisional:
+                    # Reuse exactly the existing status/score/quality; do not
+                    # create a stronger decision or learn another sample.
+                    self._publish(
+                        uid,
+                        replace(
+                            previous,
+                            provisional=False,
+                            completed_at=self._clock(),
+                        ),
+                    )
         finally:
             with self._lock:
                 state = self._states.get(uid)

@@ -214,6 +214,39 @@ class ReplASRManager(ASRManager):
             "updates": 0,
         }
 
+    def speaker_utterance_diagnostic(self, utterance_id: int) -> dict[str, Any]:
+        """Why an ASR-finalized turn lacks a final speaker verdict.
+
+        This only examines worker state; it performs no inference or DB query.
+        """
+        observer = self._repl_speaker_observer
+        if not getattr(observer, "ready", False):
+            return {
+                "reason": "model_not_ready",
+                "model_state": getattr(observer, "status", "UNKNOWN"),
+            }
+        engine = getattr(observer, "engine", None)
+        if engine is None:
+            return {"reason": "model_not_ready", "model_state": "NO_ENGINE"}
+        try:
+            latest = engine.snapshot(int(utterance_id))
+            if getattr(latest, "status", "") == "ERROR":
+                reason = "model_error"
+            elif not getattr(latest, "provisional", True):
+                reason = "final_published"
+            elif engine.is_finished(int(utterance_id)):
+                reason = "final_result_not_published"
+            else:
+                reason = "inference_timeout"
+            return {
+                "reason": reason,
+                "model_state": getattr(observer, "status", "UNKNOWN"),
+                "speaker_status": getattr(latest, "status", "PENDING"),
+                "provisional": bool(getattr(latest, "provisional", True)),
+            }
+        except Exception:
+            return {"reason": "diagnostic_unavailable"}
+
     # Historical name kept for callers written before formal activation.
     speaker_shadow_status = speaker_status
 

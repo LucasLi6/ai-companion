@@ -23,7 +23,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -2240,11 +2240,13 @@ async def cmd_repl(args) -> int:
             _identity_latency_ms: "deque[float]" = deque(maxlen=512)
             _identity_discards = 0
             _identity_wait_timeouts = 0
+            _identity_refusal_reasons: Counter[str] = Counter()
             # Explicit, human-only Speaker -> Person link preview waiting for
             # its confirmation, and the optional guided registration flow.
             # Both live in memory and expire; neither is reachable from
             # speech, the Router or the LLM.
             _pending_link: Optional[dict] = None
+            _pending_merge: Optional[dict] = None
             registration_flow = None
             _registration_signature: Optional[tuple] = None
             # Late identity notices are display-only tasks; they are cancelled
@@ -2341,6 +2343,56 @@ async def cmd_repl(args) -> int:
                     rt.profile_service,
                     audit=rt.repos.audit,
                 )
+
+            async def _canonicalize_stored_bindings() -> tuple[int, int]:
+                """Repair alias-only person bindings without guessing people.
+
+                Called at REPL startup and after explicit promotion. The
+                closure must be complete, and conflicting humans are refused.
+                Old alias rows in the voice store remain as history.
+                """
+                store = _identity_store()
+                if store is None or rt.speaker_bindings is None:
+                    return 0, 0
+                moved = refused = 0
+                try:
+                    rows = await rt.speaker_bindings.list_bindings()
+                except Exception:
+                    return 0, 1
+                seen: set[str] = set()
+                for binding in rows:
+                    original_id = str(binding["speaker_id"])
+                    try:
+                        closure = store.resolve_alias_closure(original_id)
+                        if closure.canonical is None or not closure.complete:
+                            refused += 1
+                            continue
+                        if closure.canonical in seen:
+                            continue
+                        seen.add(closure.canonical)
+                        moved += (
+                            await rt.speaker_bindings.canonicalize_alias_bindings(
+                                closure.canonical, list(closure.speaker_ids)
+                            )
+                        )
+                    except Exception:
+                        # Fail closed: never repair a binding from a partial or
+                        # conflicting alias set, and leave the old proof intact.
+                        refused += 1
+                return moved, refused
+
+            if voice_mode and speaker_mode != "off":
+                normalized, unresolved = await _canonicalize_stored_bindings()
+                if normalized:
+                    print(
+                        "speaker: normalized"
+                        f" {normalized} historical alias binding(s)"
+                    )
+                if unresolved:
+                    print(
+                        "speaker: some alias bindings need manual review"
+                        f" ({unresolved}); no unsafe merge performed"
+                    )
 
             coordinator = None
             voice_output = (
@@ -2829,7 +2881,7 @@ async def cmd_repl(args) -> int:
                 voiceprint storage. Nothing here is reachable from speech, the
                 Router, the LLM, or a SpeakerResult.
                 """
-                nonlocal _pending_link, registration_flow
+                nonlocal _pending_link, _pending_merge, registration_flow
                 nonlocal _registration_signature
                 action = parts[1].lower() if len(parts) > 1 else "status"
                 if action == "status":
@@ -2900,6 +2952,16 @@ async def cmd_repl(args) -> int:
                             f" wait_timeouts={_identity_wait_timeouts}"
                             f" refused_turns={_identity_discards}"
                         )
+                    if _identity_refusal_reasons:
+                        lines.append(
+                            "identity refusal reasons: "
+                            + ", ".join(
+                                f"{reason}={count}"
+                                for reason, count in sorted(
+                                    _identity_refusal_reasons.items()
+                                )
+                            )
+                        )
                     if identity_ledger:
                         latest = next(reversed(identity_ledger.values()))
                         lines.append(
@@ -2912,7 +2974,115 @@ async def cmd_repl(args) -> int:
                             )
                         )
                     return lines
+                if action in ("compare", "merge"):
+                    from companion.people.speaker_merge import (
+                        SpeakerMergeError,
+                        SpeakerMergeService,
+                    )
+
+                    store = _identity_store()
+                    if store is None or rt.speaker_bindings is None:
+                        return ["speaker merge service unavailable"]
+                    service = SpeakerMergeService(
+                        store, rt.speaker_bindings, audit=rt.repos.audit
+                    )
+                    if action == "merge" and len(parts) == 3:
+                        sub = parts[2].lower()
+                        if sub == "cancel":
+                            _pending_merge = None
+                            return ["speaker merge cancelled; nothing changed"]
+                        if sub == "confirm":
+                            pending = _pending_merge
+                            if (
+                                pending is None
+                                or time.monotonic() > pending["expires_at"]
+                            ):
+                                _pending_merge = None
+                                return [
+                                    "no pending merge; run"
+                                    " /speaker merge <S-ID> <TEMP-ID> first"
+                                ]
+                            if coordinator is not None and coordinator.enabled:
+                                return [
+                                    "turn the microphone off with /mic off"
+                                    " before confirming a speaker merge"
+                                ]
+                            _pending_merge = None
+                            try:
+                                done = await service.confirm(
+                                    pending["canonical"], pending["candidate"]
+                                )
+                            except SpeakerMergeError as exc:
+                                return [f"merge refused: {exc.code}"]
+                            except Exception as exc:
+                                # The voice store and person DB are separate.
+                                # Never imply rollback or success after an
+                                # unexpected error; inspect both stores.
+                                return [
+                                    "merge did not complete cleanly"
+                                    f" ({type(exc).__name__});"
+                                    " inspect /speaker list --aliases"
+                                ]
+                            return [
+                                f"merged {done.candidate} into {done.canonical}"
+                                " after local confirmation; historical alias"
+                                " remains internal",
+                                "use /mic on to resume recognition",
+                            ]
+                    if len(parts) != 4:
+                        return [
+                            f"usage: /speaker {action} <S-ID> <TEMP-ID>",
+                            "then /speaker merge confirm|cancel"
+                            if action == "merge" else
+                            "this only compares already-stored voiceprints",
+                        ]
+                    preview = await service.preview(parts[2], parts[3])
+                    lines = [
+                        "compare {} ({} samples) vs {} ({} samples)".format(
+                            preview.canonical, preview.canonical_samples,
+                            preview.candidate, preview.candidate_samples,
+                        ),
+                        "median nearest similarity: {}".format(
+                            "{:.3f}".format(preview.median_best_similarity)
+                            if preview.median_best_similarity is not None
+                            else "unavailable"
+                        ),
+                        f"review state: {preview.reason}",
+                        "similarity is not proof of human identity",
+                    ]
+                    if action == "merge":
+                        if preview.can_merge:
+                            _pending_merge = {
+                                "canonical": preview.canonical,
+                                "candidate": preview.candidate,
+                                "expires_at": time.monotonic() + 60.0,
+                            }
+                            lines.append(
+                                "check the samples truly belong to one"
+                                " person; /mic off then /speaker merge confirm"
+                                " within 60s (or /speaker merge cancel)"
+                            )
+                        else:
+                            _pending_merge = None
+                            lines.append(
+                                "merge unavailable: no identifiers were"
+                                " changed"
+                            )
+                    return lines
+                if action == "normalize":
+                    if len(parts) != 2:
+                        return ["usage: /speaker normalize"]
+                    moved, refused = await _canonicalize_stored_bindings()
+                    return [
+                        f"canonicalized {moved} historical binding(s);"
+                        f" needs review={refused}"
+                    ]
                 if action == "list":
+                    if len(parts) > 3 or (
+                        len(parts) == 3 and parts[2] != "--aliases"
+                    ):
+                        return ["usage: /speaker list [--aliases]"]
+                    show_aliases = len(parts) == 3
                     store = _identity_store()
                     if store is None:
                         return ["speaker store unavailable"]
@@ -2956,13 +3126,14 @@ async def cmd_repl(args) -> int:
                         aliases = store.aliases()
                     except Exception:  # noqa: BLE001 - display only
                         aliases = []
-                    for row in aliases:
-                        lines.append(
-                            "alias: {} -> {}".format(
-                                row.get("alias_speaker_id"),
-                                row.get("canonical_speaker_id"),
+                    if show_aliases:
+                        for row in aliases:
+                            lines.append(
+                                "alias: {} -> {}".format(
+                                    row.get("alias_speaker_id"),
+                                    row.get("canonical_speaker_id"),
+                                )
                             )
-                        )
                     try:
                         grants = store.enrollment_consents()
                     except Exception:  # noqa: BLE001 - display only
@@ -3268,6 +3439,12 @@ async def cmd_repl(args) -> int:
                         _registration_signature = None
                         lines = [step.message, f"state={step.state}"]
                         if step.state == BOUND:
+                            moved, refused = await _canonicalize_stored_bindings()
+                            if refused:
+                                lines.append(
+                                    "alias binding review needed;"
+                                    " no unsafe merge performed"
+                                )
                             lines.append(
                                 "memory learning unchanged; try"
                                 f" /speaker profile {step.speaker_id}"
@@ -3456,14 +3633,17 @@ async def cmd_repl(args) -> int:
                                     " verified_by=local_cli_confirmation"
                                 ),
                             )
+                        moved, refused = await _canonicalize_stored_bindings()
                         lines = [
                             f"promoted voice profile {result.previous_id} ->"
                             f" {result.speaker_id} (KNOWN)",
-                            f"note: {result.previous_id} is now an alias of"
-                            f" {result.speaker_id}; existing bindings keep"
-                            " resolving.",
-                            "binding and consent unchanged. bind locally:"
-                            f" /speaker bind {result.speaker_id} <PERSON_ID>",
+                            f"note: historical alias {result.previous_id}"
+                            " remains internal for old references;",
+                            f" canonical bindings moved={moved}"
+                            f" review_required={refused}.",
+                            "existing person binding is preserved; if this"
+                            " is an unbound voice, use /speaker link"
+                            f" {result.speaker_id} <PERSON_ID>",
                         ]
                         return lines
                     if result.outcome == ALREADY_KNOWN:
@@ -3981,6 +4161,24 @@ async def cmd_repl(args) -> int:
                             if formal_identity:
                                 if identity.state is not IdentityState.CONFIRMED:
                                     _identity_discards += 1
+                                    diagnostic = (
+                                        coordinator.speaker_utterance_diagnostic(
+                                            run_id, final.utterance_id
+                                        )
+                                        if wait_expired
+                                        else {"reason": identity.reason}
+                                    )
+                                    failure_reason = str(
+                                        diagnostic.get("reason")
+                                        or "diagnostic_unavailable"
+                                    )
+                                    _identity_refusal_reasons[failure_reason] += 1
+                                    logging.getLogger("companion.identity").info(
+                                        "identity_refused run_id=%s uid=%s"
+                                        " cause=%s diagnostic=%s",
+                                        run_id, final.utterance_id,
+                                        failure_reason, diagnostic,
+                                    )
                                     if identity.reason == "binding_conflict":
                                         notice = (
                                             "[id] 该声纹同时绑定到多个不同人物，"
@@ -3998,9 +4196,21 @@ async def cmd_repl(args) -> int:
                                             "本条未提交。\n"
                                         )
                                     elif wait_expired:
+                                        if failure_reason == "model_not_ready":
+                                            detail = "声纹模型尚未加载完成"
+                                        elif failure_reason == "final_result_not_published":
+                                            detail = "声纹线程已结束但未发布最终结果"
+                                        elif failure_reason == "inference_timeout":
+                                            detail = "声纹计算仍未完成"
+                                        elif failure_reason == "model_error":
+                                            detail = "声纹模型返回错误"
+                                        elif failure_reason == "mic_session_changed":
+                                            detail = "麦克风会话已切换"
+                                        else:
+                                            detail = "声纹结果未在等待窗口内确认"
                                         notice = (
-                                            "[id] 声纹分析在等待窗口内仍未完成，"
-                                            "本条未提交；可重说或用键盘继续。\n"
+                                            f"[id] {detail}，本条未提交。"
+                                            "输入 /speaker status 查看原因统计。\n"
                                         )
                                     else:
                                         notice = (

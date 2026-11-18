@@ -276,6 +276,61 @@ def test_multiple_analyses_of_one_utterance_keep_one_identity(
     assert len(store.list_speakers()) == 1
 
 
+
+def test_near_end_reuses_last_analysis_but_publishes_a_final_identity(
+    run_engine, store
+) -> None:
+    """VAD ending <300 ms after an analysis must not strand a KNOWN voice."""
+    cfg = load_speaker_config(env={})
+    stable_id = store.create_candidate()
+    assert store.add_embedding(
+        stable_id,
+        unit(1, 0),
+        quality="HIGH",
+        voiced_seconds=2.0,
+        model_id=f"{cfg.model_id}@{cfg.model_revision}",
+        embedding_version=cfg.embedding_version,
+        is_verified_reference=True,
+    ) == "ADDED"
+    assert store.promote_speaker(stable_id) is not None
+    collector = Collector()
+    fake = FakeEmbedding()
+    engine = run_engine(fake, on_result=collector)
+
+    engine.on_start(55, tone(1.5))
+    provisional = collector.wait_for(
+        lambda r: r.utterance_id == 55 and r.status == "KNOWN"
+        and r.provisional
+    )
+    assert provisional.speaker_id is not None
+    engine.on_audio(55, tone(0.1))
+    engine.on_end(55)
+    final = collector.wait_for(
+        lambda r: r.utterance_id == 55 and not r.provisional
+    )
+    engine.on_finalized(55, True)
+    wait_until(lambda: engine.is_finished(55))
+    assert final.status == "KNOWN"
+    assert final.speaker_id == provisional.speaker_id
+    assert final.similarity == provisional.similarity
+    assert final.singleton_match == provisional.singleton_match
+    assert fake.calls == 1
+
+
+def test_near_end_never_promotes_pending_to_known(run_engine) -> None:
+    """A snapshot with no real decision must not be stamped KNOWN."""
+    collector = Collector()
+    engine = run_engine(on_result=collector)
+    engine.on_start(56, tone(1.5))
+    # Do not assume snapshot is final before the background worker finishes.
+    collector.wait_for(lambda r: r.utterance_id == 56 and r.status != "PENDING")
+    engine.on_audio(56, tone(0.1))
+    engine.on_end(56)
+    final = collector.wait_for(
+        lambda r: r.utterance_id == 56 and not r.provisional
+    )
+    assert final.status != "PENDING"
+
 def test_a_changed_window_mid_utterance_cannot_spawn_a_second_identity(
     run_engine, store
 ) -> None:

@@ -111,6 +111,54 @@ async def test_binding_on_a_promoted_alias_still_resolves(rt, store):
 
 
 # ------------------------------------------------------------- multi-hop
+async def test_canonicalization_moves_old_binding_to_stable_id(rt, store):
+    temporary = store.create_candidate()
+    canonical = store.promote_speaker(temporary)
+    owner = await person(rt, "Owner")
+    await rt.speaker_bindings.bind_speaker(
+        owner.person_id, temporary, "local_cli_confirmation"
+    )
+    closure = store.resolve_alias_closure(canonical)
+    assert closure.complete
+    assert await rt.speaker_bindings.canonicalize_alias_bindings(
+        canonical, list(closure.speaker_ids)
+    ) == 1
+    rows = await rt.speaker_bindings.list_bindings()
+    assert len(rows) == 1
+    assert rows[0]["speaker_id"] == canonical
+    assert rows[0]["person_id"] == owner.person_id
+    assert rows[0]["verified_by"] == "local_cli_confirmation"
+    assert await rt.speaker_bindings.canonicalize_alias_bindings(
+        canonical, list(closure.speaker_ids)
+    ) == 0
+    assert store.resolve_canonical_speaker_id(temporary) == canonical
+    resolved = await resolver(rt, store).resolve(
+        result(temporary), run_id="run-a", utterance_id=1
+    )
+    assert resolved.state is IdentityState.CONFIRMED
+    assert resolved.person_id == owner.person_id
+
+
+async def test_canonicalization_refuses_cross_person_alias_conflicts(rt, store):
+    temporary = store.create_candidate()
+    canonical = store.promote_speaker(temporary)
+    a = await person(rt, "A")
+    b = await person(rt, "B")
+    await rt.speaker_bindings.bind_speaker(
+        a.person_id, temporary, "local_cli_confirmation"
+    )
+    await rt.speaker_bindings.bind_speaker(
+        b.person_id, canonical, "local_cli_confirmation"
+    )
+    closure = store.resolve_alias_closure(canonical)
+    with pytest.raises(SpeakerBindingError) as error:
+        await rt.speaker_bindings.canonicalize_alias_bindings(
+            canonical, list(closure.speaker_ids)
+        )
+    assert error.value.code == "speaker_alias_bound_elsewhere"
+    assert len(await rt.speaker_bindings.list_bindings()) == 2
+
+
 def test_multi_hop_alias_chain_reaches_the_live_id(store):
     base = stable(store)
     second = stable(store)
