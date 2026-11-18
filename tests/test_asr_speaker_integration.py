@@ -629,3 +629,80 @@ def test_final_does_not_wait_for_a_slow_voice_print(tmp_path) -> None:
         harness.stop()
         engine.shutdown()
         store.close()
+
+
+# ------------------------------------------------ V0.9.9.31 deferred startup
+class GatedModel:
+    """A model whose load blocks until the test releases it."""
+
+    def __init__(self) -> None:
+        self.loading = threading.Event()
+        self.release = threading.Event()
+        self._embedding = FakeEmbedding()
+
+    def load(self) -> None:
+        self.loading.set()
+        assert self.release.wait(timeout=3.0)
+
+    def warmup(self) -> None:
+        pass
+
+    def encode(self, pcm: bytes) -> np.ndarray:
+        return self._embedding.encode(pcm)
+
+
+def test_deferred_observer_never_blocks_asr_and_skips_load_time_audio(
+    tmp_path,
+) -> None:
+    from companion.speaker_id.runtime import DeferredSpeakerObserver
+
+    config = load_speaker_config(env={}, db_path=tmp_path / "speakers.sqlite3")
+    model = GatedModel()
+    results = []
+    observer = DeferredSpeakerObserver(
+        config,
+        embedding_model=model,
+        store=SpeakerStore(config.db_path),
+        on_result=results.append,
+    )
+    observer.start_loading()
+    try:
+        assert model.loading.wait(timeout=2.0)
+        assert observer.status == "LOADING"
+        assert observer.ready is False
+
+        # An utterance spoken while the model is still loading reaches the
+        # ASR hooks immediately; it is skipped for its whole lifetime and is
+        # never treated as a voiceprint sample.
+        started = time.monotonic()
+        observer.on_start(1, tone(2.0))
+        observer.on_audio(1, tone(1.0))
+        observer.on_end(1)
+        observer.on_finalized(1, True)
+        assert time.monotonic() - started < 0.5
+        assert observer.snapshot(1).status == "PENDING"
+
+        model.release.set()
+        assert wait_for(lambda: observer.ready, timeout=3.0)
+        assert observer.status == "READY"
+        # The skipped utterance still has no result; the model never saw its
+        # partial window.
+        assert observer.snapshot(1).status == "PENDING"
+        assert results == []
+
+        # Only speech opened after READY is analysed.
+        observer.on_start(2, tone(2.0))
+        observer.on_audio(2, tone(1.0))
+        observer.on_end(2)
+        observer.on_finalized(2, True)
+        assert wait_for(
+            lambda: any(
+                int(getattr(result, "utterance_id", 0)) == 2
+                and getattr(result, "status", "PENDING") != "PENDING"
+                for result in results
+            ),
+            timeout=3.0,
+        )
+    finally:
+        model.release.set()
+        observer.shutdown()

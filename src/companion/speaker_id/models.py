@@ -81,6 +81,11 @@ class SpeakerResult:
     model_id: str
     inference_ms: Optional[float]
     completed_at: float
+    # ``margin`` is None both when no second identity existed and when the
+    # value was unavailable. This flag distinguishes the legitimate singleton
+    # from malformed evidence; it defaults to False so an old producer can
+    # never accidentally claim it.
+    singleton_match: bool = False
 
 
 def pending_result(

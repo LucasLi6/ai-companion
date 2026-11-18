@@ -37,6 +37,7 @@ LEARNING_KEYS = {
     "identity_conflict",
     "asr_failed",
     "store_error",
+    "not_authorized",
 }
 
 

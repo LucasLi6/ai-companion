@@ -26,6 +26,7 @@ Design notes
 
 from __future__ import annotations
 
+import math
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -149,10 +150,17 @@ def normalize_embedding(
 
 
 def cosine(left, right) -> float:
-    """Cosine of two unit vectors, clamped for numerical noise."""
+    """Cosine of two unit vectors, clamped for numerical noise.
+
+    A non-finite dot product (NaN/Infinity from a corrupt vector) is returned
+    as NaN rather than clamped: ``min``/``max`` would silently turn NaN into a
+    perfect 1.0 score, which is the strongest possible match.
+    """
     value = float(np.asarray(left, dtype=np.float32) @ np.asarray(
         right, dtype=np.float32
     ))
+    if not math.isfinite(value):
+        return float("nan")
     return max(-1.0, min(1.0, value))
 
 

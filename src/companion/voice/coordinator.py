@@ -24,8 +24,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional
@@ -35,12 +37,33 @@ from companion.voice.barge_in_config import BargeInConfig
 from companion.voice.bridge import (
     BridgeFailure,
     PartialTranscript,
+    SpeakerUpdate,
     TurnClosed,
     VoiceBridge,
 )
 
 DEFAULT_COOLDOWN_SECONDS = 0.3
 MAX_COOLDOWN_SECONDS = 2.0
+_MAX_SPEAKER_CACHE = 64
+_SPEAKER_CACHE_TTL_SECONDS = 120.0
+# Bound on retained wait-duration samples used for P50/P95 reporting.
+_MAX_WAIT_SAMPLES = 512
+
+
+def _percentile(values: list[float], fraction: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = int(round(fraction * (len(ordered) - 1)))
+    return ordered[max(0, min(len(ordered) - 1, index))]
+
+
+@dataclass(frozen=True)
+class AcceptedVoiceTurn:
+    """One accepted final together with its microphone-session id."""
+
+    run_id: str
+    final: FinalUtterance
 
 
 class VoiceState(str, Enum):
@@ -59,7 +82,6 @@ class VoiceStats:
     stale_finals: int = 0
     turn_errors: int = 0
     playback_events: int = 0
-
 
 class VoiceCoordinator:
     """Owns mic lifecycle, half-duplex state and input pacing.
@@ -122,7 +144,37 @@ class VoiceCoordinator:
 
         # One accepted turn at a time. The REPL consumes this queue serially,
         # so a second final can never start an overlapping reply.
-        self._finals: "asyncio.Queue[FinalUtterance]" = asyncio.Queue(maxsize=1)
+        self._finals: "asyncio.Queue[AcceptedVoiceTurn]" = asyncio.Queue(
+            maxsize=1
+        )
+        self._run_id: Optional[str] = None
+        self._speaker_updates: dict[tuple[str, int], SpeakerUpdate] = {}
+        self._speaker_update_order: deque[tuple[str, int]] = deque()
+        self._speaker_update_times: dict[tuple[str, int], float] = {}
+        self._speaker_listener: Optional[
+            Callable[[SpeakerUpdate], None]
+        ] = None
+        # Event-driven waiters for a confirmation that arrives after the ASR
+        # final. No polling: the consumer sets the event when it caches a
+        # newer revision for exactly this (run, utterance) key.
+        self._speaker_waiters: dict[
+            tuple[str, int], set[asyncio.Event]
+        ] = {}
+        self._speaker_wait_stats: dict[str, Any] = {
+            "waits": 0,
+            "woken": 0,
+            "timeouts": 0,
+            "cancelled": 0,
+        }
+        self._speaker_wait_samples: deque[float] = deque(
+            maxlen=_MAX_WAIT_SAMPLES
+        )
+        self._speaker_stats: dict[str, Any] = {
+            "accepted": 0,
+            "stale": 0,
+            "late": 0,
+            "evicted": 0,
+        }
         self._current_uid: Optional[int] = None
         self._expected_generation: Optional[int] = None
         self._playback_terminal_generation: Optional[int] = None
@@ -206,13 +258,16 @@ class VoiceCoordinator:
             f"  model={model}"
         )
         # Diagnostics only. Do not alter coordinator state or transcript.
-        shadow_status = getattr(manager, "speaker_shadow_status", None)
-        if callable(shadow_status):
+        speaker_status = getattr(manager, "speaker_status", None)
+        if not callable(speaker_status):
+            speaker_status = getattr(manager, "speaker_shadow_status", None)
+        if callable(speaker_status):
             try:
-                info = shadow_status()
+                info = speaker_status()
                 description += (
-                    f"  speaker_shadow={info.get('state', 'UNKNOWN')}"
+                    f"  speaker={info.get('state', 'UNKNOWN')}"
                     f"  speaker_updates={info.get('updates', 0)}"
+                    f"  run={self._run_id or '-'}"
                 )
             except Exception:  # noqa: BLE001 - optional sidecar
                 pass
@@ -245,14 +300,41 @@ class VoiceCoordinator:
             return True, "mic: already listening"
 
         bridge = VoiceBridge(self._loop)
+        run_id = secrets.token_hex(8)
+        # A waiter belongs to the old microphone session; it must never be
+        # satisfied by the new run's updates, so switch the run id before
+        # releasing it.
+        self._run_id = run_id
+        self._wake_all_speaker_waiters()
+        self._speaker_updates.clear()
+        self._speaker_update_order.clear()
+        self._speaker_update_times.clear()
         try:
             manager = self._manager_factory()
         except Exception as exc:  # noqa: BLE001 - config/device failure
             message = _safe_message(exc)
             self._last_error = message
+            self._run_id = None
             bridge.close()
             self._set_state(VoiceState.DISABLED)
             return False, f"mic: off ({message})"
+
+        # Speaker identity is an asynchronous hint: the observer hands each
+        # result to the bridge on the loop, and the bridge discards updates
+        # from a previous microphone run.
+        speaker_setter = getattr(
+            manager, "set_speaker_update_callback", None
+        )
+        if callable(speaker_setter):
+            with contextlib.suppress(Exception):
+                speaker_setter(bridge.publish_speaker_update)
+        manager_run_id = (
+            getattr(manager, "repl_run_id", None)
+            or getattr(manager, "shadow_run_id", None)
+        )
+        bridge.set_run_id(manager_run_id or run_id)
+        if manager_run_id:
+            self._run_id = str(manager_run_id)
 
         setter = getattr(manager, "set_listeners", None)
         if callable(setter):
@@ -290,6 +372,7 @@ class VoiceCoordinator:
             self._last_error = message
             await asyncio.to_thread(_quiet_shutdown, manager)
             bridge.close()
+            self._run_id = None
             self._set_state(VoiceState.DISABLED)
             return False, f"mic: off ({message})"
 
@@ -328,7 +411,13 @@ class VoiceCoordinator:
         self._playback_terminal_generation = None
         self._barge_armed = False
         self._interrupted_generation = None
+        # Release waiters bound to this run: no later revision can arrive.
+        self._wake_all_speaker_waiters()
         await self._stop_manager()
+        self._run_id = None
+        self._speaker_updates.clear()
+        self._speaker_update_order.clear()
+        self._speaker_update_times.clear()
         self._notice("[mic] off")
         return "mic: off"
 
@@ -391,7 +480,9 @@ class VoiceCoordinator:
             if item is None:
                 return
             try:
-                if isinstance(item, FinalUtterance):
+                if isinstance(item, SpeakerUpdate):
+                    self._accept_speaker_update(item)
+                elif isinstance(item, FinalUtterance):
                     self._accept_final(item)
                 elif isinstance(item, SpeechActivity):
                     self._accept_speech(item)
@@ -418,6 +509,171 @@ class VoiceCoordinator:
         become a reply, and are cleared by the final result.
         """
         self._partial_listener = listener
+
+    def set_speaker_update_listener(
+        self, listener: Optional[Callable[[SpeakerUpdate], None]]
+    ) -> None:
+        """Attach an optional identity-update observer (runs on the loop).
+
+        The listener must not trigger a reply or block; it exists so a surface
+        can refresh labels and log a late identification. The coordinator has
+        already applied run-id and revision ordering.
+        """
+        self._speaker_listener = listener
+
+    def _accept_speaker_update(self, update: SpeakerUpdate) -> None:
+        run_id = self._run_id
+        if run_id is None or update.run_id != run_id:
+            self._speaker_stats["stale"] += 1
+            return
+        key = (update.run_id, int(update.utterance_id))
+        current = self._speaker_updates.get(key)
+        if current is not None and update.revision <= current.revision:
+            self._speaker_stats["stale"] += 1
+            return
+        now = time.monotonic()
+        self._speaker_updates[key] = update
+        self._speaker_update_times[key] = now
+        if current is None:
+            self._speaker_update_order.append(key)
+        self._speaker_stats["accepted"] += 1
+        self._prune_speaker_updates(now)
+        listener = self._speaker_listener
+        if listener is not None:
+            try:
+                listener(update)
+            except Exception:  # noqa: BLE001 - display must not break voice
+                pass
+        # Wake exactly the waiters for this turn. A waiter for another
+        # utterance (or for a previous microphone run) is never reached.
+        self._wake_speaker_waiters(key)
+
+    def _prune_speaker_updates(self, now: float) -> None:
+        while self._speaker_update_order:
+            key = self._speaker_update_order[0]
+            stamped = self._speaker_update_times.get(key, now)
+            if now - stamped <= _SPEAKER_CACHE_TTL_SECONDS:
+                break
+            self._speaker_update_order.popleft()
+            self._speaker_updates.pop(key, None)
+            self._speaker_update_times.pop(key, None)
+            self._speaker_stats["evicted"] += 1
+            self._wake_speaker_waiters(key)
+        while (
+            len(self._speaker_updates) > _MAX_SPEAKER_CACHE
+            and self._speaker_update_order
+        ):
+            key = self._speaker_update_order.popleft()
+            if key not in self._speaker_updates:
+                continue
+            self._speaker_updates.pop(key, None)
+            self._speaker_update_times.pop(key, None)
+            self._speaker_stats["evicted"] += 1
+            self._wake_speaker_waiters(key)
+
+    def _wake_speaker_waiters(self, key: tuple[str, int]) -> None:
+        waiters = self._speaker_waiters.pop(key, None)
+        if not waiters:
+            return
+        for event in waiters:
+            event.set()
+
+    def _wake_all_speaker_waiters(self) -> None:
+        waiters = self._speaker_waiters
+        self._speaker_waiters = {}
+        for events in waiters.values():
+            for event in events:
+                event.set()
+
+    async def wait_for_speaker_update(
+        self,
+        run_id: str,
+        utterance_id: int,
+        *,
+        after_revision: int,
+        timeout: float,
+    ) -> Optional[SpeakerUpdate]:
+        """Wait (bounded) for a newer identity revision of *this* turn.
+
+        Used when the ASR final is ready but the speaker worker has not yet
+        published its final analysis. The wait is event-driven — the ASR and
+        speaker threads never block — and is cancelled by a mic stop/restart
+        or by another turn's updates, which cannot satisfy it. Returns
+        ``None`` on timeout, cancellation or a run change; the caller must
+        then handle the turn with whatever evidence it already has.
+        """
+        key = (str(run_id), int(utterance_id))
+        threshold = int(after_revision)
+
+        def current() -> Optional[SpeakerUpdate]:
+            if self._run_id != str(run_id):
+                # The microphone session that produced this utterance is
+                # gone; its cached update is no longer a live answer.
+                return None
+            latest = self._speaker_updates.get(key)
+            if latest is not None and latest.revision > threshold:
+                return latest
+            return None
+
+        latest = current()
+        if latest is not None:
+            return latest
+        if timeout <= 0.0 or self._run_id != str(run_id):
+            self._speaker_wait_stats["timeouts"] += 1
+            return None
+
+        event = asyncio.Event()
+        self._speaker_waiters.setdefault(key, set()).add(event)
+        self._speaker_wait_stats["waits"] += 1
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=float(timeout))
+        except asyncio.TimeoutError:
+            self._speaker_wait_stats["timeouts"] += 1
+            self._record_wait(started, "timeout")
+            return None
+        except asyncio.CancelledError:
+            self._speaker_wait_stats["cancelled"] += 1
+            raise
+        finally:
+            waiters = self._speaker_waiters.get(key)
+            if waiters is not None:
+                waiters.discard(event)
+                if not waiters:
+                    self._speaker_waiters.pop(key, None)
+        latest = current()
+        self._speaker_wait_stats["woken"] += 1
+        self._record_wait(started, "update" if latest is not None else "closed")
+        return latest
+
+    def _record_wait(self, started: float, outcome: str) -> None:
+        self._speaker_wait_samples.append(
+            max(0.0, (time.monotonic() - started) * 1000.0)
+        )
+        self._speaker_wait_stats["last_outcome"] = outcome
+
+    def speaker_update(
+        self, run_id: str, utterance_id: int
+    ) -> Optional[SpeakerUpdate]:
+        """Latest cached identity update for one run/utterance, or ``None``."""
+        return self._speaker_updates.get(
+            (str(run_id), int(utterance_id))
+        )
+
+    def speaker_timings(self) -> dict[str, Any]:
+        samples = list(self._speaker_wait_samples)
+        waits = int(self._speaker_wait_stats["waits"])
+        timeouts = int(self._speaker_wait_stats["timeouts"])
+        return {
+            **self._speaker_stats,
+            **self._speaker_wait_stats,
+            "wait_p50_ms": _percentile(samples, 0.50),
+            "wait_p95_ms": _percentile(samples, 0.95),
+            "wait_timeout_ratio": (
+                round(timeouts / waits, 4) if waits else 0.0
+            ),
+            "wait_samples": len(samples),
+        }
 
     def _accept_partial(self, partial: PartialTranscript) -> None:
         # Only the turn currently being recorded owns the live subtitle. An
@@ -633,8 +889,9 @@ class VoiceCoordinator:
         self._turn_finished = False
         self._interrupted_generation = None
         self.stats.finals_accepted += 1
+        run_id = self._run_id or ""
         try:
-            self._finals.put_nowait(final)
+            self._finals.put_nowait(AcceptedVoiceTurn(run_id, final))
         except asyncio.QueueFull:
             self.stats.stale_finals += 1
 
@@ -658,9 +915,30 @@ class VoiceCoordinator:
         await self._stop_manager(cancel_consumer=False)
 
     # --------------------------------------------------------- turn interface
-    async def next_final(self) -> FinalUtterance:
-        """Wait for the next accepted user turn (consumed serially)."""
+    async def next_accepted_turn(self) -> AcceptedVoiceTurn:
+        """Wait for the next turn, including its microphone-session id.
+
+        Formal voice input uses this instead of :meth:`next_final`: if the mic
+        is restarted between accepting a final and processing it, the identity
+        lookup still targets the run that actually produced that utterance.
+        """
         return await self._finals.get()
+
+    async def next_final(self) -> FinalUtterance:
+        """Backward-compatible wrapper around :meth:`next_accepted_turn`."""
+        return (await self.next_accepted_turn()).final
+
+    def resume_after_discarded_turn(self) -> None:
+        """Return to LISTENING after a final that produced no reply.
+
+        Used when identity resolution refuses a turn (unknown/unbound voice).
+        No Router/TTS call happens; this only releases the half-duplex state
+        that :meth:`_accept_final` entered.
+        """
+        if self._state not in (VoiceState.THINKING, VoiceState.SPEAKING):
+            return
+        self._turn_finished = True
+        self._schedule_resume(0.0)
 
     def begin_turn(self) -> int:
         """Mark the start of a reply, including a keyboard-submitted one.

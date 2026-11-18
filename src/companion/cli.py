@@ -23,6 +23,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -56,7 +57,7 @@ from companion.domain.enums import (
     MemoryStatus,
     MemoryVisibility,
 )
-from companion.domain.models import make_utterance_event
+from companion.domain.models import make_utterance_event, new_id
 from companion.people.profile_models import (
     ProfileFieldStorage,
     profile_field_spec,
@@ -2215,23 +2216,132 @@ async def cmd_repl(args) -> int:
             # line, so proactive / voice output can be printed above it
             # without ever reading or restoring the typed buffer.
             voice_mode = bool(getattr(args, "voice", False))
-            speaker_shadow_mode = "off"
+            # ``active`` is the formal default: voice turns resolve a person
+            # through explicit bindings. ``shadow``/``off`` remain explicit
+            # rollback/diagnostic modes and keep the historical single-person
+            # behaviour.
+            speaker_mode = "off"
+            speaker_store = None
+            # The current microphone-session id, or ``None`` in text-only mode
+            # (and before the first ``/mic on``). Defined at session scope so
+            # ``/speaker status`` works without a voice coordinator.
+            speaker_run_id = None
+            identity_resolver = None
+            enrollment_policy = None
+            # Bounded, in-memory attribution index for accepted voice turns.
+            # It is deliberately not persisted: an unauthorized voice must not
+            # create a durable conversation record. A late identity update
+            # annotates this record, never the submitted UtteranceEvent.
+            identity_ledger: "OrderedDict[tuple[str, int], dict]" = OrderedDict()
+            _IDENTITY_LEDGER_MAX = 128
+            # ASR Final -> Identity Confirmed latency samples (ms), and how
+            # many accepted turns were refused because the bounded identity
+            # wait expired. In-memory only; never contains transcripts.
+            _identity_latency_ms: "deque[float]" = deque(maxlen=512)
+            _identity_discards = 0
+            _identity_wait_timeouts = 0
+            # Explicit, human-only Speaker -> Person link preview waiting for
+            # its confirmation, and the optional guided registration flow.
+            # Both live in memory and expire; neither is reachable from
+            # speech, the Router or the LLM.
+            _pending_link: Optional[dict] = None
+            registration_flow = None
+            _registration_signature: Optional[tuple] = None
+            # Late identity notices are display-only tasks; they are cancelled
+            # on exit so no task outlives the event loop.
+            _late_identity_tasks: set[asyncio.Task] = set()
             if voice_mode:
                 # Lazy import: text-only REPL must not load speaker/ASR modules.
-                from companion.voice.speaker_shadow import repl_speaker_mode
+                from companion.voice.speaker_shadow import (
+                    MODE_ACTIVE,
+                    MODE_OFF,
+                    MODE_SHADOW,
+                    repl_speaker_mode,
+                )
 
-                speaker_shadow_mode = repl_speaker_mode()
+                speaker_mode = repl_speaker_mode()
             # Voice mode shows recognized speech under the prompt as it
             # arrives; text-only sessions keep the plain prompt.
             voice_subtitle = _PartialSubtitle() if voice_mode else None
             repl_session = _build_prompt_session(subtitle=voice_subtitle)
-            # Shadow only observes: never authorize person resolution here,
-            # even if the legacy AVA_VOICE_PERSON_BINDING flag is on.
+            # The legacy binding flag is only meaningful when the formal
+            # identity path is unavailable (explicit ``off`` rollback). It
+            # never downgrades the formal active path.
             voice_binding_enabled = (
                 voice_mode
+                and speaker_mode == "off"
                 and voice_person_binding_enabled()
-                and speaker_shadow_mode != "shadow"
             )
+            formal_identity = False
+
+            def _identity_store():
+                """Open the speaker DB once; identity is optional, voice is not.
+
+                Opening it does not load the embedding model and does not touch
+                the audio path. A failure only disables identity, so
+                ASR/TTS/keyboard keep working.
+                """
+                nonlocal speaker_store
+                if speaker_store is not None:
+                    return speaker_store
+                store = None
+                try:
+                    from companion.speaker_id.config import load_speaker_config
+                    from companion.speaker_id.store import SpeakerStore
+
+                    config = load_speaker_config(
+                        debug=bool(getattr(args, "debug", False))
+                    )
+                    store = SpeakerStore(
+                        config.db_path,
+                        max_embeddings_per_speaker=(
+                            config.max_embeddings_per_speaker
+                        ),
+                        duplicate_sample_similarity=(
+                            config.duplicate_sample_similarity
+                        ),
+                        minimum_enrollment_quality=(
+                            config.minimum_enrollment_quality
+                        ),
+                    )
+                    store.initialize()
+                except Exception as exc:  # noqa: BLE001 - optional sidecar
+                    if store is not None:
+                        with contextlib.suppress(Exception):
+                            store.close()
+                    print(
+                        "speaker: unavailable "
+                        f"({type(exc).__name__}) — voice identity disabled"
+                    )
+                    return None
+                speaker_store = store
+                return store
+
+            def _link_service():
+                """Human-only Speaker -> Person -> Profile link service.
+
+                Defined outside the voice-only block so ``/speaker profile``
+                and ``/speaker link`` keep working in text-only sessions.
+                """
+                from companion.people.speaker_profile_link import (
+                    SpeakerProfileLinkService,
+                )
+
+                store = _identity_store()
+                if (
+                    store is None
+                    or rt.speaker_bindings is None
+                    or rt.profile_service is None
+                ):
+                    return None
+                return SpeakerProfileLinkService(
+                    rt.speaker_bindings,
+                    rt.repos.person,
+                    store,
+                    rt.profile_service,
+                    audit=rt.repos.audit,
+                )
+
             coordinator = None
             voice_output = (
                 _PromptTurnOutput(repl_session)
@@ -2249,6 +2359,57 @@ async def cmd_repl(args) -> int:
                     build_repl_asr_manager,
                     log_shadow_final,
                 )
+                from companion.people.identity_resolver import (
+                    IdentityResolver,
+                    IdentityState,
+                    ResolvedIdentity,
+                    UNKNOWN_DISPLAY_NAME,
+                    REASON_MODEL_UNAVAILABLE,
+                )
+                from companion.speaker_id.consent import EnrollmentPolicy
+
+                if speaker_mode in (MODE_ACTIVE, MODE_SHADOW):
+                    # Storage consent is independent from recognition. A strict
+                    # policy blocks new voiceprint clusters and new samples
+                    # unless a human explicitly arms them.
+                    enrollment_policy = EnrollmentPolicy(strict=True)
+                    _store = _identity_store()
+                    if _store is not None:
+                        with contextlib.suppress(Exception):
+                            enrollment_policy.load_from_store(_store)
+                if speaker_mode == MODE_ACTIVE:
+                    formal_identity = True
+                    if rt.speaker_bindings is not None and speaker_store is not None:
+                        identity_resolver = IdentityResolver(
+                            rt.repos.person,
+                            rt.speaker_bindings,
+                            speaker_store,
+                        )
+                        print(
+                            "speaker identity: on (only locally confirmed"
+                            " bindings identify a person; unknown voices are"
+                            " not submitted)"
+                        )
+                    else:
+                        # Recognition cannot be confirmed without the store or
+                        # the binding table. Voice stays available for ASR/TTS
+                        # diagnostics, but unresolved turns are not submitted
+                        # and never fall back to the local startup person.
+                        print(
+                            "speaker identity: unavailable (speaker store or"
+                            " bindings missing) — voice turns will not be"
+                            " submitted"
+                        )
+                elif speaker_mode == MODE_SHADOW:
+                    print(
+                        "speaker shadow: on (diagnostics only; "
+                        "voice identity is not used for person resolution)"
+                    )
+                else:
+                    print(
+                        "speaker identity: off (rollback mode; "
+                        "voice turns use the startup person)"
+                    )
                 from companion.voice.barge_in_config import (
                     BargeInConfigError,
                     load_barge_in_config,
@@ -2344,23 +2505,20 @@ async def cmd_repl(args) -> int:
                                 echo_pipeline = None
                                 barge_in_config = None
 
-                if speaker_shadow_mode == "shadow":
-                    print(
-                        "speaker shadow: on (diagnostics only; "
-                        "person binding disabled)"
-                    )
-                speaker_shadow_run_id = None
-
                 def _make_asr_manager():
-                    nonlocal speaker_shadow_run_id
+                    nonlocal speaker_run_id
                     debug = bool(getattr(args, "debug", False))
                     manager = build_repl_asr_manager(
                         load_asr_config(debug=debug),
-                        shadow=(speaker_shadow_mode == "shadow"),
+                        speaker_enabled=(
+                            speaker_mode in (MODE_ACTIVE, MODE_SHADOW)
+                        ),
                         speaker_debug=debug,
+                        enrollment_policy=enrollment_policy,
                     )
-                    speaker_shadow_run_id = getattr(
-                        manager, "shadow_run_id", None
+                    speaker_run_id = (
+                        getattr(manager, "repl_run_id", None)
+                        or getattr(manager, "shadow_run_id", None)
                     )
                     if echo_pipeline is not None and barge_in_config:
                         manager.attach_echo_canceller(
@@ -2388,11 +2546,218 @@ async def cmd_repl(args) -> int:
                         return 0.3
                     return max(0.0, min(2.0, value))
 
+                def _identity_wait_seconds() -> float:
+                    """Bounded wait for a speaker decision after the ASR final.
+
+                    250 ms by default; a human can raise it to 500 ms while
+                    the value is being validated on real devices. Never
+                    unbounded: an unresolved voice is refused, not stalled.
+                    """
+                    raw = os.environ.get("AVA_IDENTITY_WAIT_MS", "250")
+                    try:
+                        value = float(raw)
+                    except (TypeError, ValueError):
+                        return 0.25
+                    return max(0.0, min(500.0, value)) / 1000.0
+
                 def _voice_notice(text: str) -> None:
                     try:
                         asyncio.create_task(voice_output.write(text + "\n"))
                     except RuntimeError:  # loop shutting down
                         pass
+
+                def _ledger_put(key, entry) -> None:
+                    """Bound the in-memory attribution index (oldest first)."""
+                    identity_ledger[key] = entry
+                    identity_ledger.move_to_end(key)
+                    while len(identity_ledger) > _IDENTITY_LEDGER_MAX:
+                        identity_ledger.popitem(last=False)
+
+                async def _resolve_identity(result, run_id, utterance_id):
+                    if not formal_identity:
+                        return None
+                    if identity_resolver is None:
+                        # No resolver means no identity, never the startup
+                        # person. ASR/TTS still work normally.
+                        return ResolvedIdentity(
+                            run_id=run_id,
+                            utterance_id=int(utterance_id),
+                            raw_speaker_id=(
+                                str(getattr(result, "speaker_id", "") or "")
+                                or None
+                            ),
+                            canonical_speaker_id=None,
+                            person_id=None,
+                            display_name=UNKNOWN_DISPLAY_NAME,
+                            state=IdentityState.UNKNOWN,
+                            reason=REASON_MODEL_UNAVAILABLE,
+                        )
+                    return await identity_resolver.resolve(
+                        result,
+                        run_id=run_id,
+                        utterance_id=int(utterance_id),
+                    )
+
+                def _speaker_result_pending(result) -> bool:
+                    """True while the worker has not published its final verdict."""
+                    if result is None:
+                        return True
+                    if str(getattr(result, "status", "") or "") == "PENDING":
+                        return True
+                    return bool(getattr(result, "provisional", False))
+
+                def _latency_percentiles(samples):
+                    if not samples:
+                        return None, None
+                    ordered = sorted(samples)
+
+                    def pick(fraction: float) -> float:
+                        index = int(round(fraction * (len(ordered) - 1)))
+                        return ordered[
+                            max(0, min(len(ordered) - 1, index))
+                        ]
+
+                    return pick(0.50), pick(0.95)
+
+                def _observe_registration(result, *, utterance_id=None):
+                    """Feed one speaker result to the guided flow, if active.
+
+                    Only observations that can belong to this enrollment are
+                    passed: the flow's own candidate, or the new cluster the
+                    armed identity just created. Another person's voice can
+                    never fail or satisfy the registration.
+                    """
+                    nonlocal _registration_signature
+                    from companion.people.speaker_registration import (
+                        ACTIVE_STATES,
+                        SpeakerRegistrationError,
+                    )
+                    from companion.speaker_id.models import NEW_CANDIDATE
+
+                    flow = registration_flow
+                    if flow is None or flow.state not in ACTIVE_STATES:
+                        return
+                    if result is None:
+                        return
+                    speaker_id = str(
+                        getattr(result, "speaker_id", "") or ""
+                    ).strip()
+                    status = str(getattr(result, "status", "") or "")
+                    if flow.speaker_id is not None:
+                        if speaker_id != flow.speaker_id:
+                            return
+                    elif status != NEW_CANDIDATE:
+                        return
+                    try:
+                        step = flow.observe(
+                            result, utterance_id=utterance_id
+                        )
+                    except SpeakerRegistrationError:
+                        return
+                    signature = (step.state, step.reason)
+                    if signature == _registration_signature:
+                        return
+                    _registration_signature = signature
+                    try:
+                        asyncio.create_task(
+                            voice_output.write(step.message + "\n"),
+                            name="ava-registration-notice",
+                        )
+                    except RuntimeError:  # loop shutting down
+                        pass
+
+                async def _apply_late_identity(entry: dict, identity) -> None:
+                    """Display-only update of an already-decided turn.
+
+                    Runs after the reply decision. It never re-submits ASR,
+                    never calls the Router/TTS, never rewrites the submitted
+                    event or appends memory; a submitted turn's person is
+                    immutable, and two contradictory confirmed people are
+                    reported as a conflict instead of silently choosing the
+                    newer one. The rules live in a pure planner so they can be
+                    tested without a REPL.
+                    """
+                    from companion.voice.identity_updates import (
+                        CONFIRMED as LATE_CONFIRMED,
+                        CONFLICT_PENDING,
+                        CONFLICT_SUBMITTED,
+                        plan_late_identity,
+                    )
+
+                    plan = plan_late_identity(entry, identity)
+                    if plan is None:
+                        return
+                    if plan.kind in (CONFLICT_PENDING, CONFLICT_SUBMITTED):
+                        entry["identity_conflict"] = True
+                    else:
+                        if plan.state is not None:
+                            entry["state"] = (
+                                IdentityState.CONFIRMED
+                                if plan.state == "CONFIRMED"
+                                else IdentityState.TENTATIVE
+                            )
+                            entry["last_displayed_state"] = entry["state"]
+                        if plan.speaker_id is not None:
+                            entry["last_displayed_speaker_id"] = (
+                                plan.speaker_id
+                            )
+                        if plan.person_id is not None:
+                            entry["last_displayed_person_id"] = (
+                                plan.person_id
+                            )
+                        if plan.kind == LATE_CONFIRMED:
+                            entry["late_identity"] = identity
+                    await voice_output.write(plan.message)
+
+                def _on_speaker_update(update) -> None:
+                    """Annotate an already-displayed turn; never reply again."""
+                    if not formal_identity:
+                        return
+                    # A guided registration consumes the voice it armed before
+                    # any conversation decision; it still never submits text.
+                    _observe_registration(
+                        update.result, utterance_id=update.utterance_id
+                    )
+                    key = (update.run_id, int(update.utterance_id))
+                    entry = identity_ledger.get(key)
+                    if entry is None:
+                        # No final accepted yet; the main loop reads the
+                        # coordinator's latest cached revision itself.
+                        return
+                    revision = int(update.revision)
+                    if revision <= int(entry.get("last_revision", 0)):
+                        return
+                    entry["last_revision"] = revision
+
+                    async def _lift() -> None:
+                        latest = (
+                            coordinator.speaker_update(
+                                update.run_id, update.utterance_id
+                            )
+                            if coordinator is not None
+                            else None
+                        )
+                        if latest is not None and latest.revision > revision:
+                            # A newer revision is already on its way; let it
+                            # produce the single notice.
+                            return
+                        identity = await _resolve_identity(
+                            update.result,
+                            update.run_id,
+                            update.utterance_id,
+                        )
+                        if identity is None:
+                            return
+                        await _apply_late_identity(entry, identity)
+
+                    try:
+                        task = asyncio.create_task(
+                            _lift(), name="ava-late-identity"
+                        )
+                    except RuntimeError:  # loop shutting down
+                        return
+                    _late_identity_tasks.add(task)
+                    task.add_done_callback(_late_identity_tasks.discard)
 
                 # The reply currently being generated, as an explicit task so
                 # a barge-in can cancel exactly it (never the new turn). The
@@ -2421,6 +2786,10 @@ async def cmd_repl(args) -> int:
                     barge_in=barge_in_config,
                     on_barge_in=_cancel_interrupted_reply,
                 )
+                if formal_identity:
+                    coordinator.set_speaker_update_listener(
+                        _on_speaker_update
+                    )
                 # ``--voice`` means persistent listening from startup. A
                 # missing key or device is reported once and text chat
                 # continues; it never aborts the REPL.
@@ -2445,9 +2814,715 @@ async def cmd_repl(args) -> int:
                     coordinator.set_partial_listener(_show_partial)
 
             async def _prompt_once():
+                # Keyboard input always belongs to the local owner. The prompt
+                # shows that person's program-supplied display name; it is
+                # never derived from speech or from the LLM.
+                prompt_text = f"{person.display_name}> "
                 if repl_session is not None:
-                    return await repl_session.prompt_async("you> ")
-                return await asyncio.to_thread(input, "you> ")
+                    return await repl_session.prompt_async(prompt_text)
+                return await asyncio.to_thread(input, prompt_text)
+
+            async def _speaker_command(parts: list[str]) -> list[str]:
+                """Local, explicit identity/storage controls.
+
+                Only the human at this terminal can bind a speaker or grant
+                voiceprint storage. Nothing here is reachable from speech, the
+                Router, the LLM, or a SpeakerResult.
+                """
+                nonlocal _pending_link, registration_flow
+                nonlocal _registration_signature
+                action = parts[1].lower() if len(parts) > 1 else "status"
+                if action == "status":
+                    lines = [
+                        f"speaker mode: {speaker_mode}",
+                        f"formal identity: {'on' if formal_identity else 'off'}",
+                        f"run id: {speaker_run_id or '-'}",
+                    ]
+                    if coordinator is not None:
+                        lines.append(coordinator.description())
+                    if enrollment_policy is not None:
+                        snap = enrollment_policy.snapshot()
+                        lines.append(
+                            "storage consent: authorized="
+                            f"{snap['authorized']} armed={snap['armed']}"
+                        )
+                    if _pending_link is not None:
+                        lines.append(
+                            "pending link: {} -> {} (confirm within {}s)"
+                            .format(
+                                _pending_link["speaker"],
+                                _pending_link["person"],
+                                max(
+                                    0,
+                                    int(
+                                        _pending_link["expires_at"]
+                                        - time.monotonic()
+                                    ),
+                                ),
+                            )
+                        )
+                    if registration_flow is not None:
+                        latest_step = registration_flow.expire_if_due()
+                        lines.append(
+                            "registration: {} person={} speaker={}".format(
+                                latest_step.state,
+                                latest_step.person_id or "-",
+                                latest_step.speaker_id or "-",
+                            )
+                        )
+                    latency_p50, latency_p95 = _latency_percentiles(
+                        _identity_latency_ms
+                    )
+                    if latency_p50 is not None:
+                        lines.append(
+                            "identity latency (ASR Final -> CONFIRMED):"
+                            f" n={len(_identity_latency_ms)}"
+                            f" p50={latency_p50:.0f}ms"
+                            f" p95={float(latency_p95 or 0.0):.0f}ms"
+                        )
+                    if coordinator is not None:
+                        timings = coordinator.speaker_timings()
+                        wait_p50 = timings.get("wait_p50_ms")
+                        wait_p95 = timings.get("wait_p95_ms")
+                        if wait_p50 is not None:
+                            lines.append(
+                                "identity wait:"
+                                f" p50={wait_p50:.0f}ms"
+                                f" p95={float(wait_p95 or 0.0):.0f}ms"
+                                " timeouts="
+                                f"{timings.get('timeouts', 0)}"
+                                " ratio="
+                                f"{float(timings.get('wait_timeout_ratio') or 0.0):.2f}"
+                            )
+                    if _identity_wait_timeouts or _identity_discards:
+                        lines.append(
+                            "identity refusal:"
+                            f" wait_timeouts={_identity_wait_timeouts}"
+                            f" refused_turns={_identity_discards}"
+                        )
+                    if identity_ledger:
+                        latest = next(reversed(identity_ledger.values()))
+                        lines.append(
+                            "last turn: uid={} state={} reason={} submitted={}"
+                            .format(
+                                latest.get("utterance_id"),
+                                getattr(latest.get("state"), "value", "?"),
+                                latest.get("reason"),
+                                latest.get("submitted"),
+                            )
+                        )
+                    return lines
+                if action == "list":
+                    store = _identity_store()
+                    if store is None:
+                        return ["speaker store unavailable"]
+                    lines: list[str] = []
+                    bindings = (
+                        await rt.speaker_bindings.list_bindings()
+                        if rt.speaker_bindings is not None
+                        else []
+                    )
+                    if not bindings:
+                        lines.append("bindings: none")
+                    for row in bindings:
+                        person_obj = await rt.registry.get(row["person_id"])
+                        name = (
+                            person_obj.display_name
+                            if person_obj is not None
+                            else "MISSING"
+                        )
+                        lines.append(
+                            f"binding: {row['speaker_id']} ->"
+                            f" {row['person_id']} ({name})"
+                            f" verified_by={row['verified_by']}"
+                        )
+                    try:
+                        profiles = store.list_speakers()
+                    except Exception:  # noqa: BLE001 - display only
+                        profiles = []
+                    if not profiles:
+                        lines.append("speaker profiles: none")
+                    for profile in profiles:
+                        lines.append(
+                            "speaker: {} status={} samples={}"
+                            " observations={}".format(
+                                profile.get("speaker_id"),
+                                profile.get("status"),
+                                profile.get("samples", 0),
+                                profile.get("observation_count", 0),
+                            )
+                        )
+                    try:
+                        aliases = store.aliases()
+                    except Exception:  # noqa: BLE001 - display only
+                        aliases = []
+                    for row in aliases:
+                        lines.append(
+                            "alias: {} -> {}".format(
+                                row.get("alias_speaker_id"),
+                                row.get("canonical_speaker_id"),
+                            )
+                        )
+                    try:
+                        grants = store.enrollment_consents()
+                    except Exception:  # noqa: BLE001 - display only
+                        grants = []
+                    granted = [
+                        str(row["speaker_id"])
+                        for row in grants
+                        if str(row.get("status") or "").upper() == "GRANTED"
+                    ]
+                    withdrawn = [
+                        "{} ({})".format(
+                            row["speaker_id"], row.get("status")
+                        )
+                        for row in grants
+                        if str(row.get("status") or "").upper() != "GRANTED"
+                    ]
+                    if granted:
+                        lines.append(
+                            "storage authorized: " + ", ".join(granted)
+                        )
+                    if withdrawn:
+                        lines.append(
+                            "storage not authorized: " + ", ".join(withdrawn)
+                        )
+                    return lines
+                if action == "profile":
+                    if len(parts) != 3:
+                        return ["usage: /speaker profile <SPEAKER_ID>"]
+                    from companion.people.speaker_profile_link import (
+                        PROFILE_BINDING_CONFLICT,
+                        PROFILE_CONSENT_MISSING,
+                        PROFILE_MISSING,
+                        PROFILE_NO_BINDING,
+                        PROFILE_PERSON_INACTIVE,
+                        PROFILE_PERSON_MISSING,
+                        PROFILE_READY,
+                        PROFILE_UNKNOWN_SPEAKER,
+                        SpeakerLinkError,
+                    )
+
+                    store = _identity_store()
+                    link = _link_service()
+                    if store is None or link is None:
+                        return ["speaker profile link unavailable"]
+                    try:
+                        resolution = await link.resolve_profile(parts[2])
+                    except SpeakerLinkError as exc:
+                        return [f"profile lookup refused: {exc.code}"]
+                    lines: list[str] = []
+                    canonical = resolution.canonical_speaker_id
+                    if canonical is not None:
+                        row = store.get_profile(canonical)
+                        if row is not None:
+                            consent = store.enrollment_consent(canonical)
+                            samples = 0
+                            try:
+                                samples = next(
+                                    (
+                                        int(item.get("samples", 0) or 0)
+                                        for item in store.list_speakers()
+                                        if item.get("speaker_id") == canonical
+                                    ),
+                                    0,
+                                )
+                            except Exception:  # noqa: BLE001 - display only
+                                samples = 0
+                            lines.append(
+                                "voice: {} status={} samples={}"
+                                " observations={} storage={}".format(
+                                    canonical,
+                                    row.get("status"),
+                                    samples,
+                                    row.get("observation_count", 0),
+                                    (consent or {}).get("status") or "none",
+                                )
+                            )
+                    if resolution.person_id is not None:
+                        lines.append(
+                            "person: {} ({})".format(
+                                resolution.person_id,
+                                resolution.display_name or "unknown",
+                            )
+                        )
+                    if resolution.state == PROFILE_READY:
+                        profile = resolution.profile
+                        lines.append(
+                            "profile: ready revision={} tier={}".format(
+                                getattr(
+                                    getattr(profile, "metadata", None),
+                                    "revision",
+                                    "?",
+                                ),
+                                getattr(
+                                    profile, "relationship_tier", "STRANGER"
+                                ),
+                            )
+                        )
+                        flags = resolution.consent_flags
+                        lines.append(
+                            "consent: processing={} persistence={}"
+                            " memory_learning={} external_ai={}".format(
+                                int(flags.get("processing", False)),
+                                int(flags.get("persistence", False)),
+                                int(flags.get("memory_learning", False)),
+                                int(flags.get("external_ai", False)),
+                            )
+                        )
+                        summary = str(
+                            getattr(profile, "compact_summary", "") or ""
+                        ).strip()
+                        if summary:
+                            lines.append(
+                                "summary: "
+                                + summary[:200]
+                                + ("..." if len(summary) > 200 else "")
+                            )
+                        entries = getattr(profile, "entries", {}) or {}
+                        lines.append(
+                            "entries: "
+                            + str(
+                                sum(
+                                    len(items)
+                                    for items in entries.values()
+                                    if isinstance(items, (list, tuple))
+                                )
+                            )
+                        )
+                    elif resolution.state == PROFILE_MISSING:
+                        lines.append(
+                            "profile: none yet (the person is known; linking"
+                            " never creates profile content)"
+                        )
+                    elif resolution.state == PROFILE_CONSENT_MISSING:
+                        lines.append(
+                            "profile: not readable (processing/persistence"
+                            " consent missing); the person is still known"
+                        )
+                    elif resolution.state == PROFILE_NO_BINDING:
+                        lines.append(
+                            "person: none; bind explicitly with"
+                            " /speaker link <SPEAKER_ID> <PERSON_ID>"
+                        )
+                    elif resolution.state == PROFILE_UNKNOWN_SPEAKER:
+                        lines.append("voice: unknown or deleted")
+                    elif resolution.state == PROFILE_BINDING_CONFLICT:
+                        lines.append(
+                            "person: conflict (aliases bound to different"
+                            " people); resolve with /speaker unbind first"
+                        )
+                    elif resolution.state == PROFILE_PERSON_INACTIVE:
+                        lines.append("person: inactive; voice turns are refused")
+                    elif resolution.state == PROFILE_PERSON_MISSING:
+                        lines.append(
+                            "person: binding points to a missing person"
+                        )
+                    else:
+                        lines.append(
+                            "voice id unusable: {} ({})".format(
+                                parts[2], resolution.reason
+                            )
+                        )
+                    return lines
+                if action == "link":
+                    from companion.people.speaker_profile_link import (
+                        SpeakerLinkError,
+                    )
+
+                    if len(parts) == 3 and parts[2].lower() == "cancel":
+                        _pending_link = None
+                        return ["pending link cleared; nothing was bound"]
+                    if len(parts) == 3 and parts[2].lower() == "confirm":
+                        pending = _pending_link
+                        if (
+                            pending is None
+                            or time.monotonic() > pending["expires_at"]
+                        ):
+                            _pending_link = None
+                            return [
+                                "no pending link preview (or it expired);"
+                                " run /speaker link <SPEAKER_ID> <PERSON_ID>"
+                                " again"
+                            ]
+                        link = _link_service()
+                        if link is None:
+                            return ["speaker profile link unavailable"]
+                        try:
+                            result = await link.confirm_link(
+                                pending["speaker"],
+                                pending["person"],
+                                verified_by="local_cli_confirmation",
+                            )
+                        except SpeakerLinkError as exc:
+                            _pending_link = None
+                            return [f"link refused: {exc.code}"]
+                        _pending_link = None
+                        person_obj = await rt.registry.get(
+                            result.binding["person_id"]
+                        )
+                        name = (
+                            person_obj.display_name
+                            if person_obj is not None
+                            else "MISSING"
+                        )
+                        return [
+                            "linked speaker {} -> {} ({})".format(
+                                result.binding["speaker_id"],
+                                result.binding["person_id"],
+                                name,
+                            ),
+                            "note: this binds identity only; voiceprint"
+                            " storage and memory learning are unchanged.",
+                        ]
+                    if len(parts) != 4:
+                        return [
+                            "usage: /speaker link <SPEAKER_ID> <PERSON_ID>",
+                            "       /speaker link confirm|cancel",
+                        ]
+                    link = _link_service()
+                    if link is None:
+                        return ["speaker profile link unavailable"]
+                    try:
+                        preview = await link.preview_link(parts[2], parts[3])
+                    except SpeakerLinkError as exc:
+                        return [f"link preview refused: {exc.code}"]
+                    lines = [
+                        "voice: {} (canonical {}) status={}".format(
+                            preview.canonical_speaker_id or parts[2],
+                            preview.canonical_speaker_id or "-",
+                            preview.speaker_status or "unknown",
+                        ),
+                        "person: {} ({}) active={}".format(
+                            preview.person_id or "-",
+                            preview.display_name or "-",
+                            int(preview.person_active),
+                        ),
+                        "storage consent: {}".format(
+                            preview.speaker_consent or "none"
+                        ),
+                        "profile: present={} revision={}".format(
+                            int(preview.profile_present),
+                            preview.profile_revision,
+                        ),
+                    ]
+                    if preview.consent_flags:
+                        lines.append(
+                            "person consent: processing={} persistence={}"
+                            " memory_learning={} external_ai={}".format(
+                                int(preview.consent_flags.get("processing", False)),
+                                int(preview.consent_flags.get("persistence", False)),
+                                int(
+                                    preview.consent_flags.get(
+                                        "memory_learning", False
+                                    )
+                                ),
+                                int(preview.consent_flags.get("external_ai", False)),
+                            )
+                        )
+                    lines.extend(f"warning: {text}" for text in preview.warnings)
+                    if preview.can_link:
+                        _pending_link = {
+                            "speaker": parts[2],
+                            "person": parts[3],
+                            "expires_at": time.monotonic() + 60.0,
+                        }
+                        lines.append(
+                            "run /speaker link confirm within 60s to bind"
+                            " (or /speaker link cancel); nothing is bound yet"
+                        )
+                    else:
+                        _pending_link = None
+                        lines.append(f"link refused: {preview.reason}")
+                    return lines
+                if action == "register":
+                    from companion.people.speaker_registration import (
+                        BOUND,
+                        COLLECTING,
+                        SpeakerRegistrationError,
+                        SpeakerRegistrationFlow,
+                    )
+
+                    if len(parts) == 3 and parts[2].lower() in (
+                        "confirm",
+                        "cancel",
+                        "status",
+                    ):
+                        if registration_flow is None:
+                            return ["no registration in progress"]
+                        sub = parts[2].lower()
+                        if sub == "status":
+                            step = registration_flow.expire_if_due()
+                            return [
+                                f"registration: {step.state}",
+                                step.message,
+                            ]
+                        if sub == "cancel":
+                            step = registration_flow.cancel()
+                            _registration_signature = None
+                            return [step.message, f"state={step.state}"]
+                        try:
+                            step = await registration_flow.confirm()
+                        except SpeakerRegistrationError as exc:
+                            return [f"registration refused: {exc.code}"]
+                        _registration_signature = None
+                        lines = [step.message, f"state={step.state}"]
+                        if step.state == BOUND:
+                            lines.append(
+                                "memory learning unchanged; try"
+                                f" /speaker profile {step.speaker_id}"
+                            )
+                        return lines
+                    if len(parts) != 3:
+                        return [
+                            "usage: /speaker register <PERSON_ID>",
+                            "       /speaker register confirm|cancel|status",
+                        ]
+                    if speaker_mode == "off":
+                        return [
+                            "speaker identity is off; start with --voice to"
+                            " register a voice"
+                        ]
+                    if enrollment_policy is None or not formal_identity:
+                        return ["formal speaker identity is unavailable"]
+                    store = _identity_store()
+                    link = _link_service()
+                    if store is None or link is None:
+                        return ["speaker registration unavailable"]
+                    registration_flow = SpeakerRegistrationFlow(
+                        store=store,
+                        persons=rt.repos.person,
+                        link=link,
+                        enrollment_policy=enrollment_policy,
+                    )
+                    _registration_signature = None
+                    step = await registration_flow.start(parts[2])
+                    lines = [step.message, f"state={step.state}"]
+                    if step.state == COLLECTING:
+                        lines.append(
+                            "exactly one new voice identity is armed; Ava's"
+                            " own TTS audio is never enrolled."
+                        )
+                    return lines
+                if action == "bind":
+                    if len(parts) != 4:
+                        return ["usage: /speaker bind <SPEAKER_ID> <PERSON_ID>"]
+                    from companion.people.speaker_bindings import (
+                        SpeakerBindingError,
+                    )
+
+                    store = _identity_store()
+                    if store is None:
+                        return ["speaker store unavailable"]
+                    if rt.speaker_bindings is None:
+                        return ["speaker bindings unavailable"]
+                    requested, person_id = parts[2], parts[3]
+                    closure = store.resolve_alias_closure(requested)
+                    if closure.canonical is None or not closure.complete:
+                        return [
+                            f"speaker id unusable: {requested}"
+                            " (unknown, deleted, broken alias chain, or alias"
+                            " set too large to verify)"
+                        ]
+                    canonical = closure.canonical
+                    person_obj = await rt.registry.get(person_id)
+                    if person_obj is None:
+                        return [f"person not found: {person_id}"]
+                    if person_obj.registration_status.value != "ACTIVE":
+                        return [
+                            f"person not active: {person_id}"
+                            f" ({person_obj.registration_status.value})"
+                        ]
+                    related = list(closure.speaker_ids)
+                    existing = await rt.speaker_bindings.bindings_for_speaker_ids(
+                        related
+                    )
+                    conflicts = [
+                        row
+                        for row in existing
+                        if row["person_id"] != person_id
+                    ]
+                    if conflicts:
+                        return [
+                            "bind refused: this voice (or an alias) is bound"
+                            " to another person: "
+                            + ", ".join(
+                                f"{row['speaker_id']}->{row['person_id']}"
+                                for row in conflicts
+                            ),
+                            "unbind explicitly first; two people are never"
+                            " merged by a voice merge.",
+                        ]
+                    try:
+                        binding = await rt.speaker_bindings.bind_speaker(
+                            person_id,
+                            canonical,
+                            "local_cli_confirmation",
+                            related_speaker_ids=related,
+                        )
+                    except SpeakerBindingError as exc:
+                        return [f"bind refused: {exc.code}"]
+                    with contextlib.suppress(Exception):
+                        await rt.repos.audit.record(
+                            actor="local_cli",
+                            action="bind_speaker",
+                            entity_type="speaker",
+                            entity_id=canonical,
+                            detail=(
+                                f"person_id={person_id}"
+                                " verified_by=local_cli_confirmation"
+                            ),
+                        )
+                    lines = [
+                        f"binding: speaker {binding['speaker_id']} ->"
+                        f" {person_id} ({person_obj.display_name})"
+                    ]
+                    if canonical != requested:
+                        lines.append(
+                            f"note: {requested} is an alias of {canonical}"
+                        )
+                    return lines
+                if action == "unbind":
+                    if len(parts) != 3:
+                        return ["usage: /speaker unbind <SPEAKER_ID>"]
+                    store = _identity_store()
+                    if store is None:
+                        return ["speaker store unavailable"]
+                    if rt.speaker_bindings is None:
+                        return ["speaker bindings unavailable"]
+                    closure = store.resolve_alias_closure(parts[2])
+                    if closure.canonical is None or not closure.complete:
+                        return [
+                            f"speaker id unusable: {parts[2]}"
+                            " (unknown, deleted, broken alias chain, or alias"
+                            " set too large to verify)"
+                        ]
+                    canonical = closure.canonical
+                    removed = await rt.speaker_bindings.unbind_speaker(
+                        canonical, related_speaker_ids=list(closure.speaker_ids)
+                    )
+                    if not removed:
+                        return [f"no binding for speaker {canonical}"]
+                    with contextlib.suppress(Exception):
+                        await rt.repos.audit.record(
+                            actor="local_cli",
+                            action="unbind_speaker",
+                            entity_type="speaker",
+                            entity_id=canonical,
+                            detail="local_cli_confirmation",
+                        )
+                    return [
+                        f"unbound speaker {canonical} (and its aliases)"
+                    ]
+                if action == "promote":
+                    if len(parts) != 3:
+                        return [
+                            "usage: /speaker promote <SPEAKER_ID>",
+                            "upgrades a TEMP voice cluster to a stable KNOWN"
+                            " id; person binding and storage consent are"
+                            " unchanged.",
+                        ]
+                    from companion.speaker_id.promotion import (
+                        ALREADY_KNOWN,
+                        NO_SAMPLES,
+                        PROMOTED,
+                        UNKNOWN_SPEAKER,
+                        promote_voice_profile,
+                    )
+
+                    store = _identity_store()
+                    if store is None:
+                        return ["speaker store unavailable"]
+                    result = promote_voice_profile(store, parts[2])
+                    if result.outcome == PROMOTED:
+                        # The policy caches authorisation in memory; carry the
+                        # grant to the new id now instead of at next start.
+                        if (
+                            enrollment_policy is not None
+                            and result.previous_id is not None
+                            and enrollment_policy.is_authorized(
+                                result.previous_id
+                            )
+                        ):
+                            enrollment_policy.authorize(result.speaker_id)
+                        with contextlib.suppress(Exception):
+                            await rt.repos.audit.record(
+                                actor="local_cli",
+                                action="promote_speaker",
+                                entity_type="speaker",
+                                entity_id=result.speaker_id,
+                                detail=(
+                                    f"previous={result.previous_id}"
+                                    " verified_by=local_cli_confirmation"
+                                ),
+                            )
+                        lines = [
+                            f"promoted voice profile {result.previous_id} ->"
+                            f" {result.speaker_id} (KNOWN)",
+                            f"note: {result.previous_id} is now an alias of"
+                            f" {result.speaker_id}; existing bindings keep"
+                            " resolving.",
+                            "binding and consent unchanged. bind locally:"
+                            f" /speaker bind {result.speaker_id} <PERSON_ID>",
+                        ]
+                        return lines
+                    if result.outcome == ALREADY_KNOWN:
+                        return [
+                            f"{result.speaker_id} is already a stable"
+                            " identity (KNOWN)"
+                        ]
+                    if result.outcome == NO_SAMPLES:
+                        return [
+                            f"cannot promote {result.previous_id}: no usable"
+                            " voice samples yet (speak a few more times)",
+                        ]
+                    if result.outcome == UNKNOWN_SPEAKER:
+                        return [
+                            f"speaker id unusable: {parts[2]}"
+                            " (unknown, deleted, or broken alias chain)"
+                        ]
+                    return [
+                        f"promotion failed for {parts[2]}"
+                        f" ({result.outcome}); run /speaker list"
+                    ]
+                if action == "enroll":
+                    if len(parts) != 3:
+                        return [
+                            "usage: /speaker enroll <PERSON_ID>|off",
+                            "authorizes storing exactly the next new voice"
+                            " identity; existing profiles keep working.",
+                        ]
+                    if speaker_mode == "off":
+                        return [
+                            "speaker identity is off; start with --voice"
+                            " (active mode) to enroll a voice"
+                        ]
+                    if enrollment_policy is None:
+                        return ["storage consent policy unavailable"]
+                    if parts[2].lower() == "off":
+                        enrollment_policy.disarm()
+                        return ["voiceprint enrollment: disarmed"]
+                    person_obj = await rt.registry.get(parts[2])
+                    if person_obj is None:
+                        return [f"person not found: {parts[2]}"]
+                    if person_obj.registration_status.value != "ACTIVE":
+                        return [
+                            f"person not active: {parts[2]}"
+                            f" ({person_obj.registration_status.value})"
+                        ]
+                    enrollment_policy.arm_new_identity(person_obj.person_id)
+                    return [
+                        "voiceprint enrollment armed for "
+                        f"{person_obj.person_id} ({person_obj.display_name})",
+                        "the next new voice cluster may be stored;"
+                        " speak now (one identity only).",
+                    ]
+                return [
+                    "usage: /speaker list|status|profile <S>|"
+                    "link <S> <PERSON>|link confirm|cancel|bind <S> <PERSON>|"
+                    "unbind <S>|promote <S>|enroll <PERSON>|off|"
+                    "register <PERSON>|register confirm|cancel|status"
+                ]
 
             async def _handle_command(line: str) -> bool:
                 """Handle one slash command; return True to quit the REPL."""
@@ -2483,6 +3558,9 @@ async def cmd_repl(args) -> int:
                         print(output)
                 elif cmd == "/mic":
                     await _handle_mic_command(parts, voice_mode, coordinator)
+                elif cmd == "/speaker":
+                    for line in await _speaker_command(parts):
+                        print(line)
                 elif cmd == "/history":
                     for e in await rt.repos.utterance.list_events(None, 20):
                         print(f"  {e.event_id} to={e.addressee_hint.value} {e.text}")
@@ -2527,6 +3605,7 @@ async def cmd_repl(args) -> int:
                     print(
                         "commands: /to agent|human|unknown  /quiet on|off"
                         "  /speech on|off  /tts on|off|stop|status"
+                        "  /speaker list|status|bind|unbind|promote|enroll"
                         f"{voice_help}  /history  /status  /quit"
                     )
                 else:
@@ -2546,6 +3625,8 @@ async def cmd_repl(args) -> int:
                 output=None,
                 on_tts_started=None,
                 person_id: Any = _DEFAULT_PERSON,
+                event_id: Optional[str] = None,
+                speaker_label: Optional[str] = None,
             ) -> dict:
                 # Keyboard and voice both go through this one call path.
                 # Keyboard callers omit ``person_id`` and keep the startup
@@ -2585,6 +3666,8 @@ async def cmd_repl(args) -> int:
                         tts_manager=tts_manager,
                         output=output,
                         on_tts_started=_tts_started_for_turn,
+                        event_id=event_id,
+                        speaker_label=speaker_label,
                     )
                 except Exception as exc:  # noqa: BLE001 - keep the REPL alive
                     message = f"[failed] {type(exc).__name__}: {exc}\n"
@@ -2697,7 +3780,7 @@ async def cmd_repl(args) -> int:
                 try:
                     while not quit_requested:
                         final_future = asyncio.ensure_future(
-                            coordinator.next_final()
+                            coordinator.next_accepted_turn()
                         )
                         event_future = (
                             asyncio.ensure_future(proactive.next_event())
@@ -2759,16 +3842,200 @@ async def cmd_repl(args) -> int:
                             _discard_future(event_future)
                             if proactive_task is not None:
                                 await _cancel_proactive()
-                            final = final_future.result()
-                            if speaker_shadow_mode == "shadow":
+                            accepted = final_future.result()
+                            final = accepted.final
+                            run_id = accepted.run_id
+                            if speaker_mode != "off":
                                 # Run on the REPL loop, never the audio path.
-                                log_shadow_final(
-                                    final, run_id=speaker_shadow_run_id
-                                )
+                                log_shadow_final(final, run_id=run_id)
                             # The ASR renderer does not print finals in the
                             # formal REPL; echo the accepted text exactly once,
                             # above the live input line. Partials are never
                             # echoed or persisted.
+                            if formal_identity:
+                                decision_started = time.monotonic()
+                                update = coordinator.speaker_update(
+                                    run_id, final.utterance_id
+                                )
+                                result = (
+                                    update.result
+                                    if update is not None
+                                    else final.speaker
+                                )
+                                revision = (
+                                    update.revision if update is not None else 0
+                                )
+                                identity = await _resolve_identity(
+                                    result, run_id, final.utterance_id
+                                )
+                                # The ASR final frequently wins the race against
+                                # the speaker worker's own final analysis. Wait
+                                # a bounded, event-driven moment for it instead
+                                # of refusing a person who is about to be
+                                # confirmed; nothing blocks the audio path.
+                                wait_budget = _identity_wait_seconds()
+                                wait_deadline = time.monotonic() + wait_budget
+                                wait_expired = False
+                                while (
+                                    identity.state
+                                    is not IdentityState.CONFIRMED
+                                    and wait_budget > 0.0
+                                    and _speaker_result_pending(result)
+                                ):
+                                    remaining = (
+                                        wait_deadline - time.monotonic()
+                                    )
+                                    if remaining <= 0.0:
+                                        wait_expired = True
+                                        break
+                                    waited = await coordinator.wait_for_speaker_update(
+                                        run_id,
+                                        final.utterance_id,
+                                        after_revision=revision,
+                                        timeout=remaining,
+                                    )
+                                    if waited is None:
+                                        wait_expired = True
+                                        break
+                                    update = waited
+                                    revision = waited.revision
+                                    result = waited.result
+                                    identity = await _resolve_identity(
+                                        result, run_id, final.utterance_id
+                                    )
+                                decide_ms = max(
+                                    0.0,
+                                    (time.monotonic() - decision_started) * 1000.0,
+                                )
+                                final_to_decision_ms = max(
+                                    0.0,
+                                    (
+                                        time.monotonic()
+                                        - float(getattr(final, "completed_at", 0.0))
+                                    )
+                                    * 1000.0,
+                                )
+                                logging.getLogger("companion.identity").info(
+                                    "identity_decision run_id=%s uid=%s"
+                                    " state=%s reason=%s raw=%s canonical=%s"
+                                    " person=%s revision=%s status=%s"
+                                    " quality=%s similarity=%s margin=%s"
+                                    " final_to_decision_ms=%.1f resolve_ms=%.1f",
+                                    run_id,
+                                    final.utterance_id,
+                                    identity.state.value,
+                                    identity.reason,
+                                    identity.raw_speaker_id,
+                                    identity.canonical_speaker_id,
+                                    identity.person_id,
+                                    revision,
+                                    getattr(result, "status", None),
+                                    getattr(result, "reid_quality", None),
+                                    getattr(result, "similarity", None),
+                                    getattr(result, "margin", None),
+                                    final_to_decision_ms,
+                                    decide_ms,
+                                )
+                                key = (run_id, int(final.utterance_id))
+                                _ledger_put(
+                                    key,
+                                    {
+                                        "run_id": run_id,
+                                        "utterance_id": int(final.utterance_id),
+                                        "event_id": None,
+                                        "raw_speaker_id": identity.raw_speaker_id,
+                                        "canonical_speaker_id": (
+                                            identity.canonical_speaker_id
+                                        ),
+                                        "state": identity.state,
+                                        "reason": identity.reason,
+                                        "revision": revision,
+                                        "submitted": False,
+                                        "authorized": False,
+                                        "wait_expired": wait_expired,
+                                        "last_revision": revision,
+                                        "last_displayed_state": (
+                                            identity.state
+                                        ),
+                                        "last_displayed_speaker_id": (
+                                            identity.canonical_speaker_id
+                                            or identity.raw_speaker_id
+                                        ),
+                                        "last_displayed_person_id": (
+                                            identity.person_id
+                                        ),
+                                    },
+                                )
+                                if identity.state is IdentityState.CONFIRMED:
+                                    _identity_latency_ms.append(
+                                        final_to_decision_ms
+                                    )
+                                elif wait_expired:
+                                    _identity_wait_timeouts += 1
+                                label = identity.display_name
+                            else:
+                                label = "you"
+                            await voice_output.write(
+                                f"{label} 🎤> {final.text}\n"
+                            )
+                            if formal_identity:
+                                if identity.state is not IdentityState.CONFIRMED:
+                                    _identity_discards += 1
+                                    if identity.reason == "binding_conflict":
+                                        notice = (
+                                            "[id] 该声纹同时绑定到多个不同人物，"
+                                            "需人工处理（/speaker status）。"
+                                            "本条未提交。\n"
+                                        )
+                                    elif identity.reason == "person_inactive":
+                                        notice = (
+                                            "[id] 该声音绑定的人物当前不可用，"
+                                            "本条未提交。\n"
+                                        )
+                                    elif identity.reason == "consent_missing":
+                                        notice = (
+                                            "[id] 该声音绑定的人物未授权处理与保存，"
+                                            "本条未提交。\n"
+                                        )
+                                    elif wait_expired:
+                                        notice = (
+                                            "[id] 声纹分析在等待窗口内仍未完成，"
+                                            "本条未提交；可重说或用键盘继续。\n"
+                                        )
+                                    else:
+                                        notice = (
+                                            "[id] 当前声音未识别为已授权人物，"
+                                            "本条未提交；可用 /speaker bind"
+                                            " 或键盘继续。\n"
+                                        )
+                                    await voice_output.write(notice)
+                                    # The final was accepted but produced no
+                                    # Router/LLM/TTS turn. Release the
+                                    # half-duplex state without a reply.
+                                    coordinator.resume_after_discarded_turn()
+                                    continue
+                                event_id = new_id("evt")
+                                entry = identity_ledger.get(key)
+                                if entry is not None:
+                                    entry["event_id"] = event_id
+                                    entry["submitted"] = True
+                                    entry["authorized"] = True
+                                # The prompt (and its typed buffer) stays
+                                # alive; output is drawn above the input line.
+                                await _run_reply_turn(
+                                    final.text,
+                                    EventSource.VOICE,
+                                    time.monotonic(),
+                                    output=voice_output,
+                                    on_tts_started=_voice_tts_started,
+                                    person_id=identity.person_id,
+                                    event_id=event_id,
+                                    speaker_label=(
+                                        identity.canonical_speaker_id
+                                        or identity.raw_speaker_id
+                                    ),
+                                )
+                                continue
                             voice_person_id: Optional[str] = person.person_id
                             if voice_binding_enabled:
                                 voice_person_id = await resolve_voice_person_id(
@@ -2784,11 +4051,6 @@ async def cmd_repl(args) -> int:
                                     await voice_output.write(
                                         "[id] 当前声音未绑定到已登记的人，本条按匿名处理。\n"
                                     )
-                            await voice_output.write(
-                                f"you 🎤> {final.text}\n"
-                            )
-                            # The prompt (and its typed buffer) stays alive;
-                            # output is drawn above the input line.
                             await _run_reply_turn(
                                 final.text,
                                 EventSource.VOICE,
@@ -2839,6 +4101,16 @@ async def cmd_repl(args) -> int:
             if coordinator is not None:
                 with contextlib.suppress(Exception):
                     await coordinator.shutdown()
+            for task in list(_late_identity_tasks):
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+            if speaker_store is not None:
+                # The observer owns its own connection and closes it with the
+                # ASR manager; this one only served identity resolution.
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(speaker_store.close)
             await asyncio.to_thread(tts_manager.shutdown)
             confirmation = getattr(rt, "profile_confirmation", None)
             if confirmation is not None:
@@ -3954,6 +5226,8 @@ async def handle_user_message(
     output=None,
     on_tts_started=None,
     turn_runner=None,
+    event_id: Optional[str] = None,
+    speaker_label: Optional[str] = None,
 ) -> dict:
     """The only path from accepted user text to Ava's reply.
 
@@ -3961,6 +5235,10 @@ async def handle_user_message(
     this, so proactive invalidation, speaking interruption, streaming,
     persistence and the post-reply proactive schedule are identical. It never
     creates a second Router/Speaker flow.
+
+    ``event_id`` lets the caller create the identity-attribution id exactly
+    once, before the event reaches persistence; ``speaker_label`` is the
+    display-only voice label (a speaker id, never a person name).
     """
     runner = turn_runner or _run_streaming_turn
     event = make_utterance_event(
@@ -3968,7 +5246,9 @@ async def handle_user_message(
         text=text,
         addressee_hint=addressee,
         speaker_person_id=person_id,
+        speaker_label=speaker_label,
         source=source,
+        event_id=event_id,
     )
     manager = getattr(rt, "proactive_manager", None)
     if manager is not None:

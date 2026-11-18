@@ -30,6 +30,7 @@ from companion.asr.manager import (
     PartialTranscript,
     SpeechActivity,
 )
+from companion.speaker_id.models import SpeakerResult
 
 
 @dataclass(frozen=True)
@@ -52,16 +53,33 @@ class BridgeFailure:
     message: str
 
 
+@dataclass(frozen=True)
+class SpeakerUpdate:
+    """One asynchronous voice-identity snapshot for one ASR utterance.
+
+    ``run_id`` identifies the microphone session, not the speaker engine's
+    database session. ``revision`` is monotonic per utterance so a late worker
+    result can never overwrite a newer one.
+    """
+
+    run_id: str
+    utterance_id: int
+    revision: int
+    result: SpeakerResult
+
+
 VoiceItem = Union[
     FinalUtterance,
     SpeechActivity,
     TurnClosed,
     BridgeFailure,
     PartialTranscript,
+    SpeakerUpdate,
 ]
 
 _STOP = None
 _SEEN_LIMIT = 256
+_MAX_PENDING_SPEAKER = 64
 
 
 class VoiceBridge:
@@ -72,11 +90,16 @@ class VoiceBridge:
         loop: asyncio.AbstractEventLoop,
         *,
         max_pending: int = 32,
+        run_id: Optional[str] = None,
     ) -> None:
         self._loop = loop
         self._queue: "asyncio.Queue[Optional[VoiceItem]]" = asyncio.Queue(
             maxsize=max(1, int(max_pending))
         )
+        # Microphone-session id. Speaker updates from another run are stale
+        # and are discarded, so a result that arrives after a mic restart can
+        # never be attributed to the new session's utterance with the same id.
+        self._run_id = str(run_id).strip() if run_id else None
         self._closed = False
         self._lock = threading.Lock()
         # Dedupe runs on the loop thread (``_deliver``); the sets are only
@@ -101,6 +124,16 @@ class VoiceBridge:
         # dropped instead of moving the subtitle backwards.
         self._partial_delivered: dict[int, int] = {}
         self.replaced_partials = 0
+        # Speaker updates are display/identity hints, never critical path.
+        # Keep at most one queued update per (run, utterance), replacing an
+        # older revision instead of growing the bounded ASR queue.
+        self._speaker_pending: set[tuple[str, int]] = set()
+        self._speaker_order: deque[tuple[str, int]] = deque()
+        self._speaker_latest: dict[tuple[str, int], SpeakerUpdate] = {}
+        self._speaker_delivered: dict[tuple[str, int], int] = {}
+        self.dropped_speaker = 0
+        self.replaced_speaker = 0
+        self.stale_speaker = 0
 
     # -------------------------------------------------------------- publishers
     def publish_final(self, final: FinalUtterance) -> bool:
@@ -121,6 +154,26 @@ class VoiceBridge:
         """Report an ASR worker failure to the loop (called on thread death)."""
         return self._post(BridgeFailure(str(message or "语音识别已停止。")))
 
+    def set_run_id(self, run_id: Optional[str]) -> None:
+        """Bind this bridge to the current microphone session.
+
+        Called on the loop after the manager (and its observer) exists. Until
+        then no speaker event can be produced, because model loading starts
+        only when the manager starts.
+        """
+        value = str(run_id).strip() if run_id else None
+        with self._lock:
+            self._run_id = value
+
+    @property
+    def run_id(self) -> Optional[str]:
+        with self._lock:
+            return self._run_id
+
+    def publish_speaker_update(self, update: SpeakerUpdate) -> bool:
+        """Deliver one identity update; safe from the speaker worker thread."""
+        return self._post(update)
+
     def _post(self, item: VoiceItem) -> bool:
         with self._lock:
             if self._closed:
@@ -135,6 +188,53 @@ class VoiceBridge:
     # ----------------------------------------------------------- loop consumer
     def _deliver(self, item: VoiceItem) -> None:
         if self._closed:
+            return
+        if isinstance(item, SpeakerUpdate):
+            if self._run_id is not None and item.run_id != self._run_id:
+                # A result from the previous microphone session. It must not
+                # label the current session's utterance, even though ASR ids
+                # restart from the same numbers.
+                self.stale_speaker += 1
+                return
+            key = (item.run_id, item.utterance_id)
+            if item.revision <= self._speaker_delivered.get(key, 0):
+                self.stale_speaker += 1
+                return
+            if key in self._speaker_pending:
+                current = self._speaker_latest.get(key)
+                if current is None or item.revision >= current.revision:
+                    self._speaker_latest[key] = item
+                    self.replaced_speaker += 1
+                else:
+                    self.stale_speaker += 1
+                return
+            # Never let identity hints crowd out the ASR final or turn close.
+            # Small queues reserve their last slot(s) for critical events, so
+            # a bounded queue can always accept a Final instead of dropping it
+            # behind a non-critical speaker hint.
+            reserve = max(1, self._queue.maxsize // 4)
+            if self._queue.qsize() >= self._queue.maxsize - reserve:
+                self.dropped_speaker += 1
+                return
+            while len(self._speaker_pending) >= _MAX_PENDING_SPEAKER:
+                oldest = self._speaker_order.popleft()
+                if oldest in self._speaker_pending:
+                    self._speaker_pending.discard(oldest)
+                    self._speaker_latest.pop(oldest, None)
+                    self.dropped_speaker += 1
+                    break
+            self._speaker_latest[key] = item
+            self._speaker_pending.add(key)
+            self._speaker_order.append(key)
+            try:
+                self._queue.put_nowait(item)
+            except asyncio.QueueFull:
+                # Speaker updates are best-effort. Drop this hint; do not
+                # retry, because a final must keep its queue slot.
+                self._speaker_pending.discard(key)
+                self._speaker_latest.pop(key, None)
+                self.dropped += 1
+                self.dropped_speaker += 1
             return
         if isinstance(item, PartialTranscript):
             uid = item.utterance_id
@@ -211,7 +311,24 @@ class VoiceBridge:
     async def next_item(self) -> Optional[VoiceItem]:
         """Wait for the next item; ``None`` means the bridge was closed."""
         item = await self._queue.get()
-        if isinstance(item, PartialTranscript):
+        if isinstance(item, SpeakerUpdate):
+            key = (item.run_id, item.utterance_id)
+            self._speaker_pending.discard(key)
+            while self._speaker_order and (
+                self._speaker_order[0] not in self._speaker_pending
+            ):
+                self._speaker_order.popleft()
+            latest = self._speaker_latest.pop(key, None)
+            if latest is not None and latest.revision >= item.revision:
+                item = latest
+            self._speaker_delivered[key] = max(
+                self._speaker_delivered.get(key, 0), item.revision
+            )
+            # Bound the delivered-revision map for a long-running session.
+            if len(self._speaker_delivered) > _SEEN_LIMIT:
+                oldest = next(iter(self._speaker_delivered))
+                self._speaker_delivered.pop(oldest, None)
+        elif isinstance(item, PartialTranscript):
             uid = item.utterance_id
             # The slot frees as soon as the consumer has it, so the next
             # revision may be queued while this one is being displayed.
@@ -255,6 +372,7 @@ class VoiceBridge:
 __all__ = [
     "BridgeFailure",
     "PartialTranscript",
+    "SpeakerUpdate",
     "TurnClosed",
     "VoiceBridge",
     "VoiceItem",

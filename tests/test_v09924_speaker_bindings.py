@@ -359,3 +359,196 @@ async def test_anonymous_voice_event_does_not_carry_the_startup_person(rt):
     event = captured["event"]
     assert event.speaker_person_id is None
     assert event.speaker_person_id != startup.person_id
+
+
+# -- V0.9.9.31: resolver-driven turns ---------------------------------------
+def _speaker_store(tmp_path):
+    from companion.speaker_id.store import SpeakerStore
+
+    store = SpeakerStore(tmp_path / "speakers.sqlite3")
+    store.initialize()
+    return store
+
+
+def _stable_speaker(store) -> str:
+    speaker_id = store.promote_speaker(store.create_candidate())
+    assert speaker_id is not None
+    return speaker_id
+
+
+async def test_identity_resolver_drives_each_voice_turn(rt, tmp_path):
+    """A/B/UNKNOWN alternate; each turn keeps exactly its own identity."""
+    from companion.cli import handle_user_message
+    from companion.domain.models import new_id
+    from companion.people.identity_resolver import (
+        IdentityResolver,
+        IdentityState,
+    )
+
+    store = _speaker_store(tmp_path)
+    try:
+        first_speaker = _stable_speaker(store)
+        second_speaker = _stable_speaker(store)
+        alice = await _person(rt, "Alice")
+        bob = await _person(rt, "Bob")
+        await _service(rt).bind_speaker(alice.person_id, first_speaker, "owner")
+        await _service(rt).bind_speaker(bob.person_id, second_speaker, "owner")
+        await rt.conversations.get_or_create("voice-resolver")
+
+        resolver = IdentityResolver(
+            rt.repos.person, rt.speaker_bindings, store
+        )
+        seen = []
+
+        async def runner(rt_, event, **kwargs):
+            seen.append(
+                (
+                    event.speaker_person_id,
+                    event.speaker_label,
+                    event.event_id,
+                )
+            )
+            return {"delivered": True, "status": "WAIT", "action": "WAIT"}
+
+        turns = [
+            (first_speaker, alice.person_id),
+            (second_speaker, bob.person_id),
+            (None, None),
+            (second_speaker, bob.person_id),
+            (first_speaker, alice.person_id),
+            (None, None),
+        ]
+        expected_event_ids = []
+        confirmed_indices = []
+        for index, (speaker_id, expected_person) in enumerate(turns):
+            snapshot = _result(speaker_id) if speaker_id else None
+            identity = await resolver.resolve(
+                snapshot, run_id="run-a", utterance_id=index + 1
+            )
+            assert identity.person_id == expected_person
+            if identity.state is IdentityState.CONFIRMED:
+                event_id = new_id("evt")
+                expected_event_ids.append(event_id)
+                confirmed_indices.append(index)
+                label = identity.canonical_speaker_id
+            else:
+                event_id = None
+                label = None
+            await handle_user_message(
+                rt,
+                text=f"turn {index}",
+                source=EventSource.VOICE,
+                submitted_at=0.0,
+                conversation_id="voice-resolver",
+                person_id=identity.person_id,
+                addressee="agent",
+                event_id=event_id,
+                speaker_label=label,
+                turn_runner=runner,
+            )
+
+        assert [row[0] for row in seen] == [
+            person_id for _speaker, person_id in turns
+        ]
+        assert alice.person_id != bob.person_id
+        # No turn inherited the previous speaker's identity.
+        assert seen[2][0] is None and seen[3][0] == bob.person_id
+        # Confirmed turns preserve the single caller-chosen event id.
+        confirmed = [seen[index][2] for index in confirmed_indices]
+        assert confirmed == expected_event_ids
+        assert len(set(confirmed)) == len(confirmed)
+        # Only confirmed turns carry a voice label.
+        assert [row[1] for row in seen if row[1] is not None] == [
+            first_speaker,
+            second_speaker,
+            second_speaker,
+            first_speaker,
+        ]
+    finally:
+        store.close()
+
+
+async def test_unregistered_voice_is_denied_before_router(rt):
+    from companion.cli import handle_user_message
+    from companion.domain.models import make_utterance_event
+
+    await _person(rt, "Startup")
+    await rt.conversations.get_or_create("voice-denied")
+
+    # The REPL never submits an unresolved voice turn, but even if a caller
+    # does, the Orchestrator refuses it before Router/LLM/Memory.
+    event = make_utterance_event(
+        conversation_id="voice-denied",
+        text="我是谁？",
+        addressee_hint="agent",
+        speaker_person_id=None,
+        source=EventSource.VOICE,
+    )
+    report = await rt.orchestrator.process_utterance(event)
+    assert report.status == "PERMISSION_DENIED"
+    assert "unregistered_speaker" in str(report)
+
+    delivery = await handle_user_message(
+        rt,
+        text="我是谁？",
+        source=EventSource.VOICE,
+        submitted_at=0.0,
+        conversation_id="voice-denied",
+        person_id=None,
+        addressee="agent",
+    )
+    assert delivery.get("delivered") is False
+
+
+async def test_keyboard_turn_keeps_the_local_owner_and_no_voice_label(rt):
+    from companion.cli import handle_user_message
+
+    owner = await _person(rt, "Owner")
+    await rt.conversations.get_or_create("keyboard")
+    captured = {}
+
+    async def runner(rt_, event, **kwargs):
+        captured["event"] = event
+        return {"delivered": True, "status": "WAIT", "action": "WAIT"}
+
+    await handle_user_message(
+        rt,
+        text="keyboard input",
+        source=EventSource.CLI,
+        submitted_at=0.0,
+        conversation_id="keyboard",
+        person_id=owner.person_id,
+        addressee="agent",
+        turn_runner=runner,
+    )
+
+    event = captured["event"]
+    assert event.speaker_person_id == owner.person_id
+    assert event.speaker_label is None
+    assert event.source is EventSource.CLI
+
+
+async def test_guest_without_persistence_consent_gets_no_identity(rt, tmp_path):
+    from companion.people.identity_resolver import IdentityResolver
+
+    store = _speaker_store(tmp_path)
+    try:
+        speaker_id = _stable_speaker(store)
+        guest = await rt.registry.register(
+            "Visitor",
+            "guest",
+            allow_processing=True,
+            allow_persistence=False,
+            allow_memory_learning=False,
+            allow_external_ai=False,
+        )
+        await _service(rt).bind_speaker(guest.person_id, speaker_id, "owner")
+
+        identity = await IdentityResolver(
+            rt.repos.person, rt.speaker_bindings, store
+        ).resolve(_result(speaker_id), run_id="run", utterance_id=1)
+
+        assert identity.person_id is None
+        assert identity.reason == "consent_missing"
+    finally:
+        store.close()
