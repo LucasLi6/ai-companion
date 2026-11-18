@@ -21,6 +21,7 @@ No ``print()`` is called from these threads; errors are stored for
 from __future__ import annotations
 
 import dataclasses
+import logging
 import queue
 import threading
 import time
@@ -1009,6 +1010,8 @@ class TTSManager:
         *,
         submitted_at: Optional[float] = None,
         router_completed_at: Optional[float] = None,
+        voice_asr_final_at: Optional[float] = None,
+        voice_identity_confirmed_at: Optional[float] = None,
     ) -> Optional[TTSStream]:
         """Begin one streaming TTS session for a reply (Phase B).
 
@@ -1035,6 +1038,12 @@ class TTSManager:
                 timings["user_submitted_at"] = submitted_at
             if router_completed_at is not None:
                 timings["router_completed_at"] = router_completed_at
+            if voice_asr_final_at is not None:
+                timings["voice_asr_final_at"] = voice_asr_final_at
+            if voice_identity_confirmed_at is not None:
+                timings["voice_identity_confirmed_at"] = (
+                    voice_identity_confirmed_at
+                )
             self._timings[generation] = timings
             self._playback_info[generation] = (
                 response_id,
@@ -1575,6 +1584,31 @@ class TTSManager:
                             "first_audio_played_at", time.monotonic()
                         )
                         self._status = "playing"
+                        trace = dict(timings)
+                    else:
+                        trace = {}
+                if trace.get("voice_asr_final_at") is not None:
+                    # Exactly one latency summary per audio generation. All
+                    # marks use monotonic time; never log recognized text.
+                    logging.getLogger("companion.latency").info(
+                        "voice_e2e_latency generation=%s"
+                        " vad_to_asr_ms=%s asr_to_identity_ms=%s"
+                        " identity_to_router_ms=%s router_to_response_ms=%s"
+                        " response_to_text_ms=%s text_to_segment_ms=%s"
+                        " tts_connect_ms=%s segment_to_pcm_ms=%s"
+                        " pcm_to_output_ms=%s vad_to_output_ms=%s",
+                        generation,
+                        _ms(trace.get("user_submitted_at"), trace.get("voice_asr_final_at")),
+                        _ms(trace.get("voice_asr_final_at"), trace.get("voice_identity_confirmed_at")),
+                        _ms(trace.get("voice_identity_confirmed_at"), trace.get("router_completed_at")),
+                        _ms(trace.get("router_completed_at"), trace.get("response_started_at")),
+                        _ms(trace.get("response_started_at"), trace.get("first_text_at")),
+                        _ms(trace.get("first_text_at"), trace.get("first_segment_ready_at")),
+                        _ms(trace.get("tts_connect_started_at"), trace.get("tts_connect_finished_at")),
+                        _ms(trace.get("first_segment_sent_at"), trace.get("first_audio_received_at")),
+                        _ms(trace.get("first_audio_received_at"), trace.get("first_audio_played_at")),
+                        _ms(trace.get("user_submitted_at"), trace.get("first_audio_played_at")),
+                    )
                 first = False
 
     # ---------------------------------------------------------------- status
@@ -1660,6 +1694,22 @@ class TTSManager:
         user = timings.get("user_submitted_at")
         return {
             "generation": generation,
+            # Voice turns start at local VAD end, not after ASR and identity.
+            "is_voice": timings.get("voice_asr_final_at") is not None,
+            "vad_to_asr_ms": _ms(
+                user, timings.get("voice_asr_final_at")
+            ),
+            "asr_to_identity_ms": _ms(
+                timings.get("voice_asr_final_at"),
+                timings.get("voice_identity_confirmed_at"),
+            ),
+            "identity_to_router_ms": _ms(
+                timings.get("voice_identity_confirmed_at"),
+                timings.get("router_completed_at"),
+            ),
+            "vad_to_first_audio_played_ms": _ms(
+                user, timings.get("first_audio_played_at")
+            ) if timings.get("voice_asr_final_at") is not None else None,
             # Unified user-submit-relative marks (Phase B / CLI report).
             "user_to_router_ms": _ms(
                 user, timings.get("router_completed_at")
