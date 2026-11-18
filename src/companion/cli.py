@@ -2246,6 +2246,7 @@ async def cmd_repl(args) -> int:
             # Both live in memory and expire; neither is reachable from
             # speech, the Router or the LLM.
             _pending_link: Optional[dict] = None
+            _pending_merge: Optional[dict] = None
             registration_flow = None
             _registration_signature: Optional[tuple] = None
             # Late identity notices are display-only tasks; they are cancelled
@@ -2880,7 +2881,7 @@ async def cmd_repl(args) -> int:
                 voiceprint storage. Nothing here is reachable from speech, the
                 Router, the LLM, or a SpeakerResult.
                 """
-                nonlocal _pending_link, registration_flow
+                nonlocal _pending_link, _pending_merge, registration_flow
                 nonlocal _registration_signature
                 action = parts[1].lower() if len(parts) > 1 else "status"
                 if action == "status":
@@ -2972,6 +2973,101 @@ async def cmd_repl(args) -> int:
                                 latest.get("submitted"),
                             )
                         )
+                    return lines
+                if action in ("compare", "merge"):
+                    from companion.people.speaker_merge import (
+                        SpeakerMergeError,
+                        SpeakerMergeService,
+                    )
+
+                    store = _identity_store()
+                    if store is None or rt.speaker_bindings is None:
+                        return ["speaker merge service unavailable"]
+                    service = SpeakerMergeService(
+                        store, rt.speaker_bindings, audit=rt.repos.audit
+                    )
+                    if action == "merge" and len(parts) == 3:
+                        sub = parts[2].lower()
+                        if sub == "cancel":
+                            _pending_merge = None
+                            return ["speaker merge cancelled; nothing changed"]
+                        if sub == "confirm":
+                            pending = _pending_merge
+                            if (
+                                pending is None
+                                or time.monotonic() > pending["expires_at"]
+                            ):
+                                _pending_merge = None
+                                return [
+                                    "no pending merge; run"
+                                    " /speaker merge <S-ID> <TEMP-ID> first"
+                                ]
+                            if coordinator is not None and coordinator.enabled:
+                                return [
+                                    "turn the microphone off with /mic off"
+                                    " before confirming a speaker merge"
+                                ]
+                            _pending_merge = None
+                            try:
+                                done = await service.confirm(
+                                    pending["canonical"], pending["candidate"]
+                                )
+                            except SpeakerMergeError as exc:
+                                return [f"merge refused: {exc.code}"]
+                            except Exception as exc:
+                                # The voice store and person DB are separate.
+                                # Never imply rollback or success after an
+                                # unexpected error; inspect both stores.
+                                return [
+                                    "merge did not complete cleanly"
+                                    f" ({type(exc).__name__});"
+                                    " inspect /speaker list --aliases"
+                                ]
+                            return [
+                                f"merged {done.candidate} into {done.canonical}"
+                                " after local confirmation; historical alias"
+                                " remains internal",
+                                "use /mic on to resume recognition",
+                            ]
+                    if len(parts) != 4:
+                        return [
+                            f"usage: /speaker {action} <S-ID> <TEMP-ID>",
+                            "then /speaker merge confirm|cancel"
+                            if action == "merge" else
+                            "this only compares already-stored voiceprints",
+                        ]
+                    preview = await service.preview(parts[2], parts[3])
+                    lines = [
+                        "compare {} ({} samples) vs {} ({} samples)".format(
+                            preview.canonical, preview.canonical_samples,
+                            preview.candidate, preview.candidate_samples,
+                        ),
+                        "median nearest similarity: {}".format(
+                            "{:.3f}".format(preview.median_best_similarity)
+                            if preview.median_best_similarity is not None
+                            else "unavailable"
+                        ),
+                        f"review state: {preview.reason}",
+                        "similarity is not proof of human identity",
+                    ]
+                    if action == "merge":
+                        if preview.can_merge:
+                            _pending_merge = {
+                                "canonical": preview.canonical,
+                                "candidate": preview.candidate,
+                                "expires_at": time.monotonic() + 60.0,
+                            }
+                            lines.append(
+                                "check the samples truly belong to one"
+                                " person; /mic off then /speaker merge confirm"
+                                " within 60s (or /speaker merge cancel)"
+                            )
+                        else:
+                            _pending_merge = None
+                            lines.append(
+                                "merge unavailable: no identifiers were"
+                                " changed"
+                            )
                     return lines
                 if action == "normalize":
                     if len(parts) != 2:
