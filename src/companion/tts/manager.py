@@ -1744,6 +1744,22 @@ class TTSManager:
                 timings.get("tts_connect_started_at"),
                 timings.get("tts_connect_finished_at"),
             ),
+            # The sender intentionally calls open_stream() BEFORE it drains
+            # segmenter text. Therefore first_text_to_first_segment_ms
+            # includes waiting for WebSocket handshake, not merely parser
+            # work. Separate the wait so users don't misdiagnose punctuation.
+            "first_text_to_tts_connected_ms": _ms(
+                timings.get("first_text_at"),
+                timings.get("tts_connect_finished_at"),
+            ),
+            "tts_connected_to_first_segment_ms": _ms(
+                timings.get("tts_connect_finished_at"),
+                timings.get("first_segment_ready_at"),
+            ),
+            "response_to_tts_connected_ms": _ms(
+                timings.get("response_started_at"),
+                timings.get("tts_connect_finished_at"),
+            ),
             "first_segment_to_first_pcm_ms": _ms(
                 timings.get("first_segment_sent_at"),
                 timings.get("first_audio_received_at"),
