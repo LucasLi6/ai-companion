@@ -65,6 +65,11 @@ FLUSH_STRATEGIES = ("auto", "sentence_flush")
 # This is a safety valve, not a normal per-sentence threshold.
 DEFAULT_LONG_FALLBACK_CHARS = 180
 
+# Experimental, opt-in first-clause flush. With 0 (default) TTS stays
+# sentence-first; a positive threshold emits one complete clause early,
+# at safe punctuation, without fragmenting all subsequent sentences.
+DEFAULT_FIRST_CLAUSE_CHARS = 0
+
 # Phase B: speech output is on by default for the REPL. ``AVA_TTS_ENABLED``
 # only controls the session default, not a persisted setting.
 DEFAULT_ENABLED = True
@@ -94,6 +99,7 @@ class TTSConfig:
     instruction: str = DEFAULT_TTS_INSTRUCTION
     flush_strategy: str = DEFAULT_FLUSH_STRATEGY
     long_fallback_chars: int = DEFAULT_LONG_FALLBACK_CHARS
+    first_clause_chars: int = DEFAULT_FIRST_CLAUSE_CHARS
     # Empty = follow the system default output device (including Bluetooth).
     # Otherwise a PortAudio output index ("1") or a name substring
     # ("WH-1000XM6", "蓝牙") selects a specific device.
@@ -199,6 +205,10 @@ def describe_tts_config(
         "audio_format": DEFAULT_FORMAT,
         "rate": speech_rate,
         "flush_strategy": flush_strategy,
+        "first_clause_chars": _env(
+            env, "AVA_TTS_FIRST_CLAUSE_CHARS",
+            str(DEFAULT_FIRST_CLAUSE_CHARS)
+        ),
         "output_device": _env(env, "AVA_TTS_OUTPUT_DEVICE", ""),
     }
 
@@ -294,6 +304,17 @@ def load_tts_config(
     if long_fallback_chars < 1:
         raise TTSConfigError("AVA_TTS_LONG_FALLBACK_CHARS 必须是正整数。")
 
+    try:
+        first_clause_chars = int(described["first_clause_chars"])
+    except (TypeError, ValueError) as exc:
+        raise TTSConfigError(
+            "AVA_TTS_FIRST_CLAUSE_CHARS 必须是整数。"
+        ) from exc
+    if not 0 <= first_clause_chars <= 160:
+        raise TTSConfigError(
+            "AVA_TTS_FIRST_CLAUSE_CHARS 必须在 0~160 之间。"
+        )
+
     return TTSConfig(
         api_key=_env(env, DASHSCOPE_KEY_ENV),
         workspace_id=_env(env, DASHSCOPE_WORKSPACE_ENV),
@@ -308,6 +329,7 @@ def load_tts_config(
         instruction=instruction,
         flush_strategy=flush_strategy,
         long_fallback_chars=long_fallback_chars,
+        first_clause_chars=first_clause_chars,
         output_device=_env(env, "AVA_TTS_OUTPUT_DEVICE", ""),
     )
 
@@ -330,6 +352,7 @@ __all__ = [
     "DEFAULT_FLUSH_STRATEGY",
     "DEFAULT_FORMAT",
     "DEFAULT_LONG_FALLBACK_CHARS",
+    "DEFAULT_FIRST_CLAUSE_CHARS",
     "DEFAULT_MODEL",
     "DEFAULT_REGION",
     "DEFAULT_SAMPLE_RATE",

@@ -8,6 +8,7 @@ network latency claim.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -162,6 +163,28 @@ async def test_ordinary_reply_is_one_router_and_one_speaker_call(semantic_runtim
     assert response.calls == 1
     assert report.timings["router_llm_ms"] >= 5
     assert report.timings["total_ms"] >= report.timings["router_llm_ms"]
+
+
+@pytest.mark.asyncio
+async def test_router_latency_log_names_initial_and_followup_stages(
+    semantic_runtime, caplog
+):
+    router = TimedRouter(delay=0.005)
+    rt, _ = semantic_runtime(router)
+    person = await _person(rt)
+    event = _event(person.person_id, conversation="conv-router-trace")
+    with caplog.at_level(logging.INFO):
+        await rt.orchestrator.process_utterance(event)
+    trace = [
+        item.getMessage() for item in caplog.records
+        if "router_latency" in item.getMessage()
+        and f"event_id={event.event_id}" in item.getMessage()
+    ]
+    assert len(trace) == 1
+    assert "initial_llm_ms=" in trace[0]
+    assert "followup_llm_ms=" in trace[0]
+    assert "tool_execution_ms=" in trace[0]
+    assert "provider_calls=1" in trace[0]
 
 
 @pytest.mark.asyncio

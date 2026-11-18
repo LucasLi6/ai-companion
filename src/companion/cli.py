@@ -3736,6 +3736,30 @@ async def cmd_repl(args) -> int:
                 elif cmd == "/tts":
                     for output in _handle_tts_command(tts_manager, parts):
                         print(output)
+                elif cmd == "/latency":
+                    metrics = tts_manager.metrics()
+                    if metrics is None:
+                        print(
+                            "no TTS timing yet; speak one full reply first"
+                        )
+                    else:
+                        print(_format_tts_metrics(metrics))
+                    if coordinator is not None:
+                        identity_stats = coordinator.speaker_timings()
+                        print(
+                            "speaker wait: count={} timeouts={} p50={}ms"
+                            " p95={}ms".format(
+                                identity_stats.get("waits", 0),
+                                identity_stats.get("timeouts", 0),
+                                identity_stats.get("wait_p50_ms"),
+                                identity_stats.get("wait_p95_ms"),
+                            )
+                        )
+                    print(
+                        "automatic per-turn traces: logs/companion.log"
+                        " (voice_asr_latency / voice_gate_latency /"
+                        " voice_e2e_latency)"
+                    )
                 elif cmd == "/mic":
                     await _handle_mic_command(parts, voice_mode, coordinator)
                 elif cmd == "/speaker":
@@ -3785,6 +3809,7 @@ async def cmd_repl(args) -> int:
                     print(
                         "commands: /to agent|human|unknown  /quiet on|off"
                         "  /speech on|off  /tts on|off|stop|status"
+                        "  /latency"
                         "  /speaker list|status|bind|unbind|promote|enroll"
                         f"{voice_help}  /history  /status  /quit"
                     )
@@ -3807,6 +3832,7 @@ async def cmd_repl(args) -> int:
                 person_id: Any = _DEFAULT_PERSON,
                 event_id: Optional[str] = None,
                 speaker_label: Optional[str] = None,
+                voice_marks: Optional[dict] = None,
             ) -> dict:
                 # Keyboard and voice both go through this one call path.
                 # Keyboard callers omit ``person_id`` and keep the startup
@@ -3848,6 +3874,11 @@ async def cmd_repl(args) -> int:
                         on_tts_started=_tts_started_for_turn,
                         event_id=event_id,
                         speaker_label=speaker_label,
+                        **(
+                            {"voice_marks": voice_marks}
+                            if voice_marks is not None
+                            else {}
+                        ),
                     )
                 except Exception as exc:  # noqa: BLE001 - keep the REPL alive
                     message = f"[failed] {type(exc).__name__}: {exc}\n"
@@ -4230,12 +4261,28 @@ async def cmd_repl(args) -> int:
                                     entry["event_id"] = event_id
                                     entry["submitted"] = True
                                     entry["authorized"] = True
+                                # Include VAD->ASR and speaker gate in the
+                                # same clock as Router, Speaker and TTS.
+                                identity_confirmed_at = time.monotonic()
+                                vad_end_at = (
+                                    getattr(final, "vad_end_at", None)
+                                    or final.completed_at
+                                )
+                                logging.getLogger("companion.latency").info(
+                                    "voice_gate_latency uid=%s"
+                                    " event_id=%s vad_to_asr_ms=%.1f"
+                                    " asr_to_identity_ms=%.1f",
+                                    final.utterance_id,
+                                    event_id,
+                                    max(0.0, (final.completed_at - vad_end_at) * 1000.0),
+                                    max(0.0, (identity_confirmed_at - final.completed_at) * 1000.0),
+                                )
                                 # The prompt (and its typed buffer) stays
                                 # alive; output is drawn above the input line.
                                 await _run_reply_turn(
                                     final.text,
                                     EventSource.VOICE,
-                                    time.monotonic(),
+                                    vad_end_at,
                                     output=voice_output,
                                     on_tts_started=_voice_tts_started,
                                     person_id=identity.person_id,
@@ -4244,6 +4291,10 @@ async def cmd_repl(args) -> int:
                                         identity.canonical_speaker_id
                                         or identity.raw_speaker_id
                                     ),
+                                    voice_marks={
+                                        "asr_final_at": final.completed_at,
+                                        "identity_confirmed_at": identity_confirmed_at,
+                                    },
                                 )
                                 continue
                             voice_person_id: Optional[str] = person.person_id
@@ -4264,10 +4315,15 @@ async def cmd_repl(args) -> int:
                             await _run_reply_turn(
                                 final.text,
                                 EventSource.VOICE,
-                                time.monotonic(),
+                                getattr(final, "vad_end_at", None)
+                                or final.completed_at,
                                 output=voice_output,
                                 on_tts_started=_voice_tts_started,
                                 person_id=voice_person_id,
+                                voice_marks={
+                                    "asr_final_at": final.completed_at,
+                                    "identity_confirmed_at": time.monotonic(),
+                                },
                             )
                             continue
 
@@ -4535,22 +4591,37 @@ def _format_tts_metrics(metrics: dict) -> str:
             if number is not None:
                 rows.append((label, f"{number:.0f} ms"))
 
-        row("Router", "user_to_router_ms")
+        if metrics.get("is_voice"):
+            row("VAD end → ASR final", "vad_to_asr_ms")
+            row("ASR final → Identity", "asr_to_identity_ms")
+            row("Identity → Router", "identity_to_router_ms")
+        else:
+            row("Router", "user_to_router_ms")
         row("Preparation", "router_to_response_ms")
         row("Speaker first text", "response_to_first_text_ms")
-        row("First segment wait", "first_text_to_first_segment_ms")
+        row("First text → TTS connected", "first_text_to_tts_connected_ms")
         row("WebSocket handshake", "tts_connect_ms")
+        row("Connected → first segment", "tts_connected_to_first_segment_ms")
+        row("First text → first segment", "first_text_to_first_segment_ms")
         row("TTS first PCM", "first_segment_to_first_pcm_ms")
         row("Audio queue/playback", "first_pcm_to_write_ms")
         if not rows:
             # Router/preparation are absent (legacy path): show the combined
             # user→response_started phase instead of a blank section.
             row("Router/preparation", "user_to_response_started_ms")
-        totals = [
-            ("User → First text", "user_to_first_text_ms"),
-            ("User → First audio", "user_to_first_audio_ms"),
-            ("User → Text complete", "user_to_text_done_ms"),
-        ]
+        if metrics.get("is_voice"):
+            totals = [
+                ("VAD → First text", "user_to_first_text_ms"),
+                ("VAD → Audio queued", "user_to_first_audio_ms"),
+                ("VAD → First output", "vad_to_first_audio_played_ms"),
+                ("VAD → Text done", "user_to_text_done_ms"),
+            ]
+        else:
+            totals = [
+                ("User → First text", "user_to_first_text_ms"),
+                ("User → First audio", "user_to_first_audio_ms"),
+                ("User → Text complete", "user_to_text_done_ms"),
+            ]
         lines = ["Last response timing:"]
         for label, text in rows:
             lines.append(f"  {label + ':':<24}{text:>8}")
@@ -5169,6 +5240,7 @@ async def _run_streaming_turn(
     submitted_at: float | None = None,
     output=None,
     on_tts_started=None,
+    voice_marks: Optional[dict] = None,
 ) -> dict:
     """Render one turn from the real streaming API.
 
@@ -5257,13 +5329,26 @@ async def _run_streaming_turn(
                 saw_started = True
                 await _write("assistant> ")
                 if tts_manager is not None:
+                    stream_kwargs = {
+                        "submitted_at": origin,
+                        "router_completed_at": getattr(
+                            item, "router_completed_at", None
+                        ),
+                    }
+                    if voice_marks is not None:
+                        stream_kwargs.update({
+                            "event_id": event.event_id,
+                            "voice_asr_final_at": voice_marks.get(
+                                "asr_final_at"
+                            ),
+                            "voice_identity_confirmed_at": voice_marks.get(
+                                "identity_confirmed_at"
+                            ),
+                        })
                     tts_stream = tts_manager.start_stream(
                         item.response_id,
                         item.conversation_id,
-                        submitted_at=origin,
-                        router_completed_at=getattr(
-                            item, "router_completed_at", None
-                        ),
+                        **stream_kwargs,
                     )
                     tts_generation = (
                         tts_stream.generation
@@ -5438,6 +5523,7 @@ async def handle_user_message(
     turn_runner=None,
     event_id: Optional[str] = None,
     speaker_label: Optional[str] = None,
+    voice_marks: Optional[dict] = None,
 ) -> dict:
     """The only path from accepted user text to Ava's reply.
 
@@ -5476,6 +5562,11 @@ async def handle_user_message(
         submitted_at=submitted_at,
         output=output,
         on_tts_started=on_tts_started,
+        **(
+            {"voice_marks": voice_marks}
+            if voice_marks is not None
+            else {}
+        ),
     )
     if (
         manager is not None

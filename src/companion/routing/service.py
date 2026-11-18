@@ -71,6 +71,7 @@ class RoutingService:
         persist: bool = True,
         allow_tool_reads: bool = True,
     ) -> RoutingOutcome:
+        routing_started = time.monotonic()
         provider_calls = 0
         repo = self.repository if persist else None
         event_id = event.event_id
@@ -142,6 +143,26 @@ class RoutingService:
                 results.extend(new_results1)
             route = followup
 
+        routing_elapsed_ms = (time.monotonic() - routing_started) * 1000.0
+        self.logger.info(
+            "router_latency event_id=%s total_ms=%.1f initial_llm_ms=%.1f"
+            " followup_llm_ms=%.1f tool_execution_ms=%.1f"
+            " other_ms=%.1f provider_calls=%d followup_steps=%d"
+            " tool_calls=%d",
+            event_id,
+            routing_elapsed_ms,
+            router_llm_ms,
+            followup_ms,
+            tool_execution_ms,
+            max(
+                0.0,
+                routing_elapsed_ms - router_llm_ms
+                - followup_ms - tool_execution_ms,
+            ),
+            provider_calls,
+            planning_steps,
+            len(results),
+        )
         return RoutingOutcome(
             route=route,
             tool_results=results,
@@ -262,11 +283,19 @@ class RoutingService:
                     arguments_hash=ToolExecutor.arguments_hash(request),
                     execution_status="RUNNING",
                 )
+            tool_started = time.monotonic()
             result = await self.executor.execute_one(
                 request,
                 execution_context,
                 tool_call_id=row["tool_call_id"],
                 restored=True,
+            )
+            self.logger.info(
+                "router_tool_latency event_id=%s step=%d tool=%s"
+                " duration_ms=%.1f status=%s error_code=%s restored=true",
+                event_id, step_index, request.tool_name,
+                (time.monotonic() - tool_started) * 1000.0,
+                result.status.value, result.error_code or "-",
             )
             results.append(result)
             restored_requests.append(request)
@@ -293,8 +322,16 @@ class RoutingService:
                     arguments_hash=ToolExecutor.arguments_hash(request),
                     execution_status="RUNNING",
                 )
+            tool_started = time.monotonic()
             result = await self.executor.execute_one(
                 request, execution_context, tool_call_id=call_id
+            )
+            self.logger.info(
+                "router_tool_latency event_id=%s step=%d tool=%s"
+                " duration_ms=%.1f status=%s error_code=%s restored=false",
+                event_id, step_index, request.tool_name,
+                (time.monotonic() - tool_started) * 1000.0,
+                result.status.value, result.error_code or "-",
             )
             results.append(result)
             executed_requests.append(request)

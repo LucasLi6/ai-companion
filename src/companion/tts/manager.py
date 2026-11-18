@@ -21,6 +21,7 @@ No ``print()`` is called from these threads; errors are stored for
 from __future__ import annotations
 
 import dataclasses
+import logging
 import queue
 import threading
 import time
@@ -202,6 +203,7 @@ class TTSStream:
             config.segment_min_chars,
             config.segment_max_chars,
             long_fallback_chars=config.long_fallback_chars,
+            first_clause_chars=config.first_clause_chars,
         )
         self._condition = threading.Condition()
         self._pending: deque[str] = deque()
@@ -589,7 +591,7 @@ class TTSManager:
         self._queued_generation: Optional[int] = None
         self._status = "disabled"
         self._last_error: Optional[str] = None
-        self._timings: dict[int, dict[str, float]] = {}
+        self._timings: dict[int, dict[str, Any]] = {}
         self._last_finished_generation: Optional[int] = None
         self._active_stream: Optional[TTSStream] = None
         # generation -> (response_id, conversation_id) for playback notices.
@@ -1008,6 +1010,9 @@ class TTSManager:
         *,
         submitted_at: Optional[float] = None,
         router_completed_at: Optional[float] = None,
+        voice_asr_final_at: Optional[float] = None,
+        voice_identity_confirmed_at: Optional[float] = None,
+        event_id: Optional[str] = None,
     ) -> Optional[TTSStream]:
         """Begin one streaming TTS session for a reply (Phase B).
 
@@ -1032,8 +1037,16 @@ class TTSManager:
             }
             if submitted_at is not None:
                 timings["user_submitted_at"] = submitted_at
+            if event_id is not None:
+                timings["event_id"] = str(event_id)
             if router_completed_at is not None:
                 timings["router_completed_at"] = router_completed_at
+            if voice_asr_final_at is not None:
+                timings["voice_asr_final_at"] = voice_asr_final_at
+            if voice_identity_confirmed_at is not None:
+                timings["voice_identity_confirmed_at"] = (
+                    voice_identity_confirmed_at
+                )
             self._timings[generation] = timings
             self._playback_info[generation] = (
                 response_id,
@@ -1574,6 +1587,32 @@ class TTSManager:
                             "first_audio_played_at", time.monotonic()
                         )
                         self._status = "playing"
+                        trace = dict(timings)
+                    else:
+                        trace = {}
+                if trace.get("voice_asr_final_at") is not None:
+                    # Exactly one latency summary per audio generation. All
+                    # marks use monotonic time; never log recognized text.
+                    logging.getLogger("companion.latency").info(
+                        "voice_e2e_latency event_id=%s generation=%s"
+                        " vad_to_asr_ms=%s asr_to_identity_ms=%s"
+                        " identity_to_router_ms=%s router_to_response_ms=%s"
+                        " response_to_text_ms=%s text_to_segment_ms=%s"
+                        " tts_connect_ms=%s segment_to_pcm_ms=%s"
+                        " pcm_to_output_ms=%s vad_to_output_ms=%s",
+                        trace.get("event_id", "-"),
+                        generation,
+                        _ms(trace.get("user_submitted_at"), trace.get("voice_asr_final_at")),
+                        _ms(trace.get("voice_asr_final_at"), trace.get("voice_identity_confirmed_at")),
+                        _ms(trace.get("voice_identity_confirmed_at"), trace.get("router_completed_at")),
+                        _ms(trace.get("router_completed_at"), trace.get("response_started_at")),
+                        _ms(trace.get("response_started_at"), trace.get("first_text_at")),
+                        _ms(trace.get("first_text_at"), trace.get("first_segment_ready_at")),
+                        _ms(trace.get("tts_connect_started_at"), trace.get("tts_connect_finished_at")),
+                        _ms(trace.get("first_segment_sent_at"), trace.get("first_audio_received_at")),
+                        _ms(trace.get("first_audio_received_at"), trace.get("first_audio_played_at")),
+                        _ms(trace.get("user_submitted_at"), trace.get("first_audio_played_at")),
+                    )
                 first = False
 
     # ---------------------------------------------------------------- status
@@ -1642,23 +1681,37 @@ class TTSManager:
     def metrics(self, generation: Optional[int] = None) -> Optional[dict]:
         """Timing report for one reply, in ms.
 
-        Without an explicit ``generation`` this reports the most recently
-        finished reply; the CLI passes the reply's generation so text that
-        completed while audio is still pending is never confused with it.
+        Without an explicit ``generation``, prefer the newest generation
+        even while its playback is still pending. Reporting the previously
+        finished reply hid the latency of the user's latest voice turn.
         """
         with self._lock:
             if generation is None:
-                generation = self._last_finished_generation
-                if generation is None:
-                    if not self._timings:
-                        return None
-                    generation = max(self._timings)
+                if not self._timings:
+                    return None
+                generation = max(self._timings)
             timings = dict(self._timings.get(generation, {}))
         if not timings:
             return None
         user = timings.get("user_submitted_at")
         return {
             "generation": generation,
+            # Voice turns start at local VAD end, not after ASR and identity.
+            "is_voice": timings.get("voice_asr_final_at") is not None,
+            "vad_to_asr_ms": _ms(
+                user, timings.get("voice_asr_final_at")
+            ),
+            "asr_to_identity_ms": _ms(
+                timings.get("voice_asr_final_at"),
+                timings.get("voice_identity_confirmed_at"),
+            ),
+            "identity_to_router_ms": _ms(
+                timings.get("voice_identity_confirmed_at"),
+                timings.get("router_completed_at"),
+            ),
+            "vad_to_first_audio_played_ms": _ms(
+                user, timings.get("first_audio_played_at")
+            ) if timings.get("voice_asr_final_at") is not None else None,
             # Unified user-submit-relative marks (Phase B / CLI report).
             "user_to_router_ms": _ms(
                 user, timings.get("router_completed_at")
@@ -1689,6 +1742,22 @@ class TTSManager:
             ),
             "tts_connect_ms": _ms(
                 timings.get("tts_connect_started_at"),
+                timings.get("tts_connect_finished_at"),
+            ),
+            # The sender intentionally calls open_stream() BEFORE it drains
+            # segmenter text. Therefore first_text_to_first_segment_ms
+            # includes waiting for WebSocket handshake, not merely parser
+            # work. Separate the wait so users don't misdiagnose punctuation.
+            "first_text_to_tts_connected_ms": _ms(
+                timings.get("first_text_at"),
+                timings.get("tts_connect_finished_at"),
+            ),
+            "tts_connected_to_first_segment_ms": _ms(
+                timings.get("tts_connect_finished_at"),
+                timings.get("first_segment_ready_at"),
+            ),
+            "response_to_tts_connected_ms": _ms(
+                timings.get("response_started_at"),
                 timings.get("tts_connect_finished_at"),
             ),
             "first_segment_to_first_pcm_ms": _ms(

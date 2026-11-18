@@ -8,6 +8,7 @@ are never constructed here.
 from __future__ import annotations
 
 import io
+import logging
 import queue
 import threading
 import time
@@ -318,6 +319,36 @@ def test_partials_replace_each_other_and_final_commits_once() -> None:
         assert wait_for(lambda: renderer.confirmed == ["你好世界"])
         assert out.getvalue().count("你好世界") == 1
         assert renderer.partial_text == ""
+    finally:
+        running.stop()
+
+
+def test_asr_final_logs_local_upload_and_remote_completion_stages(caplog):
+    renderer, _out, _status = make_renderer(is_tty=False)
+    running = start(
+        [start_group(), end_group()],
+        [SessionScript(finals=[("您好", "s1")])],
+        renderer=renderer,
+        status=_status,
+    )
+    try:
+        with caplog.at_level(logging.INFO):
+            running.feed(2)
+            assert wait_for(lambda: renderer.confirmed == ["您好"])
+            assert wait_for(
+                lambda: any(
+                    "voice_asr_latency" in item.getMessage()
+                    for item in caplog.records
+                )
+            )
+        trace = [
+            item.getMessage() for item in caplog.records
+            if "voice_asr_latency" in item.getMessage()
+        ]
+        assert len(trace) == 1
+        assert "vad_to_input_closed_ms=" in trace[0]
+        assert "input_closed_to_server_done_ms=" in trace[0]
+        assert "server_done_to_final_ms=" in trace[0]
     finally:
         running.stop()
 
