@@ -279,6 +279,10 @@ class FinalUtterance:
     text: str
     completed_at: float
     speaker: Any = None
+    # Local VAD boundary, same monotonic clock as completed_at. This lets
+    # end-to-end voice latency include ASR finalization, which is otherwise
+    # invisible in the response/TTS timers. Older callers may omit it.
+    vad_end_at: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -2168,12 +2172,27 @@ class ASRManager:
             if not error:
                 # A failed recognition with confirmed fragments is never a
                 # normal user message: the application must not answer it.
+                completed_at = time.monotonic()
+                if utterance.vad_end_at is not None:
+                    self.logger.info(
+                        "voice_asr_latency uid=%s"
+                        " vad_to_asr_final_ms=%.1f"
+                        " session_open_ms=%s queued_audio_peak_bytes=%s",
+                        utterance.uid,
+                        max(
+                            0.0,
+                            (completed_at - utterance.vad_end_at) * 1000.0,
+                        ),
+                        utterance.open_latency_ms,
+                        utterance.max_queued_bytes,
+                    )
                 self._emit_final(
                     FinalUtterance(
                         utterance_id=utterance.uid,
                         text=merged,
-                        completed_at=time.monotonic(),
+                        completed_at=completed_at,
                         speaker=speaker,
+                        vad_end_at=utterance.vad_end_at,
                     )
                 )
         else:
