@@ -5327,22 +5327,26 @@ async def _run_streaming_turn(
                 saw_started = True
                 await _write("assistant> ")
                 if tts_manager is not None:
+                    stream_kwargs = {
+                        "submitted_at": origin,
+                        "router_completed_at": getattr(
+                            item, "router_completed_at", None
+                        ),
+                    }
+                    if voice_marks is not None:
+                        stream_kwargs.update({
+                            "event_id": event.event_id,
+                            "voice_asr_final_at": voice_marks.get(
+                                "asr_final_at"
+                            ),
+                            "voice_identity_confirmed_at": voice_marks.get(
+                                "identity_confirmed_at"
+                            ),
+                        })
                     tts_stream = tts_manager.start_stream(
                         item.response_id,
                         item.conversation_id,
-                        submitted_at=origin,
-                        router_completed_at=getattr(
-                            item, "router_completed_at", None
-                        ),
-                        event_id=event.event_id,
-                        voice_asr_final_at=(
-                            voice_marks.get("asr_final_at")
-                            if voice_marks else None
-                        ),
-                        voice_identity_confirmed_at=(
-                            voice_marks.get("identity_confirmed_at")
-                            if voice_marks else None
-                        ),
+                        **stream_kwargs,
                     )
                     tts_generation = (
                         tts_stream.generation
