@@ -329,11 +329,18 @@ def test_asr_final_logs_local_upload_and_remote_completion_stages(caplog):
         [start_group(), end_group()],
         [SessionScript(finals=[("您好", "s1")])],
         renderer=renderer,
+        status=_status,
     )
     try:
         with caplog.at_level(logging.INFO):
             running.feed(2)
             assert wait_for(lambda: renderer.confirmed == ["您好"])
+            assert wait_for(
+                lambda: any(
+                    "voice_asr_latency" in item.getMessage()
+                    for item in caplog.records
+                )
+            )
         trace = [
             item.getMessage() for item in caplog.records
             if "voice_asr_latency" in item.getMessage()
