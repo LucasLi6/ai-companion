@@ -5332,6 +5332,7 @@ async def _run_streaming_turn(
                         router_completed_at=getattr(
                             item, "router_completed_at", None
                         ),
+                        event_id=event.event_id,
                         voice_asr_final_at=(
                             voice_marks.get("asr_final_at")
                             if voice_marks else None
