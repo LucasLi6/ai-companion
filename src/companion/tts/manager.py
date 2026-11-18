@@ -1677,17 +1677,15 @@ class TTSManager:
     def metrics(self, generation: Optional[int] = None) -> Optional[dict]:
         """Timing report for one reply, in ms.
 
-        Without an explicit ``generation`` this reports the most recently
-        finished reply; the CLI passes the reply's generation so text that
-        completed while audio is still pending is never confused with it.
+        Without an explicit ``generation``, prefer the newest generation
+        even while its playback is still pending. Reporting the previously
+        finished reply hid the latency of the user's latest voice turn.
         """
         with self._lock:
             if generation is None:
-                generation = self._last_finished_generation
-                if generation is None:
-                    if not self._timings:
-                        return None
-                    generation = max(self._timings)
+                if not self._timings:
+                    return None
+                generation = max(self._timings)
             timings = dict(self._timings.get(generation, {}))
         if not timings:
             return None
