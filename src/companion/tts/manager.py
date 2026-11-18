@@ -202,6 +202,7 @@ class TTSStream:
             config.segment_min_chars,
             config.segment_max_chars,
             long_fallback_chars=config.long_fallback_chars,
+            first_clause_chars=config.first_clause_chars,
         )
         self._condition = threading.Condition()
         self._pending: deque[str] = deque()
