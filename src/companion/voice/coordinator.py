@@ -660,6 +660,20 @@ class VoiceCoordinator:
             (str(run_id), int(utterance_id))
         )
 
+    def speaker_utterance_diagnostic(
+        self, run_id: str, utterance_id: int
+    ) -> dict[str, Any]:
+        """Inspect a timed-out utterance without accepting another run."""
+        if self._run_id != str(run_id):
+            return {"reason": "mic_session_changed"}
+        getter = getattr(self._manager, "speaker_utterance_diagnostic", None)
+        if not callable(getter):
+            return {"reason": "diagnostic_unavailable"}
+        try:
+            return dict(getter(int(utterance_id)))
+        except Exception:
+            return {"reason": "diagnostic_unavailable"}
+
     def speaker_timings(self) -> dict[str, Any]:
         samples = list(self._speaker_wait_samples)
         waits = int(self._speaker_wait_stats["waits"])
