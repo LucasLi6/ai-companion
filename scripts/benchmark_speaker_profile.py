@@ -64,7 +64,7 @@ def summarise(samples: list[float]) -> dict:
     }
 
 
-def synthetic_vector(index: int, voices: int) -> np.ndarray:
+def synthetic_vector(index: int) -> np.ndarray:
     """Deterministic unit vector; identity-shaped, deliberately not speech."""
     vector = np.zeros(EMBEDDING_DIM, dtype=np.float32)
     vector[index % EMBEDDING_DIM] = 1.0
@@ -82,7 +82,7 @@ def seed_speakers(store: SpeakerStore, config, voices: int) -> list[str]:
         speaker_id = store.create_candidate()
         outcome = store.add_embedding(
             speaker_id,
-            synthetic_vector(index, voices),
+            synthetic_vector(index),
             quality=QUALITY_HIGH,
             voiced_seconds=2.0,
             model_id=model_key(config),
@@ -166,7 +166,7 @@ async def run(args) -> int:
             )
 
             vectors = [
-                synthetic_vector(index, args.voices)
+                synthetic_vector(index)
                 for index in range(args.voices)
             ]
             query = vectors[0]
