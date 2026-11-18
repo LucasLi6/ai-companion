@@ -598,6 +598,9 @@ class _Utterance:
         self.max_queued_bytes = 0
         self.last_server_event_at: Optional[float] = None
         self.last_audio_sent_at: Optional[float] = None
+        # Set by the sender thread after the final session.stop() returned.
+        # Helps distinguish local upload drain from remote ASR final delay.
+        self.input_closed_at: Optional[float] = None
 
 
 class ASRManager:
@@ -1546,8 +1549,9 @@ class ASRManager:
                         if callable(mark_last):
                             mark_last()
                         session.stop()
+                    utterance.input_closed_at = time.monotonic()
                     self._put_control(
-                        _InputClosed(utterance.uid, time.monotonic()),
+                        _InputClosed(utterance.uid, utterance.input_closed_at),
                         critical=True,
                     )
                     return
@@ -2177,11 +2181,47 @@ class ASRManager:
                     self.logger.info(
                         "voice_asr_latency uid=%s"
                         " vad_to_asr_final_ms=%.1f"
+                        " vad_to_input_closed_ms=%s"
+                        " input_closed_to_server_done_ms=%s"
+                        " server_done_to_final_ms=%s"
                         " session_open_ms=%s queued_audio_peak_bytes=%s",
                         utterance.uid,
                         max(
                             0.0,
                             (completed_at - utterance.vad_end_at) * 1000.0,
+                        ),
+                        (
+                            round(
+                                max(
+                                    0.0,
+                                    (utterance.input_closed_at -
+                                     utterance.vad_end_at) * 1000.0,
+                                ), 1,
+                            )
+                            if utterance.input_closed_at is not None else None
+                        ),
+                        (
+                            round(
+                                max(
+                                    0.0,
+                                    (utterance.session_done_at -
+                                     utterance.input_closed_at) * 1000.0,
+                                ), 1,
+                            )
+                            if (
+                                utterance.input_closed_at is not None
+                                and utterance.session_done_at is not None
+                            ) else None
+                        ),
+                        (
+                            round(
+                                max(
+                                    0.0,
+                                    (completed_at -
+                                     utterance.session_done_at) * 1000.0,
+                                ), 1,
+                            )
+                            if utterance.session_done_at is not None else None
                         ),
                         utterance.open_latency_ms,
                         utterance.max_queued_bytes,
