@@ -50,6 +50,7 @@ class TextSegmenter:
         min_chars: int = DEFAULT_MIN_CHARS,
         max_chars: int = DEFAULT_MAX_CHARS,
         long_fallback_chars: int = DEFAULT_LONG_FALLBACK_CHARS,
+        first_clause_chars: int = 0,
     ) -> None:
         # ``min_chars``/``max_chars`` are retained for API compatibility but no
         # longer act as normal force-cut thresholds. Sentence-first emission is
@@ -60,9 +61,12 @@ class TextSegmenter:
             raise ValueError("max_chars must be >= min_chars")
         if long_fallback_chars < 1:
             raise ValueError("long_fallback_chars must be >= 1")
+        if first_clause_chars < 0:
+            raise ValueError("first_clause_chars must be >= 0")
         self._min_chars = int(min_chars)
         self._max_chars = int(max_chars)
         self._long_fallback_chars = int(long_fallback_chars)
+        self._first_clause_chars = int(first_clause_chars)
         self._buffer = ""
         self._closed = False
         self._emitted = 0
@@ -161,6 +165,16 @@ class TextSegmenter:
 
             if char in _CLAUSE and self._clause_is_boundary(text, index):
                 last_soft_cut = index + 1
+                if (
+                    self._emitted == 0
+                    and self._first_clause_chars > 0
+                    and visible >= self._first_clause_chars
+                ):
+                    # Low-latency A/B mode: emit one reasonably long first
+                    # clause, then revert to normal sentence-first behavior.
+                    # Parsing already skips bracket tags, URLs, code fences,
+                    # and numeric punctuation before reaching this point.
+                    return index + 1
 
             if (
                 visible >= self._long_fallback_chars
