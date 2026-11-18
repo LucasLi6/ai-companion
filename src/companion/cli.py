@@ -4607,17 +4607,19 @@ def _format_tts_metrics(metrics: dict) -> str:
             # Router/preparation are absent (legacy path): show the combined
             # user→response_started phase instead of a blank section.
             row("Router/preparation", "user_to_response_started_ms")
-        totals = [
-            ("VAD → First text" if metrics.get("is_voice") else
-             "User → First text", "user_to_first_text_ms"),
-            ("VAD → Audio queued" if metrics.get("is_voice") else
-             "User → First audio", "user_to_first_audio_ms"),
-            ("VAD → First output" if metrics.get("is_voice") else
-             "User → Output", "vad_to_first_audio_played_ms"
-             if metrics.get("is_voice") else "user_to_first_audio_ms"),
-            ("VAD → Text done" if metrics.get("is_voice") else
-             "User → Text complete", "user_to_text_done_ms"),
-        ]
+        if metrics.get("is_voice"):
+            totals = [
+                ("VAD → First text", "user_to_first_text_ms"),
+                ("VAD → Audio queued", "user_to_first_audio_ms"),
+                ("VAD → First output", "vad_to_first_audio_played_ms"),
+                ("VAD → Text done", "user_to_text_done_ms"),
+            ]
+        else:
+            totals = [
+                ("User → First text", "user_to_first_text_ms"),
+                ("User → First audio", "user_to_first_audio_ms"),
+                ("User → Text complete", "user_to_text_done_ms"),
+            ]
         lines = ["Last response timing:"]
         for label, text in rows:
             lines.append(f"  {label + ':':<24}{text:>8}")
