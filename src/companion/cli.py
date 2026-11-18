@@ -2342,6 +2342,56 @@ async def cmd_repl(args) -> int:
                     audit=rt.repos.audit,
                 )
 
+            async def _canonicalize_stored_bindings() -> tuple[int, int]:
+                """Repair alias-only person bindings without guessing people.
+
+                Called at REPL startup and after explicit promotion. The
+                closure must be complete, and conflicting humans are refused.
+                Old alias rows in the voice store remain as history.
+                """
+                store = _identity_store()
+                if store is None or rt.speaker_bindings is None:
+                    return 0, 0
+                moved = refused = 0
+                try:
+                    rows = await rt.speaker_bindings.list_bindings()
+                except Exception:
+                    return 0, 1
+                seen: set[str] = set()
+                for binding in rows:
+                    original_id = str(binding["speaker_id"])
+                    try:
+                        closure = store.resolve_alias_closure(original_id)
+                        if closure.canonical is None or not closure.complete:
+                            refused += 1
+                            continue
+                        if closure.canonical in seen:
+                            continue
+                        seen.add(closure.canonical)
+                        moved += (
+                            await rt.speaker_bindings.canonicalize_alias_bindings(
+                                closure.canonical, list(closure.speaker_ids)
+                            )
+                        )
+                    except Exception:
+                        # Fail closed: never repair a binding from a partial or
+                        # conflicting alias set, and leave the old proof intact.
+                        refused += 1
+                return moved, refused
+
+            if voice_mode and speaker_mode != "off":
+                normalized, unresolved = await _canonicalize_stored_bindings()
+                if normalized:
+                    print(
+                        "speaker: normalized"
+                        f" {normalized} historical alias binding(s)"
+                    )
+                if unresolved:
+                    print(
+                        "speaker: some alias bindings need manual review"
+                        f" ({unresolved}); no unsafe merge performed"
+                    )
+
             coordinator = None
             voice_output = (
                 _PromptTurnOutput(repl_session)
@@ -2912,7 +2962,20 @@ async def cmd_repl(args) -> int:
                             )
                         )
                     return lines
+                if action == "normalize":
+                    if len(parts) != 2:
+                        return ["usage: /speaker normalize"]
+                    moved, refused = await _canonicalize_stored_bindings()
+                    return [
+                        f"canonicalized {moved} historical binding(s);"
+                        f" needs review={refused}"
+                    ]
                 if action == "list":
+                    if len(parts) > 3 or (
+                        len(parts) == 3 and parts[2] != "--aliases"
+                    ):
+                        return ["usage: /speaker list [--aliases]"]
+                    show_aliases = len(parts) == 3
                     store = _identity_store()
                     if store is None:
                         return ["speaker store unavailable"]
@@ -2956,13 +3019,14 @@ async def cmd_repl(args) -> int:
                         aliases = store.aliases()
                     except Exception:  # noqa: BLE001 - display only
                         aliases = []
-                    for row in aliases:
-                        lines.append(
-                            "alias: {} -> {}".format(
-                                row.get("alias_speaker_id"),
-                                row.get("canonical_speaker_id"),
+                    if show_aliases:
+                        for row in aliases:
+                            lines.append(
+                                "alias: {} -> {}".format(
+                                    row.get("alias_speaker_id"),
+                                    row.get("canonical_speaker_id"),
+                                )
                             )
-                        )
                     try:
                         grants = store.enrollment_consents()
                     except Exception:  # noqa: BLE001 - display only
@@ -3268,6 +3332,12 @@ async def cmd_repl(args) -> int:
                         _registration_signature = None
                         lines = [step.message, f"state={step.state}"]
                         if step.state == BOUND:
+                            moved, refused = await _canonicalize_stored_bindings()
+                            if refused:
+                                lines.append(
+                                    "alias binding review needed;"
+                                    " no unsafe merge performed"
+                                )
                             lines.append(
                                 "memory learning unchanged; try"
                                 f" /speaker profile {step.speaker_id}"
@@ -3456,14 +3526,17 @@ async def cmd_repl(args) -> int:
                                     " verified_by=local_cli_confirmation"
                                 ),
                             )
+                        moved, refused = await _canonicalize_stored_bindings()
                         lines = [
                             f"promoted voice profile {result.previous_id} ->"
                             f" {result.speaker_id} (KNOWN)",
-                            f"note: {result.previous_id} is now an alias of"
-                            f" {result.speaker_id}; existing bindings keep"
-                            " resolving.",
-                            "binding and consent unchanged. bind locally:"
-                            f" /speaker bind {result.speaker_id} <PERSON_ID>",
+                            f"note: historical alias {result.previous_id}"
+                            " remains internal for old references;",
+                            f" canonical bindings moved={moved}"
+                            f" review_required={refused}.",
+                            "existing person binding is preserved; if this"
+                            " is an unbound voice, use /speaker link"
+                            f" {result.speaker_id} <PERSON_ID>",
                         ]
                         return lines
                     if result.outcome == ALREADY_KNOWN:
