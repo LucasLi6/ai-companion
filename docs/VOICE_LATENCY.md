@@ -28,7 +28,7 @@ wait until Ava has spoken, then type:
 To read machine-readable per-turn traces in another terminal:
 
 ```bash
-grep -E 'voice_asr_latency|voice_gate_latency|voice_e2e_latency|action_saved|identity_decision' \
+grep -E 'voice_asr_latency|voice_gate_latency|router_latency|router_tool_latency|voice_e2e_latency|action_saved' \
   logs/voice-latency.log | tail -100
 ```
 
@@ -89,3 +89,27 @@ sounds natural. Keep 0 if quality deteriorates or there is no measurable gain.
 This instrumentation does not change Router choice, identity security
 thresholds, ASR provider, or DeepSeek. There is no claim that the model/network
 latency improved. The first-clause switch is an optional measured tradeoff.
+
+## Targeted diagnosis after a slow turn
+
+`router_latency` reports **initial LLM**, **follow-up LLM**,
+**tool execution** and **local/DB overhead** separately. For tool work,
+`router_tool_latency` logs each tool name, status, and duration, without
+storing search queries or response text.
+
+An `Identity → Router` measurement includes local preparation **before**
+RouterService, so it is not equivalent to `initial_llm_ms`. Pair the
+`voice_gate_latency event_id=...` and `router_latency event_id=...`
+records to find the same turn.
+
+`voice_asr_latency` now records
+`vad_to_input_closed_ms` (send-queue drain and local stop),
+`input_closed_to_server_done_ms` (server-side processing/network and
+client completion), and `server_done_to_final_ms` (local dispatch).
+They may be `None` when the server completes before the sender-side
+completion callback; this is not a missing-recognition error.
+
+Do not change the core Router, skip required tools, accept incomplete ASR,
+or force a particular timeout until repeated traces identify the expensive
+stage. In particular, a network search or second Router call can account
+for a high identity-to-router value.
