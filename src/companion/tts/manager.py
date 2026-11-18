@@ -591,7 +591,7 @@ class TTSManager:
         self._queued_generation: Optional[int] = None
         self._status = "disabled"
         self._last_error: Optional[str] = None
-        self._timings: dict[int, dict[str, float]] = {}
+        self._timings: dict[int, dict[str, Any]] = {}
         self._last_finished_generation: Optional[int] = None
         self._active_stream: Optional[TTSStream] = None
         # generation -> (response_id, conversation_id) for playback notices.
@@ -1012,6 +1012,7 @@ class TTSManager:
         router_completed_at: Optional[float] = None,
         voice_asr_final_at: Optional[float] = None,
         voice_identity_confirmed_at: Optional[float] = None,
+        event_id: Optional[str] = None,
     ) -> Optional[TTSStream]:
         """Begin one streaming TTS session for a reply (Phase B).
 
@@ -1036,6 +1037,8 @@ class TTSManager:
             }
             if submitted_at is not None:
                 timings["user_submitted_at"] = submitted_at
+            if event_id is not None:
+                timings["event_id"] = str(event_id)
             if router_completed_at is not None:
                 timings["router_completed_at"] = router_completed_at
             if voice_asr_final_at is not None:
@@ -1591,12 +1594,13 @@ class TTSManager:
                     # Exactly one latency summary per audio generation. All
                     # marks use monotonic time; never log recognized text.
                     logging.getLogger("companion.latency").info(
-                        "voice_e2e_latency generation=%s"
+                        "voice_e2e_latency event_id=%s generation=%s"
                         " vad_to_asr_ms=%s asr_to_identity_ms=%s"
                         " identity_to_router_ms=%s router_to_response_ms=%s"
                         " response_to_text_ms=%s text_to_segment_ms=%s"
                         " tts_connect_ms=%s segment_to_pcm_ms=%s"
                         " pcm_to_output_ms=%s vad_to_output_ms=%s",
+                        trace.get("event_id", "-"),
                         generation,
                         _ms(trace.get("user_submitted_at"), trace.get("voice_asr_final_at")),
                         _ms(trace.get("voice_asr_final_at"), trace.get("voice_identity_confirmed_at")),
