@@ -3736,6 +3736,30 @@ async def cmd_repl(args) -> int:
                 elif cmd == "/tts":
                     for output in _handle_tts_command(tts_manager, parts):
                         print(output)
+                elif cmd == "/latency":
+                    metrics = tts_manager.metrics()
+                    if metrics is None:
+                        print(
+                            "no TTS timing yet; speak one full reply first"
+                        )
+                    else:
+                        print(_format_tts_metrics(metrics))
+                    if coordinator is not None:
+                        identity_stats = coordinator.speaker_timings()
+                        print(
+                            "speaker wait: count={} timeouts={} p50={}ms"
+                            " p95={}ms".format(
+                                identity_stats.get("waits", 0),
+                                identity_stats.get("timeouts", 0),
+                                identity_stats.get("wait_p50_ms"),
+                                identity_stats.get("wait_p95_ms"),
+                            )
+                        )
+                    print(
+                        "automatic per-turn traces: logs/companion.log"
+                        " (voice_asr_latency / voice_gate_latency /"
+                        " voice_e2e_latency)"
+                    )
                 elif cmd == "/mic":
                     await _handle_mic_command(parts, voice_mode, coordinator)
                 elif cmd == "/speaker":
@@ -3785,6 +3809,7 @@ async def cmd_repl(args) -> int:
                     print(
                         "commands: /to agent|human|unknown  /quiet on|off"
                         "  /speech on|off  /tts on|off|stop|status"
+                        "  /latency"
                         "  /speaker list|status|bind|unbind|promote|enroll"
                         f"{voice_help}  /history  /status  /quit"
                     )
