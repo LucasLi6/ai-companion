@@ -507,9 +507,11 @@ def test_prompt_budget_is_bounded_and_labelled_as_an_estimate():
     # section. V0.9.9.27 adds the short/long break distinction inside the
     # continuity section. V0.9.9.29's response-v20 adds the
     # 【内部参考与说话主体】 section that keeps background reference data and
-    # other speakers out of the dialogue role. The ceiling moves with the base
-    # prompt; the per-section caps are unchanged and still bound the turn.
-    assert budget["total_tokens_estimate"] < 4300
+    # other speakers out of the dialogue role. V0.9.9.31's response-v21
+    # replaces the understanding section with the integrated 【交流的核心】
+    # guidance and retires the fixed-length rules. The ceiling moves with the
+    # base prompt; the per-section caps are unchanged and still bound the turn.
+    assert budget["total_tokens_estimate"] < 4600
 
 
 async def test_runtime_inspect_shows_metadata_without_conversation_text(

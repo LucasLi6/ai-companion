@@ -186,9 +186,11 @@ def test_persona_asset_carries_warmth_and_the_new_tone():
 
 
 def test_base_prompt_requires_a_single_paragraph_for_chat():
-    # V0.9.6 replaced the single-paragraph rule with a short-by-default rule;
+    # V0.9.9.31 replaced the fixed-length rule with a natural-length rule;
     # ordinary chat still never becomes a multi-section answer.
-    assert "默认一句话。" in BASE_RESPONSE_PROMPT
+    assert (
+        "日常交流倾向于简洁自然，但不固定回复长度。" in BASE_RESPONSE_PROMPT
+    )
     assert "不使用固定的“先回答、再解释、最后追问”结构。" in BASE_RESPONSE_PROMPT
     assert "不要把简单问题变成小型知识讲座。" in BASE_RESPONSE_PROMPT
     # Text input must never invent sensory or acoustic information.

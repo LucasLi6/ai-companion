@@ -10,13 +10,13 @@ Lifecycle per triggering turn:
         -> on_response_delivered()            (non-blocking)
         -> IMMEDIATE: judge once, right away
              (no fixed delay, no observation of Profile Review / Turn Analysis)
-        -> then a continuous, adaptive loop while the user stays silent:
+        -> then an adaptive loop while the user stays silent:
              LONG_IDLE round 1 after 20-40 s        (high activity)
-             LONG_IDLE round 2 after 45-90 s
-             LONG_IDLE round 3 after 2-5 min
-             later rounds after 5-10 min
-        -> the loop never stops by itself; only a new user turn, Quiet Mode,
-           revoked authorization, an explicit stop or shutdown ends it.
+             another round only if the human answered in between
+        -> by default one delivered LONG_IDLE message with no response ends
+           the cycle. ``AVA_PROACTIVE_MAX_UNANSWERED`` may raise (or disable,
+           with ``0``) that budget; a new user turn still ends the old cycle
+           and a later delivered reply starts a fresh one.
 
 Each round is a *judgment attempt*, not a forced send. The wait is measured
 from Ava's last **actually delivered** message (delivery is acknowledged by
@@ -64,8 +64,9 @@ ACTIVITY_LOW = "low"
 DEFAULT_ACTIVITY = ACTIVITY_HIGH
 ACTIVITY_ENV = "AVA_PROACTIVE_ACTIVITY"
 
-# (min, max) seconds per unanswered proactive round. The last entry repeats
-# forever: activity slows down but never stops.
+# (min, max) seconds per unanswered proactive round. The last entry is the
+# ceiling for later rounds; how many rounds actually run is decided by the
+# unanswered budget below.
 ACTIVITY_INTERVALS: dict[str, tuple[tuple[int, int], ...]] = {
     ACTIVITY_HIGH: (
         (20, 40),
@@ -93,10 +94,13 @@ MIN_IDLE_SECONDS = 120
 MAX_IDLE_SECONDS = 240
 
 # After this many delivered long-idle messages with no user response the
-# current cycle ends. The judge may answer "no" any number of times; only
-# messages that were really shown to the person count, and a genuine new user
-# turn starts a fresh cycle (``unanswered`` resets).
-DEFAULT_MAX_UNANSWERED_ROUNDS = 3
+# current cycle ends. One unanswered message is enough by default: Ava may
+# reach out once, then waits for the human instead of talking to an empty room.
+# The judge may answer "no" any number of times; only messages that were really
+# shown to the person count, and a genuine new user turn starts a fresh cycle
+# (``unanswered`` resets). ``AVA_PROACTIVE_MAX_UNANSWERED`` keeps an explicit
+# larger budget, and ``0`` still means "never stop for this reason".
+DEFAULT_MAX_UNANSWERED_ROUNDS = 1
 MAX_UNANSWERED_ENV = "AVA_PROACTIVE_MAX_UNANSWERED"
 
 
@@ -1134,7 +1138,9 @@ def _loop_time() -> float:
 def _load_max_unanswered(logger: logging.Logger) -> int:
     """Consecutive unanswered long-idle deliveries allowed per cycle.
 
-    ``0`` disables the budget (the pre-V0.9.9.27 behaviour). An invalid value
+    Defaults to one. ``0`` disables the budget (the pre-V0.9.9.27 behaviour).
+    An explicit value still overrides the default, so an existing
+    ``AVA_PROACTIVE_MAX_UNANSWERED=3`` keeps its old budget; an invalid value
     falls back to the default rather than stopping proactive messages.
     """
     raw = os.environ.get(MAX_UNANSWERED_ENV)

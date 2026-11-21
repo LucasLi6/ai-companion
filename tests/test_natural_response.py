@@ -90,7 +90,7 @@ def _system(ctx=None):
 
 def test_prompt_versions_are_bumped():
     assert COGNITIVE_PROMPT_VERSION == "cognitive-v9"
-    assert RESPONSE_PROMPT_VERSION == "response-v20"
+    assert RESPONSE_PROMPT_VERSION == "response-v21"
 
 
 def test_cognitive_prompt_requests_scene_proposal_but_keeps_action_local():
@@ -321,11 +321,12 @@ def test_response_prompt_renders_stances_not_style_examples():
 def test_response_prompt_forbids_fixed_replies_and_category_templates():
     assert "不使用固定的“先回答、再解释、最后追问”结构。" in RESPONSE_SYSTEM
     assert "但不要为了表现性格而刻意制造反应。" in RESPONSE_SYSTEM
-    assert "可以偶尔俏皮、小得意、嘴硬或者有些任性。" in RESPONSE_SYSTEM
+    assert "可以偶尔俏皮、小得意，或者有些任性。" in RESPONSE_SYSTEM
+    assert "幽默和嘴硬是自然的表达倾向，不是每轮需要执行的任务。" in RESPONSE_SYSTEM
 
 
 def test_response_prompt_forbids_forced_followup_questions():
-    assert "不要默认补充背景、解释原因、总结意义或提出建议。" in RESPONSE_SYSTEM
+    assert "不要把简单问题变成小型知识讲座。" in RESPONSE_SYSTEM
     assert "热情不是连续使用感叹号，不是不断夸奖，不是每轮都追问。" in RESPONSE_SYSTEM
     assert "一个自然的反应，比一段刻意热情的回复更好。" in RESPONSE_SYSTEM
     assert "不要每轮自我介绍" not in RESPONSE_SYSTEM
@@ -371,10 +372,9 @@ def test_response_prompt_has_no_hard_coded_persona_lines():
 
 
 def test_response_prompt_is_plain_text_only():
-    # V0.9.6 replaced the "one natural paragraph" rule with a length default:
-    # ordinary chat stays short, but a detailed request is allowed to expand.
+    # V0.9.9.31 removed the fixed sentence default: length follows what the
+    # exchange needs, and a detailed request is still allowed to expand.
     assert "像 Ava 自己一样，顺着这段交流，自然地说话。" in RESPONSE_SYSTEM
-    assert "默认一句话。" in RESPONSE_SYSTEM
-    assert "普通交流默认简短；复杂任务按实际需要调整长度。" in RESPONSE_SYSTEM
+    assert "日常交流倾向于简洁自然，但不固定回复长度。" in RESPONSE_SYSTEM
     assert "如果对方明确要求详细教程、解释、推导、代码或完整信息，" in RESPONSE_SYSTEM
-    assert "则根据任务需要充分展开，不能为了保持一句话而遗漏必要内容。" in RESPONSE_SYSTEM
+    assert "不能为了追求简短而遗漏必要内容。" in RESPONSE_SYSTEM

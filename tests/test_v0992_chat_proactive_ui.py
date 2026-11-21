@@ -812,8 +812,17 @@ async def test_mock_provider_has_no_proactive_manager_and_no_extra_call(chat):
 # -- T22-T25: lifecycle edges ---------------------------------------------
 
 
-async def test_continuous_judgments_never_duplicate_delivered_messages(chat):
-    """Continuous scheduling keeps judging, but rounds stay idempotent."""
+async def test_continuous_judgments_never_duplicate_delivered_messages(
+    chat, monkeypatch
+):
+    """Rounds stay idempotent while an explicit larger budget keeps judging.
+
+    V0.9.9.31 stops the cycle after one unanswered LONG_IDLE by default, so
+    this test raises the budget explicitly to keep observing further rounds.
+    """
+    from companion.proactive.manager import MAX_UNANSWERED_ENV
+
+    monkeypatch.setenv(MAX_UNANSWERED_ENV, "3")
     received, callback = _collector()
     coordinator, rt, client, judge = await chat(
         decisions=[True, True], idle_delay=0.02
