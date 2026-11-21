@@ -231,6 +231,7 @@ def _asr_config() -> ASRConfig:
         workspace_id="unit-test-workspace",
         timeout_seconds=2.0,
         final_timeout_seconds=1.0,
+        preconnect_enabled=False,
     )
 
 

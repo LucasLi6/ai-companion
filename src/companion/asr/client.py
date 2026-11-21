@@ -36,9 +36,12 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 from companion.asr.config import ASRConfig, default_max_sentence_silence_ms
+
+if TYPE_CHECKING:  # avoids a runtime import cycle with warm_connection.py
+    from companion.asr.warm_connection import WarmConnectionLease
 
 # ------------------------------------------------------------------ session state
 STATE_CREATED = "CREATED"
@@ -422,9 +425,15 @@ class ASRSession:
         *,
         client_factory: Optional[Callable[[ASRConfig], Any]] = None,
         logger: Optional[logging.Logger] = None,
+        warm_lease: Optional["WarmConnectionLease"] = None,
     ) -> None:
         self._config = config
         self._client_factory = client_factory or _default_client_factory
+        # A warm lease carries an already-open transport owned by the
+        # ASRWarmConnectionManager: this session must detach its own
+        # recognition task on close and return the lease instead of closing
+        # the shared client/socket.
+        self._warm_lease: Optional["WarmConnectionLease"] = warm_lease
         self._client: Any = None
         self._recognition: Any = None
         self._lock = threading.RLock()
@@ -468,21 +477,34 @@ class ASRSession:
             self._state = STATE_CONNECTING
         self._log("session_connect_start")
         try:
-            client = self._client_factory(self._config)
+            lease = self._warm_lease
+            if lease is not None:
+                # The handshake already happened in the background manager.
+                # ``recognize(connection=...)`` only runs this turn's task on
+                # that socket; the transport stays owned by the lease.
+                client = lease.client
+                connection = lease.connection
+            else:
+                client = self._client_factory(self._config)
+                connection = None
             # ``recognize()`` has no documented per-stream timeout parameter in
             # dashscope 2.x: an unknown ``timeout`` would be forwarded as an
             # opaque websocket request parameter (not a client deadline).
             # Connection timing is bounded by the Client's own timeout; the
             # stream/final deadlines are owned by ASRManager
             # (stream_idle/final_timeout_seconds), where they are observable.
-            recognition = client.audio.asr.recognize(
-                model=self._config.model,
-                format="pcm",
-                sample_rate=self._config.sample_rate,
-                disfluency_removal_enabled=False,
-                parameters=_build_recognition_parameters(self._config),
-            )
-            self._client = client
+            recognize_kwargs: dict[str, Any] = {
+                "model": self._config.model,
+                "format": "pcm",
+                "sample_rate": self._config.sample_rate,
+                "disfluency_removal_enabled": False,
+                "parameters": _build_recognition_parameters(self._config),
+            }
+            if connection is not None:
+                recognize_kwargs["connection"] = connection
+            recognition = client.audio.asr.recognize(**recognize_kwargs)
+            # A warm session never owns the client/connection.
+            self._client = None if lease is not None else client
             self._recognition = recognition
             recognition.start()
             self.request_id = (
@@ -639,16 +661,28 @@ class ASRSession:
         with self._lock:
             if self._state == STATE_CLOSED:
                 return
+            # A shared transport may only be reused after the provider
+            # confirmed task-finished; anything else (failure, timeout,
+            # cancel, partial input) leaves the socket in an unknown state.
+            warm_reusable = self._state == STATE_TASK_FINISHED
             if self.close_origin is None:
                 self.close_origin = origin
             self._state = STATE_CLOSED
             recognition, self._recognition = self._recognition, None
             client, self._client = self._client, None
+            warm_lease, self._warm_lease = self._warm_lease, None
         self._log("close_requested")
         if recognition is not None:
             try:
+                # With a shared connection this detaches only this turn's
+                # task; the websocket remains open for the lease.
                 recognition.close()
             except Exception:  # noqa: BLE001 - best effort
+                pass
+        if warm_lease is not None:
+            try:
+                warm_lease.release(healthy=warm_reusable)
+            except Exception:  # noqa: BLE001 - teardown must not raise
                 pass
         if client is not None:
             try:

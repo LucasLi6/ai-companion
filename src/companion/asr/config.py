@@ -77,6 +77,17 @@ DEFAULT_RENDER_QUEUE_EVENTS = 1024
 # One handshake plus a long utterance should never grow memory without bound.
 DEFAULT_MAX_UTTERANCE_SECONDS = 120
 
+# V0.9.9.33: while Ava is listening, open the ASR websocket in the background
+# so the handshake is not paid after the person starts speaking. Only the
+# transport is preconnected; no recognition task runs until real speech.
+# ``AVA_ASR_PRECONNECT_ENABLED=false`` restores the exact per-turn cold path.
+PRECONNECT_ENABLED_ENV = "AVA_ASR_PRECONNECT_ENABLED"
+DEFAULT_PRECONNECT_ENABLED = True
+# An idle socket is replaced after this long. The provider closes silent
+# connections on its own, so the client must not hand out a stale one.
+WARM_IDLE_TTL_ENV = "AVA_ASR_WARM_IDLE_TTL_SECONDS"
+DEFAULT_WARM_IDLE_TTL_SECONDS = 45.0
+
 
 class ASRError(Exception):
     """Base failure for the independent ASR demo."""
@@ -123,6 +134,10 @@ class ASRConfig:
     # official default for this model" (streaming 800, legacy message 1500);
     # ``load_asr_config`` always fills an explicit, validated value.
     max_sentence_silence_ms: Optional[int] = None
+    # Background transport preconnect. Disabling it only changes how the
+    # websocket is obtained; recognition, events and finalization are the same.
+    preconnect_enabled: bool = DEFAULT_PRECONNECT_ENABLED
+    warm_idle_ttl_seconds: float = DEFAULT_WARM_IDLE_TTL_SECONDS
     debug: bool = False
 
     def __post_init__(self) -> None:
@@ -225,6 +240,19 @@ def _int_env(
     return value
 
 
+def _bool_env(
+    env: Mapping[str, str],
+    name: str,
+    default: bool,
+) -> bool:
+    raw = _env(env, name, "true" if default else "false").lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ASRConfigError(f"{name} 必须是 true 或 false。")
+
+
 def _float_env(
     env: Mapping[str, str],
     name: str,
@@ -319,6 +347,15 @@ def load_asr_config(
         env, "AVA_ASR_MAX_SESSIONS",
         DEFAULT_MAX_CONCURRENT_SESSIONS, minimum=1,
     )
+    preconnect_enabled = _bool_env(
+        env, PRECONNECT_ENABLED_ENV, DEFAULT_PRECONNECT_ENABLED
+    )
+    warm_idle_ttl_seconds = _float_env(
+        env,
+        WARM_IDLE_TTL_ENV,
+        DEFAULT_WARM_IDLE_TTL_SECONDS,
+        minimum=0.0,
+    )
 
     chosen_device = (
         device if device is not None else _env(env, "AVA_ASR_DEVICE", "")
@@ -340,6 +377,8 @@ def load_asr_config(
         stream_idle_timeout_seconds=stream_idle_timeout_seconds,
         max_concurrent_sessions=max_concurrent,
         max_sentence_silence_ms=max_sentence_silence_ms,
+        preconnect_enabled=preconnect_enabled,
+        warm_idle_ttl_seconds=warm_idle_ttl_seconds,
         debug=debug,
     )
 
@@ -359,19 +398,23 @@ __all__ = [
     "DEFAULT_MESSAGE_MAX_SENTENCE_SILENCE_MS",
     "DEFAULT_MIN_SPEECH_MS",
     "DEFAULT_MODEL",
+    "DEFAULT_PRECONNECT_ENABLED",
     "DEFAULT_PRE_ROLL_MS",
     "DEFAULT_REGION",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_VAD_THRESHOLD",
+    "DEFAULT_WARM_IDLE_TTL_SECONDS",
     "ENV_FILE_OVERRIDE",
     "LEGACY_MESSAGE_MODEL",
     "MAX_SENTENCE_SILENCE_ENV",
     "MAX_SENTENCE_SILENCE_MAX_MS",
     "MAX_SENTENCE_SILENCE_MIN_MS",
+    "PRECONNECT_ENABLED_ENV",
     "SAMPLE_RATE",
     "SAMPLE_WIDTH",
     "VAD_WINDOW_MS",
     "VAD_WINDOW_SAMPLES",
+    "WARM_IDLE_TTL_ENV",
     "default_max_sentence_silence_ms",
     "load_asr_config",
     "load_local_env",
