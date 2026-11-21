@@ -1,11 +1,12 @@
 """V0.9.9.8: one priority frame for the Speaker, no router prose in it.
 
-The Speaker prompt keeps every original section and sentence; the sections are
-reordered so understanding comes before expression, and one 【交流理解与取舍】
-section states how facts, persona, relationship, current intent and style are
-weighed. The router still analyses everything, but its natural-language
-``reason`` stays in the decision record and audit row instead of being handed
-to the Speaker as guidance for what to say.
+The Speaker prompt keeps every original section and sentence unless V0.9.9.31
+deliberately retired it; the sections are reordered so understanding comes
+before expression, and one 【交流的核心】 section states how facts, persona,
+relationship, current intent and style are weighed. The router still analyses
+everything, but its natural-language ``reason`` stays in the decision record
+and audit row instead of being handed to the Speaker as guidance for what to
+say.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ ORIGINAL_V18 = (
 ).read_text()
 
 SECTION_ORDER = (
-    "【交流理解与取舍】",
+    "【交流的核心】",
     "【交流连续性】",
     "【相处方式】",
     "【热情与个性】",
@@ -44,6 +45,26 @@ SECTION_ORDER = (
     "【信息消化】",
     "【理性与真实】",
     "【交流边界】",
+)
+
+# V0.9.9.31 deliberately replaced the fixed-length wording. These lines must be
+# gone, and their replacements are asserted below; every other V18 line is
+# still required to survive verbatim.
+RETIRED_V21_LINES = frozenset(
+    {
+        "默认一句话。",
+        "先说最想说、最值得说的那一点，说完就停。",
+        "普通交流默认简短；复杂任务按实际需要调整长度。",
+        "则根据任务需要充分展开，不能为了保持一句话而遗漏必要内容。",
+        "可以偶尔俏皮、小得意、嘴硬或者有些任性。",
+        # V0.9.9.31 also retires the repeated "stay brief / skip explanation"
+        # wording; the same intent now lives once in 【交流的核心】 and
+        # 【说话方式】 instead of being restated in three sections.
+        "不需要每次都认真解释，也不需要永远表现得体贴周到。",
+        "有时候一句随口的反应、一个奇怪的联想，甚至半句话，就足够了。",
+        "不要默认补充背景、解释原因、总结意义或提出建议。",
+        "也不需要每次都正面回答所有细节。",
+    }
 )
 
 
@@ -78,7 +99,7 @@ def _background(messages):
 
 
 def test_prompt_version_reflects_the_reorganisation():
-    assert RESPONSE_PROMPT_VERSION == "response-v20"
+    assert RESPONSE_PROMPT_VERSION == "response-v21"
 
 
 def test_sections_follow_understanding_then_expression_order():
@@ -94,23 +115,41 @@ def test_every_original_line_is_still_present():
     missing = [
         line
         for line in ORIGINAL_V18.splitlines()
-        if line.strip() and line not in BASE_RESPONSE_PROMPT
+        if line.strip()
+        and line not in RETIRED_V21_LINES
+        and line not in BASE_RESPONSE_PROMPT
     ]
     assert missing == []
+    # A retired line must really be gone; otherwise the exclusion list would
+    # silently hide a forgotten duplicate.
+    for line in RETIRED_V21_LINES:
+        assert line not in BASE_RESPONSE_PROMPT
+
+
+def test_fixed_length_rules_are_replaced_by_natural_length_guidance():
+    for phrase in (
+        "日常交流倾向于简洁自然，但不固定回复长度。",
+        "交流值得深入时，可以自然展开观点、理由与思考",
+        "轻松闲聊时，一句随口的回应也可以足够。",
+        "不为了简短而省略真正有意义的内容",
+        "回复长度取决于你实际想表达的内容，而不是固定的字数或句数。",
+        "不能为了追求简短而遗漏必要内容。",
+    ):
+        assert phrase in BASE_RESPONSE_PROMPT
 
 
 def test_original_blocks_are_not_only_lines_but_coherent_sections():
     for header in SECTION_ORDER[1:]:
         assert BASE_RESPONSE_PROMPT.count(header) == 1
     # The new section is added once, after the intro.
-    assert BASE_RESPONSE_PROMPT.count("【交流理解与取舍】") == 1
-    assert BASE_RESPONSE_PROMPT.index("【交流理解与取舍】") < BASE_RESPONSE_PROMPT.index(
+    assert BASE_RESPONSE_PROMPT.count("【交流的核心】") == 1
+    assert BASE_RESPONSE_PROMPT.index("【交流的核心】") < BASE_RESPONSE_PROMPT.index(
         "【交流连续性】"
     )
 
 
 def test_shared_principle_covers_understanding_priority_and_non_obedience():
-    section = BASE_RESPONSE_PROMPT.split("【交流理解与取舍】", 1)[1]
+    section = BASE_RESPONSE_PROMPT.split("【交流的核心】", 1)[1]
     section = section.split("【交流连续性】", 1)[0]
     for phrase in (
         "结合对方当前的话与最近的真实对话，理解这句话的含义、指代、交流意图",
@@ -169,9 +208,12 @@ def test_compiler_precedence_remains_internal_and_compatible_with_the_prompt():
 def test_original_behavioral_capabilities_survive():
     for phrase in (
         "你可以接梗、轻轻吐槽、反问、卖关子，偶尔有点嘴硬。",
-        "不需要每次都认真解释，也不需要永远表现得体贴周到。",
         "不追求每句话都像书面语一样完整。",
-        "不能为了保持一句话而遗漏必要内容。",
+        "不能为了追求简短而遗漏必要内容。",
+        "幽默和嘴硬是自然的表达倾向，不是每轮需要执行的任务。",
+        "对方已经拒绝某种玩笑后，不要换一种措辞继续重复。",
+        "过去的记忆有助于理解对方，但不应限制当前话题。",
+        "不需要每个话题都与对方以前的项目、兴趣或经历相关。",
         "例如25.4°C可以自然说成“二十五度左右”。",
         "如果对方只是随口询问天气，通常不需要同时报出温度、湿度、风速和降水概率。",
         "如果对方询问一件新闻，通常先说发生了什么",

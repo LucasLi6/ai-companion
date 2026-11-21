@@ -134,14 +134,20 @@ async def test_exactly_one_model_call_per_generation():
 
 
 def test_prompt_version_is_v15():
-    assert RESPONSE_PROMPT_VERSION == "response-v20"
+    assert RESPONSE_PROMPT_VERSION == "response-v21"
 
 
 def test_base_prompt_has_generation_goal_and_stopping_rule():
-    # V0.9.6 rewrote the base prompt around short, spoken turns.
+    # V0.9.9.31 replaced the fixed "one sentence" rule with a length chosen
+    # from what the exchange actually needs.
     assert "【说话方式】" in BASE_RESPONSE_PROMPT
-    assert "先说最想说、最值得说的那一点，说完就停。" in BASE_RESPONSE_PROMPT
-    assert "默认一句话。" in BASE_RESPONSE_PROMPT
+    assert (
+        "日常交流倾向于简洁自然，但不固定回复长度。" in BASE_RESPONSE_PROMPT
+    )
+    assert (
+        "回复长度取决于你实际想表达的内容，而不是固定的字数或句数。"
+        in BASE_RESPONSE_PROMPT
+    )
     assert "像 Ava 自己一样，顺着这段交流，自然地说话。" in BASE_RESPONSE_PROMPT
 
 
@@ -150,7 +156,8 @@ def test_speaking_style_is_one_unified_block_not_mode_switched():
 
     assert "【说话方式】" in system
     assert "可以使用自然的短句、省略、停顿和不完整表达。" in system
-    assert "不要默认补充背景、解释原因、总结意义或提出建议。" in system
+    assert "不要把简单问题变成小型知识讲座。" in system
+    assert "不使用固定的“先回答、再解释、最后追问”结构。" in system
     # No per-turn SOCIAL/TASK strategy is injected any more.
     assert "【当前交流模式：SOCIAL】" not in system
     assert "【当前交流模式：TASK】" not in system
@@ -158,11 +165,14 @@ def test_speaking_style_is_one_unified_block_not_mode_switched():
 
 
 def test_length_is_guidance_not_a_hard_cap():
-    # V0.9.6: ordinary chat defaults to one sentence; detailed requests expand
-    # as needed. There is still no character-count cap.
-    assert "默认一句话。" in BASE_RESPONSE_PROMPT
-    assert "普通交流默认简短；复杂任务按实际需要调整长度。" in BASE_RESPONSE_PROMPT
+    # V0.9.9.31: there is no fixed sentence count; detailed requests still
+    # expand as needed. There is still no character-count cap.
+    assert (
+        "日常交流倾向于简洁自然，但不固定回复长度。" in BASE_RESPONSE_PROMPT
+    )
+    assert "轻松闲聊时，一句随口的回应也可以足够。" in BASE_RESPONSE_PROMPT
     assert "如果对方明确要求详细教程、解释、推导、代码或完整信息，" in BASE_RESPONSE_PROMPT
+    assert "不能为了追求简短而遗漏必要内容。" in BASE_RESPONSE_PROMPT
 
 
 def test_style_examples_are_not_injected():

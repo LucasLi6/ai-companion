@@ -334,7 +334,14 @@ async def test_second_long_idle_round_can_still_deliver(db):
 
 
 # --------------------------------------- multiple persisted rounds, no crash (3)
-async def test_multiple_rounds_persist_with_distinct_storage_modes(db):
+async def test_multiple_rounds_persist_with_distinct_storage_modes(
+    db, monkeypatch
+):
+    # V0.9.9.31 defaults the unanswered budget to one. This test still covers
+    # distinct storage modes for a user who explicitly raises the budget.
+    from companion.proactive.manager import MAX_UNANSWERED_ENV
+
+    monkeypatch.setenv(MAX_UNANSWERED_ENV, "3")
     rt = await _runtime(db)
     person = await _person(rt)
     event = await _delivered_turn(rt, person)
@@ -533,6 +540,34 @@ def test_activity_profiles_slow_down_but_never_stop():
         assert low_bound <= delay <= high_bound
 
     assert ACTIVITY_INTERVALS[ACTIVITY_LOW][-1] == (600, 900)
+
+
+def test_default_unanswered_budget_is_one_and_env_can_override(
+    monkeypatch,
+):
+    from companion.proactive.manager import (
+        DEFAULT_MAX_UNANSWERED_ROUNDS,
+        MAX_UNANSWERED_ENV,
+    )
+
+    def manager():
+        return ProactiveManager(
+            repos=None,
+            registry=None,
+            conversations=None,
+            orchestrator=None,
+            judge=None,
+        )
+
+    monkeypatch.delenv(MAX_UNANSWERED_ENV, raising=False)
+    assert DEFAULT_MAX_UNANSWERED_ROUNDS == 1
+    assert manager().max_unanswered_rounds == 1
+    # An explicit user setting is still respected.
+    monkeypatch.setenv(MAX_UNANSWERED_ENV, "3")
+    assert manager().max_unanswered_rounds == 3
+    # 0 keeps its existing meaning: no unanswered budget at all.
+    monkeypatch.setenv(MAX_UNANSWERED_ENV, "0")
+    assert manager().max_unanswered_rounds == 0
 
 
 def test_invalid_activity_falls_back_to_high(monkeypatch):

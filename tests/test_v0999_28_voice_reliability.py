@@ -993,12 +993,50 @@ def test_dedupe_status_semantics() -> None:
     ) is False
 
 
-async def test_three_unanswered_long_idle_deliveries_stop_the_cycle(db) -> None:
+async def test_default_unanswered_budget_stops_after_one_long_idle(
+    db, monkeypatch
+) -> None:
+    """V0.9.9.31: one unanswered LONG_IDLE message ends the cycle by default."""
+    from companion.proactive.manager import MAX_UNANSWERED_ENV
+
+    monkeypatch.delenv(MAX_UNANSWERED_ENV, raising=False)
     rt = await proactive_tests._runtime(db)
     person = await proactive_tests._person(rt)
     event = await proactive_tests._delivered_turn(rt, person)
     provider = proactive_tests._scripted(rt.proactive_manager, [True] * 6)
     manager = rt.proactive_manager
+    assert manager.max_unanswered_rounds == 1
+    try:
+        await proactive_tests._start_cycle(rt, person, event)
+        immediate = await asyncio.wait_for(manager.next_event(), 2)
+        assert await _ack(manager, immediate) is True
+        long_idle = await asyncio.wait_for(manager.next_event(), 2)
+        assert await _ack(manager, long_idle) is True
+        state = manager._states["c1"]
+        assert state.unanswered == 1
+        await proactive_tests._wait_for(lambda: state.task is None, timeout=2.0)
+        # The immediate remark plus exactly one unanswered long-idle message.
+        assert len(provider.payloads) == 2
+        rows = await rt.repos.proactive.list_for_conversation("c1")
+        assert len(rows) == 2
+        assert all(row.status == "COMPLETED" for row in rows)
+    finally:
+        await manager.shutdown()
+
+
+async def test_explicit_env_still_allows_three_unanswered_rounds(
+    db, monkeypatch
+) -> None:
+    """An explicit AVA_PROACTIVE_MAX_UNANSWERED=3 keeps the old budget."""
+    from companion.proactive.manager import MAX_UNANSWERED_ENV
+
+    monkeypatch.setenv(MAX_UNANSWERED_ENV, "3")
+    rt = await proactive_tests._runtime(db)
+    person = await proactive_tests._person(rt)
+    event = await proactive_tests._delivered_turn(rt, person)
+    provider = proactive_tests._scripted(rt.proactive_manager, [True] * 6)
+    manager = rt.proactive_manager
+    assert manager.max_unanswered_rounds == 3
     try:
         await proactive_tests._start_cycle(rt, person, event)
         for _ in range(4):
@@ -1012,6 +1050,43 @@ async def test_three_unanswered_long_idle_deliveries_stop_the_cycle(db) -> None:
         rows = await rt.repos.proactive.list_for_conversation("c1")
         assert len(rows) == 4
         assert all(row.status == "COMPLETED" for row in rows)
+    finally:
+        await manager.shutdown()
+
+
+async def test_new_user_turn_starts_a_fresh_unanswered_cycle(
+    db, monkeypatch
+) -> None:
+    from companion.proactive.manager import MAX_UNANSWERED_ENV
+
+    monkeypatch.delenv(MAX_UNANSWERED_ENV, raising=False)
+    rt = await proactive_tests._runtime(db)
+    person = await proactive_tests._person(rt)
+    event = await proactive_tests._delivered_turn(rt, person)
+    proactive_tests._scripted(rt.proactive_manager, [True] * 4)
+    manager = rt.proactive_manager
+    try:
+        await proactive_tests._start_cycle(rt, person, event)
+        immediate = await asyncio.wait_for(manager.next_event(), 2)
+        assert await _ack(manager, immediate) is True
+        long_idle = await asyncio.wait_for(manager.next_event(), 2)
+        assert await _ack(manager, long_idle) is True
+        state = manager._states["c1"]
+        await proactive_tests._wait_for(lambda: state.task is None, timeout=2.0)
+
+        # The human comes back; a new delivered turn starts a fresh budget.
+        again = await proactive_tests._delivered_turn(
+            rt, person, text="我回来了", conversation="c1"
+        )
+        manager.note_user_input("c1", again.event_id)
+        proactive_tests._scripted(manager, [True, True])
+        await proactive_tests._start_cycle(rt, person, again)
+        assert state.unanswered == 0
+        immediate2 = await asyncio.wait_for(manager.next_event(), 2)
+        assert await _ack(manager, immediate2) is True
+        long_idle2 = await asyncio.wait_for(manager.next_event(), 2)
+        assert await _ack(manager, long_idle2) is True
+        assert state.unanswered == 1
     finally:
         await manager.shutdown()
 

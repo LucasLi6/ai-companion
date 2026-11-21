@@ -70,7 +70,7 @@ def _context(**overrides):
 
 
 def test_prompt_version_and_alias_are_preserved():
-    assert RESPONSE_PROMPT_VERSION == "response-v20"
+    assert RESPONSE_PROMPT_VERSION == "response-v21"
     assert SYSTEM_PROMPT is BASE_RESPONSE_PROMPT
 
 
@@ -88,11 +88,13 @@ def test_base_prompt_carries_the_v096_sections():
 
 
 def test_base_prompt_is_short_and_spoken_by_default():
-    assert "默认一句话。" in BASE_RESPONSE_PROMPT
-    assert "先说最想说、最值得说的那一点，说完就停。" in BASE_RESPONSE_PROMPT
+    # V0.9.9.31: conversational by default, but no fixed sentence count.
+    assert (
+        "日常交流倾向于简洁自然，但不固定回复长度。" in BASE_RESPONSE_PROMPT
+    )
     assert "可以使用自然的短句、省略、停顿和不完整表达。" in BASE_RESPONSE_PROMPT
     # A detailed request still wins over brevity.
-    assert "不能为了保持一句话而遗漏必要内容。" in BASE_RESPONSE_PROMPT
+    assert "不能为了追求简短而遗漏必要内容。" in BASE_RESPONSE_PROMPT
 
 
 def test_base_prompt_digests_information_instead_of_reciting_fields():
