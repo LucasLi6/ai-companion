@@ -21,12 +21,28 @@ DASHSCOPE_WORKSPACE_ENV = "DASHSCOPE_WORKSPACE_ID"
 DEFAULT_ENV_FILE = ".env"
 ENV_FILE_OVERRIDE = "AVA_ENV_FILE"
 
-# V0.9.9.18 specifies this streaming model. The installed DashScope 2.0.4
-# resource API (client.audio.asr.recognize) is the verified streaming entry
-# point; the model name can be overridden with AVA_ASR_MODEL without touching
-# code if the account exposes a different streaming model.
-DEFAULT_MODEL = "qwen-audio-3.1-asr-flash-message"
+# V0.9.9.32 defaults to the streaming model: provisional results arrive while
+# the person is still speaking instead of only after a whole sentence is
+# uploaded. The installed DashScope 2.0.4 resource API
+# (client.audio.asr.recognize) is the verified streaming entry point; the model
+# name can be overridden with AVA_ASR_MODEL without touching code, and the
+# legacy sentence-buffered model still works through the same call.
+DEFAULT_MODEL = "qwen-audio-3.1-asr-flash-streaming"
+# Kept for explicit selection via AVA_ASR_MODEL; it buffers a whole sentence
+# before returning text and therefore shows no partial while speaking.
+LEGACY_MESSAGE_MODEL = "qwen-audio-3.1-asr-flash-message"
 DEFAULT_REGION = "cn-beijing"
+
+# Server-side sentence silence: how long the provider waits after speech
+# before it closes a sentence. This is *not* the local VAD end-silence
+# (AVA_ASR_END_SILENCE_MS) and does not replace the final confirmation.
+# 800 ms is the streaming model's official default; the legacy sentence-
+# buffered model keeps its documented 1500 ms.
+MAX_SENTENCE_SILENCE_ENV = "AVA_ASR_MAX_SENTENCE_SILENCE_MS"
+DEFAULT_MAX_SENTENCE_SILENCE_MS = 800
+DEFAULT_MESSAGE_MAX_SENTENCE_SILENCE_MS = 1500
+MAX_SENTENCE_SILENCE_MIN_MS = 200
+MAX_SENTENCE_SILENCE_MAX_MS = 6000
 
 # Qwen streaming ASR receives 16 kHz, mono, signed 16-bit little-endian PCM.
 SAMPLE_RATE = 16000
@@ -70,6 +86,19 @@ class ASRConfigError(ASRError):
     """Missing or invalid configuration (message is safe to display)."""
 
 
+def default_max_sentence_silence_ms(model: str) -> int:
+    """Provider-side sentence-silence default for *model*.
+
+    The legacy ``*-flash-message`` model documents 1500 ms; every streaming
+    model keeps the official 800 ms baseline. An explicitly configured value
+    (``AVA_ASR_MAX_SENTENCE_SILENCE_MS``) always wins over this default.
+    """
+    name = str(model or "").strip().lower()
+    if "message" in name:
+        return DEFAULT_MESSAGE_MAX_SENTENCE_SILENCE_MS
+    return DEFAULT_MAX_SENTENCE_SILENCE_MS
+
+
 @dataclass(frozen=True)
 class ASRConfig:
     api_key: str
@@ -90,7 +119,19 @@ class ASRConfig:
     asr_send_queue_frames: int = DEFAULT_ASR_SEND_QUEUE_FRAMES
     render_queue_events: int = DEFAULT_RENDER_QUEUE_EVENTS
     max_utterance_seconds: int = DEFAULT_MAX_UTTERANCE_SECONDS
+    # Provider-side sentence silence in milliseconds. ``None`` means "use the
+    # official default for this model" (streaming 800, legacy message 1500);
+    # ``load_asr_config`` always fills an explicit, validated value.
+    max_sentence_silence_ms: Optional[int] = None
     debug: bool = False
+
+    def __post_init__(self) -> None:
+        if self.max_sentence_silence_ms is None:
+            object.__setattr__(
+                self,
+                "max_sentence_silence_ms",
+                default_max_sentence_silence_ms(self.model),
+            )
 
     @property
     def sample_rate(self) -> int:
@@ -170,6 +211,7 @@ def _int_env(
     default: int,
     *,
     minimum: int,
+    maximum: Optional[int] = None,
 ) -> int:
     raw = _env(env, name, str(default))
     try:
@@ -178,6 +220,8 @@ def _int_env(
         raise ASRConfigError(f"{name} 必须是整数。") from exc
     if value < minimum:
         raise ASRConfigError(f"{name} 必须大于等于 {minimum}。")
+    if maximum is not None and value > maximum:
+        raise ASRConfigError(f"{name} 必须小于等于 {maximum}。")
     return value
 
 
@@ -225,6 +269,10 @@ def load_asr_config(
             + "。请先设置环境变量后再运行实时识别 Demo。"
         )
 
+    chosen_model = (model or "").strip() or _env(
+        env, "AVA_ASR_MODEL", DEFAULT_MODEL
+    ) or DEFAULT_MODEL
+
     raw_threshold = _env(
         env, "AVA_ASR_THRESHOLD", str(DEFAULT_VAD_THRESHOLD)
     )
@@ -245,6 +293,16 @@ def load_asr_config(
     pre_roll_ms = _int_env(
         env, "AVA_ASR_PRE_ROLL_MS", DEFAULT_PRE_ROLL_MS, minimum=0
     )
+    # Provider-side sentence silence: independent of the local VAD end
+    # silence above. The model-specific default applies only when the
+    # variable is absent; an explicit value always wins.
+    max_sentence_silence_ms = _int_env(
+        env,
+        MAX_SENTENCE_SILENCE_ENV,
+        default_max_sentence_silence_ms(chosen_model),
+        minimum=MAX_SENTENCE_SILENCE_MIN_MS,
+        maximum=MAX_SENTENCE_SILENCE_MAX_MS,
+    )
 
     timeout_seconds = _float_env(
         env, "AVA_ASR_TIMEOUT", DEFAULT_TIMEOUT_SECONDS, minimum=0.0
@@ -262,9 +320,6 @@ def load_asr_config(
         DEFAULT_MAX_CONCURRENT_SESSIONS, minimum=1,
     )
 
-    chosen_model = (model or "").strip() or _env(
-        env, "AVA_ASR_MODEL", DEFAULT_MODEL
-    ) or DEFAULT_MODEL
     chosen_device = (
         device if device is not None else _env(env, "AVA_ASR_DEVICE", "")
     ).strip()
@@ -284,6 +339,7 @@ def load_asr_config(
         final_timeout_seconds=final_timeout_seconds,
         stream_idle_timeout_seconds=stream_idle_timeout_seconds,
         max_concurrent_sessions=max_concurrent,
+        max_sentence_silence_ms=max_sentence_silence_ms,
         debug=debug,
     )
 
@@ -299,6 +355,8 @@ __all__ = [
     "DEFAULT_ENV_FILE",
     "DEFAULT_FINAL_TIMEOUT_SECONDS",
     "DEFAULT_MAX_CONCURRENT_SESSIONS",
+    "DEFAULT_MAX_SENTENCE_SILENCE_MS",
+    "DEFAULT_MESSAGE_MAX_SENTENCE_SILENCE_MS",
     "DEFAULT_MIN_SPEECH_MS",
     "DEFAULT_MODEL",
     "DEFAULT_PRE_ROLL_MS",
@@ -306,10 +364,15 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_VAD_THRESHOLD",
     "ENV_FILE_OVERRIDE",
+    "LEGACY_MESSAGE_MODEL",
+    "MAX_SENTENCE_SILENCE_ENV",
+    "MAX_SENTENCE_SILENCE_MAX_MS",
+    "MAX_SENTENCE_SILENCE_MIN_MS",
     "SAMPLE_RATE",
     "SAMPLE_WIDTH",
     "VAD_WINDOW_MS",
     "VAD_WINDOW_SAMPLES",
+    "default_max_sentence_silence_ms",
     "load_asr_config",
     "load_local_env",
 ]

@@ -6,7 +6,9 @@ session with ``start`` / ``send_audio_frame`` / ``stop`` / ``events`` /
 ``close``. ``recognize_file`` (whole-file recognition) is deliberately not
 used. ``intermediate_result_enabled`` and ``max_sentence_silence`` are passed
 through the supported ``parameters=`` escape hatch; the wire format and rate
-are named arguments.
+are named arguments. The silence budget follows the configured model
+(streaming 800 ms, legacy message 1500 ms) and can be overridden with
+``AVA_ASR_MAX_SENTENCE_SILENCE_MS``.
 
 The session owns a small thread-safe lifecycle state machine so the sender and
 receiver threads can share one connection without racing each other:
@@ -36,7 +38,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
-from companion.asr.config import ASRConfig
+from companion.asr.config import ASRConfig, default_max_sentence_silence_ms
 
 # ------------------------------------------------------------------ session state
 STATE_CREATED = "CREATED"
@@ -318,6 +320,36 @@ def _event_name(raw: Any) -> Optional[str]:
     return str(header.get("event") or "").lower() or None
 
 
+def _build_recognition_parameters(config: ASRConfig) -> dict:
+    """Build the supported ``parameters=`` payload for one session.
+
+    The streaming and the legacy sentence-buffered model share the same
+    entry point and the same officially supported parameters: provisional
+    results stay enabled (that is what makes captions keep up while the
+    person is still speaking) and text is never auto-polished by the
+    provider (``disfluency_removal_enabled=False`` on the call itself).
+
+    ``max_sentence_silence`` is the *provider-side* sentence boundary and is
+    independent of the local Silero VAD end-silence. A missing or invalid
+    value falls back to the model's official default (streaming 800 ms,
+    legacy message 1500 ms) instead of a hard-coded constant, so switching
+    ``AVA_ASR_MODEL`` cannot silently inherit the wrong model's pacing.
+    """
+    silence_ms = getattr(config, "max_sentence_silence_ms", None)
+    if (
+        not isinstance(silence_ms, int)
+        or isinstance(silence_ms, bool)
+        or silence_ms <= 0
+    ):
+        silence_ms = default_max_sentence_silence_ms(
+            getattr(config, "model", "") or ""
+        )
+    return {
+        "intermediate_result_enabled": True,
+        "max_sentence_silence": int(silence_ms),
+    }
+
+
 def _default_client_factory(config: ASRConfig) -> Any:
     try:
         import dashscope  # type: ignore[import-not-found]
@@ -448,10 +480,7 @@ class ASRSession:
                 format="pcm",
                 sample_rate=self._config.sample_rate,
                 disfluency_removal_enabled=False,
-                parameters={
-                    "intermediate_result_enabled": True,
-                    "max_sentence_silence": 1500,
-                },
+                parameters=_build_recognition_parameters(self._config),
             )
             self._client = client
             self._recognition = recognition
