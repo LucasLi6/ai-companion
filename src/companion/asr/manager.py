@@ -142,6 +142,26 @@ def _one_line(text: Any) -> str:
     return " ".join(str(text or "").split()) or "-"
 
 
+def _elapsed_ms(
+    end: Optional[float], start: Optional[float]
+) -> Optional[float]:
+    """Monotonic delta in ms, or ``None`` when it cannot be measured.
+
+    A missing timestamp or an obviously out-of-order pair is reported as
+    ``N/A`` by the caller instead of a fabricated zero.
+    """
+    if end is None or start is None:
+        return None
+    delta = (float(end) - float(start)) * 1000.0
+    if delta < 0.0:
+        return None
+    return round(delta, 1)
+
+
+def _ms_text(value: Optional[float]) -> str:
+    return "N/A" if value is None else f"{value:.0f}ms"
+
+
 @dataclass
 class ASRStats:
     """Non-secret session counters for the exit summary."""
@@ -592,8 +612,25 @@ class _Utterance:
         self.send_started_at: Optional[float] = None
         self.open_latency_ms: Optional[float] = None
         self.max_queued_bytes = 0
+        self.max_queued_audio_ms: Optional[float] = None
+        self.max_oldest_audio_age_ms: Optional[float] = None
         self.last_server_event_at: Optional[float] = None
         self.last_audio_sent_at: Optional[float] = None
+        # Longest time a single ``send_audio_frame()`` call blocked. The SDK
+        # accepting the call only means it was queued locally, never that the
+        # server processed that audio.
+        self.max_send_call_block_ms: Optional[float] = None
+        self.all_audio_sent_at: Optional[float] = None
+        # Per-turn timestamps for the one-line timing diagnostic. All are
+        # monotonic values owned by this utterance, so a later turn can never
+        # inherit an earlier turn's numbers.
+        self.speech_started_at: Optional[float] = None
+        self.first_partial_at: Optional[float] = None
+        self.last_partial_at: Optional[float] = None
+        self.first_sentence_final_at: Optional[float] = None
+        self.last_sentence_final_at: Optional[float] = None
+        self.input_closed_at: Optional[float] = None
+        self.final_emitted_at: Optional[float] = None
 
 
 class ASRManager:
@@ -1512,6 +1549,21 @@ class ASRManager:
                 except queue.Empty:
                     item = None
                 if isinstance(item, (bytes, bytearray)):
+                    if utterance.queued_since is not None:
+                        # Age of the oldest audio still waiting to reach the
+                        # SDK (an upper bound for the item just dequeued).
+                        age_ms = max(
+                            0.0,
+                            (time.monotonic() - utterance.queued_since)
+                            * 1000.0,
+                        )
+                        if (
+                            utterance.max_oldest_audio_age_ms is None
+                            or age_ms > utterance.max_oldest_audio_age_ms
+                        ):
+                            utterance.max_oldest_audio_age_ms = round(
+                                age_ms, 1
+                            )
                     utterance.queued_bytes = max(
                         0, utterance.queued_bytes - len(item)
                     )
@@ -1538,6 +1590,8 @@ class ASRManager:
                         self._flush_audio(utterance, session, buffer)
                         buffer.clear()
                     if not utterance.abort_event.is_set():
+                        # Every queued byte has now been handed to the SDK.
+                        utterance.all_audio_sent_at = time.monotonic()
                         mark_last = getattr(session, "mark_last_audio_sent", None)
                         if callable(mark_last):
                             mark_last()
@@ -1563,6 +1617,8 @@ class ASRManager:
                 and not utterance.abort_event.is_set()
             ):
                 self._flush_audio(utterance, session, buffer)
+                if utterance.all_audio_sent_at is None:
+                    utterance.all_audio_sent_at = time.monotonic()
         except ASRClientError as exc:
             self._handle_sender_error(utterance, exc, opened_ok)
         except Exception as exc:  # noqa: BLE001 - sanitized
@@ -1677,7 +1733,16 @@ class ASRManager:
         while buffer and not utterance.abort_event.is_set():
             chunk = bytes(buffer[:SEND_FRAME_BYTES])
             del buffer[:SEND_FRAME_BYTES]
+            call_started = time.monotonic()
             session.send_audio(chunk)
+            block_ms = round(
+                (time.monotonic() - call_started) * 1000.0, 1
+            )
+            if (
+                utterance.max_send_call_block_ms is None
+                or block_ms > utterance.max_send_call_block_ms
+            ):
+                utterance.max_send_call_block_ms = block_ms
             utterance.sent_bytes += len(chunk)
             utterance.last_audio_sent_at = time.monotonic()
         if utterance.send_started_at is not None:
@@ -1759,6 +1824,7 @@ class ASRManager:
             self.config.asr_send_queue_frames,
             self.config.max_utterance_seconds,
         )
+        utterance.speech_started_at = event.at
         self._utterances[utterance.uid] = utterance
         self._open_order.append(utterance)
         self._current = utterance
@@ -1847,6 +1913,9 @@ class ASRManager:
                 utterance.final_ids.add(sentence_id)
             key = sentence_id or f"#{len(utterance.finals)}"
             utterance.finals.append((key, text))
+            if utterance.first_sentence_final_at is None:
+                utterance.first_sentence_final_at = event.at
+            utterance.last_sentence_final_at = event.at
             # A confirmed fragment is only accumulated. It is never printed
             # as its own line; the whole turn is merged and rendered once by
             # ``_finish`` after VAD end and session completion.
@@ -1867,6 +1936,9 @@ class ASRManager:
             return
         utterance.partial = text
         utterance.partial_id = event.sentence_id
+        if utterance.first_partial_at is None:
+            utterance.first_partial_at = event.at
+        utterance.last_partial_at = event.at
         preview = _merge_turn_text(
             [fragment for _, fragment in utterance.finals]
             + ([utterance.partial] if utterance.partial else [])
@@ -1981,6 +2053,7 @@ class ASRManager:
             return
         if utterance.final_timer is not None:
             return
+        utterance.input_closed_at = event.at
         timeout = max(0.1, self.config.final_timeout_seconds)
         timer = threading.Timer(
             timeout, self._enqueue_final_timeout, args=(utterance.uid,)
@@ -2087,6 +2160,7 @@ class ASRManager:
         if utterance.finalized:
             return
         utterance.finalized = True
+        utterance.final_emitted_at = time.monotonic()
         # O(1) snapshot. If the recognition worker has not finished, the
         # latest provisional result (or PENDING) is attached — the final is
         # never delayed waiting for voice-print inference.
@@ -2185,6 +2259,7 @@ class ASRManager:
         self._emit_turn_closed(utterance.uid, ok)
         self._promote_pending()
         self._log_lifecycle(utterance, "utterance_finalized")
+        self._log_timing(utterance)
 
     def _maybe_finish(self, utterance: _Utterance) -> None:
         """Finish only once BOTH local VAD ended and the ASR session ended."""
@@ -2233,6 +2308,7 @@ class ASRManager:
         if promote:
             self._promote_pending()
         self._log_lifecycle(utterance, "utterance_aborted")
+        self._log_timing(utterance)
 
     def _promote_pending(self) -> None:
         for utterance in self._open_order:
@@ -2280,6 +2356,13 @@ class ASRManager:
             utterance.max_queued_bytes = max(
                 utterance.max_queued_bytes, utterance.queued_bytes
             )
+            # 16 kHz mono int16 = 32 bytes per millisecond.
+            backlog_ms = round(utterance.queued_bytes / 32.0, 1)
+            if (
+                utterance.max_queued_audio_ms is None
+                or backlog_ms > utterance.max_queued_audio_ms
+            ):
+                utterance.max_queued_audio_ms = backlog_ms
             if utterance.queued_since is None:
                 utterance.queued_since = time.monotonic()
             return True
@@ -2403,6 +2486,49 @@ class ASRManager:
             getattr(failure, "code", "")
             if getattr(failure, "code", None) is not None
             else "-",
+        )
+
+    def _log_timing(self, utterance: _Utterance) -> None:
+        """One structured, transcript-free timing line per utterance.
+
+        Debug-only. The deltas stay separate so a slow turn can be attributed
+        to the connection handshake, the upload backlog, the provider's first
+        partial, the post-speech tail, the confirmed sentence or the local
+        final confirmation - never merged into one ambiguous "ASR latency".
+        Missing timestamps print ``N/A``; zeros are never substituted.
+        """
+        if not self.config.debug or not self.logger.isEnabledFor(
+            logging.DEBUG
+        ):
+            return
+        vad_end = utterance.vad_end_at
+        audio_sent = utterance.all_audio_sent_at
+        last_final = utterance.last_sentence_final_at
+        final = utterance.final_emitted_at
+        self.logger.debug(
+            "[asr timing] uid=%s model=%s connect=%s first_partial=%s"
+            " speech_end_to_last_partial=%s speech_end_to_sentence_final=%s"
+            " max_queue=%s max_queue_age=%s max_send_call=%s bytes_sent=%s"
+            " vad_end_to_audio_sent=%s audio_sent_to_sentence_final=%s"
+            " sentence_final_to_task_done=%s audio_sent_to_final=%s"
+            " vad_to_final=%s",
+            utterance.uid,
+            self.config.model,
+            _ms_text(utterance.open_latency_ms),
+            _ms_text(
+                _elapsed_ms(utterance.first_partial_at, utterance.speech_started_at)
+            ),
+            _ms_text(_elapsed_ms(utterance.last_partial_at, vad_end)),
+            _ms_text(_elapsed_ms(utterance.first_sentence_final_at, vad_end)),
+            _ms_text(utterance.max_queued_audio_ms),
+            _ms_text(utterance.max_oldest_audio_age_ms),
+            _ms_text(utterance.max_send_call_block_ms),
+            utterance.sent_bytes,
+            _ms_text(_elapsed_ms(audio_sent, vad_end)),
+            _ms_text(_elapsed_ms(last_final, audio_sent)),
+            _ms_text(_elapsed_ms(utterance.session_done_at, last_final)),
+            _ms_text(_elapsed_ms(final, audio_sent)),
+            _ms_text(_elapsed_ms(final, vad_end)),
         )
 
     def _put_control(
