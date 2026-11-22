@@ -28,7 +28,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from datetime import timedelta
+from datetime import timedelta, timezone
 from typing import Optional
 
 from companion.agent.character import (
@@ -49,7 +49,9 @@ from companion.cognition.silence import (
     detect_explicit_silence,
 )
 from companion.domain.enums import (
+    AddresseeHint,
     CognitiveAction,
+    EventSource,
     JobType,
     ProcessingStatus,
     ReasonCode,
@@ -98,6 +100,13 @@ from companion.speech_expression.parser import (
 from companion.speech_expression.streaming import VoiceStreamAdapter
 from companion.runtime_context.connection import ConnectionInfo
 from companion.runtime_context.snapshot import RuntimeSnapshotBuilder
+from companion.runtime_context.temporal import (
+    CONTINUITY_LABELS,
+    ConversationContinuity,
+    classify_continuity,
+    day_phase,
+    humanize_gap,
+)
 from companion.storage.repositories import Repositories
 
 from .conversation import ConversationManager
@@ -2070,6 +2079,170 @@ class Orchestrator:
             "finish_reason": finish_reason,
             "model": getattr(self.response, "last_model", "") or "",
             "context": context,
+        }
+
+    async def generate_startup_greeting(
+        self, *, conversation_id: str, person_id: str
+    ) -> Optional[dict]:
+        """Generate Ava's one startup greeting as a fresh opening.
+
+        The greeting is an in-memory, non-persisted initiation. It uses only
+        the trusted persona identity, the current local time, the gap since
+        this conversation's last real human utterance, and optionally the
+        most recent exchange when that gap is very short. It deliberately
+        does not retrieve long-term memories or render the normal Speaker
+        background (memory, profile-relevant, scene, tools, routing).
+
+        No conversation turn, action, memory, profile fact or proactive
+        delivery counter is written. Authorization is enforced by the
+        provider's existing external-AI check.
+        """
+        if self.context_builder is None or self.response is None:
+            return None
+        provider_greeting = getattr(
+            self.response, "generate_startup_greeting", None
+        )
+        if not callable(provider_greeting):
+            return None
+        now = utcnow()
+        event = UtteranceEvent(
+            event_id=new_id("startup"),
+            conversation_id=conversation_id,
+            speaker_person_id=person_id,
+            speaker_label=None,
+            text="（启动开场白）",
+            source=EventSource.VOICE,
+            addressee_hint=AddresseeHint.AGENT,
+            occurred_at=now,
+        )
+
+        # Gap is measured only inside this conversation, from its newest real
+        # human utterance. Stored timestamps are normalised to aware UTC.
+        gap_seconds: Optional[int] = None
+        try:
+            recent = await self.repos.utterance.recent_context(
+                conversation_id, exclude_event_id=None, limit=1
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "startup_greeting_history_failed conversation_id=%s error=%s",
+                conversation_id,
+                type(exc).__name__,
+            )
+            recent = []
+        if recent:
+            occurred = recent[-1].occurred_at
+            if occurred.tzinfo is None:
+                occurred = occurred.replace(tzinfo=timezone.utc)
+            gap_seconds = max(
+                0, int((now - occurred).total_seconds())
+            )
+        continuity = classify_continuity(gap_seconds)
+
+        # Only an ongoing (minutes-scale) exchange lends its last group as
+        # optional background. Hours or a day later is treated as a fresh
+        # start, never as a reason to resume old topics.
+        history_limit = (
+            2 if continuity is ConversationContinuity.ACTIVE else 0
+        )
+        try:
+            context = await self.context_builder.build_proactive(
+                event, [], history_limit=history_limit
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "startup_greeting_context_failed conversation_id=%s error=%s",
+                conversation_id,
+                type(exc).__name__,
+            )
+            return None
+        # Character snapshot supplies the trusted persona identity. Scene and
+        # style compilation are disabled: neither is part of this request.
+        context, _scene_record = await self._prepare_dialogue(
+            event,
+            context,
+            [],
+            [],
+            scene_enabled=False,
+            personality_enabled=False,
+        )
+
+        startup_info: dict = {
+            "timezone_known": False,
+            "local_time": None,
+            "timezone": None,
+            "day_phase": None,
+            "gap_seconds": gap_seconds,
+            "gap_text": humanize_gap(gap_seconds),
+            "continuity": continuity.value,
+            "continuity_label": CONTINUITY_LABELS.get(continuity, ""),
+            "last_exchange": [],
+        }
+        if self.runtime_snapshot_builder is not None:
+            try:
+                snapshot = await self.runtime_snapshot_builder.build(
+                    event,
+                    allow_external_ai=True,
+                    persist=False,
+                    received_at=now,
+                    temporal_now=now,
+                )
+                if getattr(snapshot, "timezone_source", "utc") != "utc":
+                    local = (
+                        now
+                        + timedelta(
+                            seconds=int(snapshot.utc_offset_seconds or 0)
+                        )
+                    ).replace(tzinfo=None)
+                    startup_info.update(
+                        {
+                            "timezone_known": True,
+                            "local_time": snapshot.local_time,
+                            "timezone": snapshot.timezone,
+                            "day_phase": day_phase(local),
+                        }
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "startup_greeting_runtime_failed conversation_id=%s"
+                    " error=%s",
+                    conversation_id,
+                    type(exc).__name__,
+                )
+
+        if continuity is ConversationContinuity.ACTIVE:
+            turns = list(context.turns or [])
+            start = None
+            for index in range(len(turns) - 1, -1, -1):
+                turn = turns[index]
+                if turn.role != ROLE_ASSISTANT and (turn.text or "").strip():
+                    start = index
+                    break
+            if start is not None:
+                for turn in turns[start:]:
+                    role = (
+                        "assistant"
+                        if turn.role == ROLE_ASSISTANT
+                        else "user"
+                    )
+                    startup_info["last_exchange"].append(
+                        {"role": role, "text": turn.text}
+                    )
+                    if role == "assistant":
+                        break  # exactly the last user/Ava group
+
+        generated = await provider_greeting(event, context, startup_info)
+        text = normalize_response_text(
+            str(generated).strip(), RESPONSE_LAYOUT_CHAT
+        )
+        if not has_valid_reply_text(text):
+            # One greeting attempt only; never spend a second call here.
+            return None
+        return {
+            "text": text,
+            "display_text": None,
+            "finish_reason": getattr(generated, "finish_reason", None),
+            "model": getattr(self.response, "last_model", "") or "",
         }
 
     async def _prepare_context(

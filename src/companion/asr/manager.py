@@ -43,6 +43,10 @@ from companion.asr.microphone import (
     MicrophoneCapture,
 )
 from companion.asr.terminal import RenderEvent, TerminalRenderer
+from companion.asr.warm_connection import (
+    ASRWarmConnectionManager,
+    WarmConnectionLease,
+)
 from companion.asr.vad import (
     AUDIO,
     SPEECH_ENDED,
@@ -140,6 +144,26 @@ def _merge_turn_text(texts: Any) -> str:
 
 def _one_line(text: Any) -> str:
     return " ".join(str(text or "").split()) or "-"
+
+
+def _elapsed_ms(
+    end: Optional[float], start: Optional[float]
+) -> Optional[float]:
+    """Monotonic delta in ms, or ``None`` when it cannot be measured.
+
+    A missing timestamp or an obviously out-of-order pair is reported as
+    ``N/A`` by the caller instead of a fabricated zero.
+    """
+    if end is None or start is None:
+        return None
+    delta = (float(end) - float(start)) * 1000.0
+    if delta < 0.0:
+        return None
+    return round(delta, 1)
+
+
+def _ms_text(value: Optional[float]) -> str:
+    return "N/A" if value is None else f"{value:.0f}ms"
 
 
 @dataclass
@@ -592,8 +616,34 @@ class _Utterance:
         self.send_started_at: Optional[float] = None
         self.open_latency_ms: Optional[float] = None
         self.max_queued_bytes = 0
+        self.max_queued_audio_ms: Optional[float] = None
+        self.max_oldest_audio_age_ms: Optional[float] = None
         self.last_server_event_at: Optional[float] = None
         self.last_audio_sent_at: Optional[float] = None
+        # Longest time a single ``send_audio_frame()`` call blocked. The SDK
+        # accepting the call only means it was queued locally, never that the
+        # server processed that audio.
+        self.max_send_call_block_ms: Optional[float] = None
+        self.all_audio_sent_at: Optional[float] = None
+        # Per-turn timestamps for the one-line timing diagnostic. All are
+        # monotonic values owned by this utterance, so a later turn can never
+        # inherit an earlier turn's numbers.
+        self.speech_started_at: Optional[float] = None
+        self.first_partial_at: Optional[float] = None
+        self.last_partial_at: Optional[float] = None
+        self.first_sentence_final_at: Optional[float] = None
+        self.last_sentence_final_at: Optional[float] = None
+        self.input_closed_at: Optional[float] = None
+        self.final_emitted_at: Optional[float] = None
+        # V0.9.9.33 connection diagnostics. "COLD" is a per-turn handshake,
+        # "WARM" reused a background preconnect, "FALLBACK" attempted warm and
+        # opened cold after that failed before any PCM was sent.
+        self.connection_mode = "COLD"
+        self.preconnect_ms: Optional[float] = None
+        self.task_ready_at: Optional[float] = None
+        self.first_audio_sent_at: Optional[float] = None
+        self.first_partial_to_ui_ms: Optional[float] = None
+        self.first_partial_displayed_at: Optional[float] = None
 
 
 class ASRManager:
@@ -614,6 +664,7 @@ class ASRManager:
         on_partial: Optional[Callable[[PartialTranscript], None]] = None,
         render_finals: bool = True,
         speaker_observer: Optional[SpeakerObserver] = None,
+        warm_connection_manager: Optional[ASRWarmConnectionManager] = None,
     ) -> None:
         self.config = config
         self.audio_queue: "queue.Queue[Any]" = (
@@ -628,6 +679,19 @@ class ASRManager:
         )
         self._vad_segmenter = vad_segmenter
         self._session_factory = session_factory or (lambda: ASRSession(config))
+        # Preconnect is only used with the real ASRSession. An injected
+        # session factory keeps full ownership of its sessions (Mock/Fake
+        # tests), unless a warm manager is injected explicitly.
+        if warm_connection_manager is not None:
+            self._warm_connections: Optional[ASRWarmConnectionManager] = (
+                warm_connection_manager
+            )
+        elif session_factory is None and getattr(
+            config, "preconnect_enabled", False
+        ):
+            self._warm_connections = ASRWarmConnectionManager(config)
+        else:
+            self._warm_connections = None
         self._renderer = renderer or TerminalRenderer()
         self.stats = ASRStats()
         self.logger = logging.getLogger("companion.asr")
@@ -975,6 +1039,15 @@ class ASRManager:
                 self._render_thread.join(timeout=1.0)
             raise
         self._started = True
+        # Microphone capture is already live. Prepare the ASR transport in the
+        # background so the handshake is not paid after speech starts; a
+        # failed preconnect never delays listening and never blocks a turn.
+        warm = self._warm_connections
+        if warm is not None:
+            try:
+                warm.start_preconnect()
+            except Exception:  # noqa: BLE001 - optional optimization
+                pass
         description = getattr(self._microphone, "description", "默认输入设备")
         self._render(
             RenderEvent(
@@ -1040,6 +1113,14 @@ class ASRManager:
                     report=False,
                     promote=False,
                 )
+        # Sessions above released their leases; now stop rebuilding and close
+        # the idle preconnected socket. No new turn can start after abort.
+        warm = self._warm_connections
+        if warm is not None:
+            try:
+                warm.shutdown()
+            except Exception:  # noqa: BLE001 - teardown must not raise
+                pass
         with self._threads_lock:
             threads = list(self._threads)
         for thread in threads:
@@ -1483,21 +1564,92 @@ class ASRManager:
                 continue
 
     # ------------------------------------------------------------- ASR threads
+    def _open_session(self, utterance: _Utterance) -> ASRSession:
+        """Open this turn's session, preferring a preconnected transport.
+
+        A warm lease is available only when the background handshake already
+        finished and no other turn owns it; a turn never waits for one. If
+        warm opening fails before the first PCM frame, the lease is closed and
+        the turn retries cold exactly once with the queued audio untouched.
+        """
+        warm = self._warm_connections
+        if warm is not None:
+            try:
+                lease = warm.try_acquire()
+            except Exception:  # noqa: BLE001 - optimization only
+                lease = None
+            if lease is not None:
+                return self._open_warm_session(utterance, lease)
+        return self._open_cold_session(utterance)
+
+    def _open_warm_session(
+        self, utterance: _Utterance, lease: WarmConnectionLease
+    ) -> ASRSession:
+        session = ASRSession(self.config, warm_lease=lease)
+        utterance.connection_mode = "WARM"
+        utterance.preconnect_ms = lease.preconnect_ms
+        self._prepare_session(session, utterance)
+        started = time.monotonic()
+        try:
+            session.open()
+        except Exception as exc:  # noqa: BLE001 - safe pre-PCM fallback
+            # No binary frame was sent yet, so nothing has to be replayed.
+            self._close_session(utterance)
+            utterance.session = None
+            utterance.connection_mode = "FALLBACK"
+            if isinstance(exc, TypeError) and self._warm_connections is not None:
+                # e.g. an SDK whose ``recognize`` rejects ``connection=`` in
+                # combination with a preconnected socket. Keep the cold path
+                # and stop paying for handshakes that cannot be reused.
+                disable = getattr(self._warm_connections, "disable", None)
+                if callable(disable):
+                    disable("sdk_recognize_without_connection")
+            if self.config.debug and self.logger.isEnabledFor(
+                logging.DEBUG
+            ):
+                self.logger.debug(
+                    "asr_warm_open_failed uid=%s type=%s",
+                    utterance.uid,
+                    type(exc).__name__,
+                )
+            if self._stop.is_set():
+                raise
+            return self._open_cold_session(utterance)
+        self._record_open_timing(utterance, started)
+        return session
+
+    def _open_cold_session(self, utterance: _Utterance) -> ASRSession:
+        session = self._session_factory()
+        if utterance.connection_mode != "FALLBACK":
+            utterance.connection_mode = "COLD"
+        self._prepare_session(session, utterance)
+        started = time.monotonic()
+        session.open()
+        self._record_open_timing(utterance, started)
+        return session
+
+    def _prepare_session(
+        self, session: ASRSession, utterance: _Utterance
+    ) -> None:
+        utterance.session = session
+        bind = getattr(session, "bind_utterance", None)
+        if callable(bind):
+            bind(utterance.uid)
+
+    def _record_open_timing(
+        self, utterance: _Utterance, started: float
+    ) -> None:
+        open_ms = round((time.monotonic() - started) * 1000.0, 1)
+        utterance.open_latency_ms = open_ms
+        utterance.task_ready_at = time.monotonic()
+        self.stats.connection_open_latency_ms = open_ms
+
     def _sender_loop(self, utterance: _Utterance) -> None:
         session: Optional[ASRSession] = None
         opened_ok = False
         try:
-            session = self._session_factory()
-            utterance.session = session
-            bind = getattr(session, "bind_utterance", None)
-            if callable(bind):
-                bind(utterance.uid)
-            open_started = time.monotonic()
-            session.open()
+            session = self._open_session(utterance)
             opened_ok = True
-            open_ms = (time.monotonic() - open_started) * 1000.0
-            utterance.open_latency_ms = round(open_ms, 1)
-            self.stats.connection_open_latency_ms = round(open_ms, 1)
             utterance.send_started_at = time.monotonic()
             utterance.opened.set()
             buffer = bytearray()
@@ -1512,6 +1664,21 @@ class ASRManager:
                 except queue.Empty:
                     item = None
                 if isinstance(item, (bytes, bytearray)):
+                    if utterance.queued_since is not None:
+                        # Age of the oldest audio still waiting to reach the
+                        # SDK (an upper bound for the item just dequeued).
+                        age_ms = max(
+                            0.0,
+                            (time.monotonic() - utterance.queued_since)
+                            * 1000.0,
+                        )
+                        if (
+                            utterance.max_oldest_audio_age_ms is None
+                            or age_ms > utterance.max_oldest_audio_age_ms
+                        ):
+                            utterance.max_oldest_audio_age_ms = round(
+                                age_ms, 1
+                            )
                     utterance.queued_bytes = max(
                         0, utterance.queued_bytes - len(item)
                     )
@@ -1538,6 +1705,8 @@ class ASRManager:
                         self._flush_audio(utterance, session, buffer)
                         buffer.clear()
                     if not utterance.abort_event.is_set():
+                        # Every queued byte has now been handed to the SDK.
+                        utterance.all_audio_sent_at = time.monotonic()
                         mark_last = getattr(session, "mark_last_audio_sent", None)
                         if callable(mark_last):
                             mark_last()
@@ -1563,6 +1732,8 @@ class ASRManager:
                 and not utterance.abort_event.is_set()
             ):
                 self._flush_audio(utterance, session, buffer)
+                if utterance.all_audio_sent_at is None:
+                    utterance.all_audio_sent_at = time.monotonic()
         except ASRClientError as exc:
             self._handle_sender_error(utterance, exc, opened_ok)
         except Exception as exc:  # noqa: BLE001 - sanitized
@@ -1677,7 +1848,18 @@ class ASRManager:
         while buffer and not utterance.abort_event.is_set():
             chunk = bytes(buffer[:SEND_FRAME_BYTES])
             del buffer[:SEND_FRAME_BYTES]
+            call_started = time.monotonic()
             session.send_audio(chunk)
+            if utterance.first_audio_sent_at is None:
+                utterance.first_audio_sent_at = time.monotonic()
+            block_ms = round(
+                (time.monotonic() - call_started) * 1000.0, 1
+            )
+            if (
+                utterance.max_send_call_block_ms is None
+                or block_ms > utterance.max_send_call_block_ms
+            ):
+                utterance.max_send_call_block_ms = block_ms
             utterance.sent_bytes += len(chunk)
             utterance.last_audio_sent_at = time.monotonic()
         if utterance.send_started_at is not None:
@@ -1759,6 +1941,7 @@ class ASRManager:
             self.config.asr_send_queue_frames,
             self.config.max_utterance_seconds,
         )
+        utterance.speech_started_at = event.at
         self._utterances[utterance.uid] = utterance
         self._open_order.append(utterance)
         self._current = utterance
@@ -1847,6 +2030,9 @@ class ASRManager:
                 utterance.final_ids.add(sentence_id)
             key = sentence_id or f"#{len(utterance.finals)}"
             utterance.finals.append((key, text))
+            if utterance.first_sentence_final_at is None:
+                utterance.first_sentence_final_at = event.at
+            utterance.last_sentence_final_at = event.at
             # A confirmed fragment is only accumulated. It is never printed
             # as its own line; the whole turn is merged and rendered once by
             # ``_finish`` after VAD end and session completion.
@@ -1867,6 +2053,9 @@ class ASRManager:
             return
         utterance.partial = text
         utterance.partial_id = event.sentence_id
+        if utterance.first_partial_at is None:
+            utterance.first_partial_at = event.at
+        utterance.last_partial_at = event.at
         preview = _merge_turn_text(
             [fragment for _, fragment in utterance.finals]
             + ([utterance.partial] if utterance.partial else [])
@@ -1875,7 +2064,7 @@ class ASRManager:
         # the formal REPL can display what ASR heard while the user is still
         # speaking. It never becomes a message and is never persisted.
         if preview:
-            self._emit_partial(utterance, preview)
+            self._emit_partial(utterance, preview, received_at=event.at)
         # Partials are part of the standalone transcript renderer. In formal
         # voice mode (render_finals=False) the embedding app prints the final
         # itself, so provisional lines are fully suppressed to avoid a stale
@@ -1981,6 +2170,7 @@ class ASRManager:
             return
         if utterance.final_timer is not None:
             return
+        utterance.input_closed_at = event.at
         timeout = max(0.1, self.config.final_timeout_seconds)
         timer = threading.Timer(
             timeout, self._enqueue_final_timeout, args=(utterance.uid,)
@@ -2087,6 +2277,7 @@ class ASRManager:
         if utterance.finalized:
             return
         utterance.finalized = True
+        utterance.final_emitted_at = time.monotonic()
         # O(1) snapshot. If the recognition worker has not finished, the
         # latest provisional result (or PENDING) is attached — the final is
         # never delayed waiting for voice-print inference.
@@ -2185,6 +2376,8 @@ class ASRManager:
         self._emit_turn_closed(utterance.uid, ok)
         self._promote_pending()
         self._log_lifecycle(utterance, "utterance_finalized")
+        self._log_timing(utterance)
+        self._log_first_partial(utterance)
 
     def _maybe_finish(self, utterance: _Utterance) -> None:
         """Finish only once BOTH local VAD ended and the ASR session ended."""
@@ -2233,6 +2426,8 @@ class ASRManager:
         if promote:
             self._promote_pending()
         self._log_lifecycle(utterance, "utterance_aborted")
+        self._log_timing(utterance)
+        self._log_first_partial(utterance)
 
     def _promote_pending(self) -> None:
         for utterance in self._open_order:
@@ -2280,6 +2475,13 @@ class ASRManager:
             utterance.max_queued_bytes = max(
                 utterance.max_queued_bytes, utterance.queued_bytes
             )
+            # 16 kHz mono int16 = 32 bytes per millisecond.
+            backlog_ms = round(utterance.queued_bytes / 32.0, 1)
+            if (
+                utterance.max_queued_audio_ms is None
+                or backlog_ms > utterance.max_queued_audio_ms
+            ):
+                utterance.max_queued_audio_ms = backlog_ms
             if utterance.queued_since is None:
                 utterance.queued_since = time.monotonic()
             return True
@@ -2405,6 +2607,111 @@ class ASRManager:
             else "-",
         )
 
+    def _log_timing(self, utterance: _Utterance) -> None:
+        """One structured, transcript-free timing line per utterance.
+
+        Debug-only. The deltas stay separate so a slow turn can be attributed
+        to the connection handshake, the upload backlog, the provider's first
+        partial, the post-speech tail, the confirmed sentence or the local
+        final confirmation - never merged into one ambiguous "ASR latency".
+        Missing timestamps print ``N/A``; zeros are never substituted.
+        """
+        if not self.config.debug or not self.logger.isEnabledFor(
+            logging.DEBUG
+        ):
+            return
+        vad_end = utterance.vad_end_at
+        audio_sent = utterance.all_audio_sent_at
+        last_final = utterance.last_sentence_final_at
+        final = utterance.final_emitted_at
+        self.logger.debug(
+            "[asr timing] uid=%s model=%s connect=%s first_partial=%s"
+            " speech_end_to_last_partial=%s speech_end_to_sentence_final=%s"
+            " max_queue=%s max_queue_age=%s max_send_call=%s bytes_sent=%s"
+            " vad_end_to_audio_sent=%s audio_sent_to_sentence_final=%s"
+            " sentence_final_to_task_done=%s audio_sent_to_final=%s"
+            " vad_to_final=%s",
+            utterance.uid,
+            self.config.model,
+            _ms_text(utterance.open_latency_ms),
+            _ms_text(
+                _elapsed_ms(utterance.first_partial_at, utterance.speech_started_at)
+            ),
+            _ms_text(_elapsed_ms(utterance.last_partial_at, vad_end)),
+            _ms_text(_elapsed_ms(utterance.first_sentence_final_at, vad_end)),
+            _ms_text(utterance.max_queued_audio_ms),
+            _ms_text(utterance.max_oldest_audio_age_ms),
+            _ms_text(utterance.max_send_call_block_ms),
+            utterance.sent_bytes,
+            _ms_text(_elapsed_ms(audio_sent, vad_end)),
+            _ms_text(_elapsed_ms(last_final, audio_sent)),
+            _ms_text(_elapsed_ms(utterance.session_done_at, last_final)),
+            _ms_text(_elapsed_ms(final, audio_sent)),
+            _ms_text(_elapsed_ms(final, vad_end)),
+        )
+
+    def _log_first_partial(self, utterance: _Utterance) -> None:
+        """Debug-only warm-vs-cold first-partial breakdown.
+
+        Background preconnect time is reported separately and is never part
+        of the post-speech path. ``speech_started_at`` comes from local VAD,
+        so ``speech_to_first_partial_ms`` is "VAD speech start to first
+        partial", not physical voice onset. Missing values print ``N/A``.
+        """
+        if not self.config.debug or not self.logger.isEnabledFor(
+            logging.DEBUG
+        ):
+            return
+        speech = utterance.speech_started_at
+        first_partial = utterance.first_partial_at
+        first_audio = utterance.first_audio_sent_at
+        self.logger.debug(
+            "[asr first] uid=%s mode=%s preconnect_ms=%s task_start_ms=%s"
+            " speech_to_first_partial_ms=%s first_audio_ms=%s"
+            " task_start_to_first_audio_ms=%s"
+            " first_audio_to_first_partial_ms=%s"
+            " first_partial_to_ui_ms=%s max_queue_ms=%s vad_to_final_ms=%s",
+            utterance.uid,
+            utterance.connection_mode,
+            _ms_text(utterance.preconnect_ms),
+            _ms_text(utterance.open_latency_ms),
+            _ms_text(_elapsed_ms(first_partial, speech)),
+            _ms_text(_elapsed_ms(first_audio, speech)),
+            _ms_text(_elapsed_ms(first_audio, utterance.task_ready_at)),
+            _ms_text(_elapsed_ms(first_partial, first_audio)),
+            _ms_text(utterance.first_partial_to_ui_ms),
+            _ms_text(utterance.max_queued_audio_ms),
+            _ms_text(_elapsed_ms(utterance.final_emitted_at, utterance.vad_end_at)),
+        )
+
+    def note_partial_displayed(
+        self, utterance_id: int, latency_ms: Optional[float] = None
+    ) -> None:
+        """Record when the first provisional text became visible.
+
+        Called by an embedding display surface (the formal REPL) after it has
+        actually shown a partial. Safe to call from another thread; only the
+        first observation per utterance is kept, and an unknown/finished turn
+        is ignored. This never affects recognition, finalization or ordering.
+        """
+        try:
+            uid = int(utterance_id)
+        except (TypeError, ValueError):
+            return
+        utterance = self._utterances.get(uid)
+        if utterance is None or utterance.finalized:
+            return
+        if utterance.first_partial_to_ui_ms is not None:
+            return
+        if latency_ms is None:
+            latency_ms = _elapsed_ms(
+                time.monotonic(), utterance.first_partial_at
+            )
+        if latency_ms is None or latency_ms < 0:
+            return
+        utterance.first_partial_to_ui_ms = round(float(latency_ms), 1)
+        utterance.first_partial_displayed_at = time.monotonic()
+
     def _put_control(
         self,
         event: Any,
@@ -2448,17 +2755,26 @@ class ASRManager:
         except Exception:  # noqa: BLE001 - recognition must keep running
             pass
 
-    def _emit_partial(self, utterance: _Utterance, text: str) -> None:
+    def _emit_partial(
+        self,
+        utterance: _Utterance,
+        text: str,
+        *,
+        received_at: Optional[float] = None,
+    ) -> None:
         callback = self._on_partial
         if callback is None:
             return
         utterance.partial_seq += 1
+        # ``at`` is when the provider text reached us, not when the control
+        # thread emitted it. A display surface can therefore report the real
+        # receive-to-visible latency without changing this event's meaning.
         event = PartialTranscript(
             utterance_id=utterance.uid,
             text=str(text),
             sequence=utterance.partial_seq,
             is_final=False,
-            at=time.monotonic(),
+            at=received_at if received_at is not None else time.monotonic(),
         )
         try:
             callback(event)

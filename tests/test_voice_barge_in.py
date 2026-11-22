@@ -154,6 +154,8 @@ def _config(**overrides) -> ASRConfig:
         workspace_id="unit-test-workspace",
         timeout_seconds=2.0,
         final_timeout_seconds=1.0,
+        # Offline unit tests must never open a real preconnected socket.
+        preconnect_enabled=False,
     )
     base.update(overrides)
     return ASRConfig(**base)

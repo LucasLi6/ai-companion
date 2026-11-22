@@ -6,7 +6,9 @@ session with ``start`` / ``send_audio_frame`` / ``stop`` / ``events`` /
 ``close``. ``recognize_file`` (whole-file recognition) is deliberately not
 used. ``intermediate_result_enabled`` and ``max_sentence_silence`` are passed
 through the supported ``parameters=`` escape hatch; the wire format and rate
-are named arguments.
+are named arguments. The silence budget follows the configured model
+(streaming 800 ms, legacy message 1500 ms) and can be overridden with
+``AVA_ASR_MAX_SENTENCE_SILENCE_MS``.
 
 The session owns a small thread-safe lifecycle state machine so the sender and
 receiver threads can share one connection without racing each other:
@@ -34,9 +36,12 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
-from companion.asr.config import ASRConfig
+from companion.asr.config import ASRConfig, default_max_sentence_silence_ms
+
+if TYPE_CHECKING:  # avoids a runtime import cycle with warm_connection.py
+    from companion.asr.warm_connection import WarmConnectionLease
 
 # ------------------------------------------------------------------ session state
 STATE_CREATED = "CREATED"
@@ -318,6 +323,36 @@ def _event_name(raw: Any) -> Optional[str]:
     return str(header.get("event") or "").lower() or None
 
 
+def _build_recognition_parameters(config: ASRConfig) -> dict:
+    """Build the supported ``parameters=`` payload for one session.
+
+    The streaming and the legacy sentence-buffered model share the same
+    entry point and the same officially supported parameters: provisional
+    results stay enabled (that is what makes captions keep up while the
+    person is still speaking) and text is never auto-polished by the
+    provider (``disfluency_removal_enabled=False`` on the call itself).
+
+    ``max_sentence_silence`` is the *provider-side* sentence boundary and is
+    independent of the local Silero VAD end-silence. A missing or invalid
+    value falls back to the model's official default (streaming 800 ms,
+    legacy message 1500 ms) instead of a hard-coded constant, so switching
+    ``AVA_ASR_MODEL`` cannot silently inherit the wrong model's pacing.
+    """
+    silence_ms = getattr(config, "max_sentence_silence_ms", None)
+    if (
+        not isinstance(silence_ms, int)
+        or isinstance(silence_ms, bool)
+        or silence_ms <= 0
+    ):
+        silence_ms = default_max_sentence_silence_ms(
+            getattr(config, "model", "") or ""
+        )
+    return {
+        "intermediate_result_enabled": True,
+        "max_sentence_silence": int(silence_ms),
+    }
+
+
 def _default_client_factory(config: ASRConfig) -> Any:
     try:
         import dashscope  # type: ignore[import-not-found]
@@ -390,9 +425,15 @@ class ASRSession:
         *,
         client_factory: Optional[Callable[[ASRConfig], Any]] = None,
         logger: Optional[logging.Logger] = None,
+        warm_lease: Optional["WarmConnectionLease"] = None,
     ) -> None:
         self._config = config
         self._client_factory = client_factory or _default_client_factory
+        # A warm lease carries an already-open transport owned by the
+        # ASRWarmConnectionManager: this session must detach its own
+        # recognition task on close and return the lease instead of closing
+        # the shared client/socket.
+        self._warm_lease: Optional["WarmConnectionLease"] = warm_lease
         self._client: Any = None
         self._recognition: Any = None
         self._lock = threading.RLock()
@@ -436,24 +477,34 @@ class ASRSession:
             self._state = STATE_CONNECTING
         self._log("session_connect_start")
         try:
-            client = self._client_factory(self._config)
+            lease = self._warm_lease
+            if lease is not None:
+                # The handshake already happened in the background manager.
+                # ``recognize(connection=...)`` only runs this turn's task on
+                # that socket; the transport stays owned by the lease.
+                client = lease.client
+                connection = lease.connection
+            else:
+                client = self._client_factory(self._config)
+                connection = None
             # ``recognize()`` has no documented per-stream timeout parameter in
             # dashscope 2.x: an unknown ``timeout`` would be forwarded as an
             # opaque websocket request parameter (not a client deadline).
             # Connection timing is bounded by the Client's own timeout; the
             # stream/final deadlines are owned by ASRManager
             # (stream_idle/final_timeout_seconds), where they are observable.
-            recognition = client.audio.asr.recognize(
-                model=self._config.model,
-                format="pcm",
-                sample_rate=self._config.sample_rate,
-                disfluency_removal_enabled=False,
-                parameters={
-                    "intermediate_result_enabled": True,
-                    "max_sentence_silence": 1500,
-                },
-            )
-            self._client = client
+            recognize_kwargs: dict[str, Any] = {
+                "model": self._config.model,
+                "format": "pcm",
+                "sample_rate": self._config.sample_rate,
+                "disfluency_removal_enabled": False,
+                "parameters": _build_recognition_parameters(self._config),
+            }
+            if connection is not None:
+                recognize_kwargs["connection"] = connection
+            recognition = client.audio.asr.recognize(**recognize_kwargs)
+            # A warm session never owns the client/connection.
+            self._client = None if lease is not None else client
             self._recognition = recognition
             recognition.start()
             self.request_id = (
@@ -610,16 +661,28 @@ class ASRSession:
         with self._lock:
             if self._state == STATE_CLOSED:
                 return
+            # A shared transport may only be reused after the provider
+            # confirmed task-finished; anything else (failure, timeout,
+            # cancel, partial input) leaves the socket in an unknown state.
+            warm_reusable = self._state == STATE_TASK_FINISHED
             if self.close_origin is None:
                 self.close_origin = origin
             self._state = STATE_CLOSED
             recognition, self._recognition = self._recognition, None
             client, self._client = self._client, None
+            warm_lease, self._warm_lease = self._warm_lease, None
         self._log("close_requested")
         if recognition is not None:
             try:
+                # With a shared connection this detaches only this turn's
+                # task; the websocket remains open for the lease.
                 recognition.close()
             except Exception:  # noqa: BLE001 - best effort
+                pass
+        if warm_lease is not None:
+            try:
+                warm_lease.release(healthy=warm_reusable)
+            except Exception:  # noqa: BLE001 - teardown must not raise
                 pass
         if client is not None:
             try:

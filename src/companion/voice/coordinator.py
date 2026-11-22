@@ -441,6 +441,19 @@ class VoiceCoordinator:
             listener(partial.utterance_id, partial.text)
         except Exception:  # noqa: BLE001 - display must not break voice
             pass
+        # Report how long the first provisional text took to become visible.
+        # The manager only keeps the first value per utterance for its
+        # debug-only first-partial diagnostic; recognition is unaffected.
+        if partial.at > 0.0:
+            latency_ms = max(
+                0.0, (time.monotonic() - partial.at) * 1000.0
+            )
+            observer = getattr(self._manager, "note_partial_displayed", None)
+            if callable(observer):
+                try:
+                    observer(partial.utterance_id, latency_ms)
+                except Exception:  # noqa: BLE001 - diagnostics only
+                    pass
 
     def _clear_partial(self, utterance_id: int) -> None:
         """Erase the provisional line for one utterance from the surface.

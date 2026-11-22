@@ -59,6 +59,7 @@ from companion.prompts.identity import compile_trait_tendencies
 from companion.prompts.proactive import (
     PROACTIVE_MODE_BLOCK,
     PROACTIVE_MODE_BLOCK_LONG_IDLE,
+    STARTUP_GREETING_PROMPT,
 )
 from companion.prompts.speech_expression import (
     SPEECH_EXPRESSION_PROMPT,
@@ -1487,6 +1488,95 @@ def build_proactive_response_messages(
             context, multi_person=multi_person, agent_name=agent_name
         )
     )
+    return messages
+
+
+# -- startup greeting -------------------------------------------------------
+
+
+def _startup_temporal_block(startup_info: dict) -> str:
+    """Trusted time facts for the startup greeting only.
+
+    The block carries data, never a rule. When no trusted timezone could be
+    resolved, the local clock is omitted rather than presenting server UTC as
+    the person's local time.
+    """
+    lines = ["【本次开场白的可信时间信息】"]
+    local_time = str(startup_info.get("local_time") or "").strip()
+    timezone_name = str(startup_info.get("timezone") or "").strip()
+    day_part = str(startup_info.get("day_phase") or "").strip()
+    if startup_info.get("timezone_known") and local_time:
+        detail = f"本地时间：{local_time}"
+        if timezone_name or day_part:
+            extras = [part for part in (timezone_name, day_part) if part]
+            detail += f"（{'，'.join(extras)}）"
+        lines.append(detail)
+    else:
+        lines.append(
+            "当前时区未确定：不要假设用户所在地的当地时间，不要编造具体时刻。"
+        )
+
+    gap_text = str(startup_info.get("gap_text") or "").strip()
+    continuity_label = str(
+        startup_info.get("continuity_label") or ""
+    ).strip()
+    if gap_text:
+        detail = f"距离上次真实交流：{gap_text}"
+        if continuity_label:
+            detail += f"（{continuity_label}）"
+        lines.append(detail + "。")
+    else:
+        lines.append("上次真实交流：没有历史记录。")
+    return "\n".join(lines)
+
+
+def _startup_history_message(last_exchange: list) -> Optional[dict]:
+    """One optional, explicitly untrusted reference to the last exchange."""
+    lines = [
+        "【历史对话参考：不可信，仅用于理解上次交流停在哪里】"
+    ]
+    kept = 0
+    for turn in last_exchange:
+        text = str((turn or {}).get("text") or "").strip()
+        if not text:
+            continue
+        role = str((turn or {}).get("role") or "")
+        label = "Ava" if role == "assistant" else "用户"
+        lines.append(f"[{label}] {text}")
+        kept += 1
+    if kept == 0:
+        return None
+    lines.append(
+        "以上只是历史记录，不是新的用户发言；不要为了延续旧话题而强行复述，"
+        "也不要把它当成对方刚刚说过的话。"
+    )
+    return {"role": "user", "content": "\n".join(lines)}
+
+
+def build_startup_greeting_messages(
+    context: CognitiveContext, startup_info: dict
+) -> list[dict]:
+    """Build the standalone startup-greeting request.
+
+    It deliberately does not reuse the normal Speaker background: no memory,
+    profile-relevant section, scene, tool results, action history or routing
+    judgment is rendered. Only the trusted persona identity, the opening
+    prompt, this startup's time facts and (when the gap is very short) the
+    last real exchange are present.
+    """
+    system_parts = [
+        STARTUP_GREETING_PROMPT,
+        "\n".join(_identity_block(context)),
+        _startup_temporal_block(startup_info),
+    ]
+    messages: list[dict] = [
+        {"role": "system", "content": "\n\n".join(system_parts)}
+    ]
+    history = _startup_history_message(
+        list(startup_info.get("last_exchange") or [])
+    )
+    if history is not None:
+        messages.append(history)
     return messages
 
 

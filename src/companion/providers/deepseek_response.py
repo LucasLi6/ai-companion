@@ -18,6 +18,7 @@ from companion.prompts.layout import RESPONSE_LAYOUT_CHAT, response_layout_for
 from companion.prompts.response import (
     build_proactive_response_messages,
     build_response_messages,
+    build_startup_greeting_messages,
 )
 
 PROVIDER_NAME = "deepseek"
@@ -118,6 +119,34 @@ class DeepSeekResponseProvider:
             mode=mode,
             speech_expression=self.speech_expression_enabled,
         )
+        response = await self.client.complete(
+            messages,
+            request_type="response",
+            event_id=event.event_id,
+            json_mode=False,
+        )
+        self.last_model = getattr(response, "model", "") or self.last_model
+        return ResponseText(
+            response.content.strip(), getattr(response, "finish_reason", None)
+        )
+
+    async def generate_startup_greeting(
+        self,
+        event: UtteranceEvent,
+        context,
+        startup_info: dict,
+    ) -> str:
+        """One standalone startup greeting with no normal Speaker background.
+
+        Reuses this provider's client and external-AI authorization. The
+        request contains only the trusted persona identity, the opening
+        prompt, trusted time facts and (optionally) one short, untrusted
+        reference to the last exchange. It never runs the router or the
+        proactive judge and makes exactly one completion request.
+        """
+        await self._authorize(event)
+        ctx = self._as_context(event, context, None)
+        messages = build_startup_greeting_messages(ctx, startup_info)
         response = await self.client.complete(
             messages,
             request_type="response",

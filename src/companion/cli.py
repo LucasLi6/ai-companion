@@ -2147,6 +2147,150 @@ async def _select_repl_person(rt, person_id):
     return people[0], None
 
 
+STARTUP_GREETING_TIMEOUT_SECONDS = 30.0
+STARTUP_GREETING_GENERATION_TIMEOUT_SECONDS = 45.0
+STARTUP_GREETING_ENV = "AVA_STARTUP_GREETING_ENABLED"
+
+
+def _startup_greeting_enabled(env=None) -> bool:
+    """The one startup greeting is on by default; only explicit off disables."""
+    raw = (env if env is not None else os.environ).get(
+        STARTUP_GREETING_ENV, "true"
+    )
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _play_startup_greeting(
+    tts_manager,
+    *,
+    text: str,
+    conversation_id: str,
+    timeout: float = STARTUP_GREETING_TIMEOUT_SECONDS,
+) -> str:
+    """Submit the greeting and wait for its own playback to end.
+
+    Returns ``finished``/``failed``/``cancelled``/``timeout``/``submit_failed``
+    or ``tts_off``. It never guesses playback duration and never blocks the
+    event loop; the TTS callback only signals through ``call_soon_threadsafe``.
+    """
+    if tts_manager is None or not getattr(tts_manager, "enabled", False):
+        return "tts_off"
+    loop = asyncio.get_running_loop()
+    done = asyncio.Event()
+    outcome = {"kind": None}
+    response_id = f"startup-greeting-{time.monotonic_ns()}"
+
+    def _on_playback(event) -> None:
+        if getattr(event, "response_id", None) != response_id:
+            return
+        kind = getattr(event, "kind", "")
+        if kind not in ("finished", "failed", "cancelled"):
+            return
+        if outcome["kind"] is None:
+            outcome["kind"] = kind
+            try:
+                loop.call_soon_threadsafe(done.set)
+            except RuntimeError:  # event loop already closed
+                pass
+
+    tts_manager.add_playback_listener(_on_playback)
+    try:
+        if not tts_manager.submit(
+            SpeechJob(
+                response_id=response_id,
+                conversation_id=conversation_id,
+                text=text,
+                generation=tts_manager.generation,
+            )
+        ):
+            return "submit_failed"
+        try:
+            await asyncio.wait_for(done.wait(), timeout=max(0.05, timeout))
+        except asyncio.TimeoutError:
+            # Never leave startup audio playing over the first real turn.
+            with contextlib.suppress(Exception):
+                tts_manager.stop(wait=False)
+            return "timeout"
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                tts_manager.stop(wait=False)
+            raise
+        return outcome["kind"] or "unknown"
+    finally:
+        with contextlib.suppress(Exception):
+            tts_manager.remove_playback_listener(_on_playback)
+
+
+async def _run_startup_greeting(
+    rt,
+    *,
+    conversation_id: str,
+    person_id: str,
+    tts_manager,
+    output,
+) -> None:
+    """Optional startup step: display and speak one greeting, then return.
+
+    Every failure is contained here: the greeting must never prevent normal
+    listening or turn into a retry loop.
+    """
+    logger = logging.getLogger("companion.cli")
+    try:
+        greeting = await asyncio.wait_for(
+            rt.orchestrator.generate_startup_greeting(
+                conversation_id=conversation_id, person_id=person_id
+            ),
+            timeout=STARTUP_GREETING_GENERATION_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        logger.warning("startup_greeting_skipped type=TimeoutError")
+        return
+    except Exception as exc:  # noqa: BLE001 - optional startup experience
+        logger.warning(
+            "startup_greeting_skipped type=%s", type(exc).__name__
+        )
+        return
+    if not greeting:
+        return
+    text = str(greeting.get("text") or "").strip()
+    display_text = str(greeting.get("display_text") or text).strip()
+    if not display_text:
+        return
+    try:
+        await output.write("assistant> " + display_text + "\n")
+    except Exception:  # noqa: BLE001 - display must not block startup
+        pass
+    outcome = await _play_startup_greeting(
+        tts_manager,
+        text=display_text,
+        conversation_id=conversation_id,
+    )
+    if outcome not in ("finished", "tts_off"):
+        logger.warning("startup_greeting_playback=%s", outcome)
+
+
+async def _enable_after_startup_greeting(
+    coordinator,
+    *,
+    rt,
+    conversation_id: str,
+    person_id: str,
+    tts_manager,
+    output,
+):
+    """Play the greeting first, then start normal ASR listening."""
+    await _run_startup_greeting(
+        rt,
+        conversation_id=conversation_id,
+        person_id=person_id,
+        tts_manager=tts_manager,
+        output=output,
+    )
+    return await coordinator.enable()
+
+
 async def cmd_repl(args) -> int:
     # ``AVA_PROACTIVE_ACTIVITY`` (and other local settings) may live in the
     # git-ignored .env; load it before the runtime builds the proactive
@@ -2423,8 +2567,20 @@ async def cmd_repl(args) -> int:
                 )
                 # ``--voice`` means persistent listening from startup. A
                 # missing key or device is reported once and text chat
-                # continues; it never aborts the REPL.
-                _mic_ok, _mic_message = await coordinator.enable()
+                # continues; it never aborts the REPL. With DeepSeek, Ava may
+                # first say one startup greeting; ASR listening starts only
+                # after that greeting has finished playing (or was skipped).
+                if provider == "deepseek" and _startup_greeting_enabled():
+                    _mic_ok, _mic_message = await _enable_after_startup_greeting(
+                        coordinator,
+                        rt=rt,
+                        conversation_id=args.conversation,
+                        person_id=person.person_id,
+                        tts_manager=tts_manager,
+                        output=voice_output,
+                    )
+                else:
+                    _mic_ok, _mic_message = await coordinator.enable()
                 print(_mic_message)
                 if repl_session is not None and voice_subtitle is not None:
                     # Part 3: show what ASR has recognized so far under the

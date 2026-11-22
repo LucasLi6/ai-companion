@@ -8,6 +8,7 @@ are never constructed here.
 from __future__ import annotations
 
 import io
+import logging
 import queue
 import threading
 import time
@@ -22,7 +23,15 @@ from companion.asr.client import (
     ASRSession,
     parse_event,
 )
-from companion.asr.config import ASRConfig, VAD_WINDOW_SAMPLES
+from companion.asr.config import (
+    ASRConfig,
+    ASRConfigError,
+    DEFAULT_MAX_SENTENCE_SILENCE_MS,
+    DEFAULT_MODEL,
+    LEGACY_MESSAGE_MODEL,
+    VAD_WINDOW_SAMPLES,
+    load_asr_config,
+)
 from companion.asr.manager import (
     ASRManager,
     _FinalTimeout,
@@ -894,7 +903,7 @@ def test_session_uses_streaming_recognize_with_verified_parameters() -> None:
     assert call["disfluency_removal_enabled"] is False
     assert call["parameters"] == {
         "intermediate_result_enabled": True,
-        "max_sentence_silence": 1500,
+        "max_sentence_silence": DEFAULT_MAX_SENTENCE_SILENCE_MS,
     }
     session.send_audio(b"\x01\x02")
     assert recognition.sent == [b"\x01\x02"]
@@ -908,6 +917,78 @@ def test_session_uses_streaming_recognize_with_verified_parameters() -> None:
     assert session.closed is True
 
 
+def _credentials(**extra) -> dict:
+    values = {"DASHSCOPE_API_KEY": "unit-key", "DASHSCOPE_WORKSPACE_ID": "ws"}
+    values.update(extra)
+    return values
+
+
+def test_streaming_model_is_the_default_with_its_official_silence() -> None:
+    assert DEFAULT_MODEL == "qwen-audio-3.1-asr-flash-streaming"
+    cfg = load_asr_config(_credentials())
+    assert cfg.model == DEFAULT_MODEL
+    assert cfg.max_sentence_silence_ms == 800
+
+
+def test_explicit_message_model_keeps_its_1500ms_fallback() -> None:
+    cfg = load_asr_config(
+        _credentials(AVA_ASR_MODEL=LEGACY_MESSAGE_MODEL)
+    )
+    assert cfg.max_sentence_silence_ms == 1500
+    # Direct construction resolves the same model-specific default.
+    direct = ASRConfig(
+        api_key="k", workspace_id="w", model=LEGACY_MESSAGE_MODEL
+    )
+    assert direct.max_sentence_silence_ms == 1500
+
+
+def test_explicit_sentence_silence_wins_for_both_models() -> None:
+    for model in (DEFAULT_MODEL, LEGACY_MESSAGE_MODEL):
+        cfg = load_asr_config(
+            _credentials(
+                AVA_ASR_MODEL=model,
+                AVA_ASR_MAX_SENTENCE_SILENCE_MS="650",
+            )
+        )
+        assert cfg.max_sentence_silence_ms == 650
+    # The local VAD end silence is a different knob and stays independent.
+    cfg = load_asr_config(
+        _credentials(
+            AVA_ASR_MAX_SENTENCE_SILENCE_MS="650",
+            AVA_ASR_END_SILENCE_MS="700",
+        )
+    )
+    assert (cfg.max_sentence_silence_ms, cfg.end_silence_ms) == (650, 700)
+
+
+@pytest.mark.parametrize("raw", ["abc", "", "199", "6001", "0", "-5"])
+def test_invalid_sentence_silence_is_rejected(raw: str) -> None:
+    with pytest.raises(ASRConfigError, match="AVA_ASR_MAX_SENTENCE_SILENCE_MS"):
+        load_asr_config(
+            _credentials(AVA_ASR_MAX_SENTENCE_SILENCE_MS=raw)
+        )
+
+
+def test_session_parameters_follow_the_configured_model() -> None:
+    for model, expected in (
+        (DEFAULT_MODEL, 800),
+        (LEGACY_MESSAGE_MODEL, 1500),
+    ):
+        api = FakeAsrApi(FakeRecognition([]))
+        session = ASRSession(
+            config(model=model),
+            client_factory=lambda _cfg, api=api: FakeClient(api),
+        )
+        session.open()
+        call = api.calls[0]
+        assert call["parameters"] == {
+            "intermediate_result_enabled": True,
+            "max_sentence_silence": expected,
+        }
+        assert call["disfluency_removal_enabled"] is False
+        session.close()
+
+
 def test_session_send_after_close_raises_safe_error() -> None:
     session = ASRSession(config(), client_factory=lambda _cfg: FakeClient(
         FakeAsrApi(FakeRecognition([]))
@@ -915,6 +996,124 @@ def test_session_send_after_close_raises_safe_error() -> None:
     session.close()
     with pytest.raises(ASRClientError):
         session.send_audio(b"\x00\x00")
+
+
+# ------------------------------------------------------------ timing diagnostics
+def _timing_manager(*, debug: bool = True) -> ASRManager:
+    renderer, _, _ = make_renderer()
+    return ASRManager(
+        config(debug=debug),
+        microphone=FakeMic(),
+        vad_segmenter=ScriptedSegmenter([]),
+        session_factory=lambda: None,
+        renderer=renderer,
+    )
+
+
+def _track(manager: ASRManager, uid: int) -> _Utterance:
+    utterance = _Utterance(uid, 512)
+    manager._utterances[uid] = utterance
+    return utterance
+
+
+def _timing_line(caplog, manager: ASRManager, utterance: _Utterance) -> str:
+    with caplog.at_level(logging.DEBUG, logger="companion.asr"):
+        manager._log_timing(utterance)
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "[asr timing]" in record.getMessage()
+    ]
+    assert len(lines) == 1
+    return lines[0]
+
+
+def test_partial_and_final_timestamps_are_per_utterance() -> None:
+    manager = _timing_manager()
+    first = _track(manager, 7)
+    second = _track(manager, 8)
+
+    manager._handle_sentence(_Sentence(7, "你好", "s1", False, 1.0))
+    manager._handle_sentence(_Sentence(8, "再见", "s1", False, 2.0))
+    manager._handle_sentence(_Sentence(7, "你好。", "s1", True, 3.0))
+
+    assert (first.first_partial_at, first.last_partial_at) == (1.0, 1.0)
+    assert (second.first_partial_at, second.last_partial_at) == (2.0, 2.0)
+    assert (first.first_sentence_final_at, first.last_sentence_final_at) == (
+        3.0,
+        3.0,
+    )
+    # A later turn never inherits an earlier turn's confirmed sentence.
+    assert second.first_sentence_final_at is None
+    assert second.last_sentence_final_at is None
+
+
+def test_timing_line_reports_missing_data_as_na(caplog) -> None:
+    manager = _timing_manager()
+    utterance = _track(manager, 7)
+    line = _timing_line(caplog, manager, utterance)
+    assert "uid=7" in line
+    assert f"model={manager.config.model}" in line
+    for name in (
+        "connect",
+        "first_partial",
+        "speech_end_to_last_partial",
+        "speech_end_to_sentence_final",
+        "vad_end_to_audio_sent",
+        "audio_sent_to_sentence_final",
+        "sentence_final_to_task_done",
+        "audio_sent_to_final",
+        "vad_to_final",
+    ):
+        assert f"{name}=N/A" in line
+    # No transcript or audio ever appears in the diagnostic.
+    assert "你好" not in line
+
+
+def test_timing_line_separates_speech_backlog_cloud_and_final(caplog) -> None:
+    manager = _timing_manager()
+    utterance = _track(manager, 12)
+    utterance.open_latency_ms = 420.0
+    utterance.speech_started_at = 10.0
+    utterance.first_partial_at = 10.69
+    utterance.vad_end_at = 11.0
+    utterance.last_partial_at = 11.2
+    utterance.all_audio_sent_at = 11.012
+    utterance.first_sentence_final_at = 11.5
+    utterance.last_sentence_final_at = 11.52
+    utterance.session_done_at = 11.6
+    utterance.final_emitted_at = 11.61
+    utterance.max_queued_audio_ms = 64.0
+    utterance.max_oldest_audio_age_ms = 20.0
+    utterance.max_send_call_block_ms = 3.0
+    utterance.sent_bytes = 32000
+
+    line = _timing_line(caplog, manager, utterance)
+    assert "connect=420ms" in line
+    assert "first_partial=690ms" in line
+    assert "max_queue=64ms" in line
+    assert "max_queue_age=20ms" in line
+    assert "max_send_call=3ms" in line
+    assert "bytes_sent=32000" in line
+    assert "speech_end_to_last_partial=200ms" in line
+    assert "speech_end_to_sentence_final=500ms" in line
+    assert "vad_end_to_audio_sent=12ms" in line
+    assert "audio_sent_to_sentence_final=508ms" in line
+    assert "sentence_final_to_task_done=80ms" in line
+    assert "audio_sent_to_final=598ms" in line
+    assert "vad_to_final=610ms" in line
+
+
+def test_timing_line_is_debug_only(caplog) -> None:
+    manager = _timing_manager(debug=False)
+    utterance = _track(manager, 7)
+    with caplog.at_level(logging.DEBUG, logger="companion.asr"):
+        manager._log_timing(utterance)
+    assert not [
+        record
+        for record in caplog.records
+        if "[asr timing]" in record.getMessage()
+    ]
 
 
 # ------------------------------------------------------------ microphone helpers
