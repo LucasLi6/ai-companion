@@ -1,8 +1,9 @@
-"""V0.9.9.34 — one memory-aware startup greeting.
+"""V0.9.9.34 — startup greeting CLI ordering.
 
-The greeting reuses the proactive context/prompt/provider path but is
-non-persisted and runs before ASR listening starts. These tests are offline:
-a fake DeepSeek client, fake TTS manager and fake coordinator only.
+The greeting runs before ASR listening starts and its playback is awaited.
+Generation itself was simplified in V0.9.9.35 and is covered by
+``test_v0999_35_startup_greeting.py``. These tests are offline: fake TTS and
+fake coordinator only.
 """
 
 from __future__ import annotations
@@ -18,95 +19,6 @@ from companion.cli import (
     _run_startup_greeting,
     _startup_greeting_enabled,
 )
-from companion.providers.deepseek_client import ChatResponse
-from companion.runtime import build_runtime
-
-
-class _GreetingClient:
-    def __init__(self, text: str) -> None:
-        self.text = text
-        self.calls: list[dict] = []
-
-    async def complete(self, messages, *, request_type, event_id=None, **kwargs):
-        self.calls.append(
-            {"request_type": request_type, "messages": messages}
-        )
-        return ChatResponse(
-            content=self.text,
-            model="fake",
-            finish_reason="stop",
-            prompt_tokens=1,
-            completion_tokens=1,
-            total_tokens=2,
-        )
-
-
-async def _person(rt):
-    person = await rt.registry.register(
-        "Alice",
-        "friend",
-        allow_processing=True,
-        allow_persistence=True,
-        allow_memory_learning=True,
-        allow_external_ai=True,
-    )
-    await rt.conversations.get_or_create("c1")
-    return person
-
-
-# --------------------------------------------------------------- generation
-async def test_greeting_works_without_history_or_memories(db) -> None:
-    client = _GreetingClient("刚刚安静下来，像是一天还没完全开始。")
-    rt = build_runtime(
-        db,
-        provider="deepseek",
-        deepseek_client=client,
-        with_worker=False,
-        router_mode="legacy",
-    )
-    person = await _person(rt)
-
-    result = await rt.orchestrator.generate_startup_greeting(
-        conversation_id="c1", person_id=person.person_id
-    )
-
-    assert result is not None
-    assert result["text"] == "刚刚安静下来，像是一天还没完全开始。"
-    assert len(client.calls) == 1
-    system = client.calls[0]["messages"][0]["content"]
-    assert "【启动开场白】" in system
-    assert "【本轮生成模式：主动发言】" not in system
-
-    # The synthetic source event is never persisted or rendered as a user
-    # turn, so no conversation history was created.
-    turns = await rt.repos.utterance.recent_context(
-        "c1", exclude_event_id=None, limit=20
-    )
-    assert turns == []
-
-
-async def test_opening_parses_voice_expression_without_a_recovery_call(db) -> None:
-    client = _GreetingClient(
-        "VOICE=excited\nTEXT=[giggles] 今天的光让人想慢一点。"
-    )
-    rt = build_runtime(
-        db,
-        provider="deepseek",
-        deepseek_client=client,
-        with_worker=False,
-        router_mode="legacy",
-        speech_expression_enabled=True,
-    )
-    person = await _person(rt)
-
-    result = await rt.orchestrator.generate_startup_greeting(
-        conversation_id="c1", person_id=person.person_id
-    )
-
-    assert result is not None
-    assert result["text"] == "今天的光让人想慢一点。"
-    assert "[excited]" in result["display_text"]
-    assert len(client.calls) == 1  # never a second generation
 
 
 # ------------------------------------------------------------- CLI ordering
