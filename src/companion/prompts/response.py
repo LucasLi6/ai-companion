@@ -59,6 +59,7 @@ from companion.prompts.identity import compile_trait_tendencies
 from companion.prompts.proactive import (
     PROACTIVE_MODE_BLOCK,
     PROACTIVE_MODE_BLOCK_LONG_IDLE,
+    PROACTIVE_MODE_BLOCK_OPENING,
 )
 from companion.prompts.speech_expression import (
     SPEECH_EXPRESSION_PROMPT,
@@ -1374,9 +1375,13 @@ def _system_parts(
         # A short, trusted mode note only. The persona above is unchanged and
         # no fake user utterance is introduced anywhere in the request.
         block = (
-            PROACTIVE_MODE_BLOCK_LONG_IDLE
-            if str(proactive_mode).upper() == "LONG_IDLE"
-            else PROACTIVE_MODE_BLOCK
+            PROACTIVE_MODE_BLOCK_OPENING
+            if str(proactive_mode).upper() == "OPENING"
+            else (
+                PROACTIVE_MODE_BLOCK_LONG_IDLE
+                if str(proactive_mode).upper() == "LONG_IDLE"
+                else PROACTIVE_MODE_BLOCK
+            )
         )
         parts.append(block)
     if speech_expression:

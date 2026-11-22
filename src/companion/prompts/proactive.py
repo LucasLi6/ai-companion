@@ -248,6 +248,31 @@ PROACTIVE_MODE_BLOCK_LONG_IDLE = """【本轮生成模式：长时间安静后�
 保持你原本的性格和说话习惯。"""
 
 
+# Used only for the one startup greeting. It is trusted local system context,
+# never stored, and never rendered as a user message.
+PROACTIVE_MODE_BLOCK_OPENING = """【启动开场白】
+
+你是 Ava。系统刚刚完成初始化，现在可以主动对眼前的人说一句开场白。
+
+参考当前真实时间、最近对话与已知记忆，自然地说一句你此刻想说的话。
+
+开场白应简短、口语化，通常一句话即可，不超过约 50 个汉字。
+
+可以自然提及近期聊过的事情、某个仍有意义的话题，或根据当下时间表达一点自己的想法。
+
+不需要每次都提到记忆，也不需要每次提到时间。不要强行把两者拼在一起。
+
+不要机械地说“早上好”“欢迎回来”“我已经初始化完成”或者“有什么可以帮助你的吗”。
+
+不要复述上次对话的结尾，也不要假装知道对方刚才做了什么。
+
+你可以轻松、好奇、幽默或随口聊一句，保持 Ava 原有的性格。
+
+不要为了维持聊天而强行追问，也不要把开场白写成一段说明。
+
+只输出实际要说的话，不要解释生成依据。"""
+
+
 _MODE_PROMPTS = {
     "IMMEDIATE": PROACTIVE_JUDGE_SYSTEM_PROMPT_IMMEDIATE,
     "LONG_IDLE": PROACTIVE_JUDGE_SYSTEM_PROMPT_LONG_IDLE,
@@ -288,5 +313,6 @@ __all__ = [
     "PROACTIVE_JUDGE_SYSTEM_PROMPT_LONG_IDLE",
     "PROACTIVE_MODE_BLOCK",
     "PROACTIVE_MODE_BLOCK_LONG_IDLE",
+    "PROACTIVE_MODE_BLOCK_OPENING",
     "build_proactive_judge_messages",
 ]

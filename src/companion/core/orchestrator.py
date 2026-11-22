@@ -49,7 +49,9 @@ from companion.cognition.silence import (
     detect_explicit_silence,
 )
 from companion.domain.enums import (
+    AddresseeHint,
     CognitiveAction,
+    EventSource,
     JobType,
     ProcessingStatus,
     ReasonCode,
@@ -2070,6 +2072,136 @@ class Orchestrator:
             "finish_reason": finish_reason,
             "model": getattr(self.response, "last_model", "") or "",
             "context": context,
+        }
+
+    async def generate_startup_greeting(
+        self, *, conversation_id: str, person_id: str
+    ) -> Optional[dict]:
+        """Generate Ava's one startup greeting through the existing Speaker.
+
+        This is an in-memory, non-persisted initiation: the synthetic source
+        event exists only for this request and is never written as a user
+        message. It reuses the proactive context, prompt and provider path,
+        but does not require the source event to be present in stored history
+        because a fresh install or conversation may have none.
+
+        No conversation turn, action, memory, profile fact or proactive
+        delivery counter is written. Authorization is enforced by the same
+        provider path as a normal reply.
+        """
+        if self.context_builder is None or self.response is None:
+            return None
+        event = UtteranceEvent(
+            event_id=new_id("startup"),
+            conversation_id=conversation_id,
+            speaker_person_id=person_id,
+            speaker_label=None,
+            text="（启动开场白）",
+            source=EventSource.VOICE,
+            addressee_hint=AddresseeHint.AGENT,
+            occurred_at=utcnow(),
+        )
+        try:
+            context = await self.context_builder.build_proactive(
+                event, [], history_limit=12
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "startup_greeting_context_failed conversation_id=%s error=%s",
+                conversation_id,
+                type(exc).__name__,
+            )
+            return None
+
+        # The greeting is about the recent exchange, so retrieve memories
+        # with the newest privacy-filtered human turn as the query. With no
+        # history the empty query still returns the person's recent memories.
+        query = ""
+        for turn in reversed(list(context.turns or [])):
+            if turn.role != ROLE_ASSISTANT and (turn.text or "").strip():
+                query = turn.text
+                break
+        memories: list = []
+        if self.memory is not None:
+            try:
+                memories = await self.memory.retrieve(query, person_id)
+            except Exception as exc:
+                self.logger.warning(
+                    "startup_greeting_memory_failed person_id=%s error=%s",
+                    person_id,
+                    type(exc).__name__,
+                )
+        if memories:
+            try:
+                context = await self.context_builder.build_proactive(
+                    event, list(memories), history_limit=12
+                )
+            except Exception:
+                # Keep the already-filtered no-memory context.
+                pass
+
+        scene_enabled = await self._scene_enabled()
+        personality_enabled = await self._personality_enabled()
+        context, _scene_record = await self._prepare_dialogue(
+            event,
+            context,
+            list(context.memories or []),
+            [],
+            scene_enabled=scene_enabled,
+            personality_enabled=personality_enabled,
+        )
+        if self.runtime_snapshot_builder is not None:
+            try:
+                moment = utcnow()
+                snapshot = await self.runtime_snapshot_builder.build(
+                    event,
+                    allow_external_ai=True,
+                    persist=False,
+                    received_at=moment,
+                    temporal_now=moment,
+                )
+                context = self._attach_runtime_snapshot(context, snapshot)
+            except Exception as exc:
+                self.logger.warning(
+                    "startup_greeting_runtime_failed conversation_id=%s"
+                    " error=%s",
+                    conversation_id,
+                    type(exc).__name__,
+                )
+        context = await self._attach_live_affect(context, person_id)
+
+        analysis = CognitiveResult(
+            event_id=event.event_id,
+            meaning="local startup greeting (no new user message)",
+            action=CognitiveAction.RESPOND,
+            reason_code=ReasonCode.DIRECT_AGENT_ADDRESS,
+            response_style="startup_greeting",
+            provider="local_startup_greeting",
+            intent="startup_greeting",
+            addressed_to="agent",
+            reply_necessity=ReplyNecessity.USEFUL,
+            conversation_state="startup",
+        )
+        generated = await self.response.generate_proactive(
+            event, analysis, context, mode="OPENING"
+        )
+        text = str(generated).strip()
+        display_text: Optional[str] = None
+        finish_reason = getattr(generated, "finish_reason", None)
+        if self.speech_expression_enabled:
+            parsed = parse_voice_response(text)
+            text = normalize_response_text(parsed.text, RESPONSE_LAYOUT_CHAT)
+            display_text = normalize_response_text(
+                parsed.display_text, RESPONSE_LAYOUT_CHAT
+            )
+            if not has_valid_reply_text(text):
+                # One greeting attempt only; never spend a second call here.
+                return None
+        return {
+            "text": text,
+            "display_text": display_text,
+            "finish_reason": finish_reason,
+            "model": getattr(self.response, "last_model", "") or "",
         }
 
     async def _prepare_context(
